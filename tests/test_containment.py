@@ -56,3 +56,16 @@ def test_sidecar_symlink_aborts(tmp_path):
         pytest.skip("no symlink privilege")
     with pytest.raises(ct.Refusal):
         ct.sidecar_inventory(str(d))
+
+
+def test_sidecar_toplevel_symlink_aborts(tmp_path):
+    real = tmp_path / "real-side"
+    real.mkdir()
+    (real / "a.jsonl").write_bytes(b"x")
+    link = tmp_path / "linked-side"
+    try:
+        os.symlink(str(real), str(link), target_is_directory=True)
+    except OSError:
+        pytest.skip("no symlink privilege")
+    with pytest.raises(ct.Refusal):
+        ct.sidecar_inventory(str(link))

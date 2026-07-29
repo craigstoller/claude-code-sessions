@@ -67,8 +67,18 @@ def default_env():
 
 
 def _default_process_lister():
-    """Names of running processes, lowercased. Implemented in Task 9."""
-    return []
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["tasklist", "/FO", "CSV"], capture_output=True,
+                                 text=True, timeout=15).stdout
+            return [line.split('","')[0].strip('"').lower()
+                    for line in out.splitlines()[1:] if line.startswith('"')]
+        out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True,
+                             text=True, timeout=15).stdout
+        return [l.strip().lower() for l in out.splitlines() if l.strip()]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------- 2. helpers
@@ -458,6 +468,9 @@ def _is_reparse(path):
 def sidecar_inventory(sidecar_dir):
     if not os.path.isdir(sidecar_dir):
         return []
+    if _is_reparse(sidecar_dir):
+        raise Refusal("sidecar dir {0} is a symlink/junction; refusing to "
+                      "traverse".format(sidecar_dir))
     inv = []
     for dirpath, dirnames, filenames in os.walk(sidecar_dir):
         for name in dirnames + filenames:
@@ -472,6 +485,175 @@ def sidecar_inventory(sidecar_dir):
             inv.append({"rel": rel, "sha256": digest, "size": size})
     inv.sort(key=lambda e: e["rel"])
     return inv
+
+
+# ------------------------------------------------------ move validation
+@dataclasses.dataclass
+class MoveFlags:
+    transcript_only: bool = False
+    unverified_platform: bool = False
+    row: list = ()
+    yes: bool = False
+    force: bool = False
+
+
+def claude_running(env):
+    me = "python"
+    return [p for p in env.process_lister()
+            if "claude" in p and me not in p]
+
+
+MTIME_GUARD_SECONDS = 600
+
+
+def plan_move(env, session_id, target, flags):
+    target = os.path.normpath(os.path.abspath(target))
+
+    # 1. store discovery / platform posture
+    disc = discover_stores(env)
+    if disc.status == "error":
+        raise LayoutError("store discovery failed: {0}. 'Couldn't look' is never "
+                          "'nothing there' - refusing to mutate.".format(disc.detail))
+    rows, row_errors = load_rows(disc.roots)
+    if row_errors:
+        raise LayoutError("unreadable listing rows (fail-closed): " + "; ".join(row_errors))
+
+    # 2. encoding + destination folder (computed before transcript lookup: a
+    # transcript that already exists exactly AT the computed destination is a
+    # destination collision, not an ambiguous source - see step 3)
+    moved = moved_session_ids(env)
+    if rows:
+        cwds = [r.cwd for r in sorted(rows, key=lambda r: r.last_activity)[-50:]]
+    else:
+        cwds = []
+        for folder, path in iter_transcripts(env.projects_root):
+            sid = os.path.splitext(os.path.basename(path))[0]
+            if sid in moved:
+                continue
+            c = first_cwd(path)
+            if not c:
+                continue
+            enc_c, enc_l = encode(c, SCHEME_CURRENT), encode(c, SCHEME_LEGACY)
+            if folder not in (enc_c, enc_l):
+                continue        # worktree session: folder matches neither
+            cwds.append(c)
+    scheme = choose_scheme(scheme_evidence(cwds, env.projects_root), target)
+    dest_dir = os.path.join(env.projects_root, encode(target, scheme))
+    dest_transcript = os.path.join(dest_dir, session_id + ".jsonl")
+
+    # 3. transcript location, globally. A hit whose real path is exactly the
+    # computed destination transcript is not source-ambiguity - it is handled
+    # by the destination-exists check in step 4 - so it is excluded here.
+    hits = find_transcripts(env.projects_root, session_id)
+    dest_real = os.path.realpath(dest_transcript)
+    source_hits = [h for h in hits if os.path.realpath(h) != dest_real]
+    if not source_hits:
+        if hits:
+            raise Refusal("source and destination transcript are identical: "
+                          "{0}".format(dest_transcript))
+        raise Refusal("No transcript found for {0}. Use 'claude-threads list' to find "
+                      "session ids.".format(session_id))
+    if len(source_hits) > 1:
+        raise Refusal("Ambiguous: transcript exists in several folders:\n  " +
+                      "\n  ".join(source_hits))
+    source = source_hits[0]
+
+    # 4. destination checks
+    if not os.path.isdir(target):
+        raise Refusal("target must be an existing directory: {0}".format(target))
+    real_target = os.path.realpath(target)
+    for forbidden in (os.path.join(env.home, ".claude"), os.path.dirname(env.ops_dir)):
+        fr = os.path.realpath(forbidden)
+        if real_target == fr or real_target.startswith(fr + os.sep):
+            raise Refusal("refusing target inside {0}".format(forbidden))
+    if os.path.exists(dest_transcript) or os.path.exists(sidecar_path(dest_transcript)):
+        raise Refusal("destination already exists: {0}".format(dest_transcript))
+    if os.path.realpath(os.path.dirname(source)) == os.path.realpath(dest_dir):
+        raise Refusal("source and destination are the same folder")
+    if os.path.isdir(dest_dir):
+        for name in sorted(os.listdir(dest_dir)):
+            if not name.endswith(".jsonl"):
+                continue
+            other = os.path.join(dest_dir, name)
+            sid = name[:-len(".jsonl")]
+            c = last_cwd(other)
+            if sid in moved or not c:
+                continue
+            if encode(c, scheme) != os.path.basename(dest_dir):
+                raise Refusal("destination collision: {0} records cwd {1}, which does "
+                              "not encode to this folder. Two real paths can share one "
+                              "encoded folder; refusing to merge projects.".format(other, c))
+    import shutil as _shutil
+    t_hash, t_size = sha256_file(source)
+    side_src = sidecar_path(source)
+    inv = sidecar_inventory(side_src) if os.path.isdir(side_src) else []
+    need = t_size + sum(e["size"] for e in inv) + (1 << 20)
+    if _shutil.disk_usage(os.path.dirname(dest_dir)).free < need:
+        raise Refusal("not enough free space for a safe copy")
+
+    # 5. row set
+    my_rows = [r for r in rows if r.cli_session_id == session_id]
+    for local_id in (flags.row or ()):
+        lid = local_id if local_id.startswith("local_") else "local_" + local_id
+        matches = [r for r in rows if r.local_id == lid]
+        if not matches:
+            raise Refusal("no listing row with sessionId " + lid)
+        r = matches[0]
+        if r.cli_session_id not in ("", session_id):
+            raise Refusal("row {0} is linked to a different live session; rows linked "
+                          "to a different live session are never adoptable".format(lid))
+        if not flags.yes:
+            raise Refusal("adopting row {0} (title={1!r}, cwd={2!r}) requires "
+                          "confirmation: pass --yes".format(lid, r.data.get("title"), r.cwd))
+        if r not in my_rows:
+            my_rows.append(r)
+    if not my_rows:
+        if disc.status == "found" and not flags.transcript_only:
+            raise Refusal("no listing row references this transcript; moving it would "
+                          "orphan the desktop entry. If this thread was created by the "
+                          "CLI (not the desktop app), pass --transcript-only.")
+        if disc.status == "absent" and not flags.transcript_only:
+            raise Refusal("no desktop store found. If you don't use the desktop app, "
+                          "pass --transcript-only. (On mac/Linux the store locations "
+                          "are unverified - absence may mean we looked in the wrong "
+                          "place.)")
+    mode = "desktop" if my_rows else "transcript_only"
+    if mode == "desktop" and not env.is_windows and not flags.unverified_platform:
+        raise Refusal("desktop-store mutations are unverified on this platform; pass "
+                      "--unverified-platform to proceed anyway.")
+
+    # 6. guards
+    running = claude_running(env)
+    if running:
+        raise Refusal("Claude appears to be running ({0}). Close the app, then retry."
+                      .format(", ".join(sorted(set(running))[:3])))
+    age = env.now() - os.path.getmtime(source)
+    if age < MTIME_GUARD_SECONDS and not flags.force:
+        raise Refusal("transcript was written {0:.0f} seconds ago - this thread may be "
+                      "open (checked because a recent mtime lasts ~10 minutes). Close "
+                      "the app; pass --force only if you are sure this is stale."
+                      .format(age))
+
+    row_entries = []
+    for r in my_rows:
+        with open(r.path, "rb") as fh:
+            pre = fh.read()
+        post = dict(r.data)
+        post["cwd"] = target
+        post["originCwd"] = target
+        post["cliSessionId"] = session_id
+        row_entries.append({"path": r.path, "pre_b64": b64(pre),
+                            "post_b64": b64(json.dumps(post, separators=(",", ":"))
+                                            .encode("utf-8")),
+                            "rewritten": False})
+    return {
+        "op_type": "move", "session_id": session_id, "mode": mode,
+        "source_transcript": source, "dest_transcript": dest_transcript,
+        "transcript_sha256": t_hash, "transcript_size": t_size,
+        "sidecar_source": side_src if inv else None,
+        "sidecar_dest": sidecar_path(dest_transcript) if inv else None,
+        "sidecar_inventory": inv, "rows": row_entries, "target_cwd": target,
+    }
 
 
 def main(argv=None):
