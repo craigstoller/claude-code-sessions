@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-threads"
+version = "0.1.0"
+description = "Unofficial CLI to inspect and relocate Claude Code threads on disk. Fails closed; never guesses."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+claude-threads = "claude_threads:main"
+
+[tool.setuptools]
+py-modules = ["claude_threads"]
