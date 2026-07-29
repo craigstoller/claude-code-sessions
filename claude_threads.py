@@ -121,6 +121,40 @@ def unb64(s):
     return base64.b64decode(s.encode("ascii"))
 
 
+# ------------------------------------------------------- 3. encoding detection
+import re
+
+
+def encode(path, scheme):
+    return re.sub(scheme, "-", path)
+
+
+def scheme_evidence(cwds, projects_root):
+    cur = leg = 0
+    for cwd in set(c for c in cwds if c):
+        a, b = encode(cwd, SCHEME_CURRENT), encode(cwd, SCHEME_LEGACY)
+        if a == b:
+            continue  # agreeing paths carry no signal
+        cur += os.path.isdir(os.path.join(projects_root, a))
+        leg += os.path.isdir(os.path.join(projects_root, b))
+    return cur, leg
+
+
+def choose_scheme(evidence, target_path):
+    cur, leg = evidence
+    if cur > leg:
+        return SCHEME_CURRENT
+    if leg > cur:
+        return SCHEME_LEGACY
+    # tie (including 0-0): only safe when the choice cannot matter for this target
+    if encode(target_path, SCHEME_CURRENT) == encode(target_path, SCHEME_LEGACY):
+        return SCHEME_CURRENT
+    raise LayoutError(
+        "cannot determine the path-encoding scheme (evidence current={0} legacy={1}) "
+        "and the target '{2}' encodes differently under the two known schemes. "
+        "Refusing to guess.".format(cur, leg, target_path))
+
+
 def main(argv=None):
     return 0
 
