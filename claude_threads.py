@@ -1548,6 +1548,139 @@ def clear_stale_lock(env):
     return False
 
 
+# ------------------------------------------------- 6. commands: list, doctor
+_UUID_RE = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+
+
+def redact(env, text):
+    for h in {env.home, os.path.realpath(env.home)}:
+        text = text.replace(h, "~")
+    return _UUID_RE.sub(lambda m: m.group(1) + "…", text)
+
+
+def gather_list(env, query="", project=None):
+    disc = discover_stores(env)
+    rows, _ = load_rows(disc.roots)
+    items, seen = [], set()
+    for r in rows:
+        if not r.cli_session_id:
+            continue
+        seen.add(r.cli_session_id)
+        items.append({"session_id": r.cli_session_id, "title": r.data.get("title") or "",
+                      "cwd": r.cwd, "last_activity": r.last_activity, "listed": True})
+    for folder, path in iter_transcripts(env.projects_root):
+        sid = os.path.splitext(os.path.basename(path))[0]
+        if sid in seen or not path.endswith(".jsonl"):
+            continue
+        items.append({"session_id": sid, "title": "", "cwd": first_cwd(path),
+                      "last_activity": int(os.path.getmtime(path) * 1000),
+                      "listed": False})
+    if query:
+        q = query.lower()
+        items = [i for i in items
+                 if q in (i["title"] + " " + i["cwd"] + " " + i["session_id"]).lower()]
+    if project:
+        p = os.path.normpath(os.path.abspath(project)).lower()
+        items = [i for i in items if os.path.normpath(i["cwd"]).lower() == p]
+    items.sort(key=lambda i: i["last_activity"], reverse=True)
+    return items
+
+
+def cmd_list(env, ns):
+    items = gather_list(env, query=getattr(ns, "query", "") or "",
+                        project=getattr(ns, "project", None))
+    if ns.json:
+        print(json.dumps(items, indent=1))
+        return 0
+    for i in items:
+        sid = i["session_id"] if getattr(ns, "full", False) else i["session_id"][:8]
+        line = "{0}  {1:40.40}  {2}".format(sid, i["title"] or "(no title)", i["cwd"])
+        print(line if ns.verbose else redact(env, line))
+    if not items:
+        print("no threads found")
+    return 0
+
+
+RETENTION_HINT_DAYS = 30
+
+
+def gather_doctor(env):
+    disc = discover_stores(env)
+    rows, row_errors = load_rows(disc.roots)
+    transcripts = iter_transcripts(env.projects_root)
+    tids = {os.path.splitext(os.path.basename(p))[0] for _, p in transcripts}
+    blank = [r.local_id for r in rows if not r.cli_session_id]
+    dead = [{"local_id": r.local_id,
+             "age_days": round((env.now() * 1000 - r.last_activity) / 86_400_000)}
+            for r in rows if r.cli_session_id and r.cli_session_id not in tids]
+    listed = {r.cli_session_id for r in rows if r.cli_session_id}
+    unlisted = sorted(tids - listed)
+    cwds = [r.cwd for r in rows if r.cwd]
+    cur, leg = scheme_evidence(cwds, env.projects_root)
+    legacy_folders = []
+    for cwd in set(cwds):
+        a, b = encode(cwd, SCHEME_CURRENT), encode(cwd, SCHEME_LEGACY)
+        if a != b and os.path.isdir(os.path.join(env.projects_root, a)) \
+                and os.path.isdir(os.path.join(env.projects_root, b)):
+            n = len([x for x in os.listdir(os.path.join(env.projects_root, b))
+                     if x.endswith(".jsonl")])
+            legacy_folders.append({"folder": b, "transcripts": n})
+    nt = [o.manifest["op_id"] for o in nonterminal_ops(env)]
+    report = {
+        "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
+        "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
+        "dead_rows": dead, "unlisted_transcripts": unlisted,
+        "encoding": {"current": cur, "legacy": leg},
+        "legacy_folders": legacy_folders, "nonterminal_ops": nt,
+        "stale_lock": lock_is_stale(env),
+    }
+    if disc.status == "error" or row_errors:
+        report["exit_code"] = 2
+    elif blank or dead or nt or report["stale_lock"] or legacy_folders:
+        report["exit_code"] = 1
+    else:
+        report["exit_code"] = 0
+    return report
+
+
+def cmd_doctor(env, ns):
+    rep = gather_doctor(env)
+    if ns.json:
+        print(json.dumps(rep, indent=1))
+        return rep["exit_code"]
+    def say(line):
+        print(line if ns.verbose else redact(env, line))
+    say("[observed] store: {0} ({1})".format(rep["stores"]["status"],
+                                             rep["stores"]["detail"]))
+    for r in rep["stores"]["roots"]:
+        say("[observed]   root: " + r)
+    say("[observed] listing rows: {0}".format(rep["row_count"]))
+    for e in rep["row_errors"]:
+        say("[observed] UNREADABLE ROW (mutations blocked): " + e)
+    for lid in rep["blank_rows"]:
+        say("[observed] row {0} has a blank cliSessionId".format(lid))
+        say("[hypothesis]   the app blanks the link when a transcript goes missing")
+    for d in rep["dead_rows"]:
+        say("[observed] row {0}: transcript missing (last activity {1}d ago)"
+            .format(d["local_id"], d["age_days"]))
+        if d["age_days"] >= RETENTION_HINT_DAYS:
+            say("[hypothesis]   age is consistent with the ~30-day retention default")
+    for sid in rep["unlisted_transcripts"]:
+        say("[observed] transcript {0} has no listing row".format(sid))
+        say("[hypothesis]   normal for CLI-created sessions; also what an interrupted "
+            "external move leaves behind")
+    say("[observed] encoding evidence: current={0} legacy={1}"
+        .format(rep["encoding"]["current"], rep["encoding"]["legacy"]))
+    for lf in rep["legacy_folders"]:
+        say("[observed] legacy-encoded folder {0} ({1} transcripts) is shadowed"
+            .format(lf["folder"], lf["transcripts"]))
+    for oid in rep["nonterminal_ops"]:
+        say("[observed] unresolved operation {0} - run: claude-threads recover".format(oid))
+    if rep["stale_lock"]:
+        say("[observed] stale lock - run: claude-threads recover")
+    return rep["exit_code"]
+
+
 def main(argv=None):
     return 0
 
