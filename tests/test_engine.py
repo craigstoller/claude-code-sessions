@@ -217,3 +217,27 @@ def test_crash_mid_rewriting_two_rows_recoverable(planned, write_row):
     for r in op.manifest["rows"]:
         assert r["pre_b64"]
     assert os.path.isfile(t)
+
+
+def test_sidecar_delete_failure_keeps_source_and_stays_committed(planned, monkeypatch):
+    """Fix-round-2: a locked/undeletable sidecar file during the final
+    commit step must not be silently swallowed. It must not reach
+    'completed' (which would delete the source transcript out from under
+    the surviving sidecar file, orphaning it with no journal trail) - it
+    must stay nonterminal at 'committed' with the source transcript intact
+    for `recover` to finish."""
+    env, m, t, target = planned
+    sidecar_file = os.path.join(m["sidecar_source"], "sub", "agent.jsonl")
+    real_unlink = os.unlink
+    def failing_unlink(path, *a, **kw):
+        if path == sidecar_file:
+            raise PermissionError(13, "Access is denied")
+        return real_unlink(path, *a, **kw)
+    monkeypatch.setattr(os, "unlink", failing_unlink)
+    assert ct.run_move(env, m) == "committed"
+    monkeypatch.undo()
+    op = ct.list_ops(env)[0]
+    assert op.manifest["status"] == "committed"
+    assert ct.nonterminal_ops(env)
+    assert os.path.isfile(t)               # source transcript NOT deleted
+    assert os.path.isfile(sidecar_file)    # sidecar file survives, not orphaned

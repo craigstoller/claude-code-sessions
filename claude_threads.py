@@ -748,12 +748,18 @@ def _validate_sidecar_rel(rel):
 
 
 def _delete_inventoried_files(root_dir, inventory):
+    """Delete each inventoried file; return a list of (path, exc) for any
+    that could not be removed instead of swallowing the error - a caller
+    that silently ignores a failed delete here would let the file be
+    orphaned with no journal trail once the source is gone."""
+    failures = []
     for e in inventory:
         full = os.path.join(root_dir, *e["rel"].split("/"))
         try:
             os.unlink(full)
-        except OSError:
-            pass
+        except OSError as exc:
+            failures.append((full, exc))
+    return failures
 
 
 def _rmdirs_bottom_up(root_dir):
@@ -966,11 +972,21 @@ def execute_op(env, op):
     # I8: sidecar files first, then now-empty dirs, transcript LAST. A
     # cleanup failure (e.g. a locked file) leaves the op at 'committed'
     # (non-terminal, no new journal state) for `recover` to finish instead
-    # of crashing after the move has already been fully committed.
+    # of crashing after the move has already been fully committed. A failed
+    # sidecar delete must NOT be swallowed and must NOT let the transcript
+    # get deleted anyway - that would orphan the sidecar file with no
+    # journal trail. Leaving the transcript in place keeps the source
+    # coherent for recover's classification.
+    if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
+        failures = _delete_inventoried_files(m["sidecar_source"], m["sidecar_inventory"])
+        if failures:
+            print("warning: move committed, but the old copy could not be fully "
+                  "removed ({0}). Run 'claude-threads recover' to finish deleting "
+                  "it.".format(", ".join(p for p, _ in failures)))
+            return "committed"
+        _rmdirs_bottom_up(m["sidecar_source"])
+
     try:
-        if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
-            _delete_inventoried_files(m["sidecar_source"], m["sidecar_inventory"])
-            _rmdirs_bottom_up(m["sidecar_source"])
         os.unlink(m["source_transcript"])
     except OSError as exc:
         print("warning: move committed, but the old copy could not be fully "
