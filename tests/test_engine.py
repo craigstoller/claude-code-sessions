@@ -241,3 +241,34 @@ def test_sidecar_delete_failure_keeps_source_and_stays_committed(planned, monkey
     assert ct.nonterminal_ops(env)
     assert os.path.isfile(t)               # source transcript NOT deleted
     assert os.path.isfile(sidecar_file)    # sidecar file survives, not orphaned
+
+
+def test_row_drift_before_rewrite_blocks_overwrite(planned):
+    """Task 12 review (ENGINE ruling): execute_op's rewriting phase must
+    re-read each row's CURRENT bytes and compare against its journaled
+    pre-image immediately before writing it - a row that changed between
+    planning and rewriting (some other process touched it) must never be
+    blindly overwritten. This reuses _abort's existing, adversarially-
+    hardened drifted-row protection (I3/C1 - see test_recover.py's
+    aborting-dead-end tests): a row that is neither the journaled pre- nor
+    post-image is unsafe to auto-resolve either way, so _abort itself
+    refuses rather than guessing, leaving the op nonterminal at 'aborting'
+    for `claude-threads recover` - not a silent 'rolled_back'."""
+    env, m, t, target = planned
+    row = m["rows"][0]
+
+    def hook(point):
+        if point == "after-copied":
+            open(row["path"], "w").write("some other process changed this row")
+    ct._crash_hook = hook
+    with pytest.raises(ct.Refusal):
+        ct.run_move(env, m)
+    ct._crash_hook = None
+
+    assert open(row["path"]).read() == "some other process changed this row"  # untouched
+    op = ct.list_ops(env)[0]
+    assert op.manifest["status"] == "aborting"        # nonterminal; recover required
+    assert row["path"] in op.manifest.get("drifted_rows", [])
+    assert os.path.isfile(t)                          # source kept
+    assert os.path.isfile(m["dest_transcript"])        # dest also kept (nothing deleted)
+    assert ct.read_lock(env) is None                   # lock released despite the raise

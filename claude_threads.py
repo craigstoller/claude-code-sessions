@@ -978,6 +978,20 @@ def execute_op(env, op):
     try:
         rows = m["rows"]
         for i, r in enumerate(rows):
+            # A row that changed between planning and rewriting (some other
+            # process touched it) must never be blindly overwritten - re-read
+            # its CURRENT bytes right before the write and compare against
+            # the journaled pre-image. _abort independently re-derives each
+            # row's state from its current bytes (never from the "rewritten"
+            # flag), so it will correctly leave this drifted row untouched
+            # and, per its existing fail-closed contract, refuse to complete
+            # automatically if it cannot verify every row - `recover` is the
+            # path out, exactly like any other drifted-row abort.
+            with open(r["path"], "rb") as fh:
+                current = fh.read()
+            if current != unb64(r["pre_b64"]):
+                _abort(env, op)
+                return "rolled_back"
             atomic_write(r["path"], unb64(r["post_b64"]))
             r["rewritten"] = True
             save_manifest(op)
@@ -1076,6 +1090,16 @@ def run_move(env, manifest):
 
 
 # ------------------------------------------------------ undo
+def _op_sort_key(manifest):
+    """(creation time, op_id) - the same compound key list_ops sorts by.
+    op_id alone is not a safe "is this newer" comparison: its trailing
+    os.urandom(3).hex() carries no chronological meaning, only the
+    strftime-derived prefix does, and two ops created in the same wall-clock
+    second collapse to comparing that random suffix.
+    """
+    return (manifest.get("history", [{}])[0].get("at", 0), manifest.get("op_id", ""))
+
+
 def plan_undo(env, prior_op):
     """Build a reversal manifest for a completed move: source/dest swapped,
     row pre/post images swapped, same hashes. Every precondition here checks
@@ -1087,23 +1111,67 @@ def plan_undo(env, prior_op):
     a crash-interrupted move.
     """
     pm = prior_op.manifest
+    if pm.get("op_type") == "undo":
+        raise Refusal("op {0} is itself an undo; to redo, run move again"
+                      .format(pm.get("op_id")))
     if pm.get("status") != "completed":
         raise Refusal("op {0} is '{1}', not 'completed'; only completed ops can be "
                       "undone".format(pm.get("op_id"), pm.get("status")))
+    pm_key = _op_sort_key(pm)
     for other in list_ops(env):
-        if other.manifest["op_id"] > pm["op_id"] and \
+        if _op_sort_key(other.manifest) > pm_key and \
                 other.manifest.get("session_id") == pm["session_id"] and \
-                other.manifest.get("status") != "rolled_back":
+                other.manifest.get("status") not in ("rolled_back", "undone"):
             raise Refusal("a newer op touches this session; undo newest-first")
+
+    # C1: the undo's OWN destination is the original move's source path.
+    # _abort's scratch rule treats a journaled/copying-phase destination as
+    # tool-owned and deletes it unconditionally on rollback (no hash check);
+    # a foreign file the user manually put back at that path - they restored
+    # and resumed the thread there by hand - would otherwise be destroyed
+    # the moment the copy's O_EXCL create fails. Mirror plan_move's own
+    # destination-exists check here, before any op is even journaled.
+    if os.path.exists(pm["source_transcript"]) or \
+            os.path.exists(sidecar_path(pm["source_transcript"])):
+        raise Refusal("undo target already exists: {0}; refusing to overwrite it."
+                      .format(pm["source_transcript"]))
+
+    if not os.path.isfile(pm["dest_transcript"]):
+        raise Refusal("the moved transcript is missing at {0}; cannot undo."
+                      .format(pm["dest_transcript"]))
     got, gsize = sha256_file(pm["dest_transcript"])
     if got != pm["transcript_sha256"] or gsize != pm["transcript_size"]:
         raise Refusal("the moved transcript has changed since the move (resumed or "
                       "edited). Undoing would overwrite that activity; refusing.")
     for e in pm["sidecar_inventory"]:
         p = os.path.join(pm["sidecar_dest"], *e["rel"].split("/"))
-        if not os.path.isfile(p) or sha256_file(p)[0] != e["sha256"]:
+        if not os.path.isfile(p):
             raise Refusal("sidecar file {0} has changed since the move; refusing."
                           .format(e["rel"]))
+        got_s, gsize_s = sha256_file(p)          # M3: size AND hash, not hash alone
+        if got_s != e["sha256"] or gsize_s != e["size"]:
+            raise Refusal("sidecar file {0} has changed since the move; refusing."
+                          .format(e["rel"]))
+    # I3: the reverse of the loop above - journaled-subset-of-present is not
+    # enough; a file that appeared in the moved sidecar AFTER the move (never
+    # journaled, so nothing above would ever notice it) must also block undo.
+    # That file is post-move activity and must survive; refusing at plan
+    # time (before any op is journaled) avoids ever landing in a stuck
+    # two-folder state over it.
+    if pm.get("sidecar_dest") and os.path.isdir(pm["sidecar_dest"]):
+        inv_rels = {e["rel"] for e in pm["sidecar_inventory"]}
+        extra = []
+        for dirpath, dirnames, filenames in os.walk(pm["sidecar_dest"]):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, pm["sidecar_dest"]).replace(os.sep, "/")
+                if rel not in inv_rels:
+                    extra.append(full)
+        if extra:
+            raise Refusal("untracked file(s) appeared in the moved sidecar since the "
+                          "move ({0}); refusing - resolve manually."
+                          .format(", ".join(extra)))
+
     rows = []
     for r in pm["rows"]:
         with open(r["path"], "rb") as fh:
@@ -1113,6 +1181,16 @@ def plan_undo(env, prior_op):
                           "have updated it); refusing.".format(r["path"]))
         rows.append({"path": r["path"], "pre_b64": r["post_b64"],
                      "post_b64": r["pre_b64"], "rewritten": False})
+
+    # M4: target_cwd describes where THIS manifest is taking the session -
+    # for undo that is the original pre-move location, not the move's own
+    # target_cwd (which described where the FORWARD move went).
+    if pm["rows"]:
+        first_pre = json.loads(unb64(pm["rows"][0]["pre_b64"]).decode("utf-8"))
+        target_cwd = first_pre.get("cwd", "")
+    else:
+        target_cwd = ""
+
     return {
         "op_type": "undo", "undo_of": pm["op_id"], "session_id": pm["session_id"],
         "mode": pm["mode"],
@@ -1123,26 +1201,29 @@ def plan_undo(env, prior_op):
         "sidecar_source": pm.get("sidecar_dest"),
         "sidecar_dest": pm.get("sidecar_source"),
         "sidecar_inventory": pm["sidecar_inventory"],
-        "rows": rows, "target_cwd": pm.get("target_cwd", ""),
+        "rows": rows, "target_cwd": target_cwd,
     }
 
 
 def run_undo(env, prior_op):
-    """Lock -> plan_undo -> new_op -> execute_op. The engine itself needs no
-    changes for undo: an undo op is just a move manifest pointing the other
-    way. But plan_move's process guard does not run for undo, so run_undo
-    checks claude_running itself before executing (execute_op's own guard
-    only fires at its last-instant revalidation, deep into the transaction).
+    """Lock -> claude_running check -> plan_undo -> new_op -> execute_op.
+    The engine itself needs no changes for undo: an undo op is just a move
+    manifest pointing the other way. But plan_move's process guard does not
+    run for undo, so run_undo checks claude_running itself before executing
+    (execute_op's own guard only fires at its last-instant revalidation,
+    deep into the transaction) - and, like run_move/recover_op, it takes the
+    single-instance lock FIRST, before doing any of its own checks, so two
+    concurrent claude-threads invocations can never race each other here.
     On 'completed' the prior op is marked 'undone' and a moved-log entry
     cancels its 'move' entry; any other outcome (e.g. 'committed' if final
     cleanup could not fully finish, or 'rolled_back') leaves the prior op's
     status untouched for the user to retry or recover.
     """
-    manifest = plan_undo(env, prior_op)
-    if claude_running(env):
-        raise Refusal("Claude appears to be running; close the app before undoing.")
     acquire_lock(env, "undo-" + prior_op.manifest["op_id"])
     try:
+        if claude_running(env):
+            raise Refusal("Claude appears to be running; close the app before undoing.")
+        manifest = plan_undo(env, prior_op)
         op = new_op(env, manifest)
         final = execute_op(env, op)
         if final == "completed":
@@ -1360,13 +1441,42 @@ def recover_op(env, op, direction):
         else:  # committed
             final = _finish_committed(env, op)
         if final == "completed":
-            append_moved_log(env, {"kind": "move", "session_id": m["session_id"],
-                                   "from": m["source_transcript"], "to": m["dest_transcript"],
-                                   "at": env.now()})
+            # C2: a recovered op can be either direction of the engine, not
+            # just a forward move - the moved-log entry (and any follow-on
+            # bookkeeping) must be derived from what THIS op actually is,
+            # not hardcoded to "move".
+            if m.get("op_type") == "undo":
+                append_moved_log(env, {"kind": "undo", "session_id": m["session_id"],
+                                       "at": env.now()})
+                _mark_undo_of_undone(env, m)
+            else:
+                append_moved_log(env, {"kind": "move", "session_id": m["session_id"],
+                                       "from": m["source_transcript"], "to": m["dest_transcript"],
+                                       "at": env.now()})
             rotate_ops(env)
         return final
     finally:
         release_lock(env)
+
+
+def _mark_undo_of_undone(env, undo_manifest):
+    """After a recovered undo op reaches 'completed', mark the ORIGINAL op
+    it reversed as 'undone' - mirroring what run_undo does on its own
+    successful path. Without this, a crash between an undo op's 'committed'
+    status and run_undo's own set_status(prior_op, "undone") call would
+    leave the original move op stuck reading 'completed' forever, even
+    though its transcript has actually moved back home. Silently no-ops if
+    the referenced op can no longer be found (e.g. already rotated away by
+    a much later cleanup) rather than failing an otherwise-successful
+    recovery over bookkeeping for an op that is long gone either way.
+    """
+    prior_id = undo_manifest.get("undo_of")
+    if not prior_id:
+        return
+    for other in list_ops(env):
+        if other.manifest.get("op_id") == prior_id:
+            set_status(other, "undone")
+            return
 
 
 def _finish_committed(env, op):
