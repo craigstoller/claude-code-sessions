@@ -60,3 +60,28 @@ def test_moved_log_roundtrip(mkenv, tmp_path):
     ct.append_moved_log(env, {"kind": "move", "session_id": "b", "from": "x", "to": "y"})
     ct.append_moved_log(env, {"kind": "undo", "session_id": "b"})
     assert ct.moved_session_ids(env) == {"a"}
+
+
+def test_list_ops_sorts_by_creation_time(mkenv, tmp_path):
+    """Regression: ops created in same second must sort by creation time, not directory name."""
+    env = mkenv(tmp_path)
+    # Create 3 ops under frozen clock (all get same timestamp in op_id)
+    op1 = _op(env, session_id="s1")
+    op2 = _op(env, session_id="s2")
+    op3 = _op(env, session_id="s3")
+
+    # Overwrite history[0]["at"] to: 3, 1, 2 (creation order, not op_id order)
+    op1.manifest["history"][0]["at"] = 3
+    op2.manifest["history"][0]["at"] = 1
+    op3.manifest["history"][0]["at"] = 2
+
+    ct.save_manifest(op1)
+    ct.save_manifest(op2)
+    ct.save_manifest(op3)
+
+    # list_ops should return in order of creation time: op2 (1), op3 (2), op1 (3)
+    reloaded = ct.list_ops(env)
+    assert len(reloaded) == 3
+    assert reloaded[0].manifest["history"][0]["at"] == 1
+    assert reloaded[1].manifest["history"][0]["at"] == 2
+    assert reloaded[2].manifest["history"][0]["at"] == 3

@@ -293,6 +293,7 @@ import time
 class Op:
     op_dir: str
     manifest: dict
+    now: object = time.time
 
 
 def manifest_path(op):
@@ -311,14 +312,14 @@ def new_op(env, manifest):
     manifest["op_id"] = op_id
     manifest["status"] = "journaled"
     manifest["history"] = [{"status": "journaled", "at": env.now()}]
-    op = Op(op_dir, manifest)
+    op = Op(op_dir, manifest, env.now)
     save_manifest(op)
     return op
 
 
 def set_status(op, status):
     op.manifest["status"] = status
-    op.manifest["history"].append({"status": status, "at": time.time()})
+    op.manifest["history"].append({"status": status, "at": op.now()})
     save_manifest(op)
 
 
@@ -326,10 +327,15 @@ def list_ops(env):
     out = []
     if not os.path.isdir(env.ops_dir):
         return out
-    for name in sorted(os.listdir(env.ops_dir)):
+    ops = []
+    for name in os.listdir(env.ops_dir):
         mp = os.path.join(env.ops_dir, name, "manifest.json")
         if os.path.isfile(mp):
-            out.append(Op(os.path.join(env.ops_dir, name), read_json(mp)))
+            m = read_json(mp)
+            ops.append((m, Op(os.path.join(env.ops_dir, name), m)))
+    # Sort by creation time (history[0]["at"]) then op_id for stability
+    for m, op in sorted(ops, key=lambda x: (x[0].get("history", [{}])[0].get("at", 0), x[0]["op_id"])):
+        out.append(op)
     return out
 
 
@@ -363,8 +369,12 @@ def acquire_lock(env, op_id):
         fd = os.open(_lock_path(env), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         holder = read_lock(env)
+        if holder:
+            holder_str = "pid {0}, op {1}".format(*holder)
+        else:
+            holder_str = "unknown holder"
         raise Refusal("another claude-threads operation holds the lock ({0}). "
-                      "If it is dead, run: claude-threads recover".format(holder))
+                      "If it is dead, run: claude-threads recover".format(holder_str))
     with os.fdopen(fd, "w") as fh:
         fh.write("{0} {1}".format(os.getpid(), op_id))
     return _lock_path(env)
@@ -414,8 +424,10 @@ def moved_session_ids(env):
                 except ValueError:
                     continue
                 state[e.get("session_id")] = e.get("kind")
-    except OSError:
+    except FileNotFoundError:
         return set()
+    except OSError as exc:
+        raise LayoutError("cannot read moved-log at {0}: {1}".format(env.moved_log, exc))
     return {sid for sid, kind in state.items() if kind == "move"}
 
 
