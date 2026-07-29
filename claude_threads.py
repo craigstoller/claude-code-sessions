@@ -803,52 +803,98 @@ def _verify(path_hash_size_list):
     return None
 
 
+def _row_state(row):
+    """Classify a manifest row's CURRENT on-disk bytes against its journaled
+    pre/post images - a crash can land between os.replace and save_manifest,
+    so the "rewritten" flag alone can never be trusted; only the bytes can.
+    Returns "post" (needs no roll-forward, may need roll-back), "pre"
+    (untouched / already rolled back), or "drifted" (neither - some other
+    process wrote to it, or it is missing; never auto-resolved).
+    """
+    pre = unb64(row["pre_b64"])
+    post = unb64(row["post_b64"])
+    try:
+        with open(row["path"], "rb") as fh:
+            current = fh.read()
+    except OSError:
+        current = None
+    if current == post:
+        return "post"
+    if current == pre:
+        return "pre"
+    return "drifted"
+
+
+def _pre_abort_status(op):
+    """The phase the op was in before it started (or resumed) aborting -
+    used to decide whether destination files are still tool-owned scratch
+    (I3). Trusting op.manifest["status"] directly breaks the moment a crash
+    interrupts an abort itself and recover re-enters _abort: by then status
+    already reads "aborting", which carries no information about the
+    original phase. History is durable and append-only, so walk it
+    backwards past every "aborting" entry to find the real one.
+    """
+    for entry in reversed(op.manifest.get("history", [])):
+        if entry.get("status") != "aborting":
+            return entry.get("status")
+    return op.manifest["status"]
+
+
 def _abort(env, op, delete_dest=True):
-    prior_status = op.manifest["status"]
+    prior_status = _pre_abort_status(op)
     set_status(op, "aborting")
     _maybe_crash("after-aborting")
     m = op.manifest
 
-    # I4: a crash can land between os.replace and save_manifest, so the
-    # "rewritten" flag alone cannot be trusted - inspect actual bytes.
+    # Classify everything FIRST, as pure reads - no row is rewritten and no
+    # destination file is deleted until we know the WHOLE rollback can
+    # complete cleanly. Interleaving classification with mutation meant a
+    # drifted row (or dest file) discovered partway through left some rows
+    # already reverted and/or some dest files already deleted before the
+    # Refusal - making a "nothing was deleted" claim false.
+    row_restores = []
     drifted_rows = []
     for r in m["rows"]:
-        pre = unb64(r["pre_b64"])
-        post = unb64(r["post_b64"])
-        try:
-            with open(r["path"], "rb") as fh:
-                current = fh.read()
-        except OSError:
-            current = None
-        if current == post:
-            atomic_write(r["path"], pre)
-            r["rewritten"] = False
-        elif current == pre:
-            r["rewritten"] = False
-        else:
+        state = _row_state(r)
+        if state == "post":
+            row_restores.append((r, unb64(r["pre_b64"])))
+        elif state == "drifted":
             drifted_rows.append(r["path"])
-    m["drifted_rows"] = drifted_rows
-    save_manifest(op)
 
+    scratch = prior_status in ("journaled", "copying")
+    dest_deletes = []
+    drifted_dest = []
     if delete_dest:
-        scratch = prior_status in ("journaled", "copying")
-        drifted_dest = []
         for path, digest, size in _dest_files(m):
             if not os.path.isfile(path):
                 continue
             if scratch:
-                os.unlink(path)
+                dest_deletes.append(path)
                 continue
             got, gsize = sha256_file(path)
             if got == digest and gsize == size:
-                os.unlink(path)
+                dest_deletes.append(path)
             else:
                 drifted_dest.append(path)
-        problems = drifted_dest + drifted_rows
-        if problems:
-            raise Refusal("rollback could not verify every file ({0}); nothing "
-                          "further was deleted. Use 'claude-threads recover' to "
-                          "resolve.".format(", ".join(problems)))
+
+    problems = drifted_rows + drifted_dest
+    if problems:
+        m["drifted_rows"] = drifted_rows
+        save_manifest(op)
+        raise Refusal("rollback could not verify every file ({0}); nothing "
+                      "was changed. Use 'claude-threads recover' to "
+                      "resolve.".format(", ".join(problems)))
+
+    for r, pre_bytes in row_restores:
+        atomic_write(r["path"], pre_bytes)
+    for r in m["rows"]:
+        r["rewritten"] = False
+    m["drifted_rows"] = []
+    save_manifest(op)
+
+    if delete_dest:
+        for path in dest_deletes:
+            os.unlink(path)
         # I7: never rmtree - only the journaled files are ours to delete; any
         # leftover (non-inventoried) file makes its directory fail to rmdir
         # and survives, exactly like the source-side rule in execute_op.
@@ -857,20 +903,14 @@ def _abort(env, op, delete_dest=True):
     set_status(op, "rolled_back")
 
 
-def execute_op(env, op):
-    """Drive a freshly-journaled op through copy -> verify -> commit -> delete-last.
-
-    Only accepts ops whose status is 'journaled': this function always runs
-    a full transaction from the top and is not itself resumption-aware.
-    Resuming an op interrupted mid-flight is `recover`'s job (Task 11) - it
-    inspects each phase individually rather than re-entering here. Callers
-    hold the lock.
+def _validate_manifest_paths(env, m):
+    """Structural + containment validation for every path a manifest could
+    direct a write or delete to. Must run before ANY mutation - a
+    tampered/foreign manifest (or one whose target has since moved behind a
+    symlink/junction) must be rejected before a single file is touched.
+    Shared by execute_op (fresh runs) and recover_op (resumed runs, I4) so a
+    resumed op gets exactly the same up-front check a fresh one does.
     """
-    m = op.manifest
-    if m.get("status") != "journaled":
-        raise LayoutError("execute_op only runs ops from 'journaled'; use recover "
-                          "for interrupted ops")
-
     # C2(a): a tampered/foreign manifest's rel paths must be structurally
     # safe before they are ever joined onto a filesystem path.
     for e in m.get("sidecar_inventory", []):
@@ -893,6 +933,23 @@ def execute_op(env, op):
     roots = _engine_roots(env, m)
     for r in m["rows"]:
         ensure_contained(r["path"], roots)
+
+
+def execute_op(env, op):
+    """Drive a freshly-journaled op through copy -> verify -> commit -> delete-last.
+
+    Only accepts ops whose status is 'journaled': this function always runs
+    a full transaction from the top and is not itself resumption-aware.
+    Resuming an op interrupted mid-flight is `recover`'s job (Task 11) - it
+    inspects each phase individually rather than re-entering here. Callers
+    hold the lock.
+    """
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_op only runs ops from 'journaled'; use recover "
+                          "for interrupted ops")
+
+    _validate_manifest_paths(env, m)
 
     _maybe_crash("after-journaled")
 
@@ -1036,8 +1093,9 @@ def is_prefix_of(journaled_hash, journaled_size, path):
 
 
 def classify_op(env, op):
-    """Classify a non-terminal op's source/destination state and the safe
-    recovery resolutions. Rules verbatim from spec Recovery classification.
+    """Classify a non-terminal op's source/destination/row state and the
+    safe recovery resolutions. Rules per spec Recovery classification, plus
+    the adversarial-review fixes noted inline (I3, I7, C2).
     """
     m = op.manifest
     status = m["status"]
@@ -1068,14 +1126,19 @@ def classify_op(env, op):
                     return "drifted"
         return "pre"
 
+    def _dest_sidecar_ok(e):
+        p = os.path.join(m["sidecar_dest"], *e["rel"].split("/"))
+        if not os.path.isfile(p):
+            return False
+        got, gsize = sha256_file(p)
+        return got == e["sha256"] and gsize == e["size"]   # minor: size, not just hash
+
     def _dest_state():
         if not os.path.exists(m["dest_transcript"]):
             return "absent"
         got, gsize = sha256_file(m["dest_transcript"])
-        sidecars_ok = all(
-            os.path.isfile(os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
-            and sha256_file(os.path.join(m["sidecar_dest"], *e["rel"].split("/")))[0] == e["sha256"]
-            for e in m["sidecar_inventory"]) if m.get("sidecar_dest") else True
+        sidecars_ok = all(_dest_sidecar_ok(e) for e in m["sidecar_inventory"]) \
+            if m.get("sidecar_dest") else True
         if got == m["transcript_sha256"] and gsize == m["transcript_size"] and sidecars_ok:
             return "intact"
         if gsize > m["transcript_size"] and sidecars_ok and \
@@ -1084,83 +1147,190 @@ def classify_op(env, op):
         return "drifted"
 
     src, dest = _src_state(), _dest_state()
+    # C1: rows are inspected here too so the CLI can warn about a drifted
+    # row before the user even picks a direction; the actual write-vs-refuse
+    # decision for a "copied"/"rewriting" forward happens in
+    # _forward_rewrite_and_commit, not here.
+    drifted_rows = [r["path"] for r in m["rows"] if _row_state(r) == "drifted"]
+
     if status in ("journaled", "copying"):
-        return {"status": status, "source": src, "dest": "partial-scratch" if dest != "absent" else "absent",
-                "resolutions": ["back", "forward"],
+        dest_label = "partial-scratch" if dest != "absent" else "absent"
+        if src != "pre":
+            # I7: the scratch-deletion rule assumes the source is still
+            # pristine. If it has vanished or drifted, the partial
+            # destination might be the only remaining copy of the data -
+            # never delete it, and never resume the copy automatically
+            # either (it would read from an unverified source).
+            return {"status": status, "source": src, "dest": dest_label, "resolutions": [],
+                    "drifted_rows": drifted_rows,
+                    "note": "source is {0}; the partial destination may be the only "
+                            "remaining copy - refusing to delete it or resume "
+                            "automatically".format(src)}
+        return {"status": status, "source": src, "dest": dest_label,
+                "resolutions": ["back", "forward"], "drifted_rows": drifted_rows,
                 "note": "destination is tool-owned scratch at this phase"}
     if status == "aborting":
+        if drifted_rows:
+            # I3: a drifted row makes the rollback itself impossible to
+            # complete automatically - offering "back" forever (which will
+            # only raise the same Refusal every time) is a dead end.
+            return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "drifted_rows": drifted_rows,
+                    "note": "row(s) changed unexpectedly during rollback ({0}); "
+                            "automatic recovery cannot proceed - resolve manually"
+                            .format(", ".join(drifted_rows))}
         return {"status": status, "source": src, "dest": dest, "resolutions": ["back"],
-                "note": "completing an interrupted rollback"}
+                "drifted_rows": drifted_rows, "note": "completing an interrupted rollback"}
     if status in ("copied", "rewriting"):
-        if dest in ("grown", "drifted"):
+        if dest == "grown":
             return {"status": status, "source": src, "dest": dest, "resolutions": ["forward"],
-                    "note": "destination has post-crash changes; it will never be deleted"}
+                    "drifted_rows": drifted_rows,
+                    "note": "destination has post-crash growth; it will never be deleted"}
+        if dest != "intact":
+            # C2: only offer "forward" when finishing can actually succeed.
+            # A genuinely drifted (or vanished) destination can never pass
+            # the finish gate, so offering "forward" here would let the
+            # rows get flipped to point at a bad copy before discovering
+            # that. Neither direction is safe automatically - both copies
+            # are kept and the row is never touched.
+            return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "drifted_rows": drifted_rows,
+                    "note": "destination no longer contains a verifiable copy; both "
+                            "copies are kept - resolve manually"}
         return {"status": status, "source": src, "dest": dest,
-                "resolutions": ["back", "forward"], "note": ""}
+                "resolutions": ["back", "forward"], "drifted_rows": drifted_rows, "note": ""}
     if status == "committed":
         if src != "pre":
             return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "drifted_rows": drifted_rows,
                     "note": "source changed after commit; resolve manually - both copies kept"}
         if dest in ("intact", "grown"):
             return {"status": status, "source": src, "dest": dest, "resolutions": ["forward"],
+                    "drifted_rows": drifted_rows,
                     "note": "finishing means deleting the stale source duplicate"}
         return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                "drifted_rows": drifted_rows,
                 "note": "destination no longer contains the copy; keeping the source"}
-    return {"status": status, "source": src, "dest": dest, "resolutions": [], "note": "terminal"}
+    return {"status": status, "source": src, "dest": dest, "resolutions": [],
+            "drifted_rows": drifted_rows, "note": "terminal"}
+
+
+def _forward_rewrite_and_commit(env, op, c):
+    """Finish rolling a 'copied'/'rewriting' op forward: gate first (C2),
+    classify every row's CURRENT bytes before writing any of them (C1), and
+    only then mutate - either everything proceeds together or nothing does.
+    `c` is the classify_op result already computed by the caller before any
+    mutation, so its source/dest snapshot is still valid here.
+    """
+    m = op.manifest
+    if c["source"] != "pre" or c["dest"] not in ("intact", "grown"):
+        raise Refusal("cannot roll op {0} forward: {1}".format(m["op_id"], c["note"]))
+
+    row_writes = []
+    drifted = []
+    for r in m["rows"]:
+        state = _row_state(r)
+        if state == "pre":
+            row_writes.append(r)
+        elif state == "drifted":
+            drifted.append(r["path"])
+        # state == "post": already applied, nothing to do
+    if drifted:
+        raise Refusal("cannot roll op {0} forward: row(s) changed unexpectedly since "
+                      "the journaled images ({1}); nothing was written. Resolve "
+                      "manually, then retry recover.".format(m["op_id"], ", ".join(drifted)))
+
+    for r in row_writes:
+        atomic_write(r["path"], unb64(r["post_b64"]))
+        r["rewritten"] = True
+        save_manifest(op)
+    set_status(op, "committed")
+    return _finish_committed(env, op)
 
 
 def recover_op(env, op, direction):
-    c = classify_op(env, op)
-    if direction not in c["resolutions"]:
-        raise Refusal("'{0}' is not a safe resolution for op {1} ({2}); options: {3}"
-                      .format(direction, op.manifest["op_id"], c["note"],
-                              c["resolutions"] or "none - manual intervention"))
-    m = op.manifest
-    if direction == "back":
-        _abort(env, op)
-        return "rolled_back"
-    # forward
-    if m["status"] in ("journaled", "copying"):
-        for path, _, _ in _dest_files(m):        # scratch rule: clear partials
-            if os.path.exists(path):
-                os.unlink(path)
-        op.manifest["status"] = "journaled"
-        save_manifest(op)
-        final = execute_op(env, op)
-    elif m["status"] in ("copied", "rewriting"):
-        for r in m["rows"]:
-            if not r.get("rewritten"):
-                atomic_write(r["path"], unb64(r["post_b64"]))
-                r["rewritten"] = True
-                save_manifest(op)
-        set_status(op, "committed")
-        final = _finish_committed(env, op)
-    else:  # committed
-        final = _finish_committed(env, op)
-    if final == "completed":
-        append_moved_log(env, {"kind": "move", "session_id": m["session_id"],
-                               "from": m["source_transcript"], "to": m["dest_transcript"],
-                               "at": env.now()})
-    return final
+    # I5: recover mutates a journaled op exactly like run_move does, so it
+    # needs the same single-instance lock - two concurrent recover attempts
+    # (or a recover racing a live move) must not interleave.
+    acquire_lock(env, "recover-" + op.manifest["op_id"])
+    try:
+        # I4: validate containment before ANY mutation, including the
+        # scratch-dest unlink below - not just on execute_op's fresh runs.
+        _validate_manifest_paths(env, op.manifest)
+
+        c = classify_op(env, op)
+        if direction not in c["resolutions"]:
+            raise Refusal("'{0}' is not a safe resolution for op {1} ({2}); options: {3}"
+                          .format(direction, op.manifest["op_id"], c["note"],
+                                  c["resolutions"] or "none - manual intervention"))
+        m = op.manifest
+        if direction == "back":
+            _abort(env, op)
+            return "rolled_back"
+        # forward
+        if m["status"] in ("journaled", "copying"):
+            for path, _, _ in _dest_files(m):        # scratch rule: clear partials
+                if os.path.exists(path):
+                    os.unlink(path)
+            set_status(op, "journaled")               # minor: history entry, not a raw write
+            final = execute_op(env, op)
+        elif m["status"] in ("copied", "rewriting"):
+            final = _forward_rewrite_and_commit(env, op, c)
+        else:  # committed
+            final = _finish_committed(env, op)
+        if final == "completed":
+            append_moved_log(env, {"kind": "move", "session_id": m["session_id"],
+                                   "from": m["source_transcript"], "to": m["dest_transcript"],
+                                   "at": env.now()})
+            rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
 
 
 def _finish_committed(env, op):
     """Finish a 'committed' op by deleting the now-redundant source copy.
 
     Uses the same delete helpers and failure contract as execute_op's final
-    commit step (never rmtree): inventoried sidecar files first, then their
-    now-empty directories, transcript LAST. A file already missing (I8:
-    deletion already progressed - see classify_op) is simply skipped rather
-    than treated as a failure. Any real delete failure raises a Refusal
-    naming the paths and leaves the op at 'committed' (non-terminal) for a
-    later recover to retry - it is never silently swallowed.
+    commit step (never rmtree): the same un-inventoried-file and
+    claude-running guards (I6), then inventoried sidecar files, then their
+    now-empty directories, then the transcript LAST. A file already missing
+    (I8: deletion already progressed - see classify_op) is simply skipped
+    rather than treated as a failure. Any real delete failure, or either
+    guard tripping, raises a Refusal naming the paths and leaves the op at
+    'committed' (non-terminal) for a later recover to retry - it is never
+    silently swallowed.
     """
     m = op.manifest
     c = classify_op(env, op)
     if c["source"] != "pre" or c["dest"] not in ("intact", "grown"):
         raise Refusal("cannot finish op {0}: {1}".format(m["op_id"], c["note"]))
 
+    # I6(a): a live Claude process could be actively appending to the
+    # source right now; deleting it out from under a running process is
+    # exactly the hazard the pre-move guard exists to prevent.
+    running = claude_running(env)
+    if running:
+        raise Refusal("cannot finish op {0}: Claude appears to be running ({1}). "
+                      "Close it, then retry recover.".format(m["op_id"], ", ".join(sorted(set(running))[:3])))
+
     if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
+        # I6(b): same C1 guard as execute_op's own commit step - a file
+        # that appeared in the source sidecar after commit was never
+        # journaled and must never be destroyed; both copies are kept.
+        inv_rels = {e["rel"] for e in m["sidecar_inventory"]}
+        extra = []
+        for dirpath, dirnames, filenames in os.walk(m["sidecar_source"]):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, m["sidecar_source"]).replace(os.sep, "/")
+                if rel not in inv_rels:
+                    extra.append(full)
+        if extra:
+            raise Refusal("cannot finish op {0}: untracked file(s) appeared in the "
+                          "source sidecar since commit ({1}); both copies are kept - "
+                          "resolve manually".format(m["op_id"], ", ".join(extra)))
+
         remaining = [e for e in m["sidecar_inventory"]
                      if os.path.isfile(os.path.join(m["sidecar_source"], *e["rel"].split("/")))]
         failures = _delete_inventoried_files(m["sidecar_source"], remaining)
