@@ -144,11 +144,70 @@ def test_row_adoption_rules(setup, write_row):
         ct.plan_move(env, SID, target, flags(row=["local_orph"]))  # no --yes
 
 
+def test_row_adoption_across_stores(mkenv, tmp_path, write_transcript, write_row):
+    """The same local id can legitimately appear once per org/account store
+    (a per-account copy of the same desktop-app row); --row must adopt every
+    copy, not just the first one found."""
+    env = mkenv(tmp_path, n_store_roots=2)
+    src_cwd = "C:\\proj\\src"
+    target = str(tmp_path / "target")
+    os.makedirs(target)
+    write_transcript(env, ct.encode(src_cwd, ct.SCHEME_CURRENT), SID, [{"cwd": src_cwd}])
+    os.makedirs(os.path.join(env.projects_root, ct.encode("C:\\proj\\_ev", ct.SCHEME_CURRENT)))
+    write_row(env, 0, "org", "acct", "local_ev",
+              {"sessionId": "local_ev", "cliSessionId": "other", "cwd": "C:\\proj\\_ev",
+               "lastActivityAt": 2})
+    write_row(env, 0, "org", "acct", "local_orph",
+              {"sessionId": "local_orph", "cliSessionId": "", "cwd": "C:\\x", "title": "O"})
+    write_row(env, 1, "org2", "acct2", "local_orph",
+              {"sessionId": "local_orph", "cliSessionId": "", "cwd": "C:\\x", "title": "O"})
+    m = ct.plan_move(env, SID, target, flags(row=["local_orph"], yes=True))
+    assert len(m["rows"]) == 2
+    got = {os.path.realpath(r["path"]) for r in m["rows"]}
+    expected = {
+        os.path.realpath(os.path.join(env.store_candidates[0], "org", "acct", "local_orph.json")),
+        os.path.realpath(os.path.join(env.store_candidates[1], "org2", "acct2", "local_orph.json")),
+    }
+    assert got == expected
+
+
+def test_sidecar_in_manifest(setup):
+    env, t, target = setup
+    side = ct.sidecar_path(t)
+    os.makedirs(os.path.join(side, "nested"))
+    with open(os.path.join(side, "a.bin"), "wb") as fh:
+        fh.write(b"hello")
+    with open(os.path.join(side, "nested", "b.bin"), "wb") as fh:
+        fh.write(b"world!!")
+    m = ct.plan_move(env, SID, target, flags())
+    assert m["sidecar_source"] == side
+    assert m["sidecar_dest"] == ct.sidecar_path(m["dest_transcript"])
+    rels = {e["rel"]: e for e in m["sidecar_inventory"]}
+    assert set(rels) == {"a.bin", "nested/b.bin"}
+    for rel, entry in rels.items():
+        full = os.path.join(side, rel.replace("/", os.sep))
+        exp_hash, exp_size = ct.sha256_file(full)
+        assert entry["sha256"] == exp_hash
+        assert entry["size"] == exp_size
+    exp_t_hash, exp_t_size = ct.sha256_file(t)
+    assert m["transcript_sha256"] == exp_t_hash
+    assert m["transcript_size"] == exp_t_size
+    assert m["target_cwd"] == os.path.normpath(target)
+
+
 def test_process_guard(setup):
     env, t, target = setup
-    env.process_lister = lambda: ["claude.exe"]
+    env.process_lister = lambda: [(99999, "claude.exe")]
     with pytest.raises(ct.Refusal, match="running"):
         ct.plan_move(env, SID, target, flags())
+
+
+def test_process_guard_ignores_self_and_own_tool(setup):
+    env, t, target = setup
+    env.process_lister = lambda: [(os.getpid(), "claude something"),
+                                  (os.getppid(), "claude something else"),
+                                  (99999, "claude-threads.exe")]
+    assert ct.plan_move(env, SID, target, flags())["mode"] == "desktop"
 
 
 def test_mtime_guard_force(setup):

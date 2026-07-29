@@ -67,16 +67,49 @@ def default_env():
 
 
 def _default_process_lister():
+    """Running processes as (pid, text) tuples, text lowercased.
+
+    Windows `tasklist` cannot show full command lines, only the image name -
+    a node-hosted CLI (the `claude` command is a node.exe process, not an exe
+    named "claude") is therefore a known blind spot on Windows: it will not
+    match "claude" in the returned text. The mtime heuristic in plan_move is
+    the second layer that covers that gap. POSIX uses `ps ... args=` (full
+    command line, not just the executable name) specifically so a node-hosted
+    CLI process *is* visible there.
+    """
     import subprocess
     try:
         if sys.platform == "win32":
             out = subprocess.run(["tasklist", "/FO", "CSV"], capture_output=True,
                                  text=True, timeout=15).stdout
-            return [line.split('","')[0].strip('"').lower()
-                    for line in out.splitlines()[1:] if line.startswith('"')]
-        out = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True,
+            result = []
+            for line in out.splitlines()[1:]:
+                if not line.startswith('"'):
+                    continue
+                fields = line.split('","')
+                if len(fields) < 2:
+                    continue
+                name = fields[0].strip('"').lower()
+                try:
+                    pid = int(fields[1].strip('"'))
+                except ValueError:
+                    continue
+                result.append((pid, name))
+            return result
+        out = subprocess.run(["ps", "-A", "-o", "pid=,args="], capture_output=True,
                              text=True, timeout=15).stdout
-        return [l.strip().lower() for l in out.splitlines() if l.strip()]
+        result = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_s, _, rest = line.partition(" ")
+            try:
+                pid = int(pid_s)
+            except ValueError:
+                continue
+            result.append((pid, rest.strip().lower()))
+        return result
     except Exception:
         return []
 
@@ -498,9 +531,16 @@ class MoveFlags:
 
 
 def claude_running(env):
-    me = "python"
-    return [p for p in env.process_lister()
-            if "claude" in p and me not in p]
+    my_pids = {os.getpid(), os.getppid()}
+    out = []
+    for pid, text in env.process_lister():
+        if pid in my_pids:
+            continue                       # never self-refuse on our own process
+        if "claude-threads" in text:
+            continue                       # nor on another instance of this tool
+        if "claude" in text:
+            out.append(text)
+    return out
 
 
 MTIME_GUARD_SECONDS = 600
@@ -561,9 +601,11 @@ def plan_move(env, session_id, target, flags):
     # 4. destination checks
     if not os.path.isdir(target):
         raise Refusal("target must be an existing directory: {0}".format(target))
-    real_target = os.path.realpath(target)
+    real_target = os.path.normcase(os.path.realpath(target))
     for forbidden in (os.path.join(env.home, ".claude"), os.path.dirname(env.ops_dir)):
-        fr = os.path.realpath(forbidden)
+        # normcase both sides: on a first run ~/.claude-threads does not exist
+        # yet, so realpath alone does not canonicalize case on Windows.
+        fr = os.path.normcase(os.path.realpath(forbidden))
         if real_target == fr or real_target.startswith(fr + os.sep):
             raise Refusal("refusing target inside {0}".format(forbidden))
     if os.path.exists(dest_transcript) or os.path.exists(sidecar_path(dest_transcript)):
@@ -575,14 +617,25 @@ def plan_move(env, session_id, target, flags):
             if not name.endswith(".jsonl"):
                 continue
             other = os.path.join(dest_dir, name)
+            try:
+                with open(other, "rb"):
+                    pass
+            except OSError as exc:
+                raise Refusal("cannot read {0} for the destination collision scan "
+                              "(fail-closed): {1}".format(other, exc))
             sid = name[:-len(".jsonl")]
-            c = last_cwd(other)
-            if sid in moved or not c:
+            if sid in moved:
                 continue
-            if encode(c, scheme) != os.path.basename(dest_dir):
-                raise Refusal("destination collision: {0} records cwd {1}, which does "
-                              "not encode to this folder. Two real paths can share one "
-                              "encoded folder; refusing to merge projects.".format(other, c))
+            c = last_cwd(other)
+            if not c:
+                raise Refusal("destination collision: {0} has no recorded cwd; cannot "
+                              "verify it belongs to this project - refusing to merge "
+                              "(ambiguous, fail-closed).".format(other))
+            if os.path.normcase(os.path.normpath(c)) != os.path.normcase(os.path.normpath(target)):
+                raise Refusal("destination collision: {0} records cwd {1}, which is a "
+                              "different real path than {2}. Two real paths can share "
+                              "one encoded folder; refusing to merge projects."
+                              .format(other, c, target))
     import shutil as _shutil
     t_hash, t_size = sha256_file(source)
     side_src = sidecar_path(source)
@@ -595,18 +648,24 @@ def plan_move(env, session_id, target, flags):
     my_rows = [r for r in rows if r.cli_session_id == session_id]
     for local_id in (flags.row or ()):
         lid = local_id if local_id.startswith("local_") else "local_" + local_id
+        # listing rows are per-account COPIES: the same local id can legitimately
+        # appear once per store (e.g. one desktop app, two org/account stores),
+        # so every matching row - not just the first found - must be adopted.
         matches = [r for r in rows if r.local_id == lid]
         if not matches:
             raise Refusal("no listing row with sessionId " + lid)
-        r = matches[0]
-        if r.cli_session_id not in ("", session_id):
+        if any(r.cli_session_id not in ("", session_id) for r in matches):
             raise Refusal("row {0} is linked to a different live session; rows linked "
                           "to a different live session are never adoptable".format(lid))
         if not flags.yes:
-            raise Refusal("adopting row {0} (title={1!r}, cwd={2!r}) requires "
-                          "confirmation: pass --yes".format(lid, r.data.get("title"), r.cwd))
-        if r not in my_rows:
-            my_rows.append(r)
+            first = matches[0]
+            raise Refusal("adopting row {0} (title={1!r}, cwd={2!r}, "
+                          "lastActivityAt={3!r}) requires confirmation: pass --yes"
+                          .format(lid, first.data.get("title"), first.cwd,
+                                  first.data.get("lastActivityAt")))
+        for r in matches:
+            if r not in my_rows:
+                my_rows.append(r)
     if not my_rows:
         if disc.status == "found" and not flags.transcript_only:
             raise Refusal("no listing row references this transcript; moving it would "
