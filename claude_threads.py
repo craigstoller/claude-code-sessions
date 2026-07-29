@@ -715,6 +715,170 @@ def plan_move(env, session_id, target, flags):
     }
 
 
+# ------------------------------------------------------ engine execution
+_crash_hook = None
+
+
+def _maybe_crash(point):
+    if _crash_hook is not None:
+        _crash_hook(point)
+
+
+def _engine_roots(env, manifest):
+    roots = [env.projects_root, os.path.dirname(env.ops_dir)]
+    for r in manifest.get("rows", []):
+        roots.append(os.path.dirname(os.path.dirname(os.path.dirname(r["path"]))))
+    return roots
+
+
+def _copy_file(src, dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY)  # exclusive create
+    with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+        while True:
+            chunk = inp.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def _dest_files(manifest):
+    files = [(manifest["dest_transcript"], manifest["transcript_sha256"],
+              manifest["transcript_size"])]
+    for e in manifest["sidecar_inventory"]:
+        files.append((os.path.join(manifest["sidecar_dest"], *e["rel"].split("/")),
+                      e["sha256"], e["size"]))
+    return files
+
+
+def _verify(path_hash_size_list):
+    for path, digest, size in path_hash_size_list:
+        got, gsize = sha256_file(path)
+        if got != digest or gsize != size:
+            return path
+    return None
+
+
+def _abort(env, op, delete_dest=True):
+    prior_status = op.manifest["status"]
+    set_status(op, "aborting")
+    _maybe_crash("after-aborting")
+    for r in op.manifest["rows"]:
+        if r.get("rewritten"):
+            atomic_write(r["path"], unb64(r["pre_b64"]))
+            r["rewritten"] = False
+    save_manifest(op)
+    m = op.manifest
+    if delete_dest:
+        scratch = prior_status in ("journaled", "copying")
+        drifted = []
+        for path, digest, size in _dest_files(m):
+            if not os.path.isfile(path):
+                continue
+            if scratch:
+                os.unlink(path)
+                continue
+            got, gsize = sha256_file(path)
+            if got == digest and gsize == size:
+                os.unlink(path)
+            else:
+                drifted.append(path)
+        if drifted:
+            raise Refusal("destination files changed since copy ({0}); they were NOT "
+                          "deleted. Use recover --forward.".format(", ".join(drifted)))
+        if m.get("sidecar_dest") and os.path.isdir(m["sidecar_dest"]):
+            import shutil as _shutil
+            _shutil.rmtree(m["sidecar_dest"], ignore_errors=True)
+    set_status(op, "rolled_back")
+
+
+def execute_op(env, op):
+    m = op.manifest
+    roots = _engine_roots(env, m)
+    for key in ("source_transcript", "dest_transcript"):
+        ensure_contained(os.path.dirname(m[key]), [env.projects_root])
+    for r in m["rows"]:
+        ensure_contained(r["path"], roots)
+
+    _maybe_crash("after-journaled")
+
+    set_status(op, "copying")
+    _maybe_crash("after-copying")
+    _copy_file(m["source_transcript"], m["dest_transcript"])
+    for e in m["sidecar_inventory"]:
+        _copy_file(os.path.join(m["sidecar_source"], *e["rel"].split("/")),
+                   os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
+
+    bad = _verify(_dest_files(m))
+    if bad is not None:
+        _abort(env, op)
+        return "rolled_back"
+    for path, _, _ in _dest_files(m):
+        fsync_file(path)
+    set_status(op, "copied")
+    _maybe_crash("after-copied")
+
+    set_status(op, "rewriting")
+    _maybe_crash("after-rewriting")
+    try:
+        for r in m["rows"]:
+            atomic_write(r["path"], unb64(r["post_b64"]))
+            r["rewritten"] = True
+            save_manifest(op)
+    except OSError:
+        _abort(env, op)
+        return "rolled_back"
+
+    set_status(op, "committed")
+    _maybe_crash("after-committed")
+
+    # last-instant revalidation: BOTH sides + process guard (spec phase 6)
+    src_ok = True
+    got, gsize = sha256_file(m["source_transcript"])
+    if got != m["transcript_sha256"] or gsize != m["transcript_size"]:
+        src_ok = False
+    if src_ok and m.get("sidecar_source"):
+        for e in m["sidecar_inventory"]:
+            p = os.path.join(m["sidecar_source"], *e["rel"].split("/"))
+            if not os.path.isfile(p):
+                src_ok = False
+                break
+            got, gsize = sha256_file(p)
+            if got != e["sha256"] or gsize != e["size"]:
+                src_ok = False
+                break
+    dest_ok = _verify(_dest_files(m)) is None
+    if not src_ok or not dest_ok or claude_running(env):
+        _abort(env, op, delete_dest=False)   # phase-6 abort keeps BOTH copies (spec)
+        return "rolled_back"
+
+    os.unlink(m["source_transcript"])
+    if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
+        import shutil as _shutil
+        _shutil.rmtree(m["sidecar_source"])
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_move(env, manifest):
+    lock_owner_op = "pending"
+    acquire_lock(env, lock_owner_op)
+    try:
+        op = new_op(env, manifest)
+        final = execute_op(env, op)
+        if final == "completed":
+            append_moved_log(env, {"kind": "move", "session_id": manifest["session_id"],
+                                   "from": manifest["source_transcript"],
+                                   "to": manifest["dest_transcript"],
+                                   "at": env.now()})
+            rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
 def main(argv=None):
     return 0
 
