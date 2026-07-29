@@ -71,6 +71,55 @@ def _default_process_lister():
     return []
 
 
+# ---------------------------------------------------------------- 2. helpers
+import base64
+import hashlib
+import json
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+            size += len(chunk)
+    return h.hexdigest(), size
+
+
+def fsync_file(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, data):
+    tmp = path + ".ct-tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise LayoutError("unreadable JSON at {0}: {1}".format(path, exc))
+
+
+def b64(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def unb64(s):
+    return base64.b64decode(s.encode("ascii"))
+
+
 def main(argv=None):
     return 0
 
