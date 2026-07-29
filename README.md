@@ -52,8 +52,10 @@ claude-threads doctor
 **`move`** — relocate a thread to another project folder:
 
 ```
-claude-threads move 3c3c3eae "C:\path\to\project" --apply
+claude-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
 ```
+
+Get the full id from `claude-threads list --full`.
 
 **`undo`** — reverse the most recent completed operation:
 
@@ -88,7 +90,7 @@ claude-threads recover
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-28 | read-only + mutations |
-| macOS / Linux desktop | unverified | read-only (mutations behind `--unverified-platform`) |
+| macOS / Linux desktop | unverified | read-only (+ mutations behind `--unverified-platform`) |
 | CLI-only machines (any OS) | transcript layout verified | mutations behind `--transcript-only` |
 
 ## What's stored locally

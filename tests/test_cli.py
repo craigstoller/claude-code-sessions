@@ -86,6 +86,37 @@ def test_recover_lists_nonterminal(ready, capsys):
     assert ct.main(["recover"]) == 0
 
 
+def test_move_phase6_source_drift_prints_reason(ready, capsys):
+    """I3: a phase-6 rollback (the source changed at the last instant) must
+    not complete silently - `move --apply` prints only "result: rolled_back"
+    otherwise, giving no hint that two copies now exist on disk. cmd_move
+    must additionally print a reason naming the source and stating that
+    both copies were kept."""
+    env, t, target = ready
+    def hook(point):
+        if point == "after-committed":
+            with open(t, "a") as fh:        # app writes to source mid-operation
+                fh.write("\nlate write")
+    ct._crash_hook = hook
+    rc = ct.main(["move", SID, target, "--apply"])
+    ct._crash_hook = None
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "result: rolled_back" in out
+    assert "reason:" in out
+    assert "source" in out.lower()
+    assert "both copies" in out.lower()
+    assert os.path.isfile(t)                          # both copies really are kept
+    assert any(o.manifest.get("abort_keep_dest") for o in ct.list_ops(env))
+
+
+def test_recover_forward_back_mutually_exclusive(ready):
+    """M2: --forward and --back on `recover` must be mutually exclusive at
+    the argparse level, not silently resolved by if/else priority."""
+    with pytest.raises(SystemExit):
+        ct.build_parser().parse_args(["recover", "--resolve", "x", "--forward", "--back"])
+
+
 # --------------------------------------------------------- deltas: cmd_undo
 
 

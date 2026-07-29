@@ -270,9 +270,19 @@ def load_rows(roots):
     for root in roots:
         for path in sorted(_glob.glob(os.path.join(root, "*", "*", "local_*.json"))):
             try:
-                rows.append(Row(path, read_json(path)))
+                data = read_json(path)
             except LayoutError as exc:
                 errors.append(str(exc))
+                continue
+            # I2: a row file whose top-level JSON is not an object (e.g. a
+            # bare list) must not become a Row - every Row property assumes
+            # dict.get() and would raise AttributeError, crashing
+            # doctor/list/move instead of reporting a clean, fail-closed
+            # error.
+            if not isinstance(data, dict):
+                errors.append("row is not a JSON object: {0}".format(path))
+                continue
+            rows.append(Row(path, data))
     return rows, errors
 
 
@@ -846,11 +856,51 @@ def _pre_abort_status(op):
     return op.manifest["status"]
 
 
-def _abort(env, op, delete_dest=True):
+def _source_pre_verified(m):
+    """C1(a): True iff the source transcript AND every inventoried sidecar
+    file are currently present and byte-identical to what was journaled as
+    the pre-state. Gates non-scratch (hash-gated) destination deletion
+    during abort - deleting a hash-verified destination copy is only safe
+    when the source being kept instead is itself provably intact. Without
+    this, a source that vanished or drifted in a crash-adjacent window
+    would leave the destination - possibly the only remaining copy -
+    deleted anyway, because the existing hash-gate only ever checked the
+    DEST against its own journaled hash and said nothing about the
+    source's current state.
+    """
+    if not os.path.isfile(m["source_transcript"]):
+        return False
+    got, gsize = sha256_file(m["source_transcript"])
+    if got != m["transcript_sha256"] or gsize != m["transcript_size"]:
+        return False
+    if m.get("sidecar_source"):
+        for e in m["sidecar_inventory"]:
+            p = os.path.join(m["sidecar_source"], *e["rel"].split("/"))
+            if not os.path.isfile(p):
+                return False
+            got, gsize = sha256_file(p)
+            if got != e["sha256"] or gsize != e["size"]:
+                return False
+    return True
+
+
+def _abort(env, op, delete_dest=True, trigger=None):
     prior_status = _pre_abort_status(op)
+    m = op.manifest
+    # C1(b): once this op has committed to a keep-both resolution - either
+    # the phase-6 decision a caller persisted to the manifest BEFORE ever
+    # calling _abort, or one _abort itself reaches below - every future
+    # invocation for this op must keep honoring it, including a
+    # crash-resumed one via recover's "back" (which always calls _abort
+    # with its own default delete_dest=True). Without this, the earlier
+    # decision is invisible to a later call and "back" can silently
+    # complete a hash-gated delete the first call deliberately declined.
+    if m.get("abort_keep_dest"):
+        delete_dest = False
+    if trigger and not m.get("abort_reason"):
+        m["abort_reason"] = trigger
     set_status(op, "aborting")
     _maybe_crash("after-aborting")
-    m = op.manifest
 
     # Classify everything FIRST, as pure reads - no row is rewritten and no
     # destination file is deleted until we know the WHOLE rollback can
@@ -868,9 +918,17 @@ def _abort(env, op, delete_dest=True):
             drifted_rows.append(r["path"])
 
     scratch = prior_status in ("journaled", "copying")
+
+    # C1(a): a hash-gated (non-scratch) destination deletion only ever
+    # checked the DEST against its own journaled hash; it said nothing
+    # about whether the SOURCE we are keeping instead is actually still
+    # there. Verify it before any such delete is allowed to happen.
+    source_unverifiable = delete_dest and not scratch and not _source_pre_verified(m)
+
+    do_delete = delete_dest and not source_unverifiable
     dest_deletes = []
     drifted_dest = []
-    if delete_dest:
+    if do_delete:
         for path, digest, size in _dest_files(m):
             if not os.path.isfile(path):
                 continue
@@ -898,7 +956,24 @@ def _abort(env, op, delete_dest=True):
     m["drifted_rows"] = []
     save_manifest(op)
 
-    if delete_dest:
+    if source_unverifiable:
+        # C1(a): rows are restored as usual above, but the destination is
+        # never touched - the source we would be relying on to justify
+        # deleting a hash-verified dest copy could not itself be verified,
+        # so both copies are kept. Persist that decision (mirrors C1(b))
+        # so a later resumed "back" never re-attempts the same unsafe
+        # hash-gated delete.
+        m["abort_keep_dest"] = True
+        if not m.get("abort_reason"):
+            m["abort_reason"] = "source changed at last instant"
+        save_manifest(op)
+        raise Refusal(
+            "rollback could not verify the source ({0}) against its journaled "
+            "pre-state; the destination copy at {1} is being kept, not deleted "
+            "- nothing was lost, both copies remain. Run 'claude-threads "
+            "recover' to resolve.".format(m["source_transcript"], m["dest_transcript"]))
+
+    if do_delete:
         for path in dest_deletes:
             os.unlink(path)
         # I7: never rmtree - only the journaled files are ours to delete; any
@@ -967,12 +1042,12 @@ def execute_op(env, op):
             _copy_file(os.path.join(m["sidecar_source"], *e["rel"].split("/")),
                        os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
     except OSError:
-        _abort(env, op, delete_dest=True)
+        _abort(env, op, delete_dest=True, trigger="copy failed")
         return "rolled_back"
 
     bad = _verify(_dest_files(m))
     if bad is not None:
-        _abort(env, op)
+        _abort(env, op, trigger="destination verification failed")
         return "rolled_back"
     for path, _, _ in _dest_files(m):
         fsync_file(path)
@@ -996,15 +1071,21 @@ def execute_op(env, op):
             with open(r["path"], "rb") as fh:
                 current = fh.read()
             if current != unb64(r["pre_b64"]):
-                _abort(env, op)
-                return "rolled_back"
+                # M3: the following return is unreachable in practice - this
+                # is the FIRST time execute_op ever touches this row within a
+                # fresh run (only journaled ops reach execute_op), so a
+                # mismatch here can only mean "drifted" (never "post"), and
+                # _abort always raises Refusal for a drifted row rather than
+                # returning. Kept as a call, not inlined, so the abort still
+                # happens if that invariant is ever wrong.
+                _abort(env, op, trigger="row changed before rewrite")
             atomic_write(r["path"], unb64(r["post_b64"]))
             r["rewritten"] = True
             save_manifest(op)
             if i < len(rows) - 1:
                 _maybe_crash("mid-rewriting")
     except OSError:
-        _abort(env, op)
+        _abort(env, op, trigger="row changed before rewrite")
         return "rolled_back"
 
     set_status(op, "committed")
@@ -1027,7 +1108,23 @@ def execute_op(env, op):
                 src_ok = False
                 break
     dest_ok = _verify(_dest_files(m)) is None
-    if not src_ok or not dest_ok or claude_running(env):
+    running = claude_running(env)
+    if not src_ok or not dest_ok or running:
+        # I3/C1(b): persist the keep-both decision BEFORE _abort is even
+        # called - a crash inside _abort itself (e.g. right after it enters
+        # 'aborting') must not lose the fact that this rollback was always
+        # meant to keep both copies. Once this is on the manifest, _abort
+        # forces delete_dest=False on any future call for this op,
+        # including a crash-resumed 'back' via recover.
+        if not src_ok:
+            reason = "source changed at last instant"
+        elif not dest_ok:
+            reason = "destination verification failed"
+        else:
+            reason = "process guard"
+        m["abort_keep_dest"] = True
+        m["abort_reason"] = reason
+        save_manifest(op)
         _abort(env, op, delete_dest=False)   # phase-6 abort keeps BOTH copies (spec)
         return "rolled_back"
 
@@ -1043,6 +1140,12 @@ def execute_op(env, op):
                 if rel not in inv_rels:
                     extra.append(full)
         if extra:
+            # I3/C1(b): same pre-persisted keep-both decision as above - a
+            # newly-appeared source sidecar file is itself a form of
+            # "source changed" since planning.
+            m["abort_keep_dest"] = True
+            m["abort_reason"] = "source changed at last instant"
+            save_manifest(op)
             _abort(env, op, delete_dest=False)
             return "rolled_back"
 
@@ -1347,8 +1450,30 @@ def classify_op(env, op):
                     "note": "row(s) changed unexpectedly during rollback ({0}); "
                             "automatic recovery cannot proceed - resolve manually"
                             .format(", ".join(drifted_rows))}
+        # C1(c): mirror the journaled/copying branch's source gate. A
+        # hash-gated (non-scratch) "back" deletes the destination only after
+        # verifying the source is still "pre" (C1a) - if it is not, and this
+        # op has not already committed to keeping the destination
+        # (abort_keep_dest), automatic recovery cannot know in advance
+        # whether "back" will complete or refuse, and offering it forever
+        # would be the same dead end as a drifted row.
+        if src != "pre" and not m.get("abort_keep_dest"):
+            return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "drifted_rows": drifted_rows,
+                    "note": "source is {0} and the destination was never confirmed "
+                            "kept; refusing to resolve automatically - resolve "
+                            "manually".format(src)}
+        note = "completing an interrupted rollback"
+        if dest == "drifted":
+            # I4: a drifted destination is never deleted either way - the
+            # hash-gate in _abort only ever deletes a dest file that still
+            # matches its journaled hash, so "back" remains safe to offer;
+            # it will just keep (and report) the drifted file rather than
+            # touch it.
+            note += "; destination has drifted since it was journaled and will " \
+                    "be kept, not deleted"
         return {"status": status, "source": src, "dest": dest, "resolutions": ["back"],
-                "drifted_rows": drifted_rows, "note": "completing an interrupted rollback"}
+                "drifted_rows": drifted_rows, "note": note}
     if status in ("copied", "rewriting"):
         if dest == "grown":
             return {"status": status, "source": src, "dest": dest, "resolutions": ["forward"],
@@ -1769,8 +1894,9 @@ def build_parser():
 
     sp = sub.add_parser("recover", help="resolve interrupted operations")
     sp.add_argument("--resolve", dest="op_id")
-    sp.add_argument("--forward", action="store_true")
-    sp.add_argument("--back", action="store_true")
+    direction = sp.add_mutually_exclusive_group()   # M2: --forward/--back are exclusive
+    direction.add_argument("--forward", action="store_true")
+    direction.add_argument("--back", action="store_true")
     sp.add_argument("--apply", action="store_true")
     common(sp)
     return p
@@ -1782,6 +1908,34 @@ def _flags_from(ns):
                      row=ns.row, yes=ns.yes, force=ns.force)
 
 
+def _print_abort_reason(env, ns, op):
+    """I3: a rollback that completes silently (no exception - e.g. a
+    phase-6 keep-both abort) gives the user no clue anything unusual
+    happened beyond the bare word "rolled_back". If the op's manifest
+    carries an abort_reason (set by _abort/execute_op), surface it - and,
+    when the destination copy was deliberately kept, name it too.
+    """
+    reason = op.manifest.get("abort_reason")
+    if not reason:
+        return
+    line = "reason: " + reason
+    if op.manifest.get("abort_keep_dest"):
+        line += "; both copies were kept (destination retained at {0})".format(
+            op.manifest.get("dest_transcript", ""))
+    print(line if ns.verbose else redact(env, line))
+
+
+def _print_new_op_reason(env, ns, before_ids):
+    """run_move/run_undo return only a plain status string, not the Op they
+    created - so to print its abort reason (I3) after a non-completed
+    result, find the op that appeared since `before_ids` was snapshotted.
+    Safe because callers hold the single-instance lock for the duration of
+    the call that created it, so at most one new op can have appeared."""
+    for op in list_ops(env):
+        if op.manifest["op_id"] not in before_ids:
+            _print_abort_reason(env, ns, op)
+
+
 def cmd_move(env, ns):
     manifest = plan_move(env, ns.session_id, ns.target, _flags_from(ns))
     summary = ("mode={0}\nsource={1}\ndest={2}\nrows={3}"
@@ -1791,8 +1945,11 @@ def cmd_move(env, ns):
     if not ns.apply:
         print("dry run - pass --apply to execute")
         return 0
+    before_ids = {o.manifest["op_id"] for o in list_ops(env)}
     final = run_move(env, manifest)
     print("result: " + final)
+    if final != "completed":
+        _print_new_op_reason(env, ns, before_ids)
     return 0 if final == "completed" else 1
 
 
@@ -1821,11 +1978,15 @@ def cmd_undo(env, ns):
                       (" with id " + ns.op_id if ns.op_id else ""))
     prior = candidates[-1]
     if not ns.apply:
-        print("would undo {0} (session {1}); pass --apply to execute"
-              .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
+        line = ("would undo {0} (session {1}); pass --apply to execute"
+                .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
+        print(line if ns.verbose else redact(env, line))   # M1: redact the preview too
         return 0
+    before_ids = {o.manifest["op_id"] for o in list_ops(env)}
     final = run_undo(env, prior)
     print("result: " + final)
+    if final != "completed":
+        _print_new_op_reason(env, ns, before_ids)
     return 0 if final == "completed" else 1
 
 
@@ -1852,6 +2013,8 @@ def cmd_recover(env, ns):
         return 0
     final = recover_op(env, matches[0], direction)
     print("result: " + final)
+    if final != "completed":
+        _print_abort_reason(env, ns, matches[0])
     return 0
 
 

@@ -320,3 +320,81 @@ def test_journaled_scratch_blocked_when_source_drifted(crashed):
     c = ct.classify_op(env, op)
     assert c["source"] == "drifted"
     assert c["resolutions"] == []
+
+
+# --------------------------------------------- C1: crash-interrupted keep-both abort
+
+
+def test_hash_gated_abort_refuses_when_source_unverifiable_without_prior_flag(crashed):
+    """C1(a): a hash-gated (non-scratch) abort must verify the SOURCE
+    against its journaled pre-state before deleting any hash-matching
+    destination file - not just check the destination's own hash. Here
+    "back" is resumed directly from 'rewriting' (no prior abort attempt, so
+    no abort_keep_dest has ever been set) with the source deleted out from
+    under it while the destination copy is still perfectly intact: the old
+    hash-gate only looked at the DEST and would have deleted the last
+    remaining copy. It must refuse instead, and persist the keep-both
+    decision so a retry does not need to re-derive it."""
+    env, m, t = crashed("rewriting")
+    os.unlink(t)
+    op = ct.nonterminal_ops(env)[0]
+    with pytest.raises(ct.Refusal, match="source"):
+        ct.recover_op(env, op, "back")
+    assert os.path.isfile(m["dest_transcript"])
+    assert os.path.isfile(os.path.join(m["sidecar_dest"], "sub", "agent.jsonl"))
+    op2 = ct.nonterminal_ops(env)[0]
+    assert op2.manifest.get("abort_keep_dest") is True
+    assert op2.manifest.get("abort_reason")
+
+
+def test_crash_during_keep_both_abort_recover_back_preserves_dest(crashed):
+    """C1(d): regression for the reviewer's repro. execute_op's phase-6
+    failure path persists the keep-both decision (abort_keep_dest +
+    abort_reason) to the manifest BEFORE it ever calls _abort (C1b) - so
+    even if THAT abort is itself crash-interrupted right after entering
+    'aborting' (before it reaches the terminal rolled_back state), a later
+    `recover --back` must still honor the keep-both decision and never
+    delete the destination - regardless of the fact that recover's "back"
+    always calls _abort with its own default delete_dest=True.
+
+    Before this fix the persisted decision was invisible to the resumed
+    call: prior_status resolved (via history) to the ORIGINAL non-scratch
+    phase, the dest file still hash-matched its journaled hash, and the
+    old hash-gate said nothing about the source - so a resumed "back" would
+    delete the last remaining copy after the source had already been lost.
+    """
+    env, m, t = crashed("committed")
+    os.unlink(t)   # source vanishes before the (simulated) phase-6 abort
+
+    # Simulate exactly what execute_op's phase-6 failure path does (C1b):
+    # persist the keep-both decision BEFORE _abort is even called, then
+    # crash partway through that very abort (right after it enters
+    # "aborting", before row-restore or the terminal status transition).
+    op = ct.nonterminal_ops(env)[0]
+    op.manifest["abort_keep_dest"] = True
+    op.manifest["abort_reason"] = "source changed at last instant"
+    ct.save_manifest(op)
+
+    def hook(point):
+        if point == "after-aborting":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    with pytest.raises(SimulatedCrash):
+        ct._abort(env, op, delete_dest=False)
+    ct._crash_hook = None
+
+    op2 = ct.nonterminal_ops(env)[0]
+    assert op2.manifest["status"] == "aborting"
+    assert os.path.isfile(m["dest_transcript"])   # nothing deleted by the crashed attempt
+
+    c = ct.classify_op(env, op2)
+    assert "back" in c["resolutions"]   # abort_keep_dest shortcut still offers it (C1c)
+
+    try:
+        result = ct.recover_op(env, op2, "back")
+        assert result in ("rolled_back", "completed")
+    except ct.Refusal:
+        pass   # "refuse-or-complete" - either is acceptable, but nothing may be lost
+
+    assert os.path.isfile(m["dest_transcript"])
+    assert os.path.isfile(os.path.join(m["sidecar_dest"], "sub", "agent.jsonl"))

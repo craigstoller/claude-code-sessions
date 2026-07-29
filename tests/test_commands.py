@@ -210,3 +210,29 @@ def test_doctor_exit2_message_not_on_exit0(mkenv, tmp_path, capsys):
     rc = ct.cmd_doctor(env, ns())
     out = capsys.readouterr().out
     assert rc == 0 and "unrecognized or unreadable state" not in out
+
+
+def test_undo_dry_run_preview_redacted(mkenv, tmp_path, write_transcript, write_row, capsys):
+    """M1 (parked Task 14 finding): the undo dry-run preview line must pass
+    through redact(env, ...) like every other command's output - it
+    previously printed the op's session id unredacted even in the default
+    (non-verbose) mode."""
+    env = mkenv(tmp_path)
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    src = "C:\\proj\\src"
+    target = str(tmp_path / "target")
+    os.makedirs(target)
+    write_transcript(env, ct.encode(src, ct.SCHEME_CURRENT), sid, [{"cwd": src}])
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": sid, "cwd": src,
+               "originCwd": src, "title": "T"})
+    os.makedirs(os.path.join(env.projects_root, ct.encode("C:\\proj\\_ev", ct.SCHEME_CURRENT)))
+    write_row(env, 0, "o", "a", "local_ev",
+              {"sessionId": "local_ev", "cliSessionId": "other", "cwd": "C:\\proj\\_ev",
+               "lastActivityAt": 2})
+    m = ct.plan_move(env, sid, target, ct.MoveFlags())
+    assert ct.run_move(env, m) == "completed"
+    rc = ct.cmd_undo(env, ns(apply=False, show=False, op_id=None))
+    out = capsys.readouterr().out
+    assert rc == 0 and "would undo" in out
+    assert sid not in out and "aaaaaaaa" in out and "…" in out
