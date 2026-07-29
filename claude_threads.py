@@ -1632,6 +1632,19 @@ def gather_doctor(env):
     unlisted = sorted(tids - listed)
     cwds = [r.cwd for r in rows if r.cwd]
     cur, leg = scheme_evidence(cwds, env.projects_root)
+    # Recent-50 evidence: the SAME population plan_move itself consults to
+    # choose a scheme for a live move (the 50 most-recently-active rows).
+    # Ruling fix (Task 13's "cur > 0 and leg > 0" over ALL rows was wrong):
+    # a machine that lived through the 2026-07 encoding change legitimately
+    # has folders under both schemes forever after - that history alone is
+    # not an "unknown layout", it is exactly what legacy_folders already
+    # reports (a exit-1 finding). Only a genuine TIE in the evidence that
+    # would actually decide a future move - both counts equal and nonzero
+    # among the most-recent 50 rows - means the layout cannot be
+    # determined and is worth exit 2.
+    recent_rows = sorted(rows, key=lambda r: r.last_activity)[-50:]
+    recent_cwds = [r.cwd for r in recent_rows]
+    cur_recent, leg_recent = scheme_evidence(recent_cwds, env.projects_root)
     legacy_folders = []
     legacy_folders_set = set()
     for cwd in set(cwds):
@@ -1644,14 +1657,16 @@ def gather_doctor(env):
                 legacy_folders.append({"folder": b, "transcripts": n})
                 legacy_folders_set.add(b)
     unknown_layout = []
-    if cur > 0 and leg > 0:
-        unknown_layout = ["mixed encoding-scheme evidence"]
+    if cur_recent == leg_recent > 0:
+        unknown_layout = ["encoding-scheme evidence is tied/undecidable (recent 50: "
+                          "current={0} legacy={1})".format(cur_recent, leg_recent)]
     nt = [o.manifest["op_id"] for o in nonterminal_ops(env)]
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
         "dead_rows": dead, "unlisted_transcripts": unlisted,
         "encoding": {"current": cur, "legacy": leg},
+        "encoding_recent": {"current": cur_recent, "legacy": leg_recent},
         "legacy_folders": legacy_folders, "nonterminal_ops": nt,
         "stale_lock": lock_is_stale(env),
         "unknown_layout": unknown_layout,
@@ -1691,7 +1706,9 @@ def cmd_doctor(env, ns):
         say("[observed] transcript {0} has no listing row".format(sid))
         say("[hypothesis]   normal for CLI-created sessions; also what an interrupted "
             "external move leaves behind")
-    say("[observed] encoding evidence: current={0} legacy={1}"
+    say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
+        .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
+    say("[observed] encoding evidence (all rows): current={0} legacy={1}"
         .format(rep["encoding"]["current"], rep["encoding"]["legacy"]))
     for msg in rep.get("unknown_layout", []):
         say("[observed] " + msg)

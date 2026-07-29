@@ -1,4 +1,5 @@
 import json
+import os
 import types
 
 import claude_threads as ct
@@ -138,6 +139,9 @@ def test_row_dedup_by_session_id(mkenv, tmp_path, write_row):
 
 
 def test_unknown_layout_finding(mkenv, tmp_path, write_row):
+    """Genuine tie: the ONLY row (trivially inside the recent-50 window)
+    has both scheme-encoded folders on disk for its cwd, so recent-50
+    evidence is exactly tied (1 == 1 > 0) - undecidable, exit 2."""
     env = mkenv(tmp_path)
     import os as os_module
     write_row(env, 0, "o", "a", "local_1",
@@ -148,8 +152,42 @@ def test_unknown_layout_finding(mkenv, tmp_path, write_row):
     os_module.makedirs(cur_folder, exist_ok=True)
     os_module.makedirs(leg_folder, exist_ok=True)
     rep = ct.gather_doctor(env)
-    assert rep["unknown_layout"] == ["mixed encoding-scheme evidence"]
+    assert rep["encoding_recent"] == {"current": 1, "legacy": 1}
+    assert rep["unknown_layout"] == [
+        "encoding-scheme evidence is tied/undecidable (recent 50: current=1 legacy=1)"]
     assert rep["exit_code"] == 2
+
+
+def test_mixed_but_decided_history_is_not_unknown_layout(mkenv, tmp_path, write_row):
+    """Ruling fix (Task 13's 'cur > 0 and leg > 0' over ALL rows was wrong):
+    a machine that lived through the 2026-07 encoding change legitimately
+    has folders under both schemes forever after. One old row sits on a
+    project whose folder is shadowed under both encodings (a genuine
+    historical artifact - the legacy_folders finding covers it); 50 more-
+    recent rows all sit on an unrelated, purely current-scheme project.
+    Recent-50 evidence therefore has a clear winner (current), so this must
+    be exit 1 via legacy_folders, never exit 2 via unknown_layout."""
+    env = mkenv(tmp_path)
+    shadowed_cwd = "C:\\legacy_migrated_proj"
+    current_cwd = "C:\\current_only_proj"
+    os.makedirs(os.path.join(env.projects_root, ct.encode(shadowed_cwd, ct.SCHEME_CURRENT)),
+               exist_ok=True)
+    os.makedirs(os.path.join(env.projects_root, ct.encode(shadowed_cwd, ct.SCHEME_LEGACY)),
+               exist_ok=True)
+    os.makedirs(os.path.join(env.projects_root, ct.encode(current_cwd, ct.SCHEME_CURRENT)),
+               exist_ok=True)
+    write_row(env, 0, "o", "a", "local_old",
+              {"sessionId": "local_old", "cliSessionId": "s-old", "cwd": shadowed_cwd,
+               "lastActivityAt": 1})
+    for i in range(50):
+        write_row(env, 0, "o", "a", "local_r{0}".format(i),
+                  {"sessionId": "local_r{0}".format(i), "cliSessionId": "s-r{0}".format(i),
+                   "cwd": current_cwd, "lastActivityAt": 100 + i})
+    rep = ct.gather_doctor(env)
+    assert rep["encoding_recent"] == {"current": 1, "legacy": 0}   # clear winner, no tie
+    assert rep["unknown_layout"] == []
+    assert len(rep["legacy_folders"]) == 1
+    assert rep["exit_code"] == 1
 
 
 def test_doctor_exit2_message(mkenv, tmp_path, write_row, capsys):
