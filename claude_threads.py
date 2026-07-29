@@ -196,6 +196,43 @@ def discover_stores(env):
     return StoreDiscovery("absent", [], "no store under any known candidate")
 
 
+# ----------------------------------------------------------- listing rows
+import glob as _glob
+
+
+@dataclasses.dataclass
+class Row:
+    path: str
+    data: dict
+
+    @property
+    def local_id(self):
+        return self.data.get("sessionId") or os.path.splitext(os.path.basename(self.path))[0]
+
+    @property
+    def cli_session_id(self):
+        return self.data.get("cliSessionId") or ""
+
+    @property
+    def cwd(self):
+        return self.data.get("cwd") or ""
+
+    @property
+    def last_activity(self):
+        return self.data.get("lastActivityAt") or 0
+
+
+def load_rows(roots):
+    rows, errors = [], []
+    for root in roots:
+        for path in sorted(_glob.glob(os.path.join(root, "*", "*", "local_*.json"))):
+            try:
+                rows.append(Row(path, read_json(path)))
+            except LayoutError as exc:
+                errors.append(str(exc))
+    return rows, errors
+
+
 def main(argv=None):
     return 0
 
