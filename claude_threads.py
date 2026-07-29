@@ -155,6 +155,36 @@ def choose_scheme(evidence, target_path):
         "Refusing to guess.".format(cur, leg, target_path))
 
 
+# --------------------------------------------------------- store discovery
+@dataclasses.dataclass
+class StoreDiscovery:
+    status: str          # found | absent | error
+    roots: list
+    detail: str
+
+
+def discover_stores(env):
+    roots, errors, seen = [], [], set()
+    for cand in env.store_candidates:
+        parent = os.path.dirname(cand)
+        if os.path.isdir(cand):
+            real = os.path.realpath(cand)
+            if real not in seen:
+                seen.add(real)
+                roots.append(real)
+            continue
+        # candidate absent: prove we could actually look
+        try:
+            os.listdir(parent)
+        except OSError as exc:
+            errors.append("{0}: {1}".format(cand, exc))
+    if errors:
+        return StoreDiscovery("error", roots, "; ".join(errors))
+    if roots:
+        return StoreDiscovery("found", roots, "{0} root(s)".format(len(roots)))
+    return StoreDiscovery("absent", [], "no store under any known candidate")
+
+
 def main(argv=None):
     return 0
 
