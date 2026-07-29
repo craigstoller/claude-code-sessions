@@ -1018,6 +1018,175 @@ def run_move(env, manifest):
         release_lock(env)
 
 
+# ------------------------------------------------------ recovery
+def is_prefix_of(journaled_hash, journaled_size, path):
+    h = hashlib.sha256()
+    remaining = journaled_size
+    try:
+        with open(path, "rb") as fh:
+            while remaining > 0:
+                chunk = fh.read(min(1 << 20, remaining))
+                if not chunk:
+                    return False
+                h.update(chunk)
+                remaining -= len(chunk)
+    except OSError:
+        return False
+    return h.hexdigest() == journaled_hash
+
+
+def classify_op(env, op):
+    """Classify a non-terminal op's source/destination state and the safe
+    recovery resolutions. Rules verbatim from spec Recovery classification.
+    """
+    m = op.manifest
+    status = m["status"]
+
+    def _src_state():
+        transcript_present = os.path.isfile(m["source_transcript"])
+        if not transcript_present:
+            if status == "committed":
+                # I8 idempotency: a crash (or a prior partial recover) can
+                # have already deleted the source transcript before this
+                # classification runs. That is evidence deletion already
+                # progressed, not drift - tolerate it here and let the
+                # sidecar/dest checks below decide the rest.
+                pass
+            else:
+                return "missing"
+        else:
+            got, gsize = sha256_file(m["source_transcript"])
+            if got != m["transcript_sha256"] or gsize != m["transcript_size"]:
+                return "drifted"
+        if status == "committed" and m.get("sidecar_source"):
+            for e in m["sidecar_inventory"]:
+                p = os.path.join(m["sidecar_source"], *e["rel"].split("/"))
+                if not os.path.isfile(p):
+                    continue  # I8: already deleted - tolerated
+                got, gsize = sha256_file(p)
+                if got != e["sha256"] or gsize != e["size"]:
+                    return "drifted"
+        return "pre"
+
+    def _dest_state():
+        if not os.path.exists(m["dest_transcript"]):
+            return "absent"
+        got, gsize = sha256_file(m["dest_transcript"])
+        sidecars_ok = all(
+            os.path.isfile(os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
+            and sha256_file(os.path.join(m["sidecar_dest"], *e["rel"].split("/")))[0] == e["sha256"]
+            for e in m["sidecar_inventory"]) if m.get("sidecar_dest") else True
+        if got == m["transcript_sha256"] and gsize == m["transcript_size"] and sidecars_ok:
+            return "intact"
+        if gsize > m["transcript_size"] and sidecars_ok and \
+                is_prefix_of(m["transcript_sha256"], m["transcript_size"], m["dest_transcript"]):
+            return "grown"
+        return "drifted"
+
+    src, dest = _src_state(), _dest_state()
+    if status in ("journaled", "copying"):
+        return {"status": status, "source": src, "dest": "partial-scratch" if dest != "absent" else "absent",
+                "resolutions": ["back", "forward"],
+                "note": "destination is tool-owned scratch at this phase"}
+    if status == "aborting":
+        return {"status": status, "source": src, "dest": dest, "resolutions": ["back"],
+                "note": "completing an interrupted rollback"}
+    if status in ("copied", "rewriting"):
+        if dest in ("grown", "drifted"):
+            return {"status": status, "source": src, "dest": dest, "resolutions": ["forward"],
+                    "note": "destination has post-crash changes; it will never be deleted"}
+        return {"status": status, "source": src, "dest": dest,
+                "resolutions": ["back", "forward"], "note": ""}
+    if status == "committed":
+        if src != "pre":
+            return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "note": "source changed after commit; resolve manually - both copies kept"}
+        if dest in ("intact", "grown"):
+            return {"status": status, "source": src, "dest": dest, "resolutions": ["forward"],
+                    "note": "finishing means deleting the stale source duplicate"}
+        return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                "note": "destination no longer contains the copy; keeping the source"}
+    return {"status": status, "source": src, "dest": dest, "resolutions": [], "note": "terminal"}
+
+
+def recover_op(env, op, direction):
+    c = classify_op(env, op)
+    if direction not in c["resolutions"]:
+        raise Refusal("'{0}' is not a safe resolution for op {1} ({2}); options: {3}"
+                      .format(direction, op.manifest["op_id"], c["note"],
+                              c["resolutions"] or "none - manual intervention"))
+    m = op.manifest
+    if direction == "back":
+        _abort(env, op)
+        return "rolled_back"
+    # forward
+    if m["status"] in ("journaled", "copying"):
+        for path, _, _ in _dest_files(m):        # scratch rule: clear partials
+            if os.path.exists(path):
+                os.unlink(path)
+        op.manifest["status"] = "journaled"
+        save_manifest(op)
+        final = execute_op(env, op)
+    elif m["status"] in ("copied", "rewriting"):
+        for r in m["rows"]:
+            if not r.get("rewritten"):
+                atomic_write(r["path"], unb64(r["post_b64"]))
+                r["rewritten"] = True
+                save_manifest(op)
+        set_status(op, "committed")
+        final = _finish_committed(env, op)
+    else:  # committed
+        final = _finish_committed(env, op)
+    if final == "completed":
+        append_moved_log(env, {"kind": "move", "session_id": m["session_id"],
+                               "from": m["source_transcript"], "to": m["dest_transcript"],
+                               "at": env.now()})
+    return final
+
+
+def _finish_committed(env, op):
+    """Finish a 'committed' op by deleting the now-redundant source copy.
+
+    Uses the same delete helpers and failure contract as execute_op's final
+    commit step (never rmtree): inventoried sidecar files first, then their
+    now-empty directories, transcript LAST. A file already missing (I8:
+    deletion already progressed - see classify_op) is simply skipped rather
+    than treated as a failure. Any real delete failure raises a Refusal
+    naming the paths and leaves the op at 'committed' (non-terminal) for a
+    later recover to retry - it is never silently swallowed.
+    """
+    m = op.manifest
+    c = classify_op(env, op)
+    if c["source"] != "pre" or c["dest"] not in ("intact", "grown"):
+        raise Refusal("cannot finish op {0}: {1}".format(m["op_id"], c["note"]))
+
+    if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
+        remaining = [e for e in m["sidecar_inventory"]
+                     if os.path.isfile(os.path.join(m["sidecar_source"], *e["rel"].split("/")))]
+        failures = _delete_inventoried_files(m["sidecar_source"], remaining)
+        if failures:
+            raise Refusal("cannot finish op {0}: could not remove {1}".format(
+                m["op_id"], ", ".join(p for p, _ in failures)))
+        _rmdirs_bottom_up(m["sidecar_source"])
+
+    if os.path.isfile(m["source_transcript"]):
+        try:
+            os.unlink(m["source_transcript"])
+        except OSError as exc:
+            raise Refusal("cannot finish op {0}: could not remove source transcript "
+                          "{1}: {2}".format(m["op_id"], m["source_transcript"], exc))
+
+    set_status(op, "completed")
+    return "completed"
+
+
+def clear_stale_lock(env):
+    if lock_is_stale(env):
+        release_lock(env)
+        return True
+    return False
+
+
 def main(argv=None):
     return 0
 
