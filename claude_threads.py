@@ -431,6 +431,49 @@ def moved_session_ids(env):
     return {sid for sid, kind in state.items() if kind == "move"}
 
 
+# ------------------------------------------- containment & sidecar inventory
+import stat as _stat
+
+
+def ensure_contained(path, allowed_roots):
+    real = os.path.realpath(path)
+    for root in allowed_roots:
+        rreal = os.path.realpath(root)
+        if real == rreal or real.startswith(rreal + os.sep):
+            return real
+    raise LayoutError("path {0} resolves outside every recognized root".format(path))
+
+
+def _is_reparse(path):
+    if os.path.islink(path):
+        return True
+    try:
+        st = os.lstat(path)
+        return bool(getattr(st, "st_file_attributes", 0) &
+                    getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except OSError:
+        return False
+
+
+def sidecar_inventory(sidecar_dir):
+    if not os.path.isdir(sidecar_dir):
+        return []
+    inv = []
+    for dirpath, dirnames, filenames in os.walk(sidecar_dir):
+        for name in dirnames + filenames:
+            full = os.path.join(dirpath, name)
+            if _is_reparse(full):
+                raise Refusal("symlink/junction inside sidecar tree at {0}; refusing "
+                              "to traverse".format(full))
+        for name in filenames:
+            full = os.path.join(dirpath, name)
+            digest, size = sha256_file(full)
+            rel = os.path.relpath(full, sidecar_dir).replace(os.sep, "/")
+            inv.append({"rel": rel, "sha256": digest, "size": size})
+    inv.sort(key=lambda e: e["rel"])
+    return inv
+
+
 def main(argv=None):
     return 0
 
