@@ -1075,6 +1075,87 @@ def run_move(env, manifest):
         release_lock(env)
 
 
+# ------------------------------------------------------ undo
+def plan_undo(env, prior_op):
+    """Build a reversal manifest for a completed move: source/dest swapped,
+    row pre/post images swapped, same hashes. Every precondition here checks
+    the CURRENT on-disk state against what the move journaled as its
+    post-state - any drift (the app resumed the moved thread, edited a row,
+    etc.) means undoing would silently discard that activity, so it refuses
+    instead of guessing. This is undo, not recover: growth at the
+    destination is never accepted here the way `classify_op` accepts it for
+    a crash-interrupted move.
+    """
+    pm = prior_op.manifest
+    if pm.get("status") != "completed":
+        raise Refusal("op {0} is '{1}', not 'completed'; only completed ops can be "
+                      "undone".format(pm.get("op_id"), pm.get("status")))
+    for other in list_ops(env):
+        if other.manifest["op_id"] > pm["op_id"] and \
+                other.manifest.get("session_id") == pm["session_id"] and \
+                other.manifest.get("status") != "rolled_back":
+            raise Refusal("a newer op touches this session; undo newest-first")
+    got, gsize = sha256_file(pm["dest_transcript"])
+    if got != pm["transcript_sha256"] or gsize != pm["transcript_size"]:
+        raise Refusal("the moved transcript has changed since the move (resumed or "
+                      "edited). Undoing would overwrite that activity; refusing.")
+    for e in pm["sidecar_inventory"]:
+        p = os.path.join(pm["sidecar_dest"], *e["rel"].split("/"))
+        if not os.path.isfile(p) or sha256_file(p)[0] != e["sha256"]:
+            raise Refusal("sidecar file {0} has changed since the move; refusing."
+                          .format(e["rel"]))
+    rows = []
+    for r in pm["rows"]:
+        with open(r["path"], "rb") as fh:
+            cur = fh.read()
+        if cur != unb64(r["post_b64"]):
+            raise Refusal("listing row {0} has changed since the move (the app may "
+                          "have updated it); refusing.".format(r["path"]))
+        rows.append({"path": r["path"], "pre_b64": r["post_b64"],
+                     "post_b64": r["pre_b64"], "rewritten": False})
+    return {
+        "op_type": "undo", "undo_of": pm["op_id"], "session_id": pm["session_id"],
+        "mode": pm["mode"],
+        "source_transcript": pm["dest_transcript"],
+        "dest_transcript": pm["source_transcript"],
+        "transcript_sha256": pm["transcript_sha256"],
+        "transcript_size": pm["transcript_size"],
+        "sidecar_source": pm.get("sidecar_dest"),
+        "sidecar_dest": pm.get("sidecar_source"),
+        "sidecar_inventory": pm["sidecar_inventory"],
+        "rows": rows, "target_cwd": pm.get("target_cwd", ""),
+    }
+
+
+def run_undo(env, prior_op):
+    """Lock -> plan_undo -> new_op -> execute_op. The engine itself needs no
+    changes for undo: an undo op is just a move manifest pointing the other
+    way. But plan_move's process guard does not run for undo, so run_undo
+    checks claude_running itself before executing (execute_op's own guard
+    only fires at its last-instant revalidation, deep into the transaction).
+    On 'completed' the prior op is marked 'undone' and a moved-log entry
+    cancels its 'move' entry; any other outcome (e.g. 'committed' if final
+    cleanup could not fully finish, or 'rolled_back') leaves the prior op's
+    status untouched for the user to retry or recover.
+    """
+    manifest = plan_undo(env, prior_op)
+    if claude_running(env):
+        raise Refusal("Claude appears to be running; close the app before undoing.")
+    acquire_lock(env, "undo-" + prior_op.manifest["op_id"])
+    try:
+        op = new_op(env, manifest)
+        final = execute_op(env, op)
+        if final == "completed":
+            set_status(prior_op, "undone")
+            append_moved_log(env, {"kind": "undo",
+                                   "session_id": manifest["session_id"],
+                                   "at": env.now()})
+            rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
 # ------------------------------------------------------ recovery
 def is_prefix_of(journaled_hash, journaled_size, path):
     h = hashlib.sha256()
