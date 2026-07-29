@@ -164,18 +164,29 @@ class StoreDiscovery:
 
 
 def discover_stores(env):
+    # FileNotFoundError while looking is PROOF of absence (a machine that never
+    # installed the desktop app has no %APPDATA%\Claude parent at all - that is
+    # the normal CLI-only case, not an error). Any OTHER OSError means "couldn't
+    # look", which is never "nothing there".
     roots, errors, seen = [], [], set()
     for cand in env.store_candidates:
-        parent = os.path.dirname(cand)
-        if os.path.isdir(cand):
+        try:
+            os.listdir(cand)                       # store exists and is enumerable
             real = os.path.realpath(cand)
             if real not in seen:
                 seen.add(real)
                 roots.append(real)
             continue
-        # candidate absent: prove we could actually look
+        except FileNotFoundError:
+            pass                                   # candidate missing; prove the parent
+        except OSError as exc:
+            errors.append("{0}: {1}".format(cand, exc))
+            continue
+        parent = os.path.dirname(cand)
         try:
             os.listdir(parent)
+        except FileNotFoundError:
+            pass                                   # parent absent too: proven absent
         except OSError as exc:
             errors.append("{0}: {1}".format(cand, exc))
     if errors:

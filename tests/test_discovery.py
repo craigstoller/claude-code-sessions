@@ -39,3 +39,10 @@ def test_alias_dedup(mkenv, tmp_path):
     env.store_candidates = [env.store_candidates[0], env.store_candidates[0]]
     d = ct.discover_stores(env)
     assert d.status == "found" and len(d.roots) == 1
+
+
+def test_absent_when_parent_missing_entirely(mkenv, tmp_path):
+    env = mkenv(tmp_path, n_store_roots=0)
+    env.store_candidates = [str(tmp_path / "never-installed" / "Claude" / "claude-code-sessions")]
+    d = ct.discover_stores(env)
+    assert d.status == "absent"
