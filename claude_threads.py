@@ -233,6 +233,58 @@ def load_rows(roots):
     return rows, errors
 
 
+# ------------------------------------------------------ 4. transcript location
+def find_transcripts(projects_root, session_id):
+    hits = []
+    for entry in sorted(os.listdir(projects_root)):
+        cand = os.path.join(projects_root, entry, session_id + ".jsonl")
+        if os.path.isfile(cand):
+            hits.append(cand)
+    return hits
+
+
+def iter_transcripts(projects_root):
+    out = []
+    for entry in sorted(os.listdir(projects_root)):
+        folder = os.path.join(projects_root, entry)
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".jsonl"):
+                out.append((entry, os.path.join(folder, name)))
+    return out
+
+
+def _cwds_in(transcript_path):
+    vals = []
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict) and obj.get("cwd"):
+                    vals.append(obj["cwd"])
+    except OSError:
+        pass
+    return vals
+
+
+def first_cwd(transcript_path):
+    vals = _cwds_in(transcript_path)
+    return vals[0] if vals else ""
+
+
+def last_cwd(transcript_path):
+    vals = _cwds_in(transcript_path)
+    return vals[-1] if vals else ""
+
+
+def sidecar_path(transcript_path):
+    return transcript_path[:-len(".jsonl")]
+
+
 def main(argv=None):
     return 0
 
