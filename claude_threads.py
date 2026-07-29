@@ -88,7 +88,8 @@ def sha256_file(path):
 
 
 def fsync_file(path):
-    fd = os.open(path, os.O_RDONLY)
+    # Windows FlushFileBuffers requires a write-capable handle; os.O_RDONLY fails with EBADF.
+    fd = os.open(path, os.O_RDWR)
     try:
         os.fsync(fd)
     finally:

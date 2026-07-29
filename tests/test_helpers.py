@@ -31,3 +31,9 @@ def test_read_json_failure_is_layout_error(tmp_path):
 
 def test_b64_roundtrip():
     assert ct.unb64(ct.b64(b"\x00\xffdata")) == b"\x00\xffdata"
+
+
+def test_fsync_file_smoke(tmp_path):
+    p = tmp_path / "s.bin"
+    p.write_bytes(b"data")
+    ct.fsync_file(str(p))          # must not raise on Windows
