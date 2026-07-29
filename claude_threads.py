@@ -725,10 +725,46 @@ def _maybe_crash(point):
 
 
 def _engine_roots(env, manifest):
-    roots = [env.projects_root, os.path.dirname(env.ops_dir)]
-    for r in manifest.get("rows", []):
-        roots.append(os.path.dirname(os.path.dirname(os.path.dirname(r["path"]))))
+    """Allowed containment roots for listing-row paths.
+
+    Store roots come from `discover_stores`, never from the row path being
+    checked itself - deriving a row's "allowed root" from that same row's
+    path makes the containment check vacuous (it can never fail).
+    """
+    roots = [os.path.dirname(env.ops_dir)]
+    if manifest.get("rows"):
+        disc = discover_stores(env)
+        if disc.status != "found":
+            raise LayoutError(
+                "cannot verify listing-row containment: store discovery status is "
+                "'{0}', not 'found'".format(disc.status))
+        roots.extend(disc.roots)
     return roots
+
+
+def _validate_sidecar_rel(rel):
+    if os.path.isabs(rel) or "\\" in rel or any(part == ".." for part in rel.split("/")):
+        raise LayoutError("unsafe sidecar rel path in manifest: {0!r}".format(rel))
+
+
+def _delete_inventoried_files(root_dir, inventory):
+    for e in inventory:
+        full = os.path.join(root_dir, *e["rel"].split("/"))
+        try:
+            os.unlink(full)
+        except OSError:
+            pass
+
+
+def _rmdirs_bottom_up(root_dir):
+    dirs = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirs.append(dirpath)
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
 
 
 def _copy_file(src, dst):
@@ -765,15 +801,32 @@ def _abort(env, op, delete_dest=True):
     prior_status = op.manifest["status"]
     set_status(op, "aborting")
     _maybe_crash("after-aborting")
-    for r in op.manifest["rows"]:
-        if r.get("rewritten"):
-            atomic_write(r["path"], unb64(r["pre_b64"]))
-            r["rewritten"] = False
-    save_manifest(op)
     m = op.manifest
+
+    # I4: a crash can land between os.replace and save_manifest, so the
+    # "rewritten" flag alone cannot be trusted - inspect actual bytes.
+    drifted_rows = []
+    for r in m["rows"]:
+        pre = unb64(r["pre_b64"])
+        post = unb64(r["post_b64"])
+        try:
+            with open(r["path"], "rb") as fh:
+                current = fh.read()
+        except OSError:
+            current = None
+        if current == post:
+            atomic_write(r["path"], pre)
+            r["rewritten"] = False
+        elif current == pre:
+            r["rewritten"] = False
+        else:
+            drifted_rows.append(r["path"])
+    m["drifted_rows"] = drifted_rows
+    save_manifest(op)
+
     if delete_dest:
         scratch = prior_status in ("journaled", "copying")
-        drifted = []
+        drifted_dest = []
         for path, digest, size in _dest_files(m):
             if not os.path.isfile(path):
                 continue
@@ -784,21 +837,54 @@ def _abort(env, op, delete_dest=True):
             if got == digest and gsize == size:
                 os.unlink(path)
             else:
-                drifted.append(path)
-        if drifted:
-            raise Refusal("destination files changed since copy ({0}); they were NOT "
-                          "deleted. Use recover --forward.".format(", ".join(drifted)))
+                drifted_dest.append(path)
+        problems = drifted_dest + drifted_rows
+        if problems:
+            raise Refusal("rollback could not verify every file ({0}); nothing "
+                          "further was deleted. Use 'claude-threads recover' to "
+                          "resolve.".format(", ".join(problems)))
+        # I7: never rmtree - only the journaled files are ours to delete; any
+        # leftover (non-inventoried) file makes its directory fail to rmdir
+        # and survives, exactly like the source-side rule in execute_op.
         if m.get("sidecar_dest") and os.path.isdir(m["sidecar_dest"]):
-            import shutil as _shutil
-            _shutil.rmtree(m["sidecar_dest"], ignore_errors=True)
+            _rmdirs_bottom_up(m["sidecar_dest"])
     set_status(op, "rolled_back")
 
 
 def execute_op(env, op):
+    """Drive a freshly-journaled op through copy -> verify -> commit -> delete-last.
+
+    Only accepts ops whose status is 'journaled': this function always runs
+    a full transaction from the top and is not itself resumption-aware.
+    Resuming an op interrupted mid-flight is `recover`'s job (Task 11) - it
+    inspects each phase individually rather than re-entering here. Callers
+    hold the lock.
+    """
     m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_op only runs ops from 'journaled'; use recover "
+                          "for interrupted ops")
+
+    # C2(a): a tampered/foreign manifest's rel paths must be structurally
+    # safe before they are ever joined onto a filesystem path.
+    for e in m.get("sidecar_inventory", []):
+        _validate_sidecar_rel(e["rel"])
+
+    # C2(b): containment on the actual files (not just their dirnames), and
+    # on every sidecar path we are about to touch - all before any mutation.
+    ensure_contained(m["source_transcript"], [env.projects_root])
+    ensure_contained(m["dest_transcript"], [env.projects_root])
+    if m.get("sidecar_source"):
+        ensure_contained(m["sidecar_source"], [env.projects_root])
+    if m.get("sidecar_dest"):
+        ensure_contained(m["sidecar_dest"], [env.projects_root])
+    for e in m.get("sidecar_inventory", []):
+        ensure_contained(os.path.join(m["sidecar_source"], *e["rel"].split("/")),
+                         [env.projects_root])
+        ensure_contained(os.path.join(m["sidecar_dest"], *e["rel"].split("/")),
+                         [env.projects_root])
+
     roots = _engine_roots(env, m)
-    for key in ("source_transcript", "dest_transcript"):
-        ensure_contained(os.path.dirname(m[key]), [env.projects_root])
     for r in m["rows"]:
         ensure_contained(r["path"], roots)
 
@@ -806,10 +892,14 @@ def execute_op(env, op):
 
     set_status(op, "copying")
     _maybe_crash("after-copying")
-    _copy_file(m["source_transcript"], m["dest_transcript"])
-    for e in m["sidecar_inventory"]:
-        _copy_file(os.path.join(m["sidecar_source"], *e["rel"].split("/")),
-                   os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
+    try:
+        _copy_file(m["source_transcript"], m["dest_transcript"])
+        for e in m["sidecar_inventory"]:
+            _copy_file(os.path.join(m["sidecar_source"], *e["rel"].split("/")),
+                       os.path.join(m["sidecar_dest"], *e["rel"].split("/")))
+    except OSError:
+        _abort(env, op, delete_dest=True)
+        return "rolled_back"
 
     bad = _verify(_dest_files(m))
     if bad is not None:
@@ -823,10 +913,13 @@ def execute_op(env, op):
     set_status(op, "rewriting")
     _maybe_crash("after-rewriting")
     try:
-        for r in m["rows"]:
+        rows = m["rows"]
+        for i, r in enumerate(rows):
             atomic_write(r["path"], unb64(r["post_b64"]))
             r["rewritten"] = True
             save_manifest(op)
+            if i < len(rows) - 1:
+                _maybe_crash("mid-rewriting")
     except OSError:
         _abort(env, op)
         return "rolled_back"
@@ -835,10 +928,11 @@ def execute_op(env, op):
     _maybe_crash("after-committed")
 
     # last-instant revalidation: BOTH sides + process guard (spec phase 6)
-    src_ok = True
-    got, gsize = sha256_file(m["source_transcript"])
-    if got != m["transcript_sha256"] or gsize != m["transcript_size"]:
-        src_ok = False
+    src_ok = os.path.isfile(m["source_transcript"])
+    if src_ok:
+        got, gsize = sha256_file(m["source_transcript"])
+        if got != m["transcript_sha256"] or gsize != m["transcript_size"]:
+            src_ok = False
     if src_ok and m.get("sidecar_source"):
         for e in m["sidecar_inventory"]:
             p = os.path.join(m["sidecar_source"], *e["rel"].split("/"))
@@ -854,10 +948,36 @@ def execute_op(env, op):
         _abort(env, op, delete_dest=False)   # phase-6 abort keeps BOTH copies (spec)
         return "rolled_back"
 
-    os.unlink(m["source_transcript"])
+    # C1: never destroy a source-sidecar file that was never journaled - a
+    # file that is the only copy of its data must not die with the source.
     if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
-        import shutil as _shutil
-        _shutil.rmtree(m["sidecar_source"])
+        inv_rels = {e["rel"] for e in m["sidecar_inventory"]}
+        extra = []
+        for dirpath, dirnames, filenames in os.walk(m["sidecar_source"]):
+            for name in filenames:
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, m["sidecar_source"]).replace(os.sep, "/")
+                if rel not in inv_rels:
+                    extra.append(full)
+        if extra:
+            _abort(env, op, delete_dest=False)
+            return "rolled_back"
+
+    # I8: sidecar files first, then now-empty dirs, transcript LAST. A
+    # cleanup failure (e.g. a locked file) leaves the op at 'committed'
+    # (non-terminal, no new journal state) for `recover` to finish instead
+    # of crashing after the move has already been fully committed.
+    try:
+        if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
+            _delete_inventoried_files(m["sidecar_source"], m["sidecar_inventory"])
+            _rmdirs_bottom_up(m["sidecar_source"])
+        os.unlink(m["source_transcript"])
+    except OSError as exc:
+        print("warning: move committed, but the old copy could not be fully "
+              "removed ({0}). Run 'claude-threads recover' to finish deleting "
+              "it.".format(exc))
+        return "committed"
+
     set_status(op, "completed")
     return "completed"
 
@@ -867,6 +987,9 @@ def run_move(env, manifest):
     acquire_lock(env, lock_owner_op)
     try:
         op = new_op(env, manifest)
+        # we already hold the lock (no O_EXCL needed) - just record the real op_id
+        with open(_lock_path(env), "w") as fh:
+            fh.write("{0} {1}".format(os.getpid(), op.manifest["op_id"]))
         final = execute_op(env, op)
         if final == "completed":
             append_moved_log(env, {"kind": "move", "session_id": manifest["session_id"],
