@@ -1707,8 +1707,149 @@ def cmd_doctor(env, ns):
     return rep["exit_code"]
 
 
-def main(argv=None):
+# --------------------------------------------------------------- 7. CLI wiring
+import argparse
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claude-threads",
+        description="Inspect and relocate Claude Code threads on disk. Unofficial; "
+                    "fails closed. Close the Claude app before any mutation.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(sp):
+        sp.add_argument("--verbose", action="store_true",
+                        help="full paths and ids (default output is redacted)")
+
+    sp = sub.add_parser("list", help="inventory threads")
+    sp.add_argument("query", nargs="?", default="")
+    sp.add_argument("--project")
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--full", action="store_true")
+    common(sp)
+
+    sp = sub.add_parser("doctor", help="read-only health report")
+    sp.add_argument("--json", action="store_true")
+    common(sp)
+
+    sp = sub.add_parser("move", help="relocate a thread to another project folder")
+    sp.add_argument("session_id")
+    sp.add_argument("target")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--transcript-only", action="store_true", dest="transcript_only")
+    sp.add_argument("--unverified-platform", action="store_true",
+                    dest="unverified_platform")
+    sp.add_argument("--row", action="append", default=[])
+    sp.add_argument("--yes", action="store_true")
+    sp.add_argument("--force", action="store_true")
+    common(sp)
+
+    sp = sub.add_parser("undo", help="reverse the most recent operation")
+    sp.add_argument("--list", action="store_true", dest="show")
+    sp.add_argument("--id", dest="op_id")
+    sp.add_argument("--apply", action="store_true")
+    common(sp)
+
+    sp = sub.add_parser("recover", help="resolve interrupted operations")
+    sp.add_argument("--resolve", dest="op_id")
+    sp.add_argument("--forward", action="store_true")
+    sp.add_argument("--back", action="store_true")
+    sp.add_argument("--apply", action="store_true")
+    common(sp)
+    return p
+
+
+def _flags_from(ns):
+    return MoveFlags(transcript_only=ns.transcript_only,
+                     unverified_platform=ns.unverified_platform,
+                     row=ns.row, yes=ns.yes, force=ns.force)
+
+
+def cmd_move(env, ns):
+    manifest = plan_move(env, ns.session_id, ns.target, _flags_from(ns))
+    summary = ("mode={0}\nsource={1}\ndest={2}\nrows={3}"
+               .format(manifest["mode"], manifest["source_transcript"],
+                       manifest["dest_transcript"], len(manifest["rows"])))
+    print(summary if ns.verbose else redact(env, summary))
+    if not ns.apply:
+        print("dry run - pass --apply to execute")
+        return 0
+    final = run_move(env, manifest)
+    print("result: " + final)
+    return 0 if final == "completed" else 1
+
+
+def cmd_undo(env, ns):
+    ops = list_ops(env)
+    if ns.show:
+        for o in ops:
+            line = "{0}  {1:12}  {2}".format(o.manifest["op_id"],
+                                             o.manifest["status"],
+                                             o.manifest.get("session_id", ""))
+            print(line if ns.verbose else redact(env, line))
+        return 0
+    # delta: only a completed op whose op_type is "move" (or missing, which
+    # in practice never happens - every manifest sets op_type) is eligible
+    # as "the operation to undo". A completed *undo* op is itself terminal
+    # from cmd_undo's point of view - plan_undo always refuses an
+    # undo-of-undo ("to redo, run move again") - so selecting one here would
+    # only ever produce that refusal instead of reaching an older, still
+    # -undoable completed move underneath it.
+    candidates = [o for o in ops if o.manifest.get("status") == "completed"
+                 and o.manifest.get("op_type", "move") == "move"]
+    if ns.op_id:
+        candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
+    if not candidates:
+        raise Refusal("no completed operation to undo" +
+                      (" with id " + ns.op_id if ns.op_id else ""))
+    prior = candidates[-1]
+    if not ns.apply:
+        print("would undo {0} (session {1}); pass --apply to execute"
+              .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
+        return 0
+    final = run_undo(env, prior)
+    print("result: " + final)
+    return 0 if final == "completed" else 1
+
+
+def cmd_recover(env, ns):
+    if clear_stale_lock(env):
+        print("cleared a stale lock")
+    pending = nonterminal_ops(env)
+    if not ns.op_id:
+        for op in pending:
+            c = classify_op(env, op)
+            line = "{0}  {1:10}  source={2} dest={3} options={4}  {5}".format(
+                op.manifest["op_id"], c["status"], c["source"], c["dest"],
+                ",".join(c["resolutions"]) or "manual", c["note"])
+            print(line if ns.verbose else redact(env, line))
+        return 1 if pending else 0
+    matches = [o for o in pending if o.manifest["op_id"] == ns.op_id]
+    if not matches:
+        raise Refusal("no unresolved op with id " + ns.op_id)
+    direction = "forward" if ns.forward else ("back" if ns.back else None)
+    if direction is None:
+        raise Refusal("--resolve needs --forward or --back")
+    if not ns.apply:
+        print("would resolve {0} {1}; pass --apply to execute".format(ns.op_id, direction))
+        return 0
+    final = recover_op(env, matches[0], direction)
+    print("result: " + final)
     return 0
+
+
+def main(argv=None):
+    ns = build_parser().parse_args(argv)
+    env = default_env()
+    handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
+                "undo": cmd_undo, "recover": cmd_recover}
+    try:
+        return handlers[ns.cmd](env, ns)
+    except (Refusal, LayoutError) as exc:
+        label = "refused" if isinstance(exc, Refusal) else "unsafe"
+        msg = str(exc) if getattr(ns, "verbose", False) else redact(env, str(exc))
+        print("{0}: {1}".format(label, msg), file=sys.stderr)
+        return exc.exit_code
 
 
 if __name__ == "__main__":
