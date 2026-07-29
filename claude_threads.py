@@ -285,6 +285,140 @@ def sidecar_path(transcript_path):
     return transcript_path[:-len(".jsonl")]
 
 
+# ---------------------------------------------- 5. transaction engine: journal
+import time
+
+
+@dataclasses.dataclass
+class Op:
+    op_dir: str
+    manifest: dict
+
+
+def manifest_path(op):
+    return os.path.join(op.op_dir, "manifest.json")
+
+
+def save_manifest(op):
+    atomic_write(manifest_path(op), json.dumps(op.manifest, indent=1).encode("utf-8"))
+
+
+def new_op(env, manifest):
+    op_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(env.now())) + "-" + os.urandom(3).hex()
+    op_dir = os.path.join(env.ops_dir, op_id)
+    os.makedirs(op_dir)
+    manifest = dict(manifest)
+    manifest["op_id"] = op_id
+    manifest["status"] = "journaled"
+    manifest["history"] = [{"status": "journaled", "at": env.now()}]
+    op = Op(op_dir, manifest)
+    save_manifest(op)
+    return op
+
+
+def set_status(op, status):
+    op.manifest["status"] = status
+    op.manifest["history"].append({"status": status, "at": time.time()})
+    save_manifest(op)
+
+
+def list_ops(env):
+    out = []
+    if not os.path.isdir(env.ops_dir):
+        return out
+    for name in sorted(os.listdir(env.ops_dir)):
+        mp = os.path.join(env.ops_dir, name, "manifest.json")
+        if os.path.isfile(mp):
+            out.append(Op(os.path.join(env.ops_dir, name), read_json(mp)))
+    return out
+
+
+def nonterminal_ops(env):
+    return [o for o in list_ops(env) if o.manifest.get("status") in NONTERMINAL]
+
+
+def rotate_ops(env):
+    import shutil
+    terminal = [o for o in list_ops(env) if o.manifest.get("status") in TERMINAL]
+    pruned = []
+    for op in terminal[:-10]:
+        try:
+            shutil.rmtree(op.op_dir)
+            pruned.append(op.manifest["op_id"])
+        except OSError:
+            pass
+    return pruned
+
+
+LOCK_NAME = "lock"
+
+
+def _lock_path(env):
+    return os.path.join(env.ops_dir, LOCK_NAME)
+
+
+def acquire_lock(env, op_id):
+    os.makedirs(env.ops_dir, exist_ok=True)
+    try:
+        fd = os.open(_lock_path(env), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        holder = read_lock(env)
+        raise Refusal("another claude-threads operation holds the lock ({0}). "
+                      "If it is dead, run: claude-threads recover".format(holder))
+    with os.fdopen(fd, "w") as fh:
+        fh.write("{0} {1}".format(os.getpid(), op_id))
+    return _lock_path(env)
+
+
+def release_lock(env):
+    try:
+        os.unlink(_lock_path(env))
+    except FileNotFoundError:
+        pass
+
+
+def read_lock(env):
+    try:
+        with open(_lock_path(env)) as fh:
+            pid_s, _, op_id = fh.read().partition(" ")
+        return int(pid_s), op_id
+    except (OSError, ValueError):
+        return None
+
+
+def lock_is_stale(env):
+    info = read_lock(env)
+    if info is None:
+        return False
+    pid = info[0]
+    try:
+        os.kill(pid, 0)
+        return False
+    except OSError:
+        return True
+
+
+def append_moved_log(env, entry):
+    os.makedirs(os.path.dirname(env.moved_log), exist_ok=True)
+    with open(env.moved_log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def moved_session_ids(env):
+    state = {}
+    try:
+        with open(env.moved_log, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                state[e.get("session_id")] = e.get("kind")
+    except OSError:
+        return set()
+    return {sid for sid, kind in state.items() if kind == "move"}
+
+
 def main(argv=None):
     return 0
 
