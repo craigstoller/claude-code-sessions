@@ -55,3 +55,120 @@ def test_doctor_json_and_exit0(mkenv, tmp_path, capsys):
     rc = ct.cmd_doctor(env, ns(json=True))
     rep = json.loads(capsys.readouterr().out)
     assert rc == 0 and rep["exit_code"] == 0 and rep["stores"]["status"] == "found"
+
+
+def test_missing_projects_root_no_crash(mkenv, tmp_path, capsys):
+    env = mkenv(tmp_path)
+    import shutil
+    shutil.rmtree(env.projects_root)
+    rc = ct.cmd_list(env, ns())
+    out = capsys.readouterr().out
+    assert rc == 0 and "no threads found" in out
+    rc = ct.cmd_doctor(env, ns())
+    assert rc == 0
+
+
+def test_project_prefix_match(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s1", "cwd": "C:\\work\\project-a",
+               "lastActivityAt": 10})
+    write_row(env, 0, "o", "a", "local_2",
+              {"sessionId": "local_2", "cliSessionId": "s2", "cwd": "C:\\work\\project-a\\sub",
+               "lastActivityAt": 20})
+    write_row(env, 0, "o", "a", "local_3",
+              {"sessionId": "local_3", "cliSessionId": "s3", "cwd": "C:\\work\\other",
+               "lastActivityAt": 30})
+    items = ct.gather_list(env, project="C:\\work\\project-a")
+    ids = {i["session_id"] for i in items}
+    assert ids == {"s1", "s2"}
+
+
+def test_full_flag_shows_complete_id(mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    full_sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": full_sid, "cwd": "C:\\p",
+               "lastActivityAt": 10})
+    ct.cmd_list(env, ns(full=True))
+    out = capsys.readouterr().out
+    assert full_sid[:8] in out and "…" not in out
+
+
+def test_cmd_list_default_redacted(mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    sid = "12345678-9abc-def0-1234-567890abcdef"
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": sid, "cwd": env.home + "\\work",
+               "lastActivityAt": 10})
+    ct.cmd_list(env, ns())
+    out = capsys.readouterr().out
+    assert "~" in out and "12345678" in out and "…" in out and "-9abc-" not in out
+
+
+def test_cmd_list_json(mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s1", "cwd": "C:\\p",
+               "title": "Test", "lastActivityAt": 10})
+    ct.cmd_list(env, ns(json=True))
+    out = capsys.readouterr().out
+    items = json.loads(out)
+    assert len(items) == 1 and items[0]["title"] == "Test"
+
+
+def test_cmd_list_empty(mkenv, tmp_path, capsys):
+    env = mkenv(tmp_path)
+    ct.cmd_list(env, ns())
+    out = capsys.readouterr().out
+    assert "no threads found" in out
+
+
+def test_row_dedup_by_session_id(mkenv, tmp_path, write_row):
+    env = mkenv(tmp_path)
+    sid = "same-session"
+    write_row(env, 0, "o", "a", "local_old",
+              {"sessionId": "local_old", "cliSessionId": sid, "cwd": "C:\\old",
+               "title": "Old", "lastActivityAt": 10})
+    write_row(env, 0, "o", "a", "local_new",
+              {"sessionId": "local_new", "cliSessionId": sid, "cwd": "C:\\new",
+               "title": "New", "lastActivityAt": 20})
+    items = ct.gather_list(env)
+    assert len(items) == 1 and items[0]["title"] == "New" and items[0]["cwd"] == "C:\\new"
+
+
+def test_unknown_layout_finding(mkenv, tmp_path, write_row):
+    env = mkenv(tmp_path)
+    import os as os_module
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s1", "cwd": "C:\\path_with_underscore",
+               "lastActivityAt": 10})
+    cur_folder = os_module.path.join(env.projects_root, "C--path-with-underscore")
+    leg_folder = os_module.path.join(env.projects_root, "C--path_with_underscore")
+    os_module.makedirs(cur_folder, exist_ok=True)
+    os_module.makedirs(leg_folder, exist_ok=True)
+    rep = ct.gather_doctor(env)
+    assert rep["unknown_layout"] == ["mixed encoding-scheme evidence"]
+    assert rep["exit_code"] == 2
+
+
+def test_doctor_exit2_message(mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    import os as os_module
+    write_row(env, 0, "o", "a", "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s1", "cwd": "C:\\path_with_underscore",
+               "lastActivityAt": 10})
+    cur_folder = os_module.path.join(env.projects_root, "C--path-with-underscore")
+    leg_folder = os_module.path.join(env.projects_root, "C--path_with_underscore")
+    os_module.makedirs(cur_folder, exist_ok=True)
+    os_module.makedirs(leg_folder, exist_ok=True)
+    rc = ct.cmd_doctor(env, ns())
+    out = capsys.readouterr().out
+    assert rc == 2 and "unrecognized or unreadable state" in out
+
+
+def test_doctor_exit2_message_not_on_exit0(mkenv, tmp_path, capsys):
+    env = mkenv(tmp_path)
+    rc = ct.cmd_doctor(env, ns())
+    out = capsys.readouterr().out
+    assert rc == 0 and "unrecognized or unreadable state" not in out

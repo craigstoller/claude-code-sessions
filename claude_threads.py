@@ -279,22 +279,28 @@ def load_rows(roots):
 # ------------------------------------------------------ 4. transcript location
 def find_transcripts(projects_root, session_id):
     hits = []
-    for entry in sorted(os.listdir(projects_root)):
-        cand = os.path.join(projects_root, entry, session_id + ".jsonl")
-        if os.path.isfile(cand):
-            hits.append(cand)
+    try:
+        for entry in sorted(os.listdir(projects_root)):
+            cand = os.path.join(projects_root, entry, session_id + ".jsonl")
+            if os.path.isfile(cand):
+                hits.append(cand)
+    except FileNotFoundError:
+        pass
     return hits
 
 
 def iter_transcripts(projects_root):
     out = []
-    for entry in sorted(os.listdir(projects_root)):
-        folder = os.path.join(projects_root, entry)
-        if not os.path.isdir(folder):
-            continue
-        for name in sorted(os.listdir(folder)):
-            if name.endswith(".jsonl"):
-                out.append((entry, os.path.join(folder, name)))
+    try:
+        for entry in sorted(os.listdir(projects_root)):
+            folder = os.path.join(projects_root, entry)
+            if not os.path.isdir(folder):
+                continue
+            for name in sorted(os.listdir(folder)):
+                if name.endswith(".jsonl"):
+                    out.append((entry, os.path.join(folder, name)))
+    except FileNotFoundError:
+        pass
     return out
 
 
@@ -1549,39 +1555,44 @@ def clear_stale_lock(env):
 
 
 # ------------------------------------------------- 6. commands: list, doctor
-_UUID_RE = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+_UUID_RE = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 
 
-def redact(env, text):
+def redact(env, text, keep_ids=False):
     for h in {env.home, os.path.realpath(env.home)}:
         text = text.replace(h, "~")
-    return _UUID_RE.sub(lambda m: m.group(1) + "…", text)
+    if not keep_ids:
+        text = _UUID_RE.sub(lambda m: m.group(1) + "…", text)
+    return text
 
 
 def gather_list(env, query="", project=None):
     disc = discover_stores(env)
     rows, _ = load_rows(disc.roots)
-    items, seen = [], set()
+    items, seen = [], {}
     for r in rows:
         if not r.cli_session_id:
             continue
-        seen.add(r.cli_session_id)
-        items.append({"session_id": r.cli_session_id, "title": r.data.get("title") or "",
-                      "cwd": r.cwd, "last_activity": r.last_activity, "listed": True})
+        if r.cli_session_id not in seen or seen[r.cli_session_id]["last_activity"] < r.last_activity:
+            seen[r.cli_session_id] = {"session_id": r.cli_session_id, "title": r.data.get("title") or "",
+                                      "cwd": r.cwd, "last_activity": r.last_activity, "listed": True}
     for folder, path in iter_transcripts(env.projects_root):
         sid = os.path.splitext(os.path.basename(path))[0]
         if sid in seen or not path.endswith(".jsonl"):
             continue
-        items.append({"session_id": sid, "title": "", "cwd": first_cwd(path),
-                      "last_activity": int(os.path.getmtime(path) * 1000),
-                      "listed": False})
+        seen[sid] = {"session_id": sid, "title": "", "cwd": first_cwd(path),
+                     "last_activity": int(os.path.getmtime(path) * 1000),
+                     "listed": False}
+    items = list(seen.values())
     if query:
         q = query.lower()
         items = [i for i in items
                  if q in (i["title"] + " " + i["cwd"] + " " + i["session_id"]).lower()]
     if project:
-        p = os.path.normpath(os.path.abspath(project)).lower()
-        items = [i for i in items if os.path.normpath(i["cwd"]).lower() == p]
+        p = os.path.normpath(os.path.abspath(project)).lower() + os.sep
+        items = [i for i in items
+                 if os.path.normpath(i["cwd"]).lower() == p.rstrip(os.sep)
+                 or os.path.normpath(i["cwd"]).lower().startswith(p)]
     items.sort(key=lambda i: i["last_activity"], reverse=True)
     return items
 
@@ -1593,9 +1604,13 @@ def cmd_list(env, ns):
         print(json.dumps(items, indent=1))
         return 0
     for i in items:
-        sid = i["session_id"] if getattr(ns, "full", False) else i["session_id"][:8]
-        line = "{0}  {1:40.40}  {2}".format(sid, i["title"] or "(no title)", i["cwd"])
-        print(line if ns.verbose else redact(env, line))
+        line = "{0}  {1:40.40}  {2}".format(i["session_id"], i["title"] or "(no title)", i["cwd"])
+        if ns.verbose:
+            print(line)
+        elif getattr(ns, "full", False):
+            print(redact(env, line, keep_ids=True))
+        else:
+            print(redact(env, line))
     if not items:
         print("no threads found")
     return 0
@@ -1618,13 +1633,19 @@ def gather_doctor(env):
     cwds = [r.cwd for r in rows if r.cwd]
     cur, leg = scheme_evidence(cwds, env.projects_root)
     legacy_folders = []
+    legacy_folders_set = set()
     for cwd in set(cwds):
         a, b = encode(cwd, SCHEME_CURRENT), encode(cwd, SCHEME_LEGACY)
         if a != b and os.path.isdir(os.path.join(env.projects_root, a)) \
                 and os.path.isdir(os.path.join(env.projects_root, b)):
-            n = len([x for x in os.listdir(os.path.join(env.projects_root, b))
-                     if x.endswith(".jsonl")])
-            legacy_folders.append({"folder": b, "transcripts": n})
+            if b not in legacy_folders_set:
+                n = len([x for x in os.listdir(os.path.join(env.projects_root, b))
+                         if x.endswith(".jsonl")])
+                legacy_folders.append({"folder": b, "transcripts": n})
+                legacy_folders_set.add(b)
+    unknown_layout = []
+    if cur > 0 and leg > 0:
+        unknown_layout = ["mixed encoding-scheme evidence"]
     nt = [o.manifest["op_id"] for o in nonterminal_ops(env)]
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
@@ -1633,8 +1654,9 @@ def gather_doctor(env):
         "encoding": {"current": cur, "legacy": leg},
         "legacy_folders": legacy_folders, "nonterminal_ops": nt,
         "stale_lock": lock_is_stale(env),
+        "unknown_layout": unknown_layout,
     }
-    if disc.status == "error" or row_errors:
+    if disc.status == "error" or row_errors or unknown_layout:
         report["exit_code"] = 2
     elif blank or dead or nt or report["stale_lock"] or legacy_folders:
         report["exit_code"] = 1
@@ -1671,6 +1693,8 @@ def cmd_doctor(env, ns):
             "external move leaves behind")
     say("[observed] encoding evidence: current={0} legacy={1}"
         .format(rep["encoding"]["current"], rep["encoding"]["legacy"]))
+    for msg in rep.get("unknown_layout", []):
+        say("[observed] " + msg)
     for lf in rep["legacy_folders"]:
         say("[observed] legacy-encoded folder {0} ({1} transcripts) is shadowed"
             .format(lf["folder"], lf["transcripts"]))
@@ -1678,6 +1702,8 @@ def cmd_doctor(env, ns):
         say("[observed] unresolved operation {0} - run: claude-threads recover".format(oid))
     if rep["stale_lock"]:
         say("[observed] stale lock - run: claude-threads recover")
+    if rep["exit_code"] == 2:
+        say("[observed] unrecognized or unreadable state - please open an issue including the output above (paths and ids are redacted by default)")
     return rep["exit_code"]
 
 
