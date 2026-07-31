@@ -253,7 +253,7 @@ def test_row_drift_before_rewrite_blocks_overwrite(planned):
     aborting-dead-end tests): a row that is neither the journaled pre- nor
     post-image is unsafe to auto-resolve either way, so _abort itself
     refuses rather than guessing, leaving the op nonterminal at 'aborting'
-    for `claude-threads recover` - not a silent 'rolled_back'."""
+    for `claude-code-threads recover` - not a silent 'rolled_back'."""
     env, m, t, target = planned
     row = m["rows"][0]
 

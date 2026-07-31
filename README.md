@@ -1,4 +1,4 @@
-# claude-threads
+# claude-code-threads
 
 Move a Claude Code conversation to a different project folder — safely.
 
@@ -9,15 +9,19 @@ Move a Claude Code conversation to a different project folder — safely.
 
 Claude Code and Claude Desktop file every thread under the working directory it was started
 in, and there is no official way to move one to a different project after the fact — a thread
-started in the wrong folder is stuck there. `claude-threads` relocates the transcript and every
+started in the wrong folder is stuck there. `claude-code-threads` relocates the transcript and every
 listing row that points at it, verifying each side before touching the other, so the thread
 reopens cleanly in its new home.
 
 ## Install
 
 ```
-pipx install claude-threads
+pipx install claude-code-threads
 ```
+
+This installs two identical commands: `claude-code-threads`, and `cc-threads` as a shorter
+alias for everyday use. Examples below use the long form; `cc-threads doctor` is the same
+thing.
 
 Or download `claude_threads.py` and run it directly — the runtime has no dependencies beyond
 the Python 3.9+ standard library:
@@ -39,34 +43,34 @@ Five commands. All mutating commands default to a dry run; add `--apply` to exec
 **`list`** — inventory threads, optionally filtered by a search term:
 
 ```
-claude-threads list gate
+claude-code-threads list gate
 ```
 
 **`doctor`** — read-only health report (stale locks, unresolved operations, orphaned rows,
 encoding-scheme ambiguity):
 
 ```
-claude-threads doctor
+claude-code-threads doctor
 ```
 
 **`move`** — relocate a thread to another project folder:
 
 ```
-claude-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
+claude-code-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
 ```
 
-Get the full id from `claude-threads list --full`.
+Get the full id from `claude-code-threads list --full`.
 
 **`undo`** — reverse the most recent completed operation:
 
 ```
-claude-threads undo --apply
+claude-code-threads undo --apply
 ```
 
 **`recover`** — resolve an operation left non-terminal by a crash or interruption:
 
 ```
-claude-threads recover
+claude-code-threads recover
 ```
 
 ## Safety design
@@ -102,7 +106,7 @@ reported no new findings and the journal held no unresolved operations.
 
 ## What's stored locally
 
-`~/.claude-threads/` holds the tool's own bookkeeping, never your conversation content:
+`~/.claude-code-threads/` holds the tool's own bookkeeping, never your conversation content:
 
 - `ops/<op-id>/manifest.json` — the journal for each move/undo/recover operation (paths,
   hashes, row pre-images, phase history). Rotated: the 10 most recent terminal operations are
@@ -112,7 +116,7 @@ reported no new findings and the journal held no unresolved operations.
   from-path, to-path, date), used to recognize your own past moves during future collision and
   encoding-evidence checks.
 
-To purge everything the tool has ever written, delete the whole `~/.claude-threads/` directory.
+To purge everything the tool has ever written, delete the whole `~/.claude-code-threads/` directory.
 This does not touch any transcript or listing row — only the tool's own journal.
 
 **`--json` output is not redacted.** Plain-text output replaces your home directory with `~`

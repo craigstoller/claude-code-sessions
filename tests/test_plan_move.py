@@ -206,7 +206,8 @@ def test_process_guard_ignores_self_and_own_tool(setup):
     env, t, target = setup
     env.process_lister = lambda: [(os.getpid(), "claude something"),
                                   (os.getppid(), "claude something else"),
-                                  (99999, "claude-threads.exe")]
+                                  (99999, "claude-code-threads.exe"),
+                                  (99998, r"C:\pipx\venvs\claude-code-threads\cc-threads.exe")]
     assert ct.plan_move(env, SID, target, flags())["mode"] == "desktop"
 
 

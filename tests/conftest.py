@@ -19,14 +19,14 @@ def mkenv():
             r = tmp_path / f"store{i}" / "claude-code-sessions"
             r.mkdir(parents=True)
             roots.append(str(r))
-        ops = home / ".claude-threads" / "ops"
+        ops = home / ".claude-code-threads" / "ops"
         ops.mkdir(parents=True)
         return ct.Env(
             home=str(home),
             projects_root=str(projects),
             store_candidates=roots,
             ops_dir=str(ops),
-            moved_log=str(home / ".claude-threads" / "moved-log.jsonl"),
+            moved_log=str(home / ".claude-code-threads" / "moved-log.jsonl"),
             is_windows=is_windows,
             process_lister=lambda: [],
             now=lambda: 1_800_000_000.0,

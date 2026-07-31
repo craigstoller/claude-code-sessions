@@ -13,10 +13,10 @@ def ns(**kw):
 
 def test_redact(mkenv, tmp_path):
     env = mkenv(tmp_path)
-    s = env.home + "\\x cbc5281b-c0e5-4491-a043-0947c66555bc"
+    s = env.home + "\\x 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
     out = ct.redact(env, s)
     assert env.home not in out and "~" in out
-    assert "cbc5281b-c0e5-4491-a043-0947c66555bc" not in out and "cbc5281b" in out
+    assert "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" not in out and "0f1e2d3c" in out
 
 
 def test_gather_list_merges(mkenv, tmp_path, write_transcript, write_row):

@@ -1,6 +1,6 @@
 # Internals: how Claude Code / Claude Desktop store threads
 
-This is background for anyone extending or auditing `claude-threads`, not a user guide. It
+This is background for anyone extending or auditing `claude-code-threads`, not a user guide. It
 describes the on-disk layout the tool depends on and refuses to guess about.
 
 > Every claim below was **observed July 2026, app channel: Claude Desktop (Windows); format may
@@ -90,7 +90,7 @@ underscores. So `C:\Users\<you>\Projects\_Tools\my-project` becomes
 > **Do not hard-code this rule.** Derive it from folders the app itself created: take recent
 > `cwd` values out of the listing store, encode each under both schemes, and keep whichever
 > matches real directories on disk. Getting it wrong files a transcript where the app will never
-> look, and the thread vanishes from the sidebar. `claude-threads` does exactly this evidence
+> look, and the thread vanishes from the sidebar. `claude-code-threads` does exactly this evidence
 > comparison before every move (see `scheme_evidence` / `choose_scheme`), and refuses to proceed
 > if the evidence is genuinely tied.
 
