@@ -29,7 +29,7 @@ transcripts. It travels with the file.
 the `cliSessionId` pointing at the transcript above:
 
 ```
-C:\Users\<you>\AppData\Roaming\Claude\claude-code-sessions\<org-id>\<account-id>\local_<appSessionId>.json
+C:\Users\<you>\AppData\Roaming\Claude\claude-code-sessions\<account-id>\<org-id>\local_<appSessionId>.json
 ```
 
 Also in that folder, and **not** thread metadata: `scheduled-tasks.json`, `deleted_<id>`
