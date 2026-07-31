@@ -7,6 +7,10 @@ describes the on-disk layout the tool depends on and refuses to guess about.
 > change.** This is a reverse-engineered format, not a documented one — treat all of it as
 > subject to revision by a future app release, and prefer deriving facts from the disk over
 > hard-coding them (see `doctor` and the encoding-scheme detection below).
+>
+> Last confirmed end to end against a live store on **2026-07-31, Claude Desktop (Windows)
+> app 2.1.219**: a thread was relocated between projects, resumed by the app at its new
+> location, and an interrupted move was recovered in both directions.
 
 ## Where things live
 

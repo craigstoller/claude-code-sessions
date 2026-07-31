@@ -89,9 +89,16 @@ claude-threads recover
 
 | Platform | Status | Mutations |
 |---|---|---|
-| Windows 11 + Claude Desktop | verified 2026-07-28 | read-only + mutations |
+| Windows 11 + Claude Desktop | verified 2026-07-31 (app 2.1.219) | read-only + mutations |
 | macOS / Linux desktop | unverified | read-only (+ mutations behind `--unverified-platform`) |
 | CLI-only machines (any OS) | transcript layout verified | mutations behind `--transcript-only` |
+
+The Windows row is an end-to-end check on a real store, not just a passing test suite:
+a disposable thread was moved between projects, the app was restarted and the thread
+resumed at its new location, `undo` correctly **refused** once that resume had appended
+to the transcript (rather than discarding the new messages), and a deliberately
+interrupted move was resolved in both directions with `recover`. Afterwards `doctor`
+reported no new findings and the journal held no unresolved operations.
 
 ## What's stored locally
 
