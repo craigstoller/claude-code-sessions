@@ -2353,7 +2353,8 @@ def plan_sync(env, flags):
                      "title": cand["title"], "removed": removed, "reset": reset,
                      "written": False})
     return {"op_type": "sync",
-            "source_account": source.account_uuid, "source_email": source.email,
+            "source_account": source.account_uuid, "source_org": source.org_uuid,
+            "source_email": source.email, "source_path": source.path,
             "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
             "dest_email": dest.email, "dest_path": dest.path,
             "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
@@ -2695,19 +2696,42 @@ def cmd_sync(env, ns):
                       include_deleted=tuple(ns.include_deleted or ()),
                       verbatim=ns.verbatim)
     manifest = plan_sync(env, flags)
+
+    # --apply executes up front, before ANY reporting - JSON included - so
+    # that "sync --apply --json" (exactly the combination automation would
+    # use) reports what actually happened rather than silently planning-only
+    # while claiming success. A zero-row plan is the one case that skips
+    # run_sync regardless of --apply: there's nothing to journal, and
+    # journaling an empty op anyway was the parked finding this task closed.
+    final = None
+    if manifest["rows"] and ns.apply:
+        final = run_sync(env, manifest)
+
     if ns.json:
+        if final is not None:
+            manifest["result"] = final
         print(json.dumps(manifest, indent=1))
-        return 0
+        return 0 if final in (None, "completed") else 1
 
     def say(line):
         print(line if ns.verbose else redact(env, line))
 
-    # Spec s5: name both endpoints, with emails, before doing anything. A
-    # destination the user can recognise is a safety feature.
-    say("from  {0:24} ({1})   signed in".format(
-        manifest["source_email"] or "(email unknown)", manifest["source_account"][:8]))
-    say("to    {0:24} ({1})   signed out".format(
-        manifest["dest_email"] or "(email unknown)", manifest["dest_account"][:8]))
+    # Spec s5: name both endpoints, with emails, before doing anything (or,
+    # above, immediately after - the report still leads with identity).
+    # dest_email is "" for every non-live account - the dormant account's
+    # email isn't recorded anywhere on disk, so an unlabelled run always hits
+    # this, not just an edge case - so also print the store path and org
+    # prefix, through the same say()/redact() convention (redacted unless
+    # --verbose), giving a cautious user a physical folder to recognise
+    # instead of eight hex characters. Symmetric for the source.
+    say("from  {0:24} ({1}/{2})   signed in".format(
+        manifest["source_email"] or "(email unknown)",
+        manifest["source_account"][:8], manifest["source_org"][:8]))
+    say("      " + manifest["source_path"])
+    say("to    {0:24} ({1}/{2})   signed out".format(
+        manifest["dest_email"] or "(email unknown)",
+        manifest["dest_account"][:8], manifest["dest_org"][:8]))
+    say("      " + manifest["dest_path"])
     say("")
 
     tally = manifest["tally"]
@@ -2721,9 +2745,15 @@ def cmd_sync(env, ns):
         if items:
             say("{0:36}: {1}".format(label, len(items)))
     # Tombstone skips are named individually: the user deleted these on
-    # purpose and should see the deletion was honoured, not silently dropped.
-    for title in tally.get("deleted") or []:
+    # purpose and should see the deletion was honoured, not silently
+    # dropped. Capped the same way as the "to copy" list below - a source
+    # account with many deliberate deletions must not produce unbounded
+    # output.
+    deleted_titles = tally.get("deleted") or []
+    for title in deleted_titles[:15]:
         say("   kept deleted: {0}".format(title))
+    if len(deleted_titles) > 15:
+        say("   ... and {0} more".format(len(deleted_titles) - 15))
     say("{0:36}: {1}".format("to copy", len(manifest["rows"])))
     for r in manifest["rows"][:15]:
         say("   {0}".format(r["title"]))
@@ -2733,11 +2763,10 @@ def cmd_sync(env, ns):
     if not manifest["rows"]:
         say("\nnothing to copy")
         return 0
-    if not ns.apply:
+    if final is None:
         say("\ndry run - pass --apply to copy")
         return 0
 
-    final = run_sync(env, manifest)
     say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
     say("result     : {0}".format(final))
     say("Sign into {0} (or restart the app) to see them."

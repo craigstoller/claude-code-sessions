@@ -1071,5 +1071,83 @@ def test_cli_json_output(two_account_env, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(ct, "default_env", lambda: env)
     assert ct.main(["sync", "--json"]) == 0
     rep = json.loads(capsys.readouterr().out)
-    assert rep["dest_email"] == "" or isinstance(rep["dest_email"], str)
+    # Minor 4: the fixture's destination account is always email-less (its
+    # email lives nowhere on disk - resolve_sync_endpoints hardcodes "" for
+    # every non-live account) - assert the real value, not a tautology that
+    # is true for any possible string.
+    assert rep["dest_email"] == ""
     assert len(rep["rows"]) == 1
+    # --json without --apply is a plan, not a report of what happened - no
+    # row should read as written and no "result" key should be present.
+    assert all(r["written"] is False for r in rep["rows"])
+    assert "result" not in rep
+
+
+def test_cli_apply_json_executes_before_reporting(two_account_env, tmp_path,
+                                                   monkeypatch, capsys):
+    """Finding 1: `sync --apply --json` must actually execute - the JSON
+    output must describe what happened (rows written, a result), not the
+    bare plan silently left unexecuted."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--apply", "--json"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["result"] == "completed"
+    assert all(r["written"] is True for r in rep["rows"])
+    assert sorted(f for f in os.listdir(dst) if f.startswith("local_")) == [
+        "local_0.json", "local_1.json"]
+
+
+def test_cli_apply_zero_candidates_never_calls_run_sync(two_account_env, tmp_path,
+                                                         monkeypatch, capsys):
+    """Finding 3: parked finding 1 (no journaling an empty op) had code but
+    no regression test. Assert the short-circuit directly: run_sync must
+    never be reached for a zero-row plan, even with --apply, and the ops
+    directory must stay untouched."""
+    env, src, dst = two_account_env(tmp_path)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+
+    def _boom(*a, **k):
+        raise AssertionError("run_sync must not be called for a zero-row plan")
+    monkeypatch.setattr(ct, "run_sync", _boom)
+    assert ct.main(["sync", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "nothing to copy" in out
+    assert ct.list_ops(env) == []
+
+
+def test_cli_dry_run_names_the_destination_by_path_not_just_uuid(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """Finding 2: dest_email is '' in the normal case (every non-live
+    account), so an 8-char account uuid prefix was all a cautious user had
+    to recognise the destination by. The store path and org prefix must
+    also be printed, for both endpoints."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--verbose"]) == 0
+    out = capsys.readouterr().out
+    assert dst in out
+    assert src in out
+    assert "dddddddd" in out          # dest org prefix
+    assert "bbbbbbbb" in out          # source org prefix
+
+
+def test_cli_caps_the_tombstone_list_like_the_to_copy_list(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """Minor 5: the tombstone-title loop had no cap, unlike the "to copy"
+    list capped at 15 with an "... and N more" tail - a source account with
+    many deliberate deletions must not produce unbounded output."""
+    env, src, dst = two_account_env(tmp_path)
+    for i in range(17):
+        sid = "sid-t%d" % i
+        _row(src, "local_t%d.json" % i, sid, "Deleted %d" % i)
+        _transcript(env, sid)
+        with open(os.path.join(dst, "deleted_" + sid), "w") as fh:
+            fh.write("1")
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    ct.main(["sync", "--verbose"])
+    out = capsys.readouterr().out
+    assert out.count("kept deleted:") == 15
+    assert "... and 2 more" in out
