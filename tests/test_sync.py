@@ -369,6 +369,11 @@ def test_refuses_to_write_the_live_store(two_account_env, tmp_path):
     m["dest_path"] = src                        # pretend the account switched
     with pytest.raises(ct.Refusal, match="live"):
         ct.run_sync(env, m)
+    # The refusal must land before the row loop ever starts: nothing written,
+    # and the op never advances past the state new_op left it in.
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+    op = ct.list_ops(env)[-1]
+    assert op.manifest["status"] == "journaled"
 
 
 def test_second_instance_is_locked_out(two_account_env, tmp_path):
@@ -381,3 +386,58 @@ def test_second_instance_is_locked_out(two_account_env, tmp_path):
             ct.run_sync(env, m)
     finally:
         ct.release_lock(env)
+
+
+def test_row_dest_path_outside_destination_root_is_refused(two_account_env, tmp_path):
+    """The top-level dest_path guard (LIVE-account check, isdir check) only
+    means something if each row's own dest_path is independently verified to
+    sit inside it - a manifest whose row was hand-edited to point elsewhere
+    must be refused before anything is written, never silently followed."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    outside = os.path.join(str(tmp_path), "elsewhere.json")
+    m["rows"][0]["dest_path"] = outside
+    with pytest.raises(ct.LayoutError) as exc_info:
+        ct.run_sync(env, m)
+    assert exc_info.value.exit_code == 2
+    assert not os.path.exists(outside)
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+def test_crash_before_manifest_save_is_forward_pass_safe(two_account_env, tmp_path):
+    """The write happens before the manifest records it, so a crash in that
+    exact window leaves the destination file on disk with written still
+    False. Resuming this op (a real recovery is Task 5's job; simulated here
+    by re-entering execute_sync_op directly, mirroring what a forward pass
+    will do) must recognize the already-correct bytes and neither duplicate
+    the write nor refuse - the byte-identical branch doing its job."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-write-before-save":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    row0 = op.manifest["rows"][0]
+    assert row0["written"] is False
+    with open(row0["dest_path"], "rb") as fh:
+        on_disk = fh.read()
+    assert on_disk == ct.unb64(row0["post_b64"])
+
+    # Simulate a forward pass resuming this exact op.
+    op.manifest["status"] = "journaled"
+    ct.save_manifest(op)
+    assert ct.execute_sync_op(env, op) == "completed"
+    assert op.manifest["rows"][0]["written"] is True
+    with open(row0["dest_path"], "rb") as fh:
+        assert fh.read() == on_disk            # not duplicated or corrupted

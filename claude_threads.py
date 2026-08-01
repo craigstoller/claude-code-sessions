@@ -2294,7 +2294,11 @@ def execute_sync_op(env, op):
     # dormant account's store (resolve_sync_endpoints picks it, never the
     # live one). Re-check at execute time, not just at planning time, so a
     # manifest that is stale - or was hand-edited between plan and run -
-    # can never land a write in the account the app is actively using.
+    # can never land a write in the account the app is actively using. This
+    # check on m["dest_path"] only carries that guarantee transitively: it is
+    # the row loop's own ensure_contained call below - not this check alone -
+    # that stops an individually hand-edited row["dest_path"] from escaping
+    # the account this refusal just verified is safe to write.
     live = live_account(env)
     if live is not None and os.path.normcase(os.path.normpath(m["dest_path"])) == \
             os.path.normcase(os.path.normpath(live.path)):
@@ -2310,7 +2314,45 @@ def execute_sync_op(env, op):
     for i, r in enumerate(rows):
         if r.get("written"):
             continue
-        atomic_write(r["dest_path"], unb64(r["post_b64"]))
+        # Containment: a hand-edited or simply wrong row dest_path must never
+        # let this loop touch a path outside the destination this op was
+        # verified against above - the dest_path check just above only means
+        # something if every row it is supposed to "cover" is independently
+        # confirmed to actually sit inside it.
+        ensure_contained(r["dest_path"], [m["dest_path"]])
+        post = unb64(r["post_b64"])
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                current = fh.read()
+        except OSError:
+            current = None            # not there yet - the common case
+        if current is None:
+            try:
+                atomic_write(r["dest_path"], post)
+            except OSError as exc:
+                # The op stays at "writing" either way (non-terminal) -
+                # recover has an accurate record of exactly which rows
+                # landed, same as any other crash mid-loop.
+                raise Refusal(
+                    "could not write destination row {0!r} (session {1}): {2}"
+                    .format(r["name"], r["session_id"], exc))
+            _maybe_crash("sync-write-before-save")
+        elif current != post:
+            # select_sync_rows only picked rows that were ABSENT at the
+            # destination at plan time. A row now present with DIFFERENT
+            # bytes means the destination account changed it since planning
+            # (e.g. the user signed in and touched that thread) - rewriting
+            # over that would silently discard the change. execute_op
+            # refuses on the equivalent drift rather than blindly
+            # overwriting; do the same here, and leave the op non-terminal
+            # (still "writing") so it stays recoverable.
+            raise Refusal(
+                "destination row {0!r} (session {1}) changed since this sync was "
+                "planned; re-running would discard that change. The op is left "
+                "at 'writing' - resolve the row, then re-run.".format(
+                    r["name"], r["session_id"]))
+        # else: already byte-identical to the planned post-image - nothing
+        # left to write, just record this row as done.
         r["written"] = True
         save_manifest(op)
         if i < len(rows) - 1:
@@ -2321,7 +2363,13 @@ def execute_sync_op(env, op):
 
 def run_sync(env, manifest):
     """Lock, journal, execute, rotate - the same shape as run_move, minus the
-    moved-log append (sync moves nothing, so there is nothing to log there)."""
+    moved-log append (sync moves nothing, so there is nothing to log there).
+    One difference from run_move worth flagging: run_move's execute_op calls
+    _validate_manifest_paths once, up front, for every path in the manifest.
+    Sync has no such single up-front pass - each row's dest_path is instead
+    validated inline, immediately before that row is touched, inside
+    execute_sync_op's write loop (there is no sidecar inventory or transcript
+    path here for a single shared validator to be worth factoring out)."""
     acquire_lock(env, "pending")
     try:
         op = new_op(env, manifest)
