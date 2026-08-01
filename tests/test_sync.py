@@ -851,3 +851,153 @@ def test_cmd_undo_dry_run_preview_for_sync_op(two_account_env, tmp_path, capsys)
     out = capsys.readouterr().out
     assert "None" not in out
     assert "2 row" in out
+
+
+# ------------------------------------------- fix round 2 (Opus re-review)
+
+
+def test_recover_back_skips_a_drifted_written_row_and_still_terminates(two_account_env, tmp_path):
+    """Finding 5 (corrected): the reviewer's reproduction - a single event
+    ("the dormant account got opened") can both rewrite an already-written
+    row AND leave unexpected content at a still-pending row's path. Refusing
+    the whole 'back' operation over the written row's drift recreates the
+    exact dead end the user's ruling exists to close (recover back refuses,
+    recover forward refuses, undo refuses - permanently stuck). 'back' must
+    instead skip only the rows it cannot safely verify, delete the rest, and
+    always reach a terminal status."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=3)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    # let two rows land before crashing, so one can be left clean and one
+    # deliberately drifted, alongside the still-pending third row.
+    calls = []
+    def hook(point):
+        if point == "sync-mid-write":
+            calls.append(1)
+            if len(calls) == 2:
+                raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+
+    op = ct.nonterminal_ops(env)[0]
+    written_rows = [r for r in op.manifest["rows"] if r.get("written")]
+    pending_row = next(r for r in op.manifest["rows"] if not r.get("written"))
+    assert len(written_rows) == 2
+    clean_row, drifted_row = written_rows
+
+    with open(drifted_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"cliSessionId":"changed","title":"rewritten by the app"}')
+    with open(pending_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"unexpected": true}')
+
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == ["back"]
+    assert set(c["drifted_rows"]) == {pending_row["title"], drifted_row["title"]}
+
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert not os.path.exists(clean_row["dest_path"])         # removed: safe to delete
+    assert os.path.exists(drifted_row["dest_path"])            # skipped: drifted, kept
+    with open(drifted_row["dest_path"], encoding="utf-8") as fh:
+        assert json.load(fh) == {"cliSessionId": "changed", "title": "rewritten by the app"}
+    with open(pending_row["dest_path"], encoding="utf-8") as fh:
+        assert json.load(fh) == {"unexpected": True}           # never touched by back
+    assert ct.list_ops(env)[-1].manifest["status"] == "rolled_back"
+    assert ct.nonterminal_ops(env) == []
+    # the module's established "name what happened" mechanism (the same
+    # abort_reason field/print path _abort already uses for move) must say
+    # which row was left behind and why.
+    reason = ct.list_ops(env)[-1].manifest.get("abort_reason")
+    assert reason and drifted_row["title"] in reason
+
+
+def test_recover_back_skips_an_unreadable_written_row(two_account_env, tmp_path):
+    """Finding 5 (corrected): an unreadable written row is a second route to
+    the same permanent-block dead end as a drifted one, and must be skipped
+    the same way, not refused."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    written_row = next(r for r in op.manifest["rows"] if r.get("written"))
+    pending_row = next(r for r in op.manifest["rows"] if not r.get("written"))
+    os.unlink(written_row["dest_path"])
+    os.makedirs(written_row["dest_path"])          # a directory now sits where it was
+    with open(pending_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"unexpected": true}')
+    try:
+        c = ct.classify_op(env, op)
+        assert c["resolutions"] == ["back"]
+        assert written_row["title"] in c["drifted_rows"]
+
+        assert ct.recover_op(env, op, "back") == "rolled_back"
+        assert os.path.isdir(written_row["dest_path"])         # left alone, not deleted
+        assert ct.nonterminal_ops(env) == []
+    finally:
+        if os.path.isdir(written_row["dest_path"]):
+            os.rmdir(written_row["dest_path"])
+
+
+def test_classify_sync_op_note_distinguishes_changed_from_unreadable(two_account_env, tmp_path):
+    """Minor (new, from round 1's fix): an unreadable pending row is
+    correctly counted as blocking (fail-closed - 'couldn't look' is never
+    'nothing there'), but the note must not claim it 'changed', since that
+    is only true for a genuine byte mismatch, not a permission/I-O error."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    op = ct.new_op(env, m)                          # "journaled" - row never written
+    row = op.manifest["rows"][0]
+    os.makedirs(row["dest_path"])                   # a directory sits where the row lands
+    try:
+        c = ct.classify_op(env, op)
+        assert c["resolutions"] == ["back"]
+        assert row["title"] in c["drifted_rows"]
+        assert "could not be read" in c["note"]
+        assert "changed since this sync was planned" not in c["note"]
+    finally:
+        os.rmdir(row["dest_path"])
+
+
+def test_undo_sync_refuses_when_a_written_row_is_unreadable(two_account_env, tmp_path):
+    """undo_sync keeps refusing all-or-nothing on the 'unreadable' case too,
+    not just genuine byte-drift - _sync_delete_targets no longer raises
+    immediately on an unreadable row (recover's back arm needs to skip it
+    instead), so undo_sync must now check for it explicitly rather than
+    relying on the old raise-from-within-the-gate behavior."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    row_path = op.manifest["rows"][0]["dest_path"]
+    os.unlink(row_path)
+    os.makedirs(row_path)                            # a directory now sits where it was
+    try:
+        with pytest.raises(ct.Refusal, match="could not be read"):
+            ct.undo_sync(env, op)
+        assert os.path.isdir(row_path)                # left alone
+    finally:
+        os.rmdir(row_path)
+
+
+def test_undo_sync_refuses_a_non_sync_op(two_account_env, tmp_path):
+    """Finding 10 (Minor): dedicated coverage for undo_sync's op_type
+    guard - previously nothing reached it."""
+    env, src, dst = two_account_env(tmp_path)
+    op = ct.new_op(env, {"op_type": "move"})
+    with pytest.raises(ct.Refusal, match="not a sync op"):
+        ct.undo_sync(env, op)

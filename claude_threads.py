@@ -1580,17 +1580,27 @@ def recover_op(env, op, direction):
             if direction == "back":
                 # Only reachable when a destination row has drifted enough
                 # to permanently block forward (classify_sync_op's
-                # diagnosis) - remove exactly the rows this op already
-                # wrote, under the same gate undo_sync uses; the blocking
-                # row itself is never touched, because this op never wrote
-                # it.
-                drifted, removable = _sync_delete_targets(env, m)
-                if drifted:
-                    raise Refusal(
-                        "cannot roll op {0} back: these rows changed since the sync "
-                        "({1}); the destination account may have opened them. "
-                        "Refusing to delete them.".format(m["op_id"], ", ".join(drifted)))
+                # diagnosis). Unlike undo_sync's all-or-nothing, back must
+                # always terminate - refusing over a written row that also
+                # drifted or turned unreadable would recreate the exact
+                # dead end this resolution exists to close (recover back
+                # refuses, recover forward refuses, undo refuses:
+                # permanently stuck). So a row this op cannot verify is
+                # SKIPPED, never deleted, and the rest are removed; the
+                # blocking pending row itself is never even considered,
+                # because this op never wrote it.
+                drifted, unreadable, removable = _sync_delete_targets(env, m)
                 _sync_unlink_all(removable)
+                skipped = drifted + unreadable
+                if skipped:
+                    # Same reporting mechanism _abort already uses for
+                    # move - cmd_recover's existing _print_abort_reason
+                    # picks this up for free once status is non-"completed".
+                    op.manifest["abort_reason"] = (
+                        "back removed {0} row(s) it could verify; left {1} "
+                        "untouched because {2}".format(
+                            len(removable), len(skipped),
+                            _drift_clause(drifted, unreadable)))
                 set_status(op, "rolled_back")
                 rotate_ops(env)
                 return "rolled_back"
@@ -2459,28 +2469,52 @@ def run_sync(env, manifest):
         release_lock(env)
 
 
-def _sync_blocking_rows(pending_rows):
-    """Pending (not-yet-written) rows whose destination path already holds
-    unexpected bytes - exactly what makes execute_sync_op refuse if forward
-    is attempted (see its 'destination row ... changed since this sync was
-    planned' refusal). Read-only and exception-safe: classify_op must never
-    raise (that was this task's original defect - a KeyError on a sync
-    manifest), so an unreadable row is counted as blocking too, since
-    forward would refuse on it for the same reason.
+def _sync_row_drift(r):
+    """Compare a single sync row's post-image to whatever currently sits at
+    its dest_path. Returns 'absent' (nothing there), 'match' (present and
+    byte-identical to what this op wrote/would write), 'drifted' (present
+    with different bytes - someone else touched this path since the sync
+    was planned), or 'unreadable' (present but could not be read - a
+    permission or I/O error; fail-closed like every "couldn't look" in this
+    module, never treated as "nothing there"). Never raises: classify_op
+    must never raise (that was this task's original defect - a KeyError on
+    a sync manifest), and undo_sync / recover_op's 'back' arm both need this
+    same read-only per-row classification before deciding what to do.
     """
-    blocking = []
-    for r in pending_rows:
-        try:
-            with open(r["dest_path"], "rb") as fh:
-                cur = fh.read()
-        except FileNotFoundError:
-            continue                       # normal - nothing there yet
-        except OSError:
-            blocking.append(r["title"])    # unreadable - forward would refuse here too
-            continue
-        if cur != unb64(r["post_b64"]):
-            blocking.append(r["title"])
-    return blocking
+    try:
+        with open(r["dest_path"], "rb") as fh:
+            cur = fh.read()
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+    return "match" if cur == unb64(r["post_b64"]) else "drifted"
+
+
+def _sync_drift_titles(rows):
+    """(changed_titles, unreadable_titles) for ROWS, via _sync_row_drift.
+    Read-only and exception-safe."""
+    changed, unreadable = [], []
+    for r in rows:
+        state = _sync_row_drift(r)
+        if state == "drifted":
+            changed.append(r["title"])
+        elif state == "unreadable":
+            unreadable.append(r["title"])
+    return changed, unreadable
+
+
+def _drift_clause(changed, unreadable):
+    """A note/refusal fragment naming drifted vs unreadable rows separately.
+    'Changed' is only true of one of them - conflating the two would falsely
+    claim an unreadable row 'changed' when the real reason is a permission
+    or I/O error."""
+    parts = []
+    if changed:
+        parts.append("changed since this sync was planned ({0})".format(", ".join(changed)))
+    if unreadable:
+        parts.append("could not be read ({0})".format(", ".join(unreadable)))
+    return " and ".join(parts)
 
 
 def classify_sync_op(env, op):
@@ -2490,10 +2524,11 @@ def classify_sync_op(env, op):
     row changes underneath a still-in-flight sync, forward can never
     complete (execute_sync_op refuses on that exact row every time it
     re-enters), so offering it forever would be a dead end - 'back' becomes
-    the only way off a stuck op, and it only ever removes the rows THIS op
-    actually wrote, never the blocking row itself (undo_sync's and back's
-    shared row-gate, `_sync_delete_targets`, only ever touches
-    `written: True` rows).
+    the only way off a stuck op. A written row that cannot itself be
+    verified is surfaced here too, before the user even picks a direction -
+    a single event ("the dormant account got opened") can plausibly both
+    block a pending row and rewrite an already-written one, so 'options:
+    back' alone would otherwise promise more than back can deliver.
     """
     m = op.manifest
     written = [r for r in m["rows"] if r.get("written")]
@@ -2504,14 +2539,20 @@ def classify_sync_op(env, op):
                 "note": "sync: {0} row(s) written, {1} pending; forward finishes "
                         "them (use undo to remove what was written)"
                         .format(len(written), len(pending))}
-    blocking = _sync_blocking_rows(pending)
-    if blocking:
+    pend_changed, pend_unreadable = _sync_drift_titles(pending)
+    if pend_changed or pend_unreadable:
+        blocking = pend_changed + pend_unreadable
+        skip_changed, skip_unreadable = _sync_drift_titles(written)
+        skipped = skip_changed + skip_unreadable
+        note = ("sync: destination row(s) {0}; it can no longer be rolled "
+                "forward - 'back' removes the row(s) this op safely can"
+                .format(_drift_clause(pend_changed, pend_unreadable)))
+        if skipped:
+            note += ("; it will also skip {0} already-written row(s) it cannot "
+                     "verify ({1})".format(len(skipped),
+                                           _drift_clause(skip_changed, skip_unreadable)))
         return {"status": m["status"], "source": "n/a", "dest": "n/a",
-                "resolutions": ["back"], "drifted_rows": blocking,
-                "note": "sync: destination row(s) changed since this sync was "
-                        "planned ({0}); it can no longer be rolled forward - "
-                        "'back' removes the {1} row(s) this op already wrote"
-                        .format(", ".join(blocking), len(written))}
+                "resolutions": ["back"], "drifted_rows": blocking + skipped, "note": note}
     return {"status": m["status"], "source": "n/a", "dest": "n/a",
             "resolutions": ["forward"], "drifted_rows": [],
             "note": "sync: {0} row(s) written, {1} pending; forward finishes them "
@@ -2520,32 +2561,34 @@ def classify_sync_op(env, op):
 
 
 def _sync_delete_targets(env, m):
-    """Rows THIS sync op actually wrote, gated for safe deletion. Shared by
-    undo_sync and recover_op's 'back' path, which differ only in the
-    terminal status they set and the wording of the refusal they raise when
-    a row has drifted.
+    """Rows THIS sync op actually wrote, classified for safe deletion.
+    Shared by undo_sync and recover_op's 'back' path, which react
+    differently to a non-empty drifted/unreadable result: undo_sync refuses
+    the whole operation (a surprise during a user-initiated reversal of a
+    completed sync means stop and ask), while back SKIPS those rows and
+    proceeds with the rest, because back is the only exit from a stuck op
+    and must always reach a terminal status - refusing there would recreate
+    the exact dead end it exists to close.
 
-    Three gates, in order:
+    Two hard gates, checked up front - never "skip and continue", because
+    they mean the op itself cannot be trusted, not just one row:
     1. The same live-account re-check execute_sync_op makes on every write.
        Sync ships with no process guard specifically because it re-verifies
        live_account(env) against the destination at execute time, never
        relying on planning-time state alone - a delete is exactly as
        dangerous as a write here, and must carry the identical guarantee.
-    2. The same containment execute_sync_op's write loop uses (ensure_contained
-       plus the direct-child check), so a hand-edited or corrupted manifest
-       row can never point this delete outside the destination store.
-    3. A byte-for-byte compare against what this op wrote. A row this op
-       never wrote (`written` is not True) is never considered. A row
-       already gone - confirmed absent via FileNotFoundError, not merely
-       unreadable - is skipped as already-undone. A row that is present but
-       unreadable for some other reason refuses outright (fail-closed:
-       "couldn't look" is never "nothing there"). A row present with
-       different bytes than this op wrote means the destination account has
-       since touched it - collected as drifted, not deleted.
+    2. The same containment execute_sync_op's write loop uses
+       (ensure_contained plus the direct-child check), so a hand-edited or
+       corrupted manifest row can never point this delete outside the
+       destination store.
 
-    Returns (drifted_titles, removable_paths). Deletes nothing itself -
-    callers refuse when drifted_titles is non-empty and only then unlink
-    removable_paths.
+    Per row, via _sync_row_drift: a row this op never wrote (`written` is
+    not True) is never considered. 'absent' is skipped as already-undone.
+    'match' is removable. 'drifted' and 'unreadable' are reported
+    separately - neither is ever deleted.
+
+    Returns (drifted_titles, unreadable_titles, removable_paths). Deletes
+    nothing itself.
     """
     live = live_account(env)
     if live is not None and os.path.normcase(os.path.normpath(m["dest_path"])) == \
@@ -2554,7 +2597,7 @@ def _sync_delete_targets(env, m):
             "destination resolves to the LIVE account ({0}); refusing - undo, "
             "like sync, may only ever touch a dormant store, never the account "
             "that is currently live.".format(live.email or live.account_uuid))
-    drifted, removable = [], []
+    drifted, unreadable, removable = [], [], []
     for r in m["rows"]:
         if not r.get("written"):
             continue
@@ -2563,21 +2606,16 @@ def _sync_delete_targets(env, m):
             raise LayoutError(
                 "row dest_path {0!r} is not a direct child of the destination "
                 "store {1!r}; refusing".format(r["dest_path"], m["dest_path"]))
-        try:
-            with open(r["dest_path"], "rb") as fh:
-                cur = fh.read()
-        except FileNotFoundError:
+        state = _sync_row_drift(r)
+        if state == "absent":
             continue                       # confirmed absent - nothing to undo
-        except OSError as exc:
-            raise Refusal(
-                "could not read {0!r} (session {1}) to verify it still matches "
-                "what this op wrote, before removing it: {2}".format(
-                    r["name"], r["session_id"], exc))
-        if cur == unb64(r["post_b64"]):
+        elif state == "match":
             removable.append(r["dest_path"])
-        else:
+        elif state == "drifted":
             drifted.append(r["title"])
-    return drifted, removable
+        else:                              # "unreadable"
+            unreadable.append(r["title"])
+    return drifted, unreadable, removable
 
 
 def _sync_unlink_all(paths):
@@ -2601,7 +2639,12 @@ def undo_sync(env, op):
     """Delete exactly the rows this sync wrote - and only while they are still
     byte-identical to what it wrote. If the destination account has since
     opened the thread the app rewrites the row, and deleting it would discard
-    that account's own state.
+    that account's own state. A row that cannot even be read is treated the
+    same way - a surprise either way, so undo refuses rather than guessing.
+    This is the deliberate asymmetry with recover_op's 'back' arm: undo is a
+    user-initiated reversal of a *completed* sync, where a surprise means
+    stop and ask; back is the only exit from a stuck op and must always
+    terminate, so it skips instead (see _sync_delete_targets).
 
     Takes the single-instance lock first, before any of its own checks - the
     same discipline run_undo/run_move/run_sync/recover_op all use, so two
@@ -2615,11 +2658,11 @@ def undo_sync(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
-        drifted, removable = _sync_delete_targets(env, m)
-        if drifted:
-            raise Refusal("these synced rows have changed since the sync ({0}); the "
-                          "other account may have opened them. Refusing to delete "
-                          "them.".format(", ".join(drifted)))
+        drifted, unreadable, removable = _sync_delete_targets(env, m)
+        if drifted or unreadable:
+            raise Refusal("these synced rows {0}; the other account may have opened "
+                          "them. Refusing to delete any of them."
+                          .format(_drift_clause(drifted, unreadable)))
         _sync_unlink_all(removable)
         set_status(op, "undone")
         rotate_ops(env)
