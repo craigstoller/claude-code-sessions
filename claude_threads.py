@@ -19,7 +19,8 @@ import sys
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
 
-NONTERMINAL = ("journaled", "copying", "copied", "rewriting", "committed", "aborting")
+NONTERMINAL = ("journaled", "copying", "copied", "rewriting", "committed", "aborting",
+               "writing")
 TERMINAL = ("completed", "rolled_back", "undone")
 
 
@@ -2255,6 +2256,84 @@ def transform_row(data, verbatim=False):
             out[k] = v
             reset.append(k)
     return json.dumps(out, separators=(",", ":")).encode("utf-8"), removed, sorted(reset)
+
+
+def plan_sync(env, flags):
+    """Build the sync manifest. Pure planning - writes nothing."""
+    source, dest = resolve_sync_endpoints(env, flags.to or None)
+    picked, tally = select_sync_rows(env, source, dest, flags)
+    rows = []
+    for cand in picked:
+        blob, removed, reset = transform_row(cand["data"], flags.verbatim)
+        rows.append({"name": cand["name"],
+                     "dest_path": os.path.join(dest.path, cand["name"]),
+                     "post_b64": b64(blob), "session_id": cand["session_id"],
+                     "title": cand["title"], "removed": removed, "reset": reset,
+                     "written": False})
+    return {"op_type": "sync",
+            "source_account": source.account_uuid, "source_email": source.email,
+            "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
+            "dest_email": dest.email, "dest_path": dest.path,
+            "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
+
+
+def execute_sync_op(env, op):
+    """journaled -> writing -> completed.
+
+    Far simpler than execute_op because nothing is deleted and no transcript
+    moves: the destructive step that dominates a move does not exist here.
+    Each row is journaled as written immediately after its atomic_write, so a
+    crash leaves an exact record of which rows landed.
+    """
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_sync_op runs ops from 'journaled'; use recover "
+                          "for interrupted ops")
+
+    # The whole no-process-guard design rests on sync only ever writing the
+    # dormant account's store (resolve_sync_endpoints picks it, never the
+    # live one). Re-check at execute time, not just at planning time, so a
+    # manifest that is stale - or was hand-edited between plan and run -
+    # can never land a write in the account the app is actively using.
+    live = live_account(env)
+    if live is not None and os.path.normcase(os.path.normpath(m["dest_path"])) == \
+            os.path.normcase(os.path.normpath(live.path)):
+        raise Refusal(
+            "destination resolves to the LIVE account ({0}); refusing - sync must "
+            "never write to the account that is currently live, which is exactly "
+            "why it ships with no process guard.".format(live.email or live.account_uuid))
+    if not os.path.isdir(m["dest_path"]):
+        raise LayoutError("destination store vanished: " + m["dest_path"])
+
+    set_status(op, "writing")
+    rows = m["rows"]
+    for i, r in enumerate(rows):
+        if r.get("written"):
+            continue
+        atomic_write(r["dest_path"], unb64(r["post_b64"]))
+        r["written"] = True
+        save_manifest(op)
+        if i < len(rows) - 1:
+            _maybe_crash("sync-mid-write")
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_sync(env, manifest):
+    """Lock, journal, execute, rotate - the same shape as run_move, minus the
+    moved-log append (sync moves nothing, so there is nothing to log there)."""
+    acquire_lock(env, "pending")
+    try:
+        op = new_op(env, manifest)
+        # already holding the lock (no O_EXCL needed) - just record the real op_id
+        with open(_lock_path(env), "w") as fh:
+            fh.write("{0} {1}".format(os.getpid(), op.manifest["op_id"]))
+        final = execute_sync_op(env, op)
+        if final == "completed":
+            rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
 
 
 if __name__ == "__main__":

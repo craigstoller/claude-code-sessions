@@ -294,3 +294,90 @@ def test_transform_does_not_mutate_its_input():
     data = {"cliSessionId": "sid", "remoteMcpServersConfig": [{"name": "Canva"}]}
     ct.transform_row(data)
     assert "remoteMcpServersConfig" in data       # caller's dict untouched
+
+
+class SimulatedCrash(Exception):
+    pass
+
+
+def _prepared(env, src, dst, n=2):
+    for i in range(n):
+        sid = "sid-%d" % i
+        _row(src, "local_%d.json" % i, sid, "Thread %d" % i)
+        _transcript(env, sid)
+
+
+def test_run_sync_writes_rows_and_completes(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert len(m["rows"]) == 2
+    assert ct.run_sync(env, m) == "completed"
+    assert sorted(f for f in os.listdir(dst) if f.startswith("local_")) == [
+        "local_0.json", "local_1.json"]
+    op = ct.list_ops(env)[-1]
+    assert op.manifest["status"] == "completed"
+    assert op.manifest["op_type"] == "sync"
+    assert ct.read_lock(env) is None
+
+
+def test_written_rows_are_transformed(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha",
+         {"remoteMcpServersConfig": [{"name": "Canva"}]})
+    _transcript(env, "sid-a")
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    with open(os.path.join(dst, "local_a.json"), encoding="utf-8") as fh:
+        assert "remoteMcpServersConfig" not in json.load(fh)
+
+
+def test_dry_run_plan_writes_nothing(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst)
+    ct.plan_sync(env, ct.SyncFlags())          # planning alone must not write
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+    assert ct.list_ops(env) == []
+
+
+def test_crash_mid_write_leaves_a_recoverable_op(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=3)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    assert any(r.get("written") for r in op.manifest["rows"])
+    assert not all(r.get("written") for r in op.manifest["rows"])
+    assert ct.read_lock(env) is None            # released by the finally
+
+
+def test_refuses_to_write_the_live_store(two_account_env, tmp_path):
+    """The no-process-guard design rests on only ever writing the dormant
+    store, so a destination that resolves to the live account is fatal."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    m["dest_path"] = src                        # pretend the account switched
+    with pytest.raises(ct.Refusal, match="live"):
+        ct.run_sync(env, m)
+
+
+def test_second_instance_is_locked_out(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    ct.acquire_lock(env, "other-op")
+    try:
+        with pytest.raises(ct.Refusal, match="lock"):
+            ct.run_sync(env, m)
+    finally:
+        ct.release_lock(env)
