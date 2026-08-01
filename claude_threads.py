@@ -2138,6 +2138,22 @@ class Account:
     resolved_from: str = ""
 
 
+def _listdir_or_refuse(path, what):
+    """os.listdir, but a failure is a LayoutError rather than a raw OSError.
+
+    discover_stores proves only that the store ROOT is enumerable; every
+    listdir deeper than that (account dirs, org dirs, the two store folders
+    sync reads) can still hit a PermissionError, and main() catches only
+    Refusal/LayoutError - so a bare OSError escapes as an unredacted
+    traceback carrying full paths and account uuids. Same fail-closed rule
+    the rest of the module uses: "couldn't look" is never "nothing there"."""
+    try:
+        return os.listdir(path)
+    except OSError as exc:
+        raise LayoutError("could not read {0} at {1}: {2}. 'Couldn't look' is never "
+                          "'nothing there' - refusing.".format(what, path, exc))
+
+
 def _account_dirs(env):
     """Every <accountUuid>/<organizationUuid> pair present on disk."""
     disc = discover_stores(env)
@@ -2146,11 +2162,11 @@ def _account_dirs(env):
                           "'nothing there' - refusing.".format(disc.detail))
     out = []
     for root in disc.roots:
-        for acct in sorted(os.listdir(root)):
+        for acct in sorted(_listdir_or_refuse(root, "the store root")):
             ap = os.path.join(root, acct)
             if not os.path.isdir(ap):
                 continue
-            for org in sorted(os.listdir(ap)):
+            for org in sorted(_listdir_or_refuse(ap, "an account directory")):
                 op = os.path.join(ap, org)
                 if os.path.isdir(op):
                     out.append((acct, org, op))
@@ -2322,7 +2338,7 @@ def _destination_tombstones(dest):
     history matters - tombstones are per-account, so the source's deletions
     say nothing about what this account should see."""
     out = set()
-    for name in os.listdir(dest.path):
+    for name in _listdir_or_refuse(dest.path, "the destination store"):
         if name.startswith("deleted_"):
             out.add(name[len("deleted_"):])
     return out
@@ -2385,14 +2401,14 @@ def select_sync_rows(env, source, dest, flags):
     """
     tally = {"present": [], "no_transcript": [], "deleted": [], "unreadable": [],
              "filtered": [], "resurrected": []}
-    have = set(os.listdir(dest.path))
+    have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
     # Parse first, decide second: --include-deleted has to be resolved
     # against the whole set of tombstoned rows to know whether a term is
     # ambiguous, which a single streaming pass cannot see.
     entries = []
-    for name in sorted(os.listdir(source.path)):
+    for name in sorted(_listdir_or_refuse(source.path, "the source store")):
         if not (name.startswith("local_") and name.endswith(".json")):
             continue                      # scheduled-tasks.json, deleted_*, *.tmp
         p = os.path.join(source.path, name)
@@ -2557,9 +2573,16 @@ def execute_sync_op(env, op):
     # the row loop's own ensure_contained call below - not this check alone -
     # that stops an individually hand-edited row["dest_path"] from escaping
     # the account this refusal just verified is safe to write.
+    # realpath on BOTH sides, not normpath: ensure_contained - the other half
+    # of this guarantee, in the row loop below - resolves reparse points, and
+    # this comparison has to agree with it. A junction makes the two disagree
+    # (dest realpath == live realpath while the normpath strings differ),
+    # which would silently skip the single most load-bearing refusal in the
+    # design. Everywhere else in this module treats reparse points as
+    # hostile; so does this.
     live = live_account(env)
-    if live is not None and os.path.normcase(os.path.normpath(m["dest_path"])) == \
-            os.path.normcase(os.path.normpath(live.path)):
+    if live is not None and os.path.normcase(os.path.realpath(m["dest_path"])) == \
+            os.path.normcase(os.path.realpath(live.path)):
         raise Refusal(
             "destination resolves to the LIVE account ({0}); refusing - sync must "
             "never write to the account that is currently live, which is exactly "
@@ -2684,7 +2707,18 @@ def run_sync(env, manifest):
     path here for a single shared validator to be worth factoring out)."""
     acquire_lock(env, "pending")
     try:
-        op = new_op(env, manifest)
+        # "tally" is the report's data, not the operation's: it names every
+        # thread the run skipped - including the ones the destination account
+        # deliberately DELETED - and nothing in execute/undo/recover reads it.
+        # Journaling it would write those titles to disk in ~/.claude-code-threads
+        # for the lifetime of the op, so strip it from the copy that is
+        # journaled. The "rows" list (and every row dict in it) is still the
+        # same object, so run_sync's caller keeps seeing `written` flags flip.
+        op = new_op(env, dict((k, v) for k, v in manifest.items() if k != "tally"))
+        # Hand the op_id back to the caller: new_op shallow-copies the
+        # manifest and sets op_id on ITS copy, so without this a `sync --apply
+        # --json` run reports a result but no id for `undo --id` to use.
+        manifest["op_id"] = op.manifest["op_id"]
         # already holding the lock (no O_EXCL needed) - just record the real op_id
         with open(_lock_path(env), "w") as fh:
             fh.write("{0} {1}".format(os.getpid(), op.manifest["op_id"]))
@@ -2707,7 +2741,18 @@ def _sync_row_drift(r):
     must never raise (that was this task's original defect - a KeyError on
     a sync manifest), and undo_sync / recover_op's 'back' arm both need this
     same read-only per-row classification before deciding what to do.
+
+    "Never raises" has to include the manifest side, not just the disk side:
+    unb64(r["post_b64"]) raises binascii.Error (a ValueError) on a corrupt
+    manifest and KeyError if the field is missing, and main() catches
+    neither. A row whose planned bytes cannot be reconstructed is
+    "unreadable" - fail-closed, and correctly so: it can never be written
+    forward, and it must never be deleted either.
     """
+    try:
+        post = unb64(r["post_b64"])
+    except (KeyError, ValueError):
+        return "unreadable"
     try:
         with open(r["dest_path"], "rb") as fh:
             cur = fh.read()
@@ -2715,7 +2760,7 @@ def _sync_row_drift(r):
         return "absent"
     except OSError:
         return "unreadable"
-    return "match" if cur == unb64(r["post_b64"]) else "drifted"
+    return "match" if cur == post else "drifted"
 
 
 def _sync_drift_titles(rows):
@@ -2795,8 +2840,13 @@ def classify_sync_op(env, op):
             note += ("; it will also skip {0} already-written row(s) it cannot "
                      "verify ({1})".format(len(skipped),
                                            _drift_clause(skip_changed, skip_unreadable)))
+        # dict.fromkeys, not a bare concatenation: a pending row and a
+        # written row can share a title, and this list reaches cmd_recover's
+        # printed line - listing the same title twice reads as two problems.
+        # Order-preserving, unlike set().
         return {"status": m["status"], "source": "n/a", "dest": "n/a",
-                "resolutions": ["back"], "drifted_rows": blocking + skipped, "note": note}
+                "resolutions": ["back"], "note": note,
+                "drifted_rows": list(dict.fromkeys(blocking + skipped))}
     return {"status": m["status"], "source": "n/a", "dest": "n/a",
             "resolutions": ["forward", "back"], "drifted_rows": [],
             "note": "sync: {0} row(s) written, {1} pending; forward finishes them, "
@@ -2834,9 +2884,11 @@ def _sync_delete_targets(env, m):
     Returns (drifted_titles, unreadable_titles, removable_paths). Deletes
     nothing itself.
     """
+    # realpath on both sides, matching execute_sync_op's write-side check and
+    # ensure_contained below - see the note there on junctions.
     live = live_account(env)
-    if live is not None and os.path.normcase(os.path.normpath(m["dest_path"])) == \
-            os.path.normcase(os.path.normpath(live.path)):
+    if live is not None and os.path.normcase(os.path.realpath(m["dest_path"])) == \
+            os.path.normcase(os.path.realpath(live.path)):
         raise Refusal(
             "destination resolves to the LIVE account ({0}); refusing - undo, "
             "like sync, may only ever touch a dormant store, never the account "

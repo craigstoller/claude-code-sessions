@@ -115,15 +115,22 @@ is always a preview will misread `sync --apply --json`.
   under a `!! RESURRECTING …` heading *before* the list of rows to copy, and flagged again in
   that list, so bringing back a thread you deliberately deleted is never something the command
   does quietly.
-- **Connector config is not copied by default.** A row can carry a full snapshot of the
-  account's connected MCP servers; across 432 real rows on this machine that field ran as large
-  as 1.36 MB in a single row and totalled 289 MB. Stripping it is verified safe: on a real row it
-  cut 132,264 bytes to 715 (99.5% smaller) with the sidebar entry, history, responses, and
-  connectors all working normally afterward, under the account that owned them. That proves the
-  *app* tolerates the field's absence — it does not prove the *destination account* has the same
-  connectors configured. A thread that relies on one opens fine either way and fails at its first
-  tool call if the integration isn't set up there too; set it up in the destination account.
-  `--verbatim` copies rows unchanged, connector config included.
+- **Connector config and permission grants are not copied by default.** A row can carry a full
+  snapshot of the account's connected MCP servers; across 432 real rows on this machine that
+  field ran as large as 1.36 MB in a single row and totalled 289 MB. Stripping it is verified
+  safe: on a real row it cut 132,264 bytes to 715 (99.5% smaller) with the sidebar entry,
+  history, responses, and connectors all working normally afterward, under the account that owned
+  them. That proves the *app* tolerates the field's absence — it does not prove the *destination
+  account* has the same connectors configured. A thread that relies on one opens fine either way
+  and fails at its first tool call if the integration isn't set up there too; set it up in the
+  destination account. The default transform also **resets the row's permission state**
+  (`alwaysAllowedReasons`, `sessionPermissionUpdates`, `chromePermissionMode`,
+  `chromeTabGroupId`) to its defaults: a permission you granted under one login was never granted
+  under the other, and the worst case of resetting it is a re-prompt.
+  `--verbatim` skips the whole transform — it copies connector config **and those permission
+  grants** across the account boundary unchanged. The permission half is the more
+  security-relevant of the two: use `--verbatim` only when you actually want the second account
+  to inherit what the first one had allowed.
 - **It usually does not need the app closed, unlike `move`, `undo`, and `recover`.** `sync` only
   ever writes the store you are *not* signed into, and re-checks that at the moment it writes,
   not just when it planned. That re-check catches an account *switch* between planning and
@@ -147,6 +154,13 @@ is always a preview will misread `sync --apply --json`.
   other account, indefinitely. Re-running does not refresh it — `sync` only ever adds rows that
   are missing, never rewrites one that's already there. Refreshing a stale row (`--update`) is
   planned but not yet built.
+- **"Already there" is decided by filename, not by conversation.** A row counts as present in the
+  destination when a file of the *same name* (`local_<appSessionId>.json`) exists there. That is
+  exactly right for rows `sync` itself copied, since it copies the name along with the contents.
+  But a destination row pointing at the same conversation under a *different* local id — one
+  placed by an earlier hand-run script, say — is not detected, and `sync` would add a second row
+  for the same thread, showing it twice in that account's sidebar. Deleting the duplicate in the
+  app is enough to fix it.
 - Sign into the other account (or restart the app) to see the results.
 
 ## Safety design
@@ -216,6 +230,11 @@ first 8 characters by default — pass `--verbose` to see paths and ids in full.
 always contains full paths, titles, and ids, unredacted, so it can be consumed programmatically.
 Do not paste `--json` output into a public issue or forum post — copy only the fields you mean
 to share.
+
+`sync --json` is the one place this discloses **a second account's** identifiers: unlike every
+other command, its output carries the destination account's account/org uuids and full store path
+in the clear, regardless of `--verbose`, because those are what the plan is *about*. The
+plain-text report redacts them like everything else; the JSON does not.
 
 **Windows durability note.** The commit step fsyncs every file it writes before deleting the
 source, but Windows has no equivalent of a directory fsync, so the directory-entry update

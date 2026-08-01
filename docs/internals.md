@@ -151,10 +151,15 @@ shorter phase sequence, because nothing is ever deleted and no transcript moves:
 journaled -> writing -> completed
 ```
 
-Each row is written and marked `written: true` in the manifest immediately after its
-`atomic_write`, one row at a time, so a crash mid-run leaves an exact record of which rows
-landed and which didn't. A run that finds nothing to copy never creates an operation at all —
-there is nothing to journal.
+Each row is marked `written: true` in the manifest after its `atomic_write`, so an interrupted
+run leaves a record of which rows landed and which didn't (see the journal-budget note at the
+end of this section for exactly how fine-grained that record is). A run that finds nothing to
+copy never creates an operation at all — there is nothing to journal.
+
+What is journaled is the operation, not the report. `plan_sync` returns a `tally` of every
+thread the run skipped and why — including the ones the destination account deliberately deleted
+— for the CLI to print; `run_sync` strips it from the copy it journals, so those titles are never
+written into `~/.claude-code-threads/`. Nothing in execute/undo/recover reads it.
 
 **Every row is re-read immediately before it would be written.** Absent → write it. Present and
 already byte-identical to what `sync` would write → leave it alone and mark the row done anyway;

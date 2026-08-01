@@ -1653,3 +1653,169 @@ def test_an_exception_always_journals_what_landed(two_account_env, tmp_path,
     assert [bool(r.get("written")) for r in op.manifest["rows"]] == [True, False, False]
     assert ct.recover_op(env, op, "back") == "rolled_back"
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+# --------------------------- whole-branch review: minor findings
+
+
+def _reparse_or_skip(target, link):
+    """A directory reparse point at `link` pointing at `target`: a symlink
+    where the platform allows one, otherwise a Windows junction (mklink /J,
+    which needs no elevation), otherwise skip."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return link
+    except (OSError, NotImplementedError, AttributeError):
+        pass
+    if os.name == "nt":
+        import subprocess
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return link
+    pytest.skip("cannot create a directory reparse point in this environment")
+
+
+def test_live_account_check_resolves_reparse_points_on_the_write_side(two_account_env,
+                                                                      tmp_path):
+    """Minor: the live-account comparison used normpath while
+    ensure_contained (the other half of the same guarantee) uses realpath. A
+    junction makes them disagree - dest realpath == live realpath while the
+    normpath strings differ - which skips the single most load-bearing
+    refusal in the design. Before the fix this raised the row loop's
+    containment LayoutError instead of the LIVE-account Refusal."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    m["dest_path"] = _reparse_or_skip(src, os.path.join(str(tmp_path), "live-link"))
+    with pytest.raises(ct.Refusal, match="LIVE account"):
+        ct.run_sync(env, m)
+    assert [f for f in os.listdir(src) if f.startswith("local_")] == ["local_0.json"]
+
+
+def test_live_account_check_resolves_reparse_points_on_the_delete_side(two_account_env,
+                                                                       tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    op.manifest["dest_path"] = _reparse_or_skip(
+        src, os.path.join(str(tmp_path), "live-link-2"))
+    with pytest.raises(ct.Refusal, match="LIVE account"):
+        ct.undo_sync(env, op)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+
+def test_apply_json_reports_the_op_id(two_account_env, tmp_path, monkeypatch, capsys):
+    """Minor: new_op shallow-copies the manifest and sets op_id on ITS copy,
+    so automation that just ran `sync --apply --json` got a result with no id
+    to hand to `undo --id`."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--apply", "--json"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["result"] == "completed"
+    assert rep["op_id"] == ct.list_ops(env)[-1].manifest["op_id"]
+
+
+def test_classify_survives_a_corrupt_or_missing_post_image(two_account_env, tmp_path):
+    """Minor: _sync_row_drift's docstring said "Never raises", but
+    unb64(r["post_b64"]) raises binascii.Error on a corrupt manifest and
+    KeyError if the field is missing - and main() catches neither. The
+    original defect this whole feature had to fix was exactly "classify_op
+    raised on a sync manifest"."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    op = ct.new_op(env, ct.plan_sync(env, ct.SyncFlags()))
+    op.manifest["rows"][0]["post_b64"] = "!!!not base64!!!"
+    c = ct.classify_op(env, op)                    # must not raise
+    assert c["resolutions"] == ["back"]
+    assert "could not be read" in c["note"]
+    del op.manifest["rows"][0]["post_b64"]         # the KeyError half
+    assert ct.classify_op(env, op)["resolutions"] == ["back"]
+
+
+def test_tally_is_not_journaled_to_disk(two_account_env, tmp_path):
+    """Minor: plan_sync returns tally inside the manifest, so every skipped
+    thread's title - including the ones the destination deliberately DELETED
+    - was written into ~/.claude-code-threads. Nothing in execute/undo/recover
+    reads it."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Copy Me")
+    _transcript(env, "sid-a")
+    _row(src, "local_b.json", "sid-b", "Deleted Secret")
+    _transcript(env, "sid-b")
+    with open(os.path.join(dst, "deleted_sid-b"), "w") as fh:
+        fh.write("1")
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert m["tally"]["deleted"] == ["Deleted Secret"]      # the report keeps it
+    assert ct.run_sync(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    assert "tally" not in op.manifest
+    with open(ct.manifest_path(op), encoding="utf-8") as fh:
+        assert "Deleted Secret" not in fh.read()
+
+
+def test_unreadable_destination_store_is_a_layout_error_not_a_traceback(
+        two_account_env, tmp_path, monkeypatch):
+    """Minor: discover_stores proves only the ROOT is enumerable. A
+    PermissionError on an account/org dir escaped main() as a raw unredacted
+    traceback."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    real_listdir = os.listdir
+
+    def boom(p):
+        if os.path.normcase(str(p)) == os.path.normcase(dst):
+            raise PermissionError("denied")
+        return real_listdir(p)
+    monkeypatch.setattr(os, "listdir", boom)
+    with pytest.raises(ct.LayoutError) as exc_info:
+        ct.plan_sync(env, ct.SyncFlags())
+    assert exc_info.value.exit_code == 2
+
+
+def test_unreadable_account_dir_is_a_layout_error_not_a_traceback(
+        two_account_env, tmp_path, monkeypatch):
+    env, src, dst = two_account_env(tmp_path)
+    account_dir = os.path.dirname(dst)
+    real_listdir = os.listdir
+
+    def boom(p):
+        if os.path.normcase(str(p)) == os.path.normcase(account_dir):
+            raise PermissionError("denied")
+        return real_listdir(p)
+    monkeypatch.setattr(os, "listdir", boom)
+    with pytest.raises(ct.LayoutError) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    assert exc_info.value.exit_code == 2
+
+
+def test_drifted_rows_are_deduplicated(two_account_env, tmp_path):
+    """Minor: a pending and a written row can share a title, which listed it
+    twice - and that list reaches cmd_recover's printed line, reading as two
+    separate problems."""
+    env, src, dst = two_account_env(tmp_path)
+    for i in range(2):
+        sid = "sid-%d" % i
+        _row(src, "local_%d.json" % i, sid, "Same Title")
+        _transcript(env, sid)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    for r in op.manifest["rows"]:
+        with open(r["dest_path"], "w", encoding="utf-8") as fh:
+            fh.write('{"unexpected": true}')       # both drift, same title
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == ["back"]
+    assert c["drifted_rows"] == ["Same Title"]

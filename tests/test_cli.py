@@ -123,7 +123,7 @@ def test_recover_forward_back_mutually_exclusive(ready):
 def test_undo_without_id_prefers_older_completed_move_over_newer_undo(
         ready, tmp_path, write_transcript, write_row, capsys):
     """delta 2: cmd_undo's candidate filter must be completed ops whose
-    op_type is 'move' (or missing) - not just any 'completed' op.
+    op_type is 'move' or 'sync' (or missing) - not just any 'completed' op.
 
     Sequence: move session B, then move session A (SID), then undo A. A's
     own move op is now 'undone' (terminal, not 'completed'); the newest
