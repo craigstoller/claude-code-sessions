@@ -2222,5 +2222,40 @@ def select_sync_rows(env, source, dest, flags):
     return picked, tally
 
 
+# E5: stripping these took a real row from 132,264 to 715 bytes with the
+# sidebar, history, responses and connectors all unaffected - the app sources
+# connectors from the destination account's own configuration, so the row's
+# copy is redundant baggage that would otherwise disclose which integrations
+# the source account has and where their endpoints are.
+SYNC_STRIP = ("remoteMcpServersConfig", "enabledMcpTools", "bridgeSessionIds",
+              "scheduledTaskId")
+
+# A permission granted under one login was never granted under the other.
+# NOT yet measured (the E5 row carried no non-default permission state); if the
+# app dislikes the defaults the failure mode is a re-prompt, not a leak.
+SYNC_RESET = {"alwaysAllowedReasons": [], "sessionPermissionUpdates": [],
+              "chromePermissionMode": None, "chromeTabGroupId": None}
+
+
+def transform_row(data, verbatim=False):
+    """Serialize a row for the destination account. Returns (bytes, removed, reset).
+
+    Never mutates the caller's dict - selection holds the originals and a
+    dry run must be able to report without changing anything.
+    """
+    if verbatim:
+        return json.dumps(data, separators=(",", ":")).encode("utf-8"), [], []
+    out = dict(data)
+    removed = [k for k in SYNC_STRIP if k in out]
+    for k in removed:
+        out.pop(k)
+    reset = []
+    for k, v in SYNC_RESET.items():
+        if k in out and out[k] != v:
+            out[k] = v
+            reset.append(k)
+    return json.dumps(out, separators=(",", ":")).encode("utf-8"), removed, sorted(reset)
+
+
 if __name__ == "__main__":
     sys.exit(main())

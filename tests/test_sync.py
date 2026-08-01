@@ -236,3 +236,61 @@ def test_unreadable_row_is_reported_not_copied(two_account_env, tmp_path):
     picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
     assert picked == []
     assert tally["unreadable"] == ["local_bad.json"]
+
+
+def test_transform_strips_connector_fields_and_shrinks_row():
+    data = {"sessionId": "local_x", "cliSessionId": "sid", "cwd": "C:\\p",
+            "title": "T", "lastActivityAt": 5,
+            "remoteMcpServersConfig": [{"name": "Canva", "tools": ["x" * 5000]}],
+            "enabledMcpTools": ["a"] * 200,
+            "bridgeSessionIds": ["b"], "scheduledTaskId": "task-1"}
+    before = len(json.dumps(data, separators=(",", ":")).encode("utf-8"))
+    blob, removed, reset = ct.transform_row(data)
+    out = json.loads(blob)
+    for k in ("remoteMcpServersConfig", "enabledMcpTools", "bridgeSessionIds",
+              "scheduledTaskId"):
+        assert k not in out
+    assert set(removed) == {"remoteMcpServersConfig", "enabledMcpTools",
+                            "bridgeSessionIds", "scheduledTaskId"}
+    assert len(blob) < before / 10          # E5 measured 99.5% on a real row
+
+
+def test_transform_keeps_identity_fields():
+    data = {"sessionId": "local_x", "cliSessionId": "sid", "cwd": "C:\\p",
+            "originCwd": "C:\\p", "title": "T", "titleSource": "auto",
+            "lastActivityAt": 5, "createdAt": 1, "model": "m", "effort": "high",
+            "isArchived": False, "forkedFromSessionId": "other"}
+    blob, removed, reset = ct.transform_row(data)
+    out = json.loads(blob)
+    for k in data:
+        assert out[k] == data[k], k
+    assert removed == [] and reset == []
+
+
+def test_transform_resets_permission_fields():
+    data = {"cliSessionId": "sid", "title": "T",
+            "alwaysAllowedReasons": ["because"],
+            "sessionPermissionUpdates": [{"grant": "all"}],
+            "chromePermissionMode": "always", "chromeTabGroupId": 7}
+    blob, removed, reset = ct.transform_row(data)
+    out = json.loads(blob)
+    assert out["alwaysAllowedReasons"] == []
+    assert out["sessionPermissionUpdates"] == []
+    assert out["chromePermissionMode"] is None and out["chromeTabGroupId"] is None
+    assert set(reset) == {"alwaysAllowedReasons", "sessionPermissionUpdates",
+                          "chromePermissionMode", "chromeTabGroupId"}
+
+
+def test_verbatim_disables_the_transform():
+    data = {"cliSessionId": "sid", "title": "T",
+            "remoteMcpServersConfig": [{"name": "Canva"}],
+            "alwaysAllowedReasons": ["because"]}
+    blob, removed, reset = ct.transform_row(data, verbatim=True)
+    assert json.loads(blob) == data
+    assert removed == [] and reset == []
+
+
+def test_transform_does_not_mutate_its_input():
+    data = {"cliSessionId": "sid", "remoteMcpServersConfig": [{"name": "Canva"}]}
+    ct.transform_row(data)
+    assert "remoteMcpServersConfig" in data       # caller's dict untouched
