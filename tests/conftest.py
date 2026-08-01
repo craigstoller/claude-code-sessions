@@ -64,7 +64,7 @@ def two_account_env(mkenv):
     """Env with a source (signed-in) and destination account store, plus a
     ~/.claude.json naming the source, mirroring the real layout
     <accountUuid>/<organizationUuid>/local_*.json."""
-    def make(tmp_path, dest_email="other@example.com"):
+    def make(tmp_path):
         env = mkenv(tmp_path, n_store_roots=1)
         root = env.store_candidates[0]
         src = os.path.join(root, "aaaaaaaa-0000-0000-0000-000000000001",

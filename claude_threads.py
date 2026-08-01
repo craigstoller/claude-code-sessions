@@ -2071,8 +2071,13 @@ def live_account(env):
 
     ~/.claude.json's oauthAccount carries accountUuid, organizationUuid AND
     emailAddress, which resolves the whole store path and gives the user a
-    destination they can recognise. config.json's lastKnownAccountUuid is the
-    fallback but names only the account half.
+    destination they can recognise. The exact (account, org) pair is
+    preferred; if organizationUuid names a dir that doesn't exist on disk
+    (config known, dir not yet created), fall back to matching the account
+    alone. config.json's lastKnownAccountUuid is the last-resort fallback
+    but names only the account half - if more than one org dir sits under
+    that account there is no evidence which is live, so this refuses to
+    guess and returns None rather than picking one.
     """
     try:
         with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
@@ -2082,6 +2087,11 @@ def live_account(env):
     dirs = _account_dirs(env)
     acct_uuid = oa.get("accountUuid")
     if acct_uuid:
+        org_uuid = oa.get("organizationUuid")
+        exact = [(a, o, p) for a, o, p in dirs if a == acct_uuid and o == org_uuid]
+        if exact:
+            a, o, p = exact[0]
+            return Account(a, o, oa.get("emailAddress") or "", p)
         for a, o, p in dirs:
             if a == acct_uuid:
                 return Account(a, o, oa.get("emailAddress") or "", p)
@@ -2093,9 +2103,14 @@ def live_account(env):
         except (OSError, ValueError):
             continue
         if last:
-            for a, o, p in dirs:
-                if a == last:
-                    return Account(a, o, "", p)
+            matches = [(a, o, p) for a, o, p in dirs if a == last]
+            if len(matches) == 1:
+                a, o, p = matches[0]
+                return Account(a, o, "", p)
+            if len(matches) > 1:
+                return None    # ambiguous org under this account - fail closed
+            # zero matches: this candidate's config names an account with no
+            # store dir on disk yet - try the next store candidate's config
     return None
 
 
@@ -2111,16 +2126,24 @@ def resolve_sync_endpoints(env, to=None):
         raise Refusal(
             "cannot identify the signed-in account from ~/.claude.json or config.json.\n"
             "Refusing to guess which store is live - naming the wrong one would write the\n"
-            "account the app is actively using. Re-run with --to <uuid> naming the\n"
-            "DESTINATION explicitly. Stores found:\n" + listing)
+            "account the app is actively using, with no process guard to stop it.\n"
+            "--to cannot override this: it names the destination, and without knowing\n"
+            "which account is live we cannot verify the one you named is not it.\n"
+            "Fix: sign in to the Claude desktop app so ~/.claude.json names the account.\n"
+            "Stores found:\n" + listing)
     others = [Account(a, o, "", p) for a, o, p in dirs if a != source.account_uuid]
     if not others:
         raise Refusal("no other account store on this machine - nothing to sync into")
     if to:
-        matched = [c for c in others if to.lower() in (c.account_uuid + " " + c.email).lower()]
-        if len(matched) != 1:
-            raise Refusal("--to {0!r} matched {1} accounts; be more specific"
-                          .format(to, len(matched)))
+        matched = [c for c in others
+                  if to.lower() in (c.account_uuid + " " + c.org_uuid + " " + c.email).lower()]
+        if not matched:
+            raise Refusal("--to {0!r} matched no other account store".format(to))
+        if len(matched) > 1:
+            listing = "\n".join("   {0}/{1}".format(c.account_uuid[:8], c.org_uuid[:8])
+                                for c in matched)
+            raise Refusal("--to {0!r} matched {1} accounts; be more specific:\n{2}"
+                          .format(to, len(matched), listing))
         return source, matched[0]
     if len(others) > 1:
         listing = "\n".join("   {0}/{1}".format(c.account_uuid[:8], c.org_uuid[:8])
