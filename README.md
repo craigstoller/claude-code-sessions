@@ -34,9 +34,11 @@ python claude_threads.py --help
 
 `move`, `undo`, and `recover` refuse to mutate anything while they can see a running Claude
 process, but closing the app first avoids the refusal and guarantees nothing is actively
-appending to the transcript you're about to relocate. (`sync` is the one exception — see below:
-it never writes the account you're signed into, so it carries no such check and doesn't need the
-app closed.)
+appending to the transcript you're about to relocate. (`sync` is the partial exception — see
+below: it never writes the account you're signed into, so it usually carries no such check.
+The exception to the exception is when it had to fall back to `config.json` to work out which
+account is signed in — weaker evidence, so it then requires the app closed like everything
+else.)
 
 ## Usage
 
@@ -112,9 +114,18 @@ is always a preview will misread `sync --apply --json`.
   connectors configured. A thread that relies on one opens fine either way and fails at its first
   tool call if the integration isn't set up there too; set it up in the destination account.
   `--verbatim` copies rows unchanged, connector config included.
-- **It does not need the app closed, unlike `move`, `undo`, and `recover`.** `sync` only ever
-  writes the store you are *not* signed into, and re-checks that at the moment it writes, not
-  just when it planned.
+- **It usually does not need the app closed, unlike `move`, `undo`, and `recover`.** `sync` only
+  ever writes the store you are *not* signed into, and re-checks that at the moment it writes,
+  not just when it planned. That re-check catches an account *switch* between planning and
+  writing; it is the same determination run again, not an independent second opinion, so it is
+  only as good as the evidence underneath it. When that evidence is `~/.claude.json`'s
+  `oauthAccount` — the normal case, where you are signed in — it is strong and no process check
+  applies. When `~/.claude.json` is missing or has no `oauthAccount` and `sync` has to fall back
+  to `config.json`'s `lastKnownAccountUuid`, it is weaker: that field can still name the account
+  you switched *away* from, which would make the "other" store the live one. A dry run labels
+  that case explicitly (`from  (from config.json)`, plus a warning line) instead of the ordinary
+  `(email unknown)`, and `--apply`, `undo`, and `recover --back` all refuse in that state while
+  they can see a running Claude process. Signing into the desktop app removes the check.
 - **`sync` cannot tell you the destination's email** — it isn't recorded anywhere on disk for an
   account you aren't currently signed into, so a dry run prints `(email unknown)` for it. Both
   endpoints print their account/org id prefix and their full store path instead, so you have a
@@ -144,7 +155,9 @@ is always a preview will misread `sync --apply --json`.
   into, re-verifying that at the moment it writes as well as when it planned. That is also why
   it refuses outright if it cannot identify which account is signed in at all: `--to` names a
   destination, but without a confirmed live account there is nothing to check that destination
-  against.
+  against. And when the only evidence for which account is live comes from `config.json` rather
+  than a signed-in `oauthAccount`, `sync` stops relying on that check alone and adds the same
+  running-app guard `move`/`undo`/`recover` use.
 - **Refusal philosophy.** The tool fails closed: an unrecognized on-disk layout, an unreadable
   row, an ambiguous encoding scheme, or a running Claude process is a refusal, not a guess.
   "Couldn't look" is never treated as "nothing there."

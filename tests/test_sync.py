@@ -1151,3 +1151,171 @@ def test_cli_caps_the_tombstone_list_like_the_to_copy_list(
     out = capsys.readouterr().out
     assert out.count("kept deleted:") == 15
     assert "... and 2 more" in out
+
+
+# ------------------------------- whole-branch review: Finding 1 (Critical)
+#
+# live_account's config.json fallback can name a DORMANT account as live
+# (lastKnownAccountUuid's freshness across an account switch has never been
+# measured), and execute_sync_op's "re-check" calls the same live_account, so
+# it returns the same wrong answer. The ruling: keep the fallback usable, but
+# back the weaker evidence with the running-app guard the other mutating
+# commands already use.
+
+
+def _weaken(env):
+    """Force live_account down its config.json fallback: no ~/.claude.json,
+    and config.json's lastKnownAccountUuid naming the source account."""
+    os.unlink(os.path.join(env.home, ".claude.json"))
+    cfg = os.path.join(os.path.dirname(env.store_candidates[0]), "config.json")
+    with open(cfg, "w", encoding="utf-8") as fh:
+        json.dump({"lastKnownAccountUuid": "aaaaaaaa-0000-0000-0000-000000000001"}, fh)
+
+
+def _app_running(env):
+    env.process_lister = lambda: [(999999, "claude.exe")]
+
+
+def test_live_account_config_fallback_success_path(two_account_env, tmp_path):
+    """The fallback's SUCCESS branch had no test at all - only its None
+    return was covered. It must resolve, report itself as the weaker
+    'config' determination, and still leave the other store as the
+    destination."""
+    env, src, dst = two_account_env(tmp_path)
+    _weaken(env)
+    acct = ct.live_account(env)
+    assert acct is not None
+    assert acct.account_uuid == "aaaaaaaa-0000-0000-0000-000000000001"
+    assert acct.org_uuid == "bbbbbbbb-0000-0000-0000-000000000002"
+    assert acct.email == ""                       # config.json records no email
+    assert acct.resolved_from == "config"
+    assert os.path.normcase(acct.path) == os.path.normcase(src)
+    source, dest = ct.resolve_sync_endpoints(env)
+    assert source.resolved_from == "config"       # provenance survives resolution
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+
+
+def test_oauth_resolution_records_its_stronger_provenance(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    assert ct.live_account(env).resolved_from == "oauth"
+    assert ct.resolve_sync_endpoints(env)[0].resolved_from == "oauth"
+
+
+def test_weakly_resolved_apply_refuses_while_claude_is_running(two_account_env,
+                                                               tmp_path):
+    """The hole: config.json can name the account the user switched AWAY
+    from, making the "other" store the live one - and the execute-time
+    re-check calls the same live_account, so it agrees. On that evidence
+    sync must fall back to the process guard the other mutating commands
+    use, rather than writing another account's store while the app runs."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    _weaken(env)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    _app_running(env)
+    with pytest.raises(ct.Refusal, match="config.json") as exc_info:
+        ct.run_sync(env, m)
+    assert "Close the Claude app" in str(exc_info.value)
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+    op = ct.list_ops(env)[-1]
+    assert op.manifest["status"] == "journaled"    # refused before the row loop
+
+
+def test_weakly_resolved_apply_succeeds_when_claude_is_not_running(two_account_env,
+                                                                  tmp_path):
+    """The fallback stays usable: the same weakly-resolved run completes
+    normally once no Claude process is visible."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    _weaken(env)
+    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == ["local_0.json"]
+
+
+def test_oauth_resolved_apply_never_consults_the_process_lister(two_account_env,
+                                                                tmp_path):
+    """An oauthAccount-resolved run is unchanged: no process guard at all.
+    The lister reports a running Claude, so if it were consulted the run
+    would refuse - it must never be called in the first place."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    calls = []
+
+    def lister():
+        calls.append(1)
+        return [(999999, "claude.exe")]
+    env.process_lister = lister
+    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+    assert calls == []
+
+
+def test_undo_sync_of_a_weak_store_refuses_while_claude_is_running(two_account_env,
+                                                                   tmp_path):
+    """A weakly-resolved store must not be DELETED from while the app runs
+    either - undo_sync inherits the guard through _sync_delete_targets."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))    # strong evidence: fine
+    op = ct.list_ops(env)[-1]
+    _weaken(env)
+    _app_running(env)
+    with pytest.raises(ct.Refusal, match="config.json"):
+        ct.undo_sync(env, op)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))     # untouched
+
+
+def test_recover_back_on_a_weak_store_refuses_while_claude_is_running(two_account_env,
+                                                                      tmp_path):
+    """recover's sync 'back' arm deletes through the same helper and must
+    honour the same guard - a weakly-resolved account must not be written
+    OR deleted from while the app is running."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    written_row = next(r for r in op.manifest["rows"] if r.get("written"))
+    pending_row = next(r for r in op.manifest["rows"] if not r.get("written"))
+    with open(pending_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"unexpected": true}')          # blocks forward -> back is offered
+    _weaken(env)
+    _app_running(env)
+    with pytest.raises(ct.Refusal, match="config.json"):
+        ct.recover_op(env, op, "back")
+    assert os.path.exists(written_row["dest_path"])          # nothing deleted
+
+
+def test_cli_labels_a_config_resolved_source_instead_of_email_unknown(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """A config.json-resolved source used to print a bare '(email unknown)',
+    identical to an ordinary dormant-side line. It must name the evidence and
+    state that --apply now needs the app closed."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    _weaken(env)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--verbose"]) == 0
+    out = capsys.readouterr().out
+    assert "(from config.json)" in out
+    assert "from  (email unknown)" not in out
+    assert "lastKnownAccountUuid" in out
+    assert "refuse while Claude is running" in out
+
+
+def test_json_plan_carries_the_live_account_provenance(two_account_env, tmp_path,
+                                                       monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    _weaken(env)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["source_resolved_from"] == "config"

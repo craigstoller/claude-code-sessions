@@ -2124,6 +2124,17 @@ class Account:
     org_uuid: str
     email: str
     path: str
+    # How live_account() decided this was the signed-in account, and therefore
+    # how much the whole no-process-guard design is entitled to trust it:
+    #   "oauth"  - ~/.claude.json's oauthAccount named it outright (strong).
+    #   "config" - only config.json's lastKnownAccountUuid named it. That
+    #              field's freshness across an account switch has never been
+    #              measured, so it can name the account the user switched
+    #              AWAY from - which would make the "other" store the live
+    #              one (weak; see _guard_weakly_resolved).
+    #   ""       - not a live-account determination at all (every dormant
+    #              candidate resolve_sync_endpoints builds).
+    resolved_from: str = ""
 
 
 def _account_dirs(env):
@@ -2157,6 +2168,14 @@ def live_account(env):
     but names only the account half - if more than one org dir sits under
     that account there is no evidence which is live, so this refuses to
     guess and returns None rather than picking one.
+
+    The returned Account records WHICH of those two paths answered, in
+    `resolved_from`. That is not decoration: sync ships with no running-app
+    guard because it only ever writes the dormant store, and the config.json
+    fallback is not strong enough evidence to underwrite that on its own (its
+    freshness across an account switch has never been measured). Callers that
+    are about to mutate must therefore consult `resolved_from` - see
+    _guard_weakly_resolved.
     """
     try:
         with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
@@ -2170,10 +2189,10 @@ def live_account(env):
         exact = [(a, o, p) for a, o, p in dirs if a == acct_uuid and o == org_uuid]
         if exact:
             a, o, p = exact[0]
-            return Account(a, o, oa.get("emailAddress") or "", p)
+            return Account(a, o, oa.get("emailAddress") or "", p, "oauth")
         for a, o, p in dirs:
             if a == acct_uuid:
-                return Account(a, o, oa.get("emailAddress") or "", p)
+                return Account(a, o, oa.get("emailAddress") or "", p, "oauth")
     for cand in env.store_candidates:
         cfg = os.path.join(os.path.dirname(cand), "config.json")
         try:
@@ -2185,12 +2204,50 @@ def live_account(env):
             matches = [(a, o, p) for a, o, p in dirs if a == last]
             if len(matches) == 1:
                 a, o, p = matches[0]
-                return Account(a, o, "", p)
+                return Account(a, o, "", p, "config")
             if len(matches) > 1:
                 return None    # ambiguous org under this account - fail closed
             # zero matches: this candidate's config names an account with no
             # store dir on disk yet - try the next store candidate's config
     return None
+
+
+def _guard_weakly_resolved(env, live, what):
+    """Refuse to `what` a store while Claude may be running, unless the live
+    account was named outright by ~/.claude.json's oauthAccount.
+
+    sync is the one mutating command with no running-app guard. That is only
+    safe because the destination is *guaranteed* to be the dormant account -
+    and live_account's config.json fallback does not deliver a guarantee. Its
+    lastKnownAccountUuid can name the account the user switched away from, in
+    which case the store sync picks as "the other one" is the account the app
+    is actively using; the execute-time re-check cannot catch that, because it
+    calls the same live_account and gets the same wrong answer.
+
+    So: keep the fallback usable, but back the weaker evidence with the
+    stronger check. A weakly-resolved live account (config.json, or no
+    determination at all) makes sync behave like move/undo/recover - it
+    refuses in the presence of a running Claude process. An oauthAccount
+    resolution is unchanged: the process lister is never even consulted.
+
+    `what` names the mutation for the message ("write to", "delete from").
+    """
+    if live is not None and live.resolved_from == "oauth":
+        return
+    running = claude_running(env)
+    if not running:
+        return
+    how = ("could not be identified at all just now" if live is None else
+           "was identified only from config.json's lastKnownAccountUuid, not from "
+           "a signed-in oauthAccount in ~/.claude.json")
+    raise Refusal(
+        "the signed-in account {0}, so the destination is only probably the dormant "
+        "store - and Claude appears to be running ({1}). sync ships without a "
+        "process guard only because it KNOWS it is writing the dormant account; on "
+        "this weaker evidence it refuses to {2} another account's store. Close the "
+        "Claude app and re-run, or sign in to the desktop app so ~/.claude.json "
+        "names the account (which removes this check entirely)."
+        .format(how, running[0], what))
 
 
 def resolve_sync_endpoints(env, to=None):
@@ -2355,6 +2412,12 @@ def plan_sync(env, flags):
     return {"op_type": "sync",
             "source_account": source.account_uuid, "source_org": source.org_uuid,
             "source_email": source.email, "source_path": source.path,
+            # Provenance of the live-account determination ("oauth"/"config"),
+            # so the CLI can say plainly which evidence this plan rests on and
+            # warn that --apply will need the app closed. The executor does
+            # NOT read this key - it re-derives live_account itself, which is
+            # what makes the guard unbypassable by a hand-edited manifest.
+            "source_resolved_from": source.resolved_from,
             "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
             "dest_email": dest.email, "dest_path": dest.path,
             "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
@@ -2389,6 +2452,11 @@ def execute_sync_op(env, op):
             "destination resolves to the LIVE account ({0}); refusing - sync must "
             "never write to the account that is currently live, which is exactly "
             "why it ships with no process guard.".format(live.email or live.account_uuid))
+    # ...and the check above is only worth what live_account's evidence is
+    # worth. A live account resolved from config.json (or not resolved at
+    # all) cannot underwrite "the destination is definitely dormant", so this
+    # op falls back to the same running-app guard move/undo/recover use.
+    _guard_weakly_resolved(env, live, "write to")
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
 
@@ -2617,6 +2685,12 @@ def _sync_delete_targets(env, m):
             "destination resolves to the LIVE account ({0}); refusing - undo, "
             "like sync, may only ever touch a dormant store, never the account "
             "that is currently live.".format(live.email or live.account_uuid))
+    # A weakly-resolved live account is exactly as dangerous here as it is on
+    # the write side (execute_sync_op) - a store that is only PROBABLY dormant
+    # must not be deleted from while the app might be running either. Both
+    # callers of this helper (undo_sync, recover_op's sync 'back' arm) inherit
+    # the guard from this one place, so neither can bypass it.
+    _guard_weakly_resolved(env, live, "delete from")
     drifted, unreadable, removable = [], [], []
     for r in m["rows"]:
         if not r.get("written"):
@@ -2724,10 +2798,21 @@ def cmd_sync(env, ns):
     # prefix, through the same say()/redact() convention (redacted unless
     # --verbose), giving a cautious user a physical folder to recognise
     # instead of eight hex characters. Symmetric for the source.
+    # A source resolved from config.json must never print the same
+    # "(email unknown)" an ordinary dormant-side line prints - that is the
+    # weaker determination the whole no-process-guard design rests on, and it
+    # would otherwise look identical to the normal case. Say where it came
+    # from, and say what --apply will now require.
+    weak = manifest.get("source_resolved_from") == "config"
     say("from  {0:24} ({1}/{2})   signed in".format(
-        manifest["source_email"] or "(email unknown)",
+        "(from config.json)" if weak else
+        (manifest["source_email"] or "(email unknown)"),
         manifest["source_account"][:8], manifest["source_org"][:8]))
     say("      " + manifest["source_path"])
+    if weak:
+        say("      ! identified from config.json's lastKnownAccountUuid, not from a")
+        say("        signed-in oauthAccount - weaker evidence that this is really the")
+        say("        live account, so --apply will refuse while Claude is running.")
     say("to    {0:24} ({1}/{2})   signed out".format(
         manifest["dest_email"] or "(email unknown)",
         manifest["dest_account"][:8], manifest["dest_org"][:8]))

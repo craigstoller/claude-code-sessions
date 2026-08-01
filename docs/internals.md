@@ -165,15 +165,39 @@ the thread, for instance) and overwriting it would discard that. The refusal lea
 
 **`sync` also re-confirms, at the moment it writes, that the destination is still the dormant
 account** — the same check that chose it at plan time (`resolve_sync_endpoints`), run again
-against `live_account()` at execute time. This is *why* `sync` can ship with no running-app
-guard at all, unlike `move`/`undo`/`recover`: those refuse in the presence of a running Claude
-process because they might be racing it, but `sync` never touches the account a running process
-would be using, and re-verifies that fact fresh on every write rather than trusting a plan made
-moments — or days — earlier. The same logic is why `sync` refuses outright if it cannot identify
-the signed-in account at all, from neither `~/.claude.json` nor `config.json`: with no live
-account confirmed, there is nothing to check the named destination *against*. `--to` only
-narrows which dormant store to use among several; it cannot supply that missing certainty, and
-does not attempt to.
+against `live_account()` at execute time. This is *why* `sync` can normally ship with no
+running-app guard, unlike `move`/`undo`/`recover`: those refuse in the presence of a running
+Claude process because they might be racing it, but `sync` never touches the account a running
+process would be using.
+
+Be precise about what that re-check buys, because it is easy to over-read. It calls the *same*
+`live_account()` and compares its answer to the manifest's destination, so it catches an account
+**switch** between planning and writing (or a hand-edited/stale manifest). It is **not** an
+independent verification of the original determination: if `live_account()` was wrong at plan
+time it is wrong again at execute time, and the two agree.
+
+That matters because `live_account()` has two evidence paths of very different strength:
+
+| Source | `Account.resolved_from` | Strength |
+|---|---|---|
+| `~/.claude.json` → `oauthAccount` | `"oauth"` | Names the account, org, and email outright. |
+| `config.json` → `lastKnownAccountUuid` | `"config"` | Names only the account half, and its freshness across an account switch has **never been measured** — it can still name the account you switched *away* from, which would make the "other" store the live one. |
+
+So the fallback stays usable, but it does not get to underwrite the no-process-guard design on
+its own. When `resolved_from` is `"config"` (or `live_account()` returns `None` outright at
+execute time), `_guard_weakly_resolved` applies the same running-app refusal the other mutating
+commands use — on the write side (`execute_sync_op`) *and* the delete side
+(`_sync_delete_targets`, shared by `undo_sync` and `recover`'s `back` arm), so a store that is
+only *probably* dormant can be neither written nor deleted from while the app is visible. When
+`resolved_from` is `"oauth"` nothing changes: the process lister is never even consulted. The
+dry run labels a weakly-resolved source explicitly rather than printing the same
+`(email unknown)` an ordinary dormant-side line prints.
+
+The related-but-separate rule is that `sync` refuses outright if it cannot identify the
+signed-in account at all, from neither `~/.claude.json` nor `config.json`: with no live account
+confirmed, there is nothing to check the named destination *against*. `--to` only narrows which
+dormant store to use among several; it cannot supply that missing certainty, and does not
+attempt to.
 
 **A stuck sync is recoverable, but not by rolling forward forever.** If a destination row drifts
 while a sync is non-terminal, `writing` can never complete — `sync` refuses on that same row
