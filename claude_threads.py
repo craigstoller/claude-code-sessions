@@ -2318,14 +2318,36 @@ def execute_sync_op(env, op):
         # let this loop touch a path outside the destination this op was
         # verified against above - the dest_path check just above only means
         # something if every row it is supposed to "cover" is independently
-        # confirmed to actually sit inside it.
-        ensure_contained(r["dest_path"], [m["dest_path"]])
+        # confirmed to actually sit inside it. ensure_contained alone admits
+        # the root itself (real == rreal); a row dest_path equal to the root
+        # would pass that check yet still put atomic_write's <path>.ct-tmp
+        # scratch file one level OUTSIDE the root (a sibling, in its parent)
+        # before the write even fails - so also require every row to be a
+        # direct child of the verified root, not just "under" it.
+        real_dest = ensure_contained(r["dest_path"], [m["dest_path"]])
+        if os.path.dirname(real_dest) != os.path.realpath(m["dest_path"]):
+            raise LayoutError(
+                "row dest_path {0!r} is not a direct child of the destination "
+                "store {1!r}; refusing".format(r["dest_path"], m["dest_path"]))
         post = unb64(r["post_b64"])
         try:
             with open(r["dest_path"], "rb") as fh:
                 current = fh.read()
-        except OSError:
+        except FileNotFoundError:
             current = None            # not there yet - the common case
+        except OSError as exc:
+            # Anything other than "doesn't exist yet" - permission denied,
+            # the row name resolving to a directory, an I/O error - must
+            # refuse rather than be treated as "absent" and written over:
+            # _row_state elsewhere in this module maps an unreadable current
+            # file to "drifted" (the REFUSING branch), never to "safe to
+            # write". Getting this wrong here would silently overwrite a
+            # destination row this process could not actually verify.
+            raise Refusal(
+                "could not read destination row {0!r} (session {1}) to check "
+                "for changes since planning: {2}. The op is left at 'writing' "
+                "- resolve the row, then re-run.".format(
+                    r["name"], r["session_id"], exc))
         if current is None:
             try:
                 atomic_write(r["dest_path"], post)

@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 
 import pytest
 
@@ -434,10 +435,92 @@ def test_crash_before_manifest_save_is_forward_pass_safe(two_account_env, tmp_pa
         on_disk = fh.read()
     assert on_disk == ct.unb64(row0["post_b64"])
 
+    # A byte-for-byte comparison alone would also pass if the resume simply
+    # rewrote identical bytes - it would prove content but not prove the
+    # no-rewrite branch was actually taken. atomic_write goes through
+    # os.replace, which changes the file's identity (confirmed empirically
+    # on this platform: st_ino and st_ctime both change across a real
+    # replace of the same bytes) - record that identity before the forward
+    # pass so an accidental unconditional rewrite is caught even though its
+    # bytes would look identical.
+    before_stat = os.stat(row0["dest_path"])
+
     # Simulate a forward pass resuming this exact op.
     op.manifest["status"] = "journaled"
     ct.save_manifest(op)
     assert ct.execute_sync_op(env, op) == "completed"
     assert op.manifest["rows"][0]["written"] is True
+    after_stat = os.stat(row0["dest_path"])
+    assert after_stat.st_ino == before_stat.st_ino     # no os.replace happened
+    assert after_stat.st_ctime == before_stat.st_ctime  # backstop signal
     with open(row0["dest_path"], "rb") as fh:
         assert fh.read() == on_disk            # not duplicated or corrupted
+
+
+def test_row_dest_path_equal_to_destination_root_is_refused(two_account_env, tmp_path):
+    """ensure_contained alone treats the destination root as 'contained' in
+    itself (real == rreal) - a row dest_path hand-edited to equal
+    m["dest_path"] must still be refused, since atomic_write's
+    <path>.ct-tmp scratch file would otherwise land one level OUTSIDE the
+    verified root (a sibling of the destination directory, in its parent)
+    before the write even fails."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    m["rows"][0]["dest_path"] = m["dest_path"]        # the store root itself
+    stray_scratch = m["dest_path"] + ".ct-tmp"
+    with pytest.raises(ct.LayoutError):
+        ct.run_sync(env, m)
+    assert not os.path.exists(stray_scratch)
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+def test_destination_row_changed_since_planning_is_refused(two_account_env, tmp_path):
+    """select_sync_rows only guarantees a row was ABSENT at plan time. If the
+    destination account changes it before this op runs (or resumes), the
+    planned post-image must never be rewritten over that change - refuse,
+    leave the bytes untouched, and leave the op non-terminal at 'writing' so
+    it stays recoverable instead of silently completing over the loss."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha")
+    _transcript(env, "sid-a")
+    m = ct.plan_sync(env, ct.SyncFlags())
+    dest_path = m["rows"][0]["dest_path"]
+    with open(dest_path, "w", encoding="utf-8") as fh:
+        fh.write('{"changed": true}')
+    with pytest.raises(ct.Refusal, match="changed"):
+        ct.run_sync(env, m)
+    with open(dest_path, encoding="utf-8") as fh:
+        assert fh.read() == '{"changed": true}'        # untouched
+    op = ct.list_ops(env)[-1]
+    assert op.manifest["status"] == "writing"
+
+
+def test_atomic_write_failure_becomes_a_refusal_not_a_traceback(two_account_env, tmp_path):
+    """atomic_write raising OSError (full disk, a permission change, an
+    unmounted destination) must never propagate raw - main() only catches
+    Refusal/LayoutError (and only those get redact()'d before being printed),
+    so a bare OSError would surface as an unredacted traceback exposing
+    paths and account UUIDs. Provoke a real OSError rather than a mock: a
+    leftover, read-only <name>.ct-tmp scratch file at the write target
+    blocks atomic_write's own open() while the row itself is still absent -
+    so the pre-write existence check correctly treats it as new, and the
+    failure exercised is atomic_write's, not the read-check's."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha")
+    _transcript(env, "sid-a")
+    m = ct.plan_sync(env, ct.SyncFlags())
+    dest_path = m["rows"][0]["dest_path"]
+    scratch = dest_path + ".ct-tmp"
+    with open(scratch, "wb") as fh:
+        fh.write(b"leftover")
+    os.chmod(scratch, stat.S_IREAD)
+    try:
+        with pytest.raises(ct.Refusal) as exc_info:
+            ct.run_sync(env, m)
+        assert "could not write" in str(exc_info.value)
+        op = ct.list_ops(env)[-1]
+        assert op.manifest["status"] == "writing"
+    finally:
+        os.chmod(scratch, stat.S_IWRITE)
+        os.unlink(scratch)
