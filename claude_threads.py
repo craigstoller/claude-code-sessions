@@ -1952,6 +1952,21 @@ def build_parser():
     direction.add_argument("--back", action="store_true")
     sp.add_argument("--apply", action="store_true")
     common(sp)
+
+    sp = sub.add_parser("sync", help="copy thread listing rows to your other account")
+    sp.add_argument("--to", default="", metavar="EMAIL_OR_UUID",
+                    help="destination account (required if more than one exists)")
+    sp.add_argument("--only", default="", metavar="SUBSTRING",
+                    help="only threads whose title contains this")
+    sp.add_argument("--include-deleted", action="append", default=[],
+                    dest="include_deleted", metavar="TITLE_OR_ID",
+                    help="also copy this session even though the destination "
+                         "deleted it (names one session; not a blanket switch)")
+    sp.add_argument("--verbatim", action="store_true",
+                    help="copy rows unchanged instead of stripping connector config")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    common(sp)
     return p
 
 
@@ -2092,7 +2107,7 @@ def main(argv=None):
     ns = build_parser().parse_args(argv)
     env = default_env()
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
-                "undo": cmd_undo, "recover": cmd_recover}
+                "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync}
     try:
         return handlers[ns.cmd](env, ns)
     except (Refusal, LayoutError) as exc:
@@ -2310,7 +2325,11 @@ def transform_row(data, verbatim=False):
     if verbatim:
         return json.dumps(data, separators=(",", ":")).encode("utf-8"), [], []
     out = dict(data)
-    removed = [k for k in SYNC_STRIP if k in out]
+    # Sorted, not SYNC_STRIP declaration order: `reset` below is sorted() too,
+    # and the JSON manifest (--json) surfaces both lists on the same row - a
+    # reviewer flagged the mismatched conventions as a stability trap for
+    # anything that reads or diffs that output.
+    removed = sorted(k for k in SYNC_STRIP if k in out)
     for k in removed:
         out.pop(k)
     reset = []
@@ -2669,6 +2688,61 @@ def undo_sync(env, op):
         return "undone"
     finally:
         release_lock(env)
+
+
+def cmd_sync(env, ns):
+    flags = SyncFlags(to=ns.to, only=ns.only,
+                      include_deleted=tuple(ns.include_deleted or ()),
+                      verbatim=ns.verbatim)
+    manifest = plan_sync(env, flags)
+    if ns.json:
+        print(json.dumps(manifest, indent=1))
+        return 0
+
+    def say(line):
+        print(line if ns.verbose else redact(env, line))
+
+    # Spec s5: name both endpoints, with emails, before doing anything. A
+    # destination the user can recognise is a safety feature.
+    say("from  {0:24} ({1})   signed in".format(
+        manifest["source_email"] or "(email unknown)", manifest["source_account"][:8]))
+    say("to    {0:24} ({1})   signed out".format(
+        manifest["dest_email"] or "(email unknown)", manifest["dest_account"][:8]))
+    say("")
+
+    tally = manifest["tally"]
+    LABELS = [("present", "already in the destination"),
+              ("no_transcript", "skipped, transcript gone"),
+              ("deleted", "skipped, deleted in the destination"),
+              ("unreadable", "skipped, unreadable row"),
+              ("filtered", "skipped, did not match --only")]
+    for key, label in LABELS:
+        items = tally.get(key) or []
+        if items:
+            say("{0:36}: {1}".format(label, len(items)))
+    # Tombstone skips are named individually: the user deleted these on
+    # purpose and should see the deletion was honoured, not silently dropped.
+    for title in tally.get("deleted") or []:
+        say("   kept deleted: {0}".format(title))
+    say("{0:36}: {1}".format("to copy", len(manifest["rows"])))
+    for r in manifest["rows"][:15]:
+        say("   {0}".format(r["title"]))
+    if len(manifest["rows"]) > 15:
+        say("   ... and {0} more".format(len(manifest["rows"]) - 15))
+
+    if not manifest["rows"]:
+        say("\nnothing to copy")
+        return 0
+    if not ns.apply:
+        say("\ndry run - pass --apply to copy")
+        return 0
+
+    final = run_sync(env, manifest)
+    say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
+    say("result     : {0}".format(final))
+    say("Sign into {0} (or restart the app) to see them."
+        .format(manifest["dest_email"] or "the other account"))
+    return 0 if final == "completed" else 1
 
 
 if __name__ == "__main__":

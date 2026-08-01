@@ -1001,3 +1001,75 @@ def test_undo_sync_refuses_a_non_sync_op(two_account_env, tmp_path):
     op = ct.new_op(env, {"op_type": "move"})
     with pytest.raises(ct.Refusal, match="not a sync op"):
         ct.undo_sync(env, op)
+
+
+# --------------------------------------------------------------- T6: CLI
+
+
+def test_transform_removed_and_reset_lists_use_the_same_order():
+    """Parked finding: removed came back in SYNC_STRIP declaration order
+    while reset came back sorted() - inconsistent ordering between two
+    lists the JSON manifest surfaces side by side for the same row. Both
+    must use the same (sorted) convention so that output is stable."""
+    data = {"cliSessionId": "sid", "title": "T",
+            "scheduledTaskId": "task-1", "remoteMcpServersConfig": [1],
+            "bridgeSessionIds": ["b"], "enabledMcpTools": ["a"],
+            "chromeTabGroupId": 7, "alwaysAllowedReasons": ["x"]}
+    blob, removed, reset = ct.transform_row(data)
+    assert removed == sorted(removed)
+    assert reset == sorted(reset)
+
+
+def test_cli_dry_run_prints_endpoints_and_writes_nothing(two_account_env, tmp_path,
+                                                         monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync"]) == 0
+    out = capsys.readouterr().out
+    assert "me@example.com" in out
+    assert "signed in" in out
+    assert "dry run" in out.lower()
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+def test_cli_apply_writes_and_reports(two_account_env, tmp_path, monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "copied     : 2" in out
+    assert len([f for f in os.listdir(dst) if f.startswith("local_")]) == 2
+
+
+def test_cli_names_tombstoned_skips_individually(two_account_env, tmp_path,
+                                                 monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Deleted Over There")
+    _transcript(env, "sid-a")
+    with open(os.path.join(dst, "deleted_sid-a"), "w") as fh:
+        fh.write("1")
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    ct.main(["sync", "--verbose"])
+    out = capsys.readouterr().out
+    assert "Deleted Over There" in out
+    assert "deleted in the destination" in out.lower()
+
+
+def test_cli_refusal_exits_1(two_account_env, tmp_path, monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    os.unlink(os.path.join(env.home, ".claude.json"))
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync"]) == 1
+    assert "refused" in capsys.readouterr().err.lower()
+
+
+def test_cli_json_output(two_account_env, tmp_path, monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--json"]) == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["dest_email"] == "" or isinstance(rep["dest_email"], str)
+    assert len(rep["rows"]) == 1
