@@ -4,10 +4,11 @@ Unofficial. Fails closed: verifies the on-disk layout against evidence and
 refuses to mutate anything it cannot positively verify.
 
 Sections (in order):
-  1. Env, exceptions, constants        4. Transcript location
-  2. Helpers (hashing, atomic IO)      5. Transaction engine (move/undo/recover)
-  3. Platform & store discovery,       6. Commands (list/doctor/move/undo/recover)
-     rows, encoding detection          7. CLI wiring
+  1. Env, exceptions, constants        5. Transaction engine (move/undo/recover)
+  2. Helpers (hashing, atomic IO)      6. Commands (list/doctor/move/undo/recover)
+  3. Platform & store discovery,       7. CLI wiring
+     rows, encoding detection          8. Sync (cross-account)
+  4. Transcript location
 """
 from __future__ import annotations
 
@@ -2035,6 +2036,97 @@ def main(argv=None):
         msg = str(exc) if getattr(ns, "verbose", False) else redact(env, str(exc))
         print("{0}: {1}".format(label, msg), file=sys.stderr)
         return exc.exit_code
+
+
+# ----------------------------------------------------------------- 8. sync
+@dataclasses.dataclass
+class Account:
+    account_uuid: str
+    org_uuid: str
+    email: str
+    path: str
+
+
+def _account_dirs(env):
+    """Every <accountUuid>/<organizationUuid> pair present on disk."""
+    disc = discover_stores(env)
+    if disc.status == "error":
+        raise LayoutError("store discovery failed: {0}. 'Couldn't look' is never "
+                          "'nothing there' - refusing.".format(disc.detail))
+    out = []
+    for root in disc.roots:
+        for acct in sorted(os.listdir(root)):
+            ap = os.path.join(root, acct)
+            if not os.path.isdir(ap):
+                continue
+            for org in sorted(os.listdir(ap)):
+                op = os.path.join(ap, org)
+                if os.path.isdir(op):
+                    out.append((acct, org, op))
+    return out
+
+
+def live_account(env):
+    """The signed-in account, named outright rather than guessed.
+
+    ~/.claude.json's oauthAccount carries accountUuid, organizationUuid AND
+    emailAddress, which resolves the whole store path and gives the user a
+    destination they can recognise. config.json's lastKnownAccountUuid is the
+    fallback but names only the account half.
+    """
+    try:
+        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
+            oa = (json.load(fh) or {}).get("oauthAccount") or {}
+    except (OSError, ValueError):
+        oa = {}
+    dirs = _account_dirs(env)
+    acct_uuid = oa.get("accountUuid")
+    if acct_uuid:
+        for a, o, p in dirs:
+            if a == acct_uuid:
+                return Account(a, o, oa.get("emailAddress") or "", p)
+    for cand in env.store_candidates:
+        cfg = os.path.join(os.path.dirname(cand), "config.json")
+        try:
+            with open(cfg, encoding="utf-8") as fh:
+                last = (json.load(fh) or {}).get("lastKnownAccountUuid")
+        except (OSError, ValueError):
+            continue
+        if last:
+            for a, o, p in dirs:
+                if a == last:
+                    return Account(a, o, "", p)
+    return None
+
+
+def resolve_sync_endpoints(env, to=None):
+    """(source, destination). Source is the signed-in account; destination is
+    the other store. Refuses rather than guessing - row-freshness is NEVER
+    used to choose, because sync's whole safety model is 'we only ever write
+    the dormant store', and a wrong guess writes the live one."""
+    dirs = _account_dirs(env)
+    source = live_account(env)
+    if source is None:
+        listing = "\n".join("   {0}/{1}".format(a[:8], o[:8]) for a, o, _ in dirs)
+        raise Refusal(
+            "cannot identify the signed-in account from ~/.claude.json or config.json.\n"
+            "Refusing to guess which store is live - naming the wrong one would write the\n"
+            "account the app is actively using. Re-run with --to <uuid> naming the\n"
+            "DESTINATION explicitly. Stores found:\n" + listing)
+    others = [Account(a, o, "", p) for a, o, p in dirs if a != source.account_uuid]
+    if not others:
+        raise Refusal("no other account store on this machine - nothing to sync into")
+    if to:
+        matched = [c for c in others if to.lower() in (c.account_uuid + " " + c.email).lower()]
+        if len(matched) != 1:
+            raise Refusal("--to {0!r} matched {1} accounts; be more specific"
+                          .format(to, len(matched)))
+        return source, matched[0]
+    if len(others) > 1:
+        listing = "\n".join("   {0}/{1}".format(c.account_uuid[:8], c.org_uuid[:8])
+                            for c in others)
+        raise Refusal("more than one other account store; name one with --to:\n" + listing)
+    return source, others[0]
 
 
 if __name__ == "__main__":

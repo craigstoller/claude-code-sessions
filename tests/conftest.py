@@ -57,3 +57,26 @@ def write_row():
             json.dump(data, fh)
         return path
     return make
+
+
+@pytest.fixture
+def two_account_env(mkenv):
+    """Env with a source (signed-in) and destination account store, plus a
+    ~/.claude.json naming the source, mirroring the real layout
+    <accountUuid>/<organizationUuid>/local_*.json."""
+    def make(tmp_path, dest_email="other@example.com"):
+        env = mkenv(tmp_path, n_store_roots=1)
+        root = env.store_candidates[0]
+        src = os.path.join(root, "aaaaaaaa-0000-0000-0000-000000000001",
+                           "bbbbbbbb-0000-0000-0000-000000000002")
+        dst = os.path.join(root, "cccccccc-0000-0000-0000-000000000003",
+                           "dddddddd-0000-0000-0000-000000000004")
+        os.makedirs(src)
+        os.makedirs(dst)
+        with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {
+                "accountUuid": "aaaaaaaa-0000-0000-0000-000000000001",
+                "organizationUuid": "bbbbbbbb-0000-0000-0000-000000000002",
+                "emailAddress": "me@example.com"}}, fh)
+        return env, src, dst
+    return make
