@@ -2349,14 +2349,38 @@ class SyncFlags:
 
 
 def _destination_tombstones(dest):
-    """Session ids the DESTINATION account has deleted. Only the destination's
-    history matters - tombstones are per-account, so the source's deletions
-    say nothing about what this account should see."""
+    """Ids the DESTINATION account has deleted. Only the destination's history
+    matters - tombstones are per-account, so the source's deletions say
+    nothing about what this account should see.
+
+    Returns raw ids, deliberately not "session ids": a tombstone is filed
+    under a row's cliSessionId OR its local id, and callers must test both
+    (see _tombstone_ids)."""
     out = set()
     for name in _listdir_or_refuse(dest.path, "the destination store"):
         if name.startswith("deleted_"):
             out.add(name[len("deleted_"):])
     return out
+
+
+def _tombstone_ids(e):
+    """Both ids a tombstone for this row could be filed under.
+
+    The spec said `deleted_<cliSessionId>`, and that was what E4 measured. It
+    is not the whole truth. On this machine's own live store the thread titled
+    'E4 tombstone test' carries TWO tombstones: one named for its cliSessionId
+    (bc7333f9...) and one named for its filename stem, i.e. its local id
+    (747a0b6e...). So the app files deletions in both id spaces, and a skip
+    that checks only the session id can miss a real deletion and resurrect a
+    thread the account's user deliberately removed - the first row of this
+    design's own risk table.
+
+    Checking both is safe in the direction that matters. A false positive
+    means declining to copy one row, which the report names and
+    --include-deleted overrides; a false negative resurrects a deletion
+    silently.
+    """
+    return [i for i in (e.get("session_id"), e.get("local_id")) if i]
 
 
 def _resolve_tombstone_overrides(entries, tombs, named):
@@ -2367,7 +2391,8 @@ def _resolve_tombstone_overrides(entries, tombs, named):
     tested per row, so one term silently resurrected every tombstoned thread
     whose title happened to contain it (the reviewer got three from one
     term). Resolve each term against the tombstoned rows up front instead: a
-    full cliSessionId matches exactly; anything else is a title substring and
+    full id - either of the two a tombstone can be filed under, see
+    _tombstone_ids - matches exactly; anything else is a title substring and
     must single one out. More than one match is a refusal that names the
     candidates - resurrecting a deliberately deleted thread is the first row
     of this design's own risk table and must never happen by accident.
@@ -2380,10 +2405,12 @@ def _resolve_tombstone_overrides(entries, tombs, named):
     Returns the set of row filenames whose tombstone skip is overridden.
     """
     out = set()
-    candidates = [e for e in entries if e["session_id"] and e["session_id"] in tombs]
+    candidates = [e for e in entries
+                  if any(i in tombs for i in _tombstone_ids(e))]
     for term in (named or ()):
         t = term.lower()
-        matched = [e for e in candidates if e["session_id"].lower() == t]
+        matched = [e for e in candidates
+                   if t in [i.lower() for i in _tombstone_ids(e)]]
         if not matched:
             matched = [e for e in candidates if t in e["title"].lower()]
         if len(matched) > 1:
@@ -2437,6 +2464,10 @@ def select_sync_rows(env, source, dest, flags):
             continue
         entries.append({"name": name, "src_path": p, "data": d,
                         "session_id": d.get("cliSessionId") or "",
+                        # The row's OTHER id: the filename stem, which is the
+                        # local id, not the session id. Tombstones are written
+                        # in both spaces - see _tombstone_ids.
+                        "local_id": name[len("local_"):-len(".json")],
                         "title": d.get("title") or "(untitled)",
                         "last_activity": d.get("lastActivityAt") or 0})
     overridden = _resolve_tombstone_overrides(entries, tombs, flags.include_deleted)
@@ -2454,7 +2485,7 @@ def select_sync_rows(env, source, dest, flags):
             tally["no_transcript"].append(title)
             continue
         overrode = False
-        if sid in tombs:
+        if any(i in tombs for i in _tombstone_ids(e)):
             # E4: the app shows a restored row for a deleted session, so this
             # skip is the only thing preventing a resurrection.
             if name not in overridden:

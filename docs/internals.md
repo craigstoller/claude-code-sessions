@@ -117,12 +117,21 @@ that still references it, which is a normal, expected state rather than corrupti
 
 *(observed July 2026, Claude Desktop (Windows); format may change)*
 
-Deleting a thread in the app writes a file named `deleted_<cliSessionId>` beside the listing
-rows, inside `<accountUuid>/<organizationUuid>/`. It is 13 bytes: an epoch-millisecond
-timestamp of the deletion. The listing row is **removed outright**, not blanked in place, and
-the **transcript is left on disk**.
+Deleting a thread in the app writes a `deleted_<id>` file beside the listing rows, inside
+`<accountUuid>/<organizationUuid>/`. It is 13 bytes: an epoch-millisecond timestamp of the
+deletion. The listing row is **removed outright**, not blanked in place, and the **transcript
+is left on disk**.
 
-Two consequences that are easy to get wrong:
+**`<id>` is not always the `cliSessionId`, which is the trap.** The obvious reading — and what
+the first measurement here recorded — is `deleted_<cliSessionId>`. That is incomplete. A
+thread on the author's own store carries *two* tombstones: one named for its `cliSessionId`
+(`bc7333f9…`) and one named for its **local id**, the `local_<id>.json` filename stem
+(`747a0b6e…`). So deletions are filed in **both id spaces**, and anything that honours
+tombstones has to test both. Checking only the session id misses a real deletion silently;
+`sync` checks both, and errs toward declining to copy, because a false positive is one named
+row you can override and a false negative resurrects something someone deliberately deleted.
+
+Two further consequences that are easy to get wrong:
 
 - **They are per-account.** A deletion under one account says nothing about what another
   account should see — a tombstone lives inside the same per-account folder as the rows it's

@@ -195,6 +195,33 @@ def test_skips_sessions_the_destination_deleted(two_account_env, tmp_path):
     assert tally["deleted"] == ["Alpha"]
 
 
+def test_skips_a_tombstone_filed_under_the_rows_local_id(two_account_env, tmp_path):
+    """The spec said tombstones are named `deleted_<cliSessionId>`, and E4
+    measured one. That is not the whole truth: on the author's own live store
+    the thread 'E4 tombstone test' carries TWO tombstones - one for its
+    cliSessionId (bc7333f9...) and one for its filename stem, i.e. its local
+    id (747a0b6e...). A skip that only checks the session id therefore misses
+    a real deletion and resurrects the thread."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_747a0b6e.json", "bc7333f9", "E4 tombstone test")
+    _transcript(env, "bc7333f9")
+    # ONLY the local-id tombstone - the session-id one is absent, which is
+    # the case the old `sid in tombs` test could not see.
+    with open(os.path.join(dst, "deleted_747a0b6e"), "w") as fh:
+        fh.write("1785541024931")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
+    assert picked == []
+    assert tally["deleted"] == ["E4 tombstone test"]
+
+    # ...and --include-deleted can still name it, by either id.
+    picked, tally = ct.select_sync_rows(
+        env, source, dest, ct.SyncFlags(include_deleted=("747a0b6e",)))
+    assert [r["title"] for r in picked] == ["E4 tombstone test"]
+    assert tally["resurrected"] == ["E4 tombstone test"]
+    assert picked[0]["overrode_tombstone"] is True
+
+
 def test_include_deleted_overrides_only_for_named_sessions(two_account_env, tmp_path):
     env, src, dst = two_account_env(tmp_path)
     _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")

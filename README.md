@@ -109,8 +109,9 @@ is always a preview will misread `sync --apply --json`.
   reopening the app, which showed the thread again. `sync` reads the *destination's* records and
   skips any source thread they cover, and names each skip in its report (`kept deleted: …`).
   `--include-deleted "<title-or-id>"` overrides the skip for **one** named thread; it never
-  applies to a whole run. The name must resolve unambiguously — a full session id, or a title
-  substring matching exactly one deleted thread. A substring that hits several is a refusal
+  applies to a whole run. The name must resolve unambiguously — a full id, or a title
+  substring matching exactly one deleted thread. (The app files a deletion under the thread's
+  session id *or* under its local id, and `sync` honours both, so either id works here.) A substring that hits several is a refusal
   listing the candidates, not a silent multi-resurrection. Anything it does resurrect is printed
   under a `!! RESURRECTING …` heading *before* the list of rows to copy, and flagged again in
   that list, so bringing back a thread you deliberately deleted is never something the command
