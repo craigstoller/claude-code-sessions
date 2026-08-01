@@ -87,9 +87,13 @@ claude-code-threads sync --apply
 There is only one copy of the conversation itself — shared, and carrying no account identity —
 so a synced thread opens and resumes normally under the other account. Without `--to`, the
 destination must be unambiguous: exactly one other account store on the machine, or `--to
-<uuid-substring>` naming one of several by its account or org id. Not by email: the destination
-is an account you are not signed into, so its email is never recorded on disk for `sync` to match
-against (more on this below) — only account/org id substrings work. `sync` refuses outright if it
+<substring>` naming one of several by its account id, org id, or **store path**. Not by email:
+the destination is an account you are not signed into, so its email is never recorded on disk for
+`sync` to match against (more on this below). The path is matchable because ids alone are not
+always enough — Windows exposes two store roots (the MSIX package path and the classic
+`%APPDATA%\Claude` path), and a machine that migrated between installers can hold the same
+account under both, in which case the path is the only thing that tells the two copies apart.
+Both "which store did you mean" refusals print the full path beside each candidate. `sync` refuses outright if it
 cannot tell which account is signed in, from either `~/.claude.json` or `config.json` — `--to`
 cannot substitute for that: it only narrows *which* dormant store to use, and if we don't know
 which account is live we cannot verify the one you named isn't it.
@@ -103,8 +107,14 @@ is always a preview will misread `sync --apply --json`.
   (`deleted_<id>`) when you delete a thread but does not consult it when a row for that thread
   reappears elsewhere — confirmed by restoring a deleted row alongside its own record and
   reopening the app, which showed the thread again. `sync` reads the *destination's* records and
-  skips any source thread they cover. `--include-deleted "<title-or-id>"` overrides the skip for
-  that one named thread; it never applies to a whole run.
+  skips any source thread they cover, and names each skip in its report (`kept deleted: …`).
+  `--include-deleted "<title-or-id>"` overrides the skip for **one** named thread; it never
+  applies to a whole run. The name must resolve unambiguously — a full session id, or a title
+  substring matching exactly one deleted thread. A substring that hits several is a refusal
+  listing the candidates, not a silent multi-resurrection. Anything it does resurrect is printed
+  under a `!! RESURRECTING …` heading *before* the list of rows to copy, and flagged again in
+  that list, so bringing back a thread you deliberately deleted is never something the command
+  does quietly.
 - **Connector config is not copied by default.** A row can carry a full snapshot of the
   account's connected MCP servers; across 432 real rows on this machine that field ran as large
   as 1.36 MB in a single row and totalled 289 MB. Stripping it is verified safe: on a real row it

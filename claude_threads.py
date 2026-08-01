@@ -1574,13 +1574,14 @@ def recover_op(env, op, direction):
         if m.get("op_type") == "sync":
             # direction is already guaranteed to be a member of c["resolutions"]
             # by the check above, and classify_sync_op only ever offers
-            # exactly one of "back" or "forward" (never both, never
-            # anything else) for a non-terminal sync op - so no further
-            # validation is needed here.
+            # "back", "forward" or both (never anything else) for a
+            # non-terminal sync op - so no further validation is needed here.
             if direction == "back":
-                # Only reachable when a destination row has drifted enough
-                # to permanently block forward (classify_sync_op's
-                # diagnosis). Unlike undo_sync's all-or-nothing, back must
+                # Always available for a non-terminal sync, because drift is
+                # only one of the ways forward can be permanently blocked (an
+                # I/O or layout failure leaves the pending row absent, which
+                # looks like no drift at all). Unlike undo_sync's
+                # all-or-nothing, back must
                 # always terminate - refusing over a written row that also
                 # drifted or turned unreadable would recreate the exact
                 # dead end this resolution exists to close (recover back
@@ -2250,6 +2251,16 @@ def _guard_weakly_resolved(env, live, what):
         .format(how, running[0], what))
 
 
+def _candidate_line(account_uuid, org_uuid, path):
+    """One line of a "which store did you mean" listing. The store path is
+    part of it because the 8-char id prefixes alone are not always
+    distinguishing: two store roots (Windows' MSIX path and the classic
+    %APPDATA% path) can hold the same account, and telling the user to "be
+    more specific" while showing two identical lines is a wall, not a
+    refusal. Redacted like everything else by main()'s redact()."""
+    return "   {0}/{1}   {2}".format(account_uuid[:8], org_uuid[:8], path)
+
+
 def resolve_sync_endpoints(env, to=None):
     """(source, destination). Source is the signed-in account; destination is
     the other store. Refuses rather than guessing - row-freshness is NEVER
@@ -2258,7 +2269,7 @@ def resolve_sync_endpoints(env, to=None):
     dirs = _account_dirs(env)
     source = live_account(env)
     if source is None:
-        listing = "\n".join("   {0}/{1}".format(a[:8], o[:8]) for a, o, _ in dirs)
+        listing = "\n".join(_candidate_line(a, o, p) for a, o, p in dirs)
         raise Refusal(
             "cannot identify the signed-in account from ~/.claude.json or config.json.\n"
             "Refusing to guess which store is live - naming the wrong one would write the\n"
@@ -2271,18 +2282,28 @@ def resolve_sync_endpoints(env, to=None):
     if not others:
         raise Refusal("no other account store on this machine - nothing to sync into")
     if to:
-        matched = [c for c in others
-                  if to.lower() in (c.account_uuid + " " + c.org_uuid + " " + c.email).lower()]
+        # The PATH is part of the match string, not just the ids and email.
+        # default_env legitimately yields two store roots on Windows (the MSIX
+        # package path and the classic %APPDATA%\Claude path), and a machine
+        # that migrated between installers can hold the SAME account uuids
+        # under both - in which case account_uuid/org_uuid/email are identical
+        # for both candidates and no --to value could ever tell them apart.
+        # The path is the only thing that differs, so it has to be matchable
+        # (and, below, printed) or sync is simply unusable on such a machine.
+        matched = [c for c in others if to.lower() in
+                   (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
+                    c.path).lower()]
         if not matched:
             raise Refusal("--to {0!r} matched no other account store".format(to))
         if len(matched) > 1:
-            listing = "\n".join("   {0}/{1}".format(c.account_uuid[:8], c.org_uuid[:8])
+            listing = "\n".join(_candidate_line(c.account_uuid, c.org_uuid, c.path)
                                 for c in matched)
-            raise Refusal("--to {0!r} matched {1} accounts; be more specific:\n{2}"
+            raise Refusal("--to {0!r} matched {1} accounts; be more specific (a longer "
+                          "id, or part of the store path):\n{2}"
                           .format(to, len(matched), listing))
         return source, matched[0]
     if len(others) > 1:
-        listing = "\n".join("   {0}/{1}".format(c.account_uuid[:8], c.org_uuid[:8])
+        listing = "\n".join(_candidate_line(c.account_uuid, c.org_uuid, c.path)
                             for c in others)
         raise Refusal("more than one other account store; name one with --to:\n" + listing)
     return source, others[0]
@@ -2307,6 +2328,45 @@ def _destination_tombstones(dest):
     return out
 
 
+def _resolve_tombstone_overrides(entries, tombs, named):
+    """Map each --include-deleted term to exactly ONE tombstoned source row.
+
+    The flag's contract is that it names a single thread and "never applies
+    blanket to a whole run" - but the match used to be a bare title substring
+    tested per row, so one term silently resurrected every tombstoned thread
+    whose title happened to contain it (the reviewer got three from one
+    term). Resolve each term against the tombstoned rows up front instead: a
+    full cliSessionId matches exactly; anything else is a title substring and
+    must single one out. More than one match is a refusal that names the
+    candidates - resurrecting a deliberately deleted thread is the first row
+    of this design's own risk table and must never happen by accident.
+
+    A term that matches nothing is deliberately NOT an error: the destination
+    may simply hold no tombstone for that thread, in which case the row is
+    copied by the ordinary rules and the report's "resurrected" section
+    correctly stays empty. Nothing is claimed that did not happen.
+
+    Returns the set of row filenames whose tombstone skip is overridden.
+    """
+    out = set()
+    candidates = [e for e in entries if e["session_id"] and e["session_id"] in tombs]
+    for term in (named or ()):
+        t = term.lower()
+        matched = [e for e in candidates if e["session_id"].lower() == t]
+        if not matched:
+            matched = [e for e in candidates if t in e["title"].lower()]
+        if len(matched) > 1:
+            listing = "\n".join("   {0}  (session {1})".format(e["title"], e["session_id"])
+                                for e in matched)
+            raise Refusal(
+                "--include-deleted {0!r} matched {1} threads the destination account "
+                "deleted. It names ONE thread; it is not a blanket override. Re-run "
+                "naming a full session id, or a title substring unique to one of:\n{2}"
+                .format(term, len(matched), listing))
+        out.update(e["name"] for e in matched)
+    return out
+
+
 def select_sync_rows(env, source, dest, flags):
     """Which source rows are eligible to copy, and why the rest were skipped.
 
@@ -2314,15 +2374,24 @@ def select_sync_rows(env, source, dest, flags):
     other sidecar), it is absent from the destination by filename, its
     transcript still exists somewhere under ~/.claude/projects (a row with no
     transcript is a dead pointer), and the destination holds no tombstone for
-    its cliSessionId - unless the row's title/session id was named via
-    --include-deleted, which overrides the tombstone skip for that row only.
+    its cliSessionId - unless --include-deleted named it unambiguously
+    (_resolve_tombstone_overrides), which overrides the tombstone skip for
+    that row only. Such a row is marked `overrode_tombstone` and listed in
+    tally["resurrected"] so the report can say what it is about to bring
+    back; tally["deleted"] holds only the rows whose deletion was honoured.
+
+    Note that presence is keyed on FILENAME, not cliSessionId: a destination
+    row for the same conversation under a different local id is not detected.
     """
     tally = {"present": [], "no_transcript": [], "deleted": [], "unreadable": [],
-             "filtered": []}
+             "filtered": [], "resurrected": []}
     have = set(os.listdir(dest.path))
     tombs = _destination_tombstones(dest)
-    named = tuple(s.lower() for s in (flags.include_deleted or ()))
-    picked = []
+
+    # Parse first, decide second: --include-deleted has to be resolved
+    # against the whole set of tombstoned rows to know whether a term is
+    # ambiguous, which a single streaming pass cannot see.
+    entries = []
     for name in sorted(os.listdir(source.path)):
         if not (name.startswith("local_") and name.endswith(".json")):
             continue                      # scheduled-tasks.json, deleted_*, *.tmp
@@ -2335,8 +2404,15 @@ def select_sync_rows(env, source, dest, flags):
         if not isinstance(d, dict):
             tally["unreadable"].append(name)
             continue
-        title = d.get("title") or "(untitled)"
-        sid = d.get("cliSessionId") or ""
+        entries.append({"name": name, "src_path": p, "data": d,
+                        "session_id": d.get("cliSessionId") or "",
+                        "title": d.get("title") or "(untitled)",
+                        "last_activity": d.get("lastActivityAt") or 0})
+    overridden = _resolve_tombstone_overrides(entries, tombs, flags.include_deleted)
+
+    picked = []
+    for e in entries:
+        name, sid, title = e["name"], e["session_id"], e["title"]
         if flags.only and flags.only.lower() not in title.lower():
             tally["filtered"].append(title)
             continue
@@ -2346,14 +2422,19 @@ def select_sync_rows(env, source, dest, flags):
         if not sid or not find_transcripts(env.projects_root, sid):
             tally["no_transcript"].append(title)
             continue
+        overrode = False
         if sid in tombs:
             # E4: the app shows a restored row for a deleted session, so this
             # skip is the only thing preventing a resurrection.
-            if not any(n in title.lower() or n == sid.lower() for n in named):
+            if name not in overridden:
                 tally["deleted"].append(title)
                 continue
-        picked.append({"name": name, "src_path": p, "data": d, "session_id": sid,
-                       "title": title, "last_activity": d.get("lastActivityAt") or 0})
+            overrode = True
+            tally["resurrected"].append(title)
+        picked.append({"name": name, "src_path": e["src_path"], "data": e["data"],
+                       "session_id": sid, "title": title,
+                       "last_activity": e["last_activity"],
+                       "overrode_tombstone": overrode})
     picked.sort(key=lambda r: r["last_activity"], reverse=True)
     return picked, tally
 
@@ -2408,6 +2489,10 @@ def plan_sync(env, flags):
                      "dest_path": os.path.join(dest.path, cand["name"]),
                      "post_b64": b64(blob), "session_id": cand["session_id"],
                      "title": cand["title"], "removed": removed, "reset": reset,
+                     # carried per row (not just in the tally) so --json and
+                     # any later reader can tell which rows only exist because
+                     # a deliberate deletion was overridden
+                     "overrode_tombstone": bool(cand.get("overrode_tombstone")),
                      "written": False})
     return {"op_type": "sync",
             "source_account": source.account_uuid, "source_org": source.org_uuid,
@@ -2423,13 +2508,40 @@ def plan_sync(env, flags):
             "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
 
 
+# Journal-write budget for execute_sync_op's row loop.
+#
+# save_manifest rewrites and fsyncs the WHOLE manifest, which carries a base64
+# post-image of every row in the op - so flagging each row `written` with its
+# own save_manifest costs rows x manifest bytes. Measured: 60 stripped rows at
+# ~2 KB each produce a 197,693-byte manifest and rewrite 11.9 MB during one
+# execute. Extrapolated to this machine's real rows under --verbatim (432
+# rows, the largest 1.36 MB) that is a ~385 MB manifest rewritten 432 times:
+# over 160 GB of fsynced I/O, i.e. a first `sync --verbatim --apply` into an
+# empty second account would look like an indefinite hang.
+#
+# So spend a fixed byte budget on per-row journaling and stop when it is gone.
+# Small manifests - the stripped path, and every op in the test suite - still
+# journal every row individually, because doing so costs nothing measurable
+# and keeps the finest-grained crash record. A huge --verbatim manifest is
+# written once, at the end (or on the way out through an exception - see the
+# loop). Under-reporting what landed is harmless by construction:
+# execute_sync_op re-reads every destination row before writing it and
+# recognises one that already holds exactly the planned bytes, so a resumed op
+# marks it done rather than duplicating or refusing. The tradeoff bought is
+# bounded I/O for a coarser - never wrong - record of which rows landed.
+SYNC_JOURNAL_BYTE_BUDGET = 32 * 1024 * 1024
+
+
 def execute_sync_op(env, op):
     """journaled -> writing -> completed.
 
     Far simpler than execute_op because nothing is deleted and no transcript
     moves: the destructive step that dominates a move does not exist here.
-    Each row is journaled as written immediately after its atomic_write, so a
-    crash leaves an exact record of which rows landed.
+    Rows are journaled as written on a byte budget (SYNC_JOURNAL_BYTE_BUDGET),
+    and always on the way out - normally or through an exception - so any
+    failure this process can observe leaves an exact record of which rows
+    landed. Only a hard kill (power loss, SIGKILL) can lose the tail of that
+    record, and a resumed op recovers from it safely either way.
     """
     m = op.manifest
     if m.get("status") != "journaled":
@@ -2462,6 +2574,33 @@ def execute_sync_op(env, op):
 
     set_status(op, "writing")
     rows = m["rows"]
+    # What one save_manifest costs, estimated once rather than measured per
+    # row: the manifest is dominated by the rows' base64 post-images, and
+    # flipping a `written` flag does not change its size materially.
+    per_save = sum(len(r.get("post_b64") or "") for r in rows) + 4096
+    budget = SYNC_JOURNAL_BYTE_BUDGET
+    try:
+        _sync_write_rows(op, m, rows, per_save, budget)
+    except BaseException:
+        # Journal what actually landed before the failure propagates. Every
+        # in-process failure - Refusal, LayoutError, a bare OSError, even
+        # KeyboardInterrupt - therefore still leaves an exact record, which is
+        # what recover's 'back' arm needs to remove exactly the rows this op
+        # wrote. Best-effort: a save that itself fails must never mask the
+        # original failure.
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    save_manifest(op)          # the tail of the batch, before the op is terminal
+    set_status(op, "completed")
+    return "completed"
+
+
+def _sync_write_rows(op, m, rows, per_save, budget):
+    """execute_sync_op's write loop, split out only so its caller can wrap it
+    in the journal-on-the-way-out handler above."""
     for i, r in enumerate(rows):
         if r.get("written"):
             continue
@@ -2527,11 +2666,11 @@ def execute_sync_op(env, op):
         # else: already byte-identical to the planned post-image - nothing
         # left to write, just record this row as done.
         r["written"] = True
-        save_manifest(op)
+        if budget >= per_save:
+            budget -= per_save
+            save_manifest(op)
         if i < len(rows) - 1:
             _maybe_crash("sync-mid-write")
-    set_status(op, "completed")
-    return "completed"
 
 
 def run_sync(env, manifest):
@@ -2617,6 +2756,23 @@ def classify_sync_op(env, op):
     a single event ("the dormant account got opened") can plausibly both
     block a pending row and rewrite an already-written one, so 'options:
     back' alone would otherwise promise more than back can deliver.
+
+    Correction from the whole-branch review: 'back' is offered ALWAYS, not
+    only on drift. Destination-row drift is just one of the ways
+    execute_sync_op can leave an op non-terminal - atomic_write raising
+    OSError, the row-containment LayoutError and the vanished-store
+    LayoutError all leave the pending row simply ABSENT, which reads as no
+    drift, which used to classify as "forward only". Forward then raised the
+    same error on every re-entry, 'back' was refused as unsafe, and undo
+    refused the op for not being 'completed': every exit refused and the op
+    was stuck forever - the exact dead end 'back' exists to close, left open
+    for the I/O and layout cases. 'back' is unconditionally safe here (it
+    only deletes rows this op recorded as written AND that are still
+    byte-identical to what it wrote, skipping everything else), so there is
+    no state in which withholding it is right. classify_op's move branches
+    already offer two resolutions where both are safe; follow that shape:
+    ["forward", "back"] normally, ["back"] alone when a drifted or
+    unreadable pending row makes forward impossible.
     """
     m = op.manifest
     written = [r for r in m["rows"] if r.get("written")]
@@ -2642,10 +2798,10 @@ def classify_sync_op(env, op):
         return {"status": m["status"], "source": "n/a", "dest": "n/a",
                 "resolutions": ["back"], "drifted_rows": blocking + skipped, "note": note}
     return {"status": m["status"], "source": "n/a", "dest": "n/a",
-            "resolutions": ["forward"], "drifted_rows": [],
-            "note": "sync: {0} row(s) written, {1} pending; forward finishes them "
-                    "(use undo to remove what was written)"
-                    .format(len(written), len(pending))}
+            "resolutions": ["forward", "back"], "drifted_rows": [],
+            "note": "sync: {0} row(s) written, {1} pending; forward finishes them, "
+                    "back removes the {0} already written (use undo instead once "
+                    "the op has completed)".format(len(written), len(pending))}
 
 
 def _sync_delete_targets(env, m):
@@ -2771,12 +2927,22 @@ def cmd_sync(env, ns):
                       verbatim=ns.verbatim)
     manifest = plan_sync(env, flags)
 
-    # --apply executes up front, before ANY reporting - JSON included - so
-    # that "sync --apply --json" (exactly the combination automation would
-    # use) reports what actually happened rather than silently planning-only
-    # while claiming success. A zero-row plan is the one case that skips
-    # run_sync regardless of --apply: there's nothing to journal, and
-    # journaling an empty op anyway was the parked finding this task closed.
+    def say(line):
+        print(line if ns.verbose else redact(env, line))
+
+    # Ordering, which the human report and the JSON dump have no reason to
+    # share: the human report prints BOTH ENDPOINTS FIRST, before anything
+    # happens (spec s5 - a recognisable destination is a safety feature, and
+    # a run that dies inside run_sync must still leave a record of which two
+    # accounts were involved rather than a bare "refused: <msg>"). --json
+    # instead has to execute first, because "sync --apply --json" - exactly
+    # the combination automation would use - must report what actually
+    # happened, not the plan it would have run.
+    if not ns.json:
+        _print_sync_report(say, manifest)
+
+    # A zero-row plan skips run_sync regardless of --apply: there's nothing
+    # to journal, and journaling an empty op anyway was a parked finding.
     final = None
     if manifest["rows"] and ns.apply:
         final = run_sync(env, manifest)
@@ -2787,11 +2953,29 @@ def cmd_sync(env, ns):
         print(json.dumps(manifest, indent=1))
         return 0 if final in (None, "completed") else 1
 
-    def say(line):
-        print(line if ns.verbose else redact(env, line))
+    if not manifest["rows"]:
+        say("\nnothing to copy")
+        return 0
+    if final is None:
+        say("\ndry run - pass --apply to copy")
+        return 0
 
-    # Spec s5: name both endpoints, with emails, before doing anything (or,
-    # above, immediately after - the report still leads with identity).
+    # "copied: N" reads r["written"], which run_sync's execute loop set on
+    # the row dicts THIS manifest still holds: new_op shallow-copies the
+    # manifest, so the "rows" list and every row dict inside it are shared
+    # between the caller's manifest and the journaled one. That coupling is
+    # load-bearing here and easy to break by deep-copying "for safety".
+    say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
+    say("result     : {0}".format(final))
+    say("Sign into {0} (or restart the app) to see them."
+        .format(manifest["dest_email"] or "the other account"))
+    return 0 if final == "completed" else 1
+
+
+def _print_sync_report(say, manifest):
+    """The human-readable plan: both endpoints, then the skip tally, then
+    what --include-deleted is resurrecting, then what would be copied."""
+    # Spec s5: name both endpoints, with emails, before doing anything.
     # dest_email is "" for every non-live account - the dormant account's
     # email isn't recorded anywhere on disk, so an unlabelled run always hits
     # this, not just an edge case - so also print the store path and org
@@ -2839,24 +3023,30 @@ def cmd_sync(env, ns):
         say("   kept deleted: {0}".format(title))
     if len(deleted_titles) > 15:
         say("   ... and {0} more".format(len(deleted_titles) - 15))
+
+    # --include-deleted is the one thing this command does that the user
+    # cannot undo by simply deleting a row again - it brings back a thread
+    # they deliberately deleted, the first row of the design's own risk
+    # table. It used to be the LEAST visible thing here: the rescued row
+    # entered the plan with no marker and tally["deleted"] held only the
+    # skips, so the report said nothing at all. Name every resurrection,
+    # under an unmissable label, BEFORE the ordinary "to copy" list.
+    resurrected = tally.get("resurrected") or []
+    if resurrected:
+        say("")
+        say("!! RESURRECTING {0} thread(s) the destination account DELETED "
+            "(--include-deleted):".format(len(resurrected)))
+        for title in resurrected[:15]:
+            say("   !! {0}".format(title))
+        if len(resurrected) > 15:
+            say("   ... and {0} more".format(len(resurrected) - 15))
+        say("")
+
     say("{0:36}: {1}".format("to copy", len(manifest["rows"])))
     for r in manifest["rows"][:15]:
-        say("   {0}".format(r["title"]))
+        say("   {0}{1}".format("!! " if r.get("overrode_tombstone") else "", r["title"]))
     if len(manifest["rows"]) > 15:
         say("   ... and {0} more".format(len(manifest["rows"]) - 15))
-
-    if not manifest["rows"]:
-        say("\nnothing to copy")
-        return 0
-    if final is None:
-        say("\ndry run - pass --apply to copy")
-        return 0
-
-    say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
-    say("result     : {0}".format(final))
-    say("Sign into {0} (or restart the app) to see them."
-        .format(manifest["dest_email"] or "the other account"))
-    return 0 if final == "completed" else 1
 
 
 if __name__ == "__main__":

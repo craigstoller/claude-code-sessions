@@ -550,7 +550,13 @@ def test_undo_sync_refuses_when_a_written_row_changed(two_account_env, tmp_path)
     assert os.path.exists(os.path.join(dst, "local_0.json"))
 
 
-def test_classify_sync_op_offers_forward_only(two_account_env, tmp_path):
+def test_classify_sync_op_offers_forward_and_back(two_account_env, tmp_path):
+    """Was test_classify_sync_op_offers_forward_only, which pinned
+    resolutions == ["forward"] for an undrifted interrupted sync. The
+    whole-branch review's Finding 2 changes exactly that: 'back' is
+    unconditionally safe for a sync and must always be offered, because
+    drift is not the only way forward can be permanently blocked (see
+    test_stalled_sync_after_a_write_error_can_still_go_back)."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=3)
     m = ct.plan_sync(env, ct.SyncFlags())
@@ -567,7 +573,7 @@ def test_classify_sync_op_offers_forward_only(two_account_env, tmp_path):
     op = ct.nonterminal_ops(env)[0]
     c = ct.classify_op(env, op)
     assert c["status"] == "writing"
-    assert c["resolutions"] == ["forward"]
+    assert c["resolutions"] == ["forward", "back"]
 
 
 def test_recover_forward_finishes_an_interrupted_sync(two_account_env, tmp_path):
@@ -1319,3 +1325,331 @@ def test_json_plan_carries_the_live_account_provenance(two_account_env, tmp_path
     monkeypatch.setattr(ct, "default_env", lambda: env)
     assert ct.main(["sync", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["source_resolved_from"] == "config"
+
+
+# ----------------------------- whole-branch review: Finding 2 (Important)
+#
+# classify_sync_op picked back-vs-forward purely from destination-row DRIFT.
+# Every other way execute_sync_op can fail - atomic_write raising OSError,
+# the containment LayoutError, the vanished-store LayoutError - leaves the
+# pending row simply ABSENT, which reads as no drift, which yielded
+# ["forward"]. Forward then raised the same error every time, back was
+# refused as unsafe, and undo refused the op for not being 'completed':
+# permanently stuck. 'back' is now always offered.
+
+
+def test_stalled_sync_after_a_write_error_can_still_go_back(two_account_env, tmp_path):
+    """The reviewer's first reproduction: a persistent write error (here a
+    read-only leftover .ct-tmp scratch file, which makes atomic_write fail
+    identically on every re-entry) used to leave the op at 'writing' with
+    every exit refusing."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    blocked = m["rows"][1]["dest_path"] + ".ct-tmp"
+    with open(blocked, "wb") as fh:
+        fh.write(b"leftover")
+    os.chmod(blocked, stat.S_IREAD)
+    try:
+        with pytest.raises(ct.Refusal, match="could not write"):
+            ct.run_sync(env, m)
+        op = ct.nonterminal_ops(env)[0]
+        assert op.manifest["status"] == "writing"
+        c = ct.classify_op(env, op)
+        # The blocking row is ABSENT, not drifted - which is exactly why the
+        # old drift-only classification called this "forward" and stuck.
+        assert c["drifted_rows"] == []
+        assert c["resolutions"] == ["forward", "back"]
+        # forward really is a dead end: the same refusal, every time.
+        with pytest.raises(ct.Refusal, match="could not write"):
+            ct.recover_op(env, op, "forward")
+        assert ct.recover_op(env, op, "back") == "rolled_back"
+        assert ct.nonterminal_ops(env) == []
+        # (the test's own read-only .ct-tmp is still there; it is not a row)
+        assert [f for f in os.listdir(dst) if f.endswith(".json")] == []
+    finally:
+        os.chmod(blocked, stat.S_IWRITE)
+        os.unlink(blocked)
+
+
+def test_stalled_sync_after_a_containment_error_can_still_go_back(two_account_env,
+                                                                  tmp_path):
+    """The reviewer's second reproduction: the row-containment LayoutError
+    reaches the same dead end by the same route."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    outside = os.path.join(str(tmp_path), "elsewhere.json")
+    m["rows"][1]["dest_path"] = outside
+    with pytest.raises(ct.LayoutError):
+        ct.run_sync(env, m)
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    with pytest.raises(ct.LayoutError):
+        ct.recover_op(env, op, "forward")
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert ct.nonterminal_ops(env) == []
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+    assert not os.path.exists(outside)
+
+
+# ----------------------------- whole-branch review: Finding 3 (Important)
+
+
+def _tombstoned(env, src, dst, titles):
+    """A source row + transcript + destination tombstone for each title."""
+    out = []
+    for i, title in enumerate(titles):
+        sid = "sid-r%d" % i
+        _row(src, "local_r%d.json" % i, sid, title)
+        _transcript(env, sid)
+        with open(os.path.join(dst, "deleted_" + sid), "w") as fh:
+            fh.write("1")
+        out.append(sid)
+    return out
+
+
+def test_include_deleted_refuses_an_ambiguous_term(two_account_env, tmp_path):
+    """The spec says the flag names ONE thread and "never applies blanket to
+    a whole run". A bare substring tested per row let one term resurrect
+    every tombstoned thread it happened to hit - the reviewer got three."""
+    env, src, dst = two_account_env(tmp_path)
+    _tombstoned(env, src, dst, ["Alpha", "Beta", "Gamma"])
+    source, dest = ct.resolve_sync_endpoints(env)
+    with pytest.raises(ct.Refusal, match="matched 3 threads") as exc_info:
+        ct.select_sync_rows(env, source, dest, ct.SyncFlags(include_deleted=("a",)))
+    msg = str(exc_info.value)
+    for title in ("Alpha", "Beta", "Gamma"):
+        assert title in msg               # the candidates are named
+    assert "not a blanket override" in msg
+
+
+def test_include_deleted_accepts_a_full_session_id_when_titles_collide(two_account_env,
+                                                                       tmp_path):
+    """A full cliSessionId is the unambiguous escape hatch even when every
+    title contains the same substring."""
+    env, src, dst = two_account_env(tmp_path)
+    sids = _tombstoned(env, src, dst, ["Alpha", "Beta", "Gamma"])
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest,
+                                        ct.SyncFlags(include_deleted=(sids[1],)))
+    assert [p["title"] for p in picked] == ["Beta"]
+    assert tally["resurrected"] == ["Beta"]
+    assert sorted(tally["deleted"]) == ["Alpha", "Gamma"]
+
+
+def test_include_deleted_marks_the_row_and_fills_the_resurrected_tally(two_account_env,
+                                                                       tmp_path):
+    """A rescued row used to enter the plan with no marker at all, and
+    tally["deleted"] held only the rows that were SKIPPED - so nothing
+    downstream could tell a tombstone had been overridden."""
+    env, src, dst = two_account_env(tmp_path)
+    _tombstoned(env, src, dst, ["Alpha", "Beta"])
+    _row(src, "local_plain.json", "sid-plain", "Ordinary")
+    _transcript(env, "sid-plain")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest,
+                                        ct.SyncFlags(include_deleted=("Alpha",)))
+    by_title = {p["title"]: p for p in picked}
+    assert by_title["Alpha"]["overrode_tombstone"] is True
+    assert by_title["Ordinary"]["overrode_tombstone"] is False
+    assert tally["resurrected"] == ["Alpha"]
+    assert tally["deleted"] == ["Beta"]
+    m = ct.plan_sync(env, ct.SyncFlags(include_deleted=("Alpha",)))
+    marked = {r["title"]: r["overrode_tombstone"] for r in m["rows"]}
+    assert marked == {"Alpha": True, "Ordinary": False}
+
+
+def test_cli_names_what_include_deleted_resurrects_before_the_copy_list(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """Resurrecting a deliberately deleted thread is the first row of the
+    design's own risk table and was the least visible thing the command did:
+    the report said nothing at all. It must now be named, unmissably, before
+    the ordinary "to copy" list."""
+    env, src, dst = two_account_env(tmp_path)
+    _tombstoned(env, src, dst, ["Alpha", "Beta"])
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--include-deleted", "Alpha", "--verbose"]) == 0
+    out = capsys.readouterr().out
+    assert "RESURRECTING 1 thread" in out
+    assert out.index("RESURRECTING") < out.index("to copy")
+    assert "!! Alpha" in out
+    assert "kept deleted: Beta" in out          # the honoured one still reported
+
+
+def test_cli_include_deleted_ambiguity_is_a_refusal_not_three_resurrections(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    env, src, dst = two_account_env(tmp_path)
+    _tombstoned(env, src, dst, ["Alpha", "Beta", "Gamma"])
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["sync", "--include-deleted", "a", "--apply", "--verbose"]) == 1
+    err = capsys.readouterr().err
+    assert "matched 3 threads" in err
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+# ----------------------------- whole-branch review: Finding 4 (Important)
+
+
+def test_endpoints_are_printed_before_the_run_even_when_it_fails(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """The spec calls a recognisable destination a safety feature and prints
+    both endpoints BEFORE anything happens. Moving execution ahead of all
+    printing (to make --apply --json report reality) was over-broad: a run
+    that died inside run_sync emitted only "refused: <msg>" with no record of
+    which two accounts were involved."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+
+    def boom(*a, **k):
+        raise ct.Refusal("run_sync exploded")
+    monkeypatch.setattr(ct, "run_sync", boom)
+    assert ct.main(["sync", "--apply", "--verbose"]) == 1
+    cap = capsys.readouterr()
+    assert "run_sync exploded" in cap.err
+    assert src in cap.out and dst in cap.out
+    assert "signed in" in cap.out
+
+
+# ----------------------------- whole-branch review: Finding 5 (Important)
+
+
+def test_to_can_name_a_duplicated_account_by_store_path(mkenv, tmp_path):
+    """default_env legitimately yields two store roots on Windows (the MSIX
+    package path and the classic %APPDATA% path), and a machine that migrated
+    between installers can hold the same account uuids under both. Matching
+    only on account/org/email made every --to value ambiguous while the
+    refusal listed two identical 8-char lines: no input could resolve it."""
+    live_a = "aaaaaaaa-0000-0000-0000-000000000001"
+    live_o = "bbbbbbbb-0000-0000-0000-000000000002"
+    other_a = "cccccccc-0000-0000-0000-000000000003"
+    other_o = "dddddddd-0000-0000-0000-000000000004"
+    env = mkenv(tmp_path, n_store_roots=2)
+    os.makedirs(os.path.join(env.store_candidates[0], live_a, live_o))
+    dup = []
+    for root in env.store_candidates:
+        p = os.path.join(root, other_a, other_o)
+        os.makedirs(p)
+        dup.append(os.path.realpath(p))
+    with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": live_a, "organizationUuid": live_o,
+                                    "emailAddress": "me@example.com"}}, fh)
+
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    msg = str(exc_info.value)
+    assert dup[0] in msg and dup[1] in msg          # distinguishable at last
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env, to=other_a)
+    msg = str(exc_info.value)
+    assert "be more specific" in msg
+    assert dup[0] in msg and dup[1] in msg
+    # ...and the store path is now a usable discriminator, which nothing was.
+    source, dest = ct.resolve_sync_endpoints(env, to="store1")
+    assert os.path.normcase(dest.path) == os.path.normcase(dup[1])
+    assert os.path.normcase(ct.resolve_sync_endpoints(env, to="store0")[1].path) == \
+        os.path.normcase(dup[0])
+
+
+# ----------------------------- whole-branch review: Finding 6 (Important)
+
+
+def _save_snapshots(monkeypatch):
+    """Record the written-flags the journal held at each save_manifest."""
+    saves = []
+    real = ct.save_manifest
+
+    def counting(op):
+        saves.append([bool(r.get("written")) for r in op.manifest.get("rows", [])])
+        real(op)
+    monkeypatch.setattr(ct, "save_manifest", counting)
+    return saves
+
+
+def test_journal_writes_are_batched_when_the_manifest_is_large(two_account_env,
+                                                               tmp_path, monkeypatch):
+    """save_manifest rewrites and fsyncs the WHOLE manifest, which carries a
+    base64 post-image of every row - so one save per row is O(rows x
+    manifest). Measured at 60 rows x ~2 KB that is 11.9 MB; extrapolated to
+    this machine's real --verbatim rows (432 rows, up to 1.36 MB) it is over
+    160 GB, i.e. an apparent hang. A zero budget stands in for a manifest too
+    big to journal per row."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=4)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    monkeypatch.setattr(ct, "SYNC_JOURNAL_BYTE_BUDGET", 0)
+    saves = _save_snapshots(monkeypatch)
+    assert ct.run_sync(env, m) == "completed"
+    # No per-row journal write: a snapshot with SOME but not all rows flagged
+    # is the signature of one save per row (3 of them, for 4 rows).
+    assert [s for s in saves if any(s) and not all(s)] == []
+    assert saves[-1] == [True] * 4                 # the tail always lands
+    assert len([f for f in os.listdir(dst) if f.startswith("local_")]) == 4
+
+
+def test_small_manifests_still_journal_every_row(two_account_env, tmp_path,
+                                                 monkeypatch):
+    """The budget is a cap, not a mode switch: an ordinary (stripped) sync is
+    nowhere near it, so it keeps the finest-grained crash record."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=4)
+    saves = _save_snapshots(monkeypatch)
+    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+    assert len([s for s in saves if any(s) and not all(s)]) == 3
+
+
+def test_an_interrupted_batch_resumes_without_duplicating_or_refusing(
+        two_account_env, tmp_path, monkeypatch):
+    """The batching is safe precisely because of execute_sync_op's
+    re-read-before-write: a manifest that UNDER-reports what landed is
+    harmless, since a row already holding exactly the planned bytes is
+    recognised and skipped on resume. Simulate the worst case a hard kill can
+    produce - every row on disk, none of them journalled - and resume."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=4)
+    monkeypatch.setattr(ct, "SYNC_JOURNAL_BYTE_BUDGET", 0)
+    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+
+    op = ct.list_ops(env)[-1]
+    for r in op.manifest["rows"]:
+        r["written"] = False               # the journal tail was lost
+    op.manifest["status"] = "journaled"
+    ct.save_manifest(op)
+    before = [os.stat(r["dest_path"]).st_ino for r in op.manifest["rows"]]
+
+    assert ct.execute_sync_op(env, op) == "completed"
+    assert all(r["written"] for r in op.manifest["rows"])
+    # atomic_write goes through os.replace, which changes st_ino - identical
+    # inodes prove the re-read branch skipped every row rather than rewriting
+    # it (the same signal test_crash_before_manifest_save_is_forward_pass_safe
+    # uses).
+    assert [os.stat(r["dest_path"]).st_ino for r in op.manifest["rows"]] == before
+    assert len([f for f in os.listdir(dst) if f.startswith("local_")]) == 4
+
+
+def test_an_exception_always_journals_what_landed(two_account_env, tmp_path,
+                                                  monkeypatch):
+    """Batching must not cost 'back' its accuracy: every failure this process
+    can observe journals the written flags on the way out, so recover --back
+    still removes exactly the rows that landed. Only a hard kill can lose the
+    tail."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=3)
+    monkeypatch.setattr(ct, "SYNC_JOURNAL_BYTE_BUDGET", 0)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]                  # re-read from disk
+    assert [bool(r.get("written")) for r in op.manifest["rows"]] == [True, False, False]
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []

@@ -199,15 +199,40 @@ confirmed, there is nothing to check the named destination *against*. `--to` onl
 dormant store to use among several; it cannot supply that missing certainty, and does not
 attempt to.
 
-**A stuck sync is recoverable, but not by rolling forward forever.** If a destination row drifts
-while a sync is non-terminal, `writing` can never complete — `sync` refuses on that same row
-every time it re-enters, per the re-read rule above. `doctor` flags the op as nonterminal, and
-running `recover` with no `--resolve` lists it, offering `back` instead of `forward` and naming
-the row that's blocking it. Resolving it with `--resolve <op-id> --back --apply` removes every
-row this op can verify it wrote — present, and still byte-identical to what was written — and
-**skips**, rather than deletes, any row it wrote that has since drifted or gone unreadable,
-reporting what it left behind. It always ends at `rolled_back`, because `back` is the only exit
-from a stuck op and must terminate rather than recreate the same dead end.
+**A stuck sync is recoverable, and `back` is always on the table.** A non-terminal sync op
+always offers `back`, and additionally offers `forward` whenever rolling forward still looks
+viable. `back` is unconditionally safe here — it only ever deletes rows the op recorded as
+written *and* that are still byte-identical to what it wrote, skipping everything else — so
+there is no state in which withholding it is correct.
+
+That matters because drift is only one of the ways forward can be permanently blocked. If a
+destination row drifts while a sync is non-terminal, `writing` can never complete (`sync`
+refuses on that same row every time it re-enters, per the re-read rule above) and `recover`
+offers `back` alone, naming the blocking row. But `atomic_write` raising `OSError`, the
+row-containment `LayoutError` and the vanished-store `LayoutError` all leave the pending row
+simply **absent**, which is not drift at all — classifying on drift alone called those
+"forward", forward raised the same error on every retry, `back` was refused as unsafe and `undo`
+refused the op for not being `completed`. Every exit refused; the op was stuck forever.
+
+Resolving with `--resolve <op-id> --back --apply` removes every row this op can verify it wrote
+— present, and still byte-identical to what was written — and **skips**, rather than deletes,
+any row it wrote that has since drifted or gone unreadable, reporting what it left behind. It
+always ends at `rolled_back`, because `back` is the only guaranteed exit from a stuck op and
+must terminate rather than recreate the same dead end.
+
+**The journal is written on a byte budget, not once per row.** `save_manifest` rewrites and
+fsyncs the whole manifest, which carries a base64 post-image of every row — so flagging each row
+`written` with its own save costs *rows × manifest* bytes. Measured at 60 stripped rows (~2 KB
+each) that is 11.9 MB; extrapolated to this machine's real rows under `--verbatim` (432 rows,
+the largest 1.36 MB) it is a ~385 MB manifest rewritten 432 times, over 160 GB of fsynced I/O.
+So `execute_sync_op` spends a fixed byte budget (`SYNC_JOURNAL_BYTE_BUDGET`) on per-row
+journaling and stops when it is gone: ordinary stripped syncs are nowhere near the cap and still
+journal every row, while a huge `--verbatim` manifest is written once. It is also always written
+on the way out of the loop, normally *or* through an exception, so every failure the process can
+observe still leaves an exact record — only a hard kill (power loss, `SIGKILL`) can lose the
+tail. A manifest that under-reports what landed is harmless either way: the re-read rule above
+recognises a row that already holds exactly the planned bytes and marks it done rather than
+duplicating or refusing.
 
 This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses entirely,
 touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation
