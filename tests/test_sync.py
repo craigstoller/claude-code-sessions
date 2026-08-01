@@ -843,6 +843,34 @@ def test_recover_back_removes_written_rows_when_a_pending_row_is_blocked(two_acc
     assert ct.nonterminal_ops(env) == []
 
 
+def test_recover_back_says_so_when_it_removes_nothing(two_account_env, tmp_path):
+    """A hard kill during a batched run can leave rows on disk that the
+    manifest never marked written, and 'back' only removes rows it can see it
+    wrote - so it removes nothing and, before this, printed a bare
+    'rolled_back'. It must name the forward-then-undo route that does clean
+    them up, or the rows are silently stranded in the OTHER account's store."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    ct.run_sync(env, m)
+    op = ct.list_ops(env)[-1]
+    # Simulate the lost tail: the rows are on disk, the journal never
+    # recorded them. This is exactly the post-SIGKILL state.
+    landed = [r["dest_path"] for r in op.manifest["rows"]]
+    assert all(os.path.exists(p) for p in landed)
+    for r in op.manifest["rows"]:
+        r["written"] = False
+    op.manifest["status"] = "writing"
+    ct.save_manifest(op)
+
+    op = ct.nonterminal_ops(env)[0]
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert all(os.path.exists(p) for p in landed)     # nothing deleted
+    reason = ct.list_ops(env)[-1].manifest.get("abort_reason") or ""
+    assert "removed nothing" in reason
+    assert "--forward" in reason and "undo" in reason
+
+
 def test_cmd_undo_dry_run_preview_for_sync_op(two_account_env, tmp_path, capsys):
     """Minor 9: cmd_undo's dry-run line prints session_id, which a sync
     manifest does not have, so it used to print 'session None'. Newly

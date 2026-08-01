@@ -1593,15 +1593,30 @@ def recover_op(env, op, direction):
                 drifted, unreadable, removable = _sync_delete_targets(env, m)
                 _sync_unlink_all(removable)
                 skipped = drifted + unreadable
+                # Same reporting mechanism _abort already uses for move -
+                # cmd_recover's existing _print_abort_reason picks this up for
+                # free once status is non-"completed".
                 if skipped:
-                    # Same reporting mechanism _abort already uses for
-                    # move - cmd_recover's existing _print_abort_reason
-                    # picks this up for free once status is non-"completed".
                     op.manifest["abort_reason"] = (
                         "back removed {0} row(s) it could verify; left {1} "
                         "untouched because {2}".format(
                             len(removable), len(skipped),
                             _drift_clause(drifted, unreadable)))
+                elif not removable:
+                    # Say so out loud rather than printing a bare
+                    # "rolled_back". This is reachable and it is a trap: a
+                    # hard kill (not an exception - those journal on the way
+                    # out) during a batched run can leave rows on disk that
+                    # the manifest never marked written, and 'back' only
+                    # removes rows it can see it wrote. Name the forward
+                    # route, because it is the one that cleans them up.
+                    op.manifest["abort_reason"] = (
+                        "back removed nothing - this op's manifest records no "
+                        "row as written. If rows did land in the destination, "
+                        "'recover --resolve {0} --forward --apply' will "
+                        "recognise and record them, after which 'undo --id {0} "
+                        "--apply' removes them exactly."
+                        .format(m["op_id"]))
                 set_status(op, "rolled_back")
                 rotate_ops(env)
                 return "rolled_back"
@@ -2536,9 +2551,12 @@ def plan_sync(env, flags):
 # empty second account would look like an indefinite hang.
 #
 # So spend a fixed byte budget on per-row journaling and stop when it is gone.
-# Small manifests - the stripped path, and every op in the test suite - still
-# journal every row individually, because doing so costs nothing measurable
-# and keeps the finest-grained crash record. A huge --verbatim manifest is
+# How far the budget stretches is a function of manifest size, not row count:
+# it buys BUDGET / manifest_bytes per-row saves. Small runs - every op in the
+# test suite, and any modest stripped sync - journal every row individually.
+# A stripped sync of this machine's own corpus (432 rows, ~1 KB of base64
+# each, ~417 KB of manifest) journals roughly the first 78 rows individually
+# and batches the rest; that is the intended shape, not a shortfall. A huge --verbatim manifest is
 # written once, at the end (or on the way out through an exception - see the
 # loop). Under-reporting what landed is harmless by construction:
 # execute_sync_op re-reads every destination row before writing it and
@@ -2616,7 +2634,10 @@ def execute_sync_op(env, op):
         except Exception:
             pass
         raise
-    save_manifest(op)          # the tail of the batch, before the op is terminal
+    # set_status saves the manifest itself, so it IS the tail-of-batch write -
+    # an explicit save_manifest here would serialize and fsync the whole thing
+    # a second time, which on the very manifest the budget exists to bound
+    # doubles the cost the budget just saved.
     set_status(op, "completed")
     return "completed"
 

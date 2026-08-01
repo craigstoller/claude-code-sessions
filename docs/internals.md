@@ -231,13 +231,21 @@ fsyncs the whole manifest, which carries a base64 post-image of every row — so
 each) that is 11.9 MB; extrapolated to this machine's real rows under `--verbatim` (432 rows,
 the largest 1.36 MB) it is a ~385 MB manifest rewritten 432 times, over 160 GB of fsynced I/O.
 So `execute_sync_op` spends a fixed byte budget (`SYNC_JOURNAL_BYTE_BUDGET`) on per-row
-journaling and stops when it is gone: ordinary stripped syncs are nowhere near the cap and still
-journal every row, while a huge `--verbatim` manifest is written once. It is also always written
-on the way out of the loop, normally *or* through an exception, so every failure the process can
-observe still leaves an exact record — only a hard kill (power loss, `SIGKILL`) can lose the
-tail. A manifest that under-reports what landed is harmless either way: the re-read rule above
-recognises a row that already holds exactly the planned bytes and marks it done rather than
-duplicating or refusing.
+journaling and stops when it is gone. How far that stretches depends on manifest *size*, not row
+count — it buys `budget ÷ manifest bytes` individual saves. A small run journals every row; a
+stripped sync of this machine's own corpus (432 rows, ~417 KB of manifest) journals roughly the
+first 78 individually and batches the rest; a ~385 MB `--verbatim` manifest is written once. The
+manifest is also always written on the way out of the loop, normally *or* through an exception,
+so every failure the process can observe still leaves an exact record — only a hard kill (power
+loss, `SIGKILL`) can lose the tail. A manifest that under-reports what landed is harmless for
+rolling *forward*: the re-read rule above recognises a row that already holds exactly the planned
+bytes and marks it done rather than duplicating or refusing.
+
+Rolling *back* is the direction where a lost tail shows. `back` only removes rows the manifest
+records as `written`, so rows that landed in a batch the kill discarded are left in the
+destination and `back` reports that it removed nothing. The route that cleans them up is
+`recover --resolve <op> --forward --apply` — which re-reads them, recognises them, and records
+them — followed by `undo --id <op> --apply`. `back` names that route when it removes nothing.
 
 This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses entirely,
 touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation
