@@ -178,12 +178,12 @@ does not attempt to.
 **A stuck sync is recoverable, but not by rolling forward forever.** If a destination row drifts
 while a sync is non-terminal, `writing` can never complete — `sync` refuses on that same row
 every time it re-enters, per the re-read rule above. `doctor` flags the op as nonterminal, and
-running `recover` (without `--id`) lists it offering `back` instead of `forward`, naming the row
-that's blocking it. `recover --back` removes every row this op can verify it wrote — present,
-and still byte-identical to what was written — and **skips**, rather than deletes, any row it
-wrote that has since drifted or gone unreadable, reporting what it left behind. It always ends
-at `rolled_back`, because `back` is the only exit from a stuck op and must terminate rather than
-recreate the same dead end.
+running `recover` with no `--resolve` lists it, offering `back` instead of `forward` and naming
+the row that's blocking it. Resolving it with `--resolve <op-id> --back --apply` removes every
+row this op can verify it wrote — present, and still byte-identical to what was written — and
+**skips**, rather than deletes, any row it wrote that has since drifted or gone unreadable,
+reporting what it left behind. It always ends at `rolled_back`, because `back` is the only exit
+from a stuck op and must terminate rather than recreate the same dead end.
 
 This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses entirely,
 touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation

@@ -85,10 +85,17 @@ claude-code-threads sync --apply
 There is only one copy of the conversation itself — shared, and carrying no account identity —
 so a synced thread opens and resumes normally under the other account. Without `--to`, the
 destination must be unambiguous: exactly one other account store on the machine, or `--to
-<email-or-uuid-substring>` naming one of several. `sync` refuses outright if it cannot tell which
-account is signed in, from either `~/.claude.json` or `config.json` — `--to` cannot substitute
-for that: it only narrows *which* dormant store to use, and if we don't know which account is
-live we cannot verify the one you named isn't it.
+<uuid-substring>` naming one of several by its account or org id. Not by email: the destination
+is an account you are not signed into, so its email is never recorded on disk for `sync` to match
+against (more on this below) — only account/org id substrings work. `sync` refuses outright if it
+cannot tell which account is signed in, from either `~/.claude.json` or `config.json` — `--to`
+cannot substitute for that: it only narrows *which* dormant store to use, and if we don't know
+which account is live we cannot verify the one you named isn't it.
+
+`--json` prints the plan by itself, the same as the default dry run. Combined with `--apply` it
+runs first and describes what actually happened instead — real `written` flags per row and a
+`result` key, not the plan it would have executed. Automation that assumes `sync --json` output
+is always a preview will misread `sync --apply --json`.
 
 - **Threads you deleted in the destination stay deleted.** The app writes a small record
   (`deleted_<id>`) when you delete a thread but does not consult it when a row for that thread
@@ -105,8 +112,9 @@ live we cannot verify the one you named isn't it.
   connectors configured. A thread that relies on one opens fine either way and fails at its first
   tool call if the integration isn't set up there too; set it up in the destination account.
   `--verbatim` copies rows unchanged, connector config included.
-- **It does not need the app closed, unlike `move`.** `sync` only ever writes the store you are
-  *not* signed into, and re-checks that at the moment it writes, not just when it planned.
+- **It does not need the app closed, unlike `move`, `undo`, and `recover`.** `sync` only ever
+  writes the store you are *not* signed into, and re-checks that at the moment it writes, not
+  just when it planned.
 - **`sync` cannot tell you the destination's email** — it isn't recorded anywhere on disk for an
   account you aren't currently signed into, so a dry run prints `(email unknown)` for it. Both
   endpoints print their account/org id prefix and their full store path instead, so you have a

@@ -1954,8 +1954,8 @@ def build_parser():
     common(sp)
 
     sp = sub.add_parser("sync", help="copy thread listing rows to your other account")
-    sp.add_argument("--to", default="", metavar="EMAIL_OR_UUID",
-                    help="destination account (required if more than one exists)")
+    sp.add_argument("--to", default="", metavar="UUID_SUBSTRING",
+                    help="destination account/org id substring (required if more than one exists)")
     sp.add_argument("--only", default="", metavar="SUBSTRING",
                     help="only threads whose title contains this")
     sp.add_argument("--include-deleted", action="append", default=[],
