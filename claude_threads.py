@@ -2152,5 +2152,75 @@ def resolve_sync_endpoints(env, to=None):
     return source, others[0]
 
 
+@dataclasses.dataclass
+class SyncFlags:
+    to: str = ""
+    only: str = ""
+    include_deleted: tuple = ()
+    verbatim: bool = False
+
+
+def _destination_tombstones(dest):
+    """Session ids the DESTINATION account has deleted. Only the destination's
+    history matters - tombstones are per-account, so the source's deletions
+    say nothing about what this account should see."""
+    out = set()
+    for name in os.listdir(dest.path):
+        if name.startswith("deleted_"):
+            out.add(name[len("deleted_"):])
+    return out
+
+
+def select_sync_rows(env, source, dest, flags):
+    """Which source rows are eligible to copy, and why the rest were skipped.
+
+    A row qualifies only if: it is a local_*.json row (not a tombstone or
+    other sidecar), it is absent from the destination by filename, its
+    transcript still exists somewhere under ~/.claude/projects (a row with no
+    transcript is a dead pointer), and the destination holds no tombstone for
+    its cliSessionId - unless the row's title/session id was named via
+    --include-deleted, which overrides the tombstone skip for that row only.
+    """
+    tally = {"present": [], "no_transcript": [], "deleted": [], "unreadable": [],
+             "filtered": []}
+    have = set(os.listdir(dest.path))
+    tombs = _destination_tombstones(dest)
+    named = tuple(s.lower() for s in (flags.include_deleted or ()))
+    picked = []
+    for name in sorted(os.listdir(source.path)):
+        if not (name.startswith("local_") and name.endswith(".json")):
+            continue                      # scheduled-tasks.json, deleted_*, *.tmp
+        p = os.path.join(source.path, name)
+        try:
+            d = read_json(p)
+        except LayoutError:
+            tally["unreadable"].append(name)
+            continue
+        if not isinstance(d, dict):
+            tally["unreadable"].append(name)
+            continue
+        title = d.get("title") or "(untitled)"
+        sid = d.get("cliSessionId") or ""
+        if flags.only and flags.only.lower() not in title.lower():
+            tally["filtered"].append(title)
+            continue
+        if name in have:
+            tally["present"].append(title)
+            continue
+        if not sid or not find_transcripts(env.projects_root, sid):
+            tally["no_transcript"].append(title)
+            continue
+        if sid in tombs:
+            # E4: the app shows a restored row for a deleted session, so this
+            # skip is the only thing preventing a resurrection.
+            if not any(n in title.lower() or n == sid.lower() for n in named):
+                tally["deleted"].append(title)
+                continue
+        picked.append({"name": name, "src_path": p, "data": d, "session_id": sid,
+                       "title": title, "last_activity": d.get("lastActivityAt") or 0})
+    picked.sort(key=lambda r: r["last_activity"], reverse=True)
+    return picked, tally
+
+
 if __name__ == "__main__":
     sys.exit(main())

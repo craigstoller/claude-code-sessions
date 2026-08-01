@@ -148,3 +148,91 @@ def test_layout_error_on_store_discovery_failure(two_account_env, tmp_path, monk
     with pytest.raises(ct.LayoutError) as exc_info:
         ct.resolve_sync_endpoints(env)
     assert exc_info.value.exit_code == 2
+
+
+def _row(store, name, sid, title, extra=None):
+    d = {"sessionId": name[:-5], "cliSessionId": sid, "cwd": "C:\\p",
+         "title": title, "lastActivityAt": 1}
+    d.update(extra or {})
+    with open(os.path.join(store, name), "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    return d
+
+
+def _transcript(env, sid):
+    folder = os.path.join(env.projects_root, "C--p")
+    os.makedirs(folder, exist_ok=True)
+    p = os.path.join(folder, sid + ".jsonl")
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write('{"cwd":"C:\\\\p"}\n')
+    return p
+
+
+def test_selects_only_missing_rows_with_live_transcripts(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(src, "local_b.json", "sid-b", "Bravo"); _transcript(env, "sid-b")
+    _row(dst, "local_b.json", "sid-b", "Bravo")          # already there
+    _row(src, "local_c.json", "sid-c", "Charlie")         # transcript missing
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
+    assert [p["title"] for p in picked] == ["Alpha"]
+    assert tally["present"] == ["Bravo"]
+    assert tally["no_transcript"] == ["Charlie"]
+
+
+def test_skips_sessions_the_destination_deleted(two_account_env, tmp_path):
+    """E4: the app writes tombstones but does not honour them, so copying a
+    row for a tombstoned session resurrects a thread the user deleted."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    with open(os.path.join(dst, "deleted_sid-a"), "w") as fh:
+        fh.write("1785541024931")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
+    assert picked == []
+    assert tally["deleted"] == ["Alpha"]
+
+
+def test_include_deleted_overrides_only_for_named_sessions(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(src, "local_b.json", "sid-b", "Bravo"); _transcript(env, "sid-b")
+    for sid in ("sid-a", "sid-b"):
+        with open(os.path.join(dst, "deleted_" + sid), "w") as fh:
+            fh.write("1")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest,
+                                        ct.SyncFlags(include_deleted=("Alpha",)))
+    assert [p["title"] for p in picked] == ["Alpha"]      # named one only
+    assert tally["deleted"] == ["Bravo"]
+
+
+def test_only_filter(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(src, "local_b.json", "sid-b", "Bravo"); _transcript(env, "sid-b")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags(only="alph"))
+    assert [p["title"] for p in picked] == ["Alpha"]
+    assert tally["filtered"] == ["Bravo"]
+
+
+def test_non_row_files_are_never_candidates(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    for junk in ("scheduled-tasks.json", "deleted_sid-z", "local_q.json.tmp"):
+        with open(os.path.join(src, junk), "w") as fh:
+            fh.write("{}")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
+    assert picked == []
+
+
+def test_unreadable_row_is_reported_not_copied(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    with open(os.path.join(src, "local_bad.json"), "w") as fh:
+        fh.write("{not json")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
+    assert picked == []
+    assert tally["unreadable"] == ["local_bad.json"]
