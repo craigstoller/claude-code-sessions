@@ -664,3 +664,190 @@ def test_cmd_recover_lists_sync_and_move_ops_without_a_traceback(
     # Refusal/LayoutError. It must now return cleanly: 1 means "unresolved
     # ops remain", which is correct - neither op was resolved here.
     assert ct.cmd_recover(env, ns) == 1
+
+
+# ------------------------------------------- fix round 1 (Opus review)
+
+
+def test_undo_sync_refuses_when_destination_is_the_live_account(two_account_env, tmp_path):
+    """Finding 1 (Critical): sync ships with no process guard specifically
+    because every write re-checks live_account(env) at execute time - a
+    stale manifest can never land a write in the account the app is
+    actively using. undo deletes from that same store and must carry the
+    identical guarantee, or 'sync A->B, sign into B, undo' unlinks listing
+    rows out from under a live app."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    # sign into the destination account - it is now live
+    with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {
+            "accountUuid": "cccccccc-0000-0000-0000-000000000003",
+            "organizationUuid": "dddddddd-0000-0000-0000-000000000004",
+            "emailAddress": "them@example.com"}}, fh)
+    with pytest.raises(ct.Refusal, match="live"):
+        ct.undo_sync(env, op)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))     # untouched
+
+
+def test_undo_sync_refuses_row_dest_path_outside_destination_root(two_account_env, tmp_path):
+    """Finding 2 (Important): every other mutation in this module validates
+    containment first (_validate_manifest_paths for move, ensure_contained
+    plus the direct-child check for sync writes) - a hand-edited or
+    corrupted manifest row must never let undo delete an arbitrary path."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    outside = os.path.join(str(tmp_path), "elsewhere.json")
+    with open(outside, "w") as fh:
+        fh.write("do not delete me")
+    op.manifest["rows"][0]["dest_path"] = outside
+    with pytest.raises(ct.LayoutError):
+        ct.undo_sync(env, op)
+    assert os.path.exists(outside)
+
+
+def test_undo_sync_refuses_when_locked(two_account_env, tmp_path):
+    """Finding 3 (Important): undo_sync must take the single-instance lock
+    first, before any of its own checks - the same discipline
+    run_undo/run_move/run_sync/recover_op all use - or two concurrent
+    'undo --apply' runs can both pass the completed/drift checks and race
+    their unlinks."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    ct.acquire_lock(env, "other-op")
+    try:
+        with pytest.raises(ct.Refusal, match="lock"):
+            ct.undo_sync(env, op)
+    finally:
+        ct.release_lock(env)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+
+def test_undo_sync_wraps_unlink_failure_as_a_refusal(two_account_env, tmp_path):
+    """Finding 4 (Important): a bare OSError from os.unlink must never
+    propagate raw - main() only catches Refusal/LayoutError, the exact
+    traceback defect this task exists to fix, now on the delete side."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    row_path = op.manifest["rows"][0]["dest_path"]
+    os.chmod(row_path, stat.S_IREAD)              # Windows: unlink of a read-only
+    try:                                          # file raises PermissionError
+        with pytest.raises(ct.Refusal) as exc_info:
+            ct.undo_sync(env, op)
+        assert "could not remove" in str(exc_info.value)
+        assert os.path.exists(row_path)
+    finally:
+        os.chmod(row_path, stat.S_IWRITE)
+
+
+def test_undo_sync_refuses_when_not_completed(two_account_env, tmp_path):
+    """Minor 10: dedicated coverage for undo_sync's 'not completed' guard -
+    previously only exercised incidentally."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    op = ct.new_op(env, m)                         # status "journaled", never run
+    with pytest.raises(ct.Refusal, match="journaled"):
+        ct.undo_sync(env, op)
+
+
+def test_undo_sync_all_or_nothing_with_two_rows_one_drifted(two_account_env, tmp_path):
+    """Minor 10: the original single-row drift test doesn't prove the
+    all-or-nothing claim the report made - with two written rows and only
+    one drifted, undo_sync must refuse and leave BOTH files on disk, not
+    quietly remove the one that didn't drift."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    with open(os.path.join(dst, "local_0.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"cliSessionId":"sid-0","title":"renamed by the app"}')
+    with pytest.raises(ct.Refusal, match="changed"):
+        ct.undo_sync(env, op)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))    # drifted - kept
+    assert os.path.exists(os.path.join(dst, "local_1.json"))    # untouched too
+
+
+def test_classify_sync_op_offers_back_when_a_pending_row_is_blocked(two_account_env, tmp_path):
+    """Finding 5 (plan-mandated): when a destination row changes underneath
+    a still-in-flight sync, forward can never complete - execute_sync_op
+    refuses on that exact row every time it re-enters. classify_sync_op
+    must detect this, name the blocking row, and switch from offering
+    forward forever (a dead end) to offering back."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    pending_row = next(r for r in op.manifest["rows"] if not r.get("written"))
+    with open(pending_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"unexpected": true}')
+
+    c = ct.classify_op(env, op)
+    assert c["status"] == "writing"
+    assert c["resolutions"] == ["back"]
+    assert c["drifted_rows"] == [pending_row["title"]]
+
+
+def test_recover_back_removes_written_rows_when_a_pending_row_is_blocked(two_account_env, tmp_path):
+    """Finding 5 (plan-mandated): recover --resolve --back on a sync op
+    removes exactly the rows it already wrote - never the blocking pending
+    row, which this op never wrote in the first place - and leaves the op
+    terminal (rolled_back) instead of stuck forever."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    written_row = next(r for r in op.manifest["rows"] if r.get("written"))
+    pending_row = next(r for r in op.manifest["rows"] if not r.get("written"))
+    with open(pending_row["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write('{"unexpected": true}')
+
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert not os.path.exists(written_row["dest_path"])          # removed
+    with open(pending_row["dest_path"], encoding="utf-8") as fh:
+        assert json.load(fh) == {"unexpected": True}              # left alone
+    assert ct.list_ops(env)[-1].manifest["status"] == "rolled_back"
+    assert ct.nonterminal_ops(env) == []
+
+
+def test_cmd_undo_dry_run_preview_for_sync_op(two_account_env, tmp_path, capsys):
+    """Minor 9: cmd_undo's dry-run line prints session_id, which a sync
+    manifest does not have, so it used to print 'session None'. Newly
+    reachable because this task widened the candidate filter to include
+    sync - the preview must say something meaningful instead."""
+    import types
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    ns = types.SimpleNamespace(show=False, op_id=None, apply=False, verbose=True)
+    assert ct.cmd_undo(env, ns) == 0
+    out = capsys.readouterr().out
+    assert "None" not in out
+    assert "2 row" in out
