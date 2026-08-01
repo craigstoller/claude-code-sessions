@@ -112,3 +112,80 @@ Transcripts are cleaned up on a retention timer, `cleanupPeriodDays`, defaulting
 when unset in `~/.claude/settings.json`. A listing row whose `cliSessionId` no longer resolves
 to any transcript on disk is consistent with this: the transcript aged out from under a row
 that still references it, which is a normal, expected state rather than corruption.
+
+## Deletion records ("tombstones")
+
+*(observed July 2026, Claude Desktop (Windows); format may change)*
+
+Deleting a thread in the app writes a file named `deleted_<cliSessionId>` beside the listing
+rows, inside `<accountUuid>/<organizationUuid>/`. It is 13 bytes: an epoch-millisecond
+timestamp of the deletion. The listing row is **removed outright**, not blanked in place, and
+the **transcript is left on disk**.
+
+Two consequences that are easy to get wrong:
+
+- **They are per-account.** A deletion under one account says nothing about what another
+  account should see — a tombstone lives inside the same per-account folder as the rows it's
+  paired with, never anywhere shared.
+- **The app writes them but does not honour them.** Deleting a disposable thread, then
+  restoring its backed-up listing row while leaving the tombstone in place, then relaunching the
+  app, showed the thread in the sidebar again. The tombstone survived the launch with its
+  contents unchanged — nothing consumed or pruned it.
+
+So any tool that copies listing rows between accounts must consult the *destination's*
+tombstones itself; nothing in the app stops a copy from resurrecting a thread the user
+deliberately deleted. `sync` (see the README) reads the destination's tombstones and skips any
+source thread they cover for exactly this reason. As far as we found, this is undocumented
+elsewhere: a review of seven other Claude session-copying tools' source, READMEs, and docs
+turned up zero mentions of `deleted_*` files, "tombstone," or soft-deletion of any kind.
+
+## `sync`'s journal, and how `recover`/`undo` treat it
+
+*(describes this tool's own design, not a reverse-engineered fact about the app)*
+
+A `sync` operation reuses `move`'s journal, single-instance lock, and rotation — the same
+`ops/<op-id>/manifest.json`, the same `doctor`/`recover` bookkeeping — but moves through a much
+shorter phase sequence, because nothing is ever deleted and no transcript moves:
+
+```
+journaled -> writing -> completed
+```
+
+Each row is written and marked `written: true` in the manifest immediately after its
+`atomic_write`, one row at a time, so a crash mid-run leaves an exact record of which rows
+landed and which didn't. A run that finds nothing to copy never creates an operation at all —
+there is nothing to journal.
+
+**Every row is re-read immediately before it would be written.** Absent → write it. Present and
+already byte-identical to what `sync` would write → leave it alone and mark the row done anyway;
+this is what makes re-running, or resuming a crashed run, safe. Present with *different* bytes →
+refuse, because the destination account has touched that row since the sync was planned (opened
+the thread, for instance) and overwriting it would discard that. The refusal leaves the op at
+`writing`, not a terminal status.
+
+**`sync` also re-confirms, at the moment it writes, that the destination is still the dormant
+account** — the same check that chose it at plan time (`resolve_sync_endpoints`), run again
+against `live_account()` at execute time. This is *why* `sync` can ship with no running-app
+guard at all, unlike `move`/`undo`/`recover`: those refuse in the presence of a running Claude
+process because they might be racing it, but `sync` never touches the account a running process
+would be using, and re-verifies that fact fresh on every write rather than trusting a plan made
+moments — or days — earlier. The same logic is why `sync` refuses outright if it cannot identify
+the signed-in account at all, from neither `~/.claude.json` nor `config.json`: with no live
+account confirmed, there is nothing to check the named destination *against*. `--to` only
+narrows which dormant store to use among several; it cannot supply that missing certainty, and
+does not attempt to.
+
+**A stuck sync is recoverable, but not by rolling forward forever.** If a destination row drifts
+while a sync is non-terminal, `writing` can never complete — `sync` refuses on that same row
+every time it re-enters, per the re-read rule above. `doctor` flags the op as nonterminal, and
+running `recover` (without `--id`) lists it offering `back` instead of `forward`, naming the row
+that's blocking it. `recover --back` removes every row this op can verify it wrote — present,
+and still byte-identical to what was written — and **skips**, rather than deletes, any row it
+wrote that has since drifted or gone unreadable, reporting what it left behind. It always ends
+at `rolled_back`, because `back` is the only exit from a stuck op and must terminate rather than
+recreate the same dead end.
+
+This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses entirely,
+touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation
+being reversed at the user's explicit request is a case where a surprise should mean stop and
+ask, not best-effort cleanup — the opposite of what a stuck, still-in-flight op needs.

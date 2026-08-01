@@ -32,13 +32,15 @@ python claude_threads.py --help
 
 ## Before any move: close the Claude app.
 
-The tool refuses to mutate anything while it can see a running Claude process, but closing the
-app first avoids the refusal and guarantees nothing is actively appending to the transcript
-you're about to relocate.
+`move`, `undo`, and `recover` refuse to mutate anything while they can see a running Claude
+process, but closing the app first avoids the refusal and guarantees nothing is actively
+appending to the transcript you're about to relocate. (`sync` is the one exception — see below:
+it never writes the account you're signed into, so it carries no such check and doesn't need the
+app closed.)
 
 ## Usage
 
-Five commands. All mutating commands default to a dry run; add `--apply` to execute.
+Six commands. All mutating commands default to a dry run; add `--apply` to execute.
 
 **`list`** — inventory threads, optionally filtered by a search term:
 
@@ -73,6 +75,51 @@ claude-code-threads undo --apply
 claude-code-threads recover
 ```
 
+**`sync`** — copy a thread's sidebar **listing row** from your signed-in account into your
+*other* Claude account's store on this machine, so it shows up in that account's sidebar too:
+
+```
+claude-code-threads sync --apply
+```
+
+There is only one copy of the conversation itself — shared, and carrying no account identity —
+so a synced thread opens and resumes normally under the other account. Without `--to`, the
+destination must be unambiguous: exactly one other account store on the machine, or `--to
+<email-or-uuid-substring>` naming one of several. `sync` refuses outright if it cannot tell which
+account is signed in, from either `~/.claude.json` or `config.json` — `--to` cannot substitute
+for that: it only narrows *which* dormant store to use, and if we don't know which account is
+live we cannot verify the one you named isn't it.
+
+- **Threads you deleted in the destination stay deleted.** The app writes a small record
+  (`deleted_<id>`) when you delete a thread but does not consult it when a row for that thread
+  reappears elsewhere — confirmed by restoring a deleted row alongside its own record and
+  reopening the app, which showed the thread again. `sync` reads the *destination's* records and
+  skips any source thread they cover. `--include-deleted "<title-or-id>"` overrides the skip for
+  that one named thread; it never applies to a whole run.
+- **Connector config is not copied by default.** A row can carry a full snapshot of the
+  account's connected MCP servers; across 432 real rows on this machine that field ran as large
+  as 1.36 MB in a single row and totalled 289 MB. Stripping it is verified safe: on a real row it
+  cut 132,264 bytes to 715 (99.5% smaller) with the sidebar entry, history, responses, and
+  connectors all working normally afterward, under the account that owned them. That proves the
+  *app* tolerates the field's absence — it does not prove the *destination account* has the same
+  connectors configured. A thread that relies on one opens fine either way and fails at its first
+  tool call if the integration isn't set up there too; set it up in the destination account.
+  `--verbatim` copies rows unchanged, connector config included.
+- **It does not need the app closed, unlike `move`.** `sync` only ever writes the store you are
+  *not* signed into, and re-checks that at the moment it writes, not just when it planned.
+- **`sync` cannot tell you the destination's email** — it isn't recorded anywhere on disk for an
+  account you aren't currently signed into, so a dry run prints `(email unknown)` for it. Both
+  endpoints print their account/org id prefix and their full store path instead, so you have a
+  physical folder to recognise: the home directory becomes `~` and each id is truncated to 8
+  characters (e.g. `~\AppData\...\claude-code-sessions\aaaaaaaa…\bbbbbbbb…`) unless you pass
+  `--verbose` for the paths and ids in full. Check the path, not just the email, before `--apply`.
+- A synced row is a **snapshot**: title and last-activity time live in the row itself, so a
+  thread you keep using shows its copy-time title and sits at its copy-time position in the
+  other account, indefinitely. Re-running does not refresh it — `sync` only ever adds rows that
+  are missing, never rewrites one that's already there. Refreshing a stale row (`--update`) is
+  planned but not yet built.
+- Sign into the other account (or restart the app) to see the results.
+
 ## Safety design
 
 - **Dry-run by default.** Every mutating command prints its plan and does nothing until you
@@ -85,6 +132,11 @@ claude-code-threads recover
   reverse.
 - **`recover`** classifies and resolves any operation a crash or interruption left in a
   non-terminal state — nothing is left stranded.
+- **`sync`** only ever writes rows into the store of the account you are *not* currently signed
+  into, re-verifying that at the moment it writes as well as when it planned. That is also why
+  it refuses outright if it cannot identify which account is signed in at all: `--to` names a
+  destination, but without a confirmed live account there is nothing to check that destination
+  against.
 - **Refusal philosophy.** The tool fails closed: an unrecognized on-disk layout, an unreadable
   row, an ambiguous encoding scheme, or a running Claude process is a refusal, not a guess.
   "Couldn't look" is never treated as "nothing there."
@@ -104,11 +156,19 @@ to the transcript (rather than discarding the new messages), and a deliberately
 interrupted move was resolved in both directions with `recover`. Afterwards `doctor`
 reported no new findings and the journal held no unresolved operations.
 
+`sync`'s underlying mechanics were checked against two real, live accounts on this machine before
+the command existed: rows copied by hand between them and confirmed visible in the destination's
+sidebar, and — separately — a deleted thread's row restored alongside its own deletion record and
+confirmed visible again, which is the finding that makes `sync`'s tombstone-skipping mandatory
+(see `docs/internals.md`). The `sync` command itself is covered by its test suite and a read-only
+dry run against a real store; it has not yet had its own end-to-end `--apply` run against two live
+accounts the way `move` has above.
+
 ## What's stored locally
 
 `~/.claude-code-threads/` holds the tool's own bookkeeping, never your conversation content:
 
-- `ops/<op-id>/manifest.json` — the journal for each move/undo/recover operation (paths,
+- `ops/<op-id>/manifest.json` — the journal for each move/undo/recover/sync operation (paths,
   hashes, row pre-images, phase history). Rotated: the 10 most recent terminal operations are
   kept, non-terminal ones never pruned automatically.
 - `ops/lock` — a single-instance lock held for the duration of a mutation.
@@ -136,10 +196,11 @@ window into `journaled`/`completed`/`rolled_back`.
 
 ## Roadmap
 
-- **`sync`** (copying a thread's listing row across accounts on the same machine) is deferred
-  pending some tombstone-semantics experiments — the two-layer model (shared transcript,
-  per-account listing copy) means a naive copy can't currently tell a deleted thread from one
-  that was never copied.
+- **`sync --update`** (refreshing a previously synced row that the destination account has kept
+  using) is deferred, not dismissed. Refreshing means overwriting a row the destination account
+  may have changed itself since the copy — the one place `sync` could destroy something instead
+  of just adding to it — so it needs the same drift-refusal treatment `undo` already has before
+  it ships.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
