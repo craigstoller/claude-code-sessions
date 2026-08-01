@@ -524,3 +524,143 @@ def test_atomic_write_failure_becomes_a_refusal_not_a_traceback(two_account_env,
     finally:
         os.chmod(scratch, stat.S_IWRITE)
         os.unlink(scratch)
+
+
+def test_undo_sync_removes_exactly_the_rows_it_wrote(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    _row(dst, "local_pre.json", "sid-pre", "Pre-existing")
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    op = ct.list_ops(env)[-1]
+    assert ct.undo_sync(env, op) == "undone"
+    left = sorted(f for f in os.listdir(dst) if f.startswith("local_"))
+    assert left == ["local_pre.json"]           # untouched
+    assert ct.list_ops(env)[-1].manifest["status"] == "undone"
+
+
+def test_undo_sync_refuses_when_a_written_row_changed(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    with open(os.path.join(dst, "local_0.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"cliSessionId":"sid-0","title":"renamed by the app"}')
+    op = ct.list_ops(env)[-1]
+    with pytest.raises(ct.Refusal, match="changed"):
+        ct.undo_sync(env, op)
+    assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+
+def test_classify_sync_op_offers_forward_only(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=3)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    c = ct.classify_op(env, op)
+    assert c["status"] == "writing"
+    assert c["resolutions"] == ["forward"]
+
+
+def test_recover_forward_finishes_an_interrupted_sync(two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=3)
+    m = ct.plan_sync(env, ct.SyncFlags())
+
+    def hook(point):
+        if point == "sync-mid-write":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert len([f for f in os.listdir(dst) if f.startswith("local_")]) == 3
+    assert ct.nonterminal_ops(env) == []
+
+
+def test_cmd_undo_can_select_a_sync_op(two_account_env, tmp_path, monkeypatch):
+    import types
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    ns = types.SimpleNamespace(show=False, op_id=None, apply=True, verbose=False)
+    assert ct.cmd_undo(env, ns) == 0
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+def test_cmd_recover_lists_sync_and_move_ops_without_a_traceback(
+        two_account_env, tmp_path, write_transcript, write_row):
+    """Regression for the review finding: classify_op's first line used to
+    dereference m["source_transcript"] unconditionally, and a sync manifest
+    has no such key - so classify_op(sync_op) raised a bare KeyError, which
+    main() does not catch (only Refusal/LayoutError are). cmd_recover's
+    listing loop calls classify_op on every pending op in turn, so that
+    KeyError didn't just break the sync op's own line - it aborted the whole
+    loop, taking an unrelated move op queued behind it down too. Prove both
+    ops now list cleanly with the dispatch fix in place."""
+    env, src, dst = two_account_env(tmp_path)
+
+    # A non-terminal sync op, left exactly the way a real refused sync
+    # leaves one on disk: journaled, then refused before any row is written
+    # because the destination resolved to the live account (same scenario as
+    # test_refuses_to_write_the_live_store).
+    _prepared(env, src, dst, n=1)
+    sync_manifest = ct.plan_sync(env, ct.SyncFlags())
+    sync_manifest["dest_path"] = src                  # pretend the account switched
+    with pytest.raises(ct.Refusal, match="live"):
+        ct.run_sync(env, sync_manifest)
+
+    # An unrelated non-terminal MOVE op, queued behind the sync op in
+    # nonterminal_ops' creation-time order.
+    move_sid = "move-sess"
+    move_cwd = "C:\\proj\\src"
+    target = str(tmp_path / "target")
+    os.makedirs(target)
+    write_transcript(env, ct.encode(move_cwd, ct.SCHEME_CURRENT), move_sid,
+                     [{"cwd": move_cwd}])
+    # Evidence folder + row so scheme detection resolves unambiguously
+    # regardless of what pytest's own tmp_path segment happens to contain -
+    # same precedent as test_recover.py's `crashed` fixture.
+    os.makedirs(os.path.join(env.projects_root,
+                             ct.encode("C:\\proj\\_ev", ct.SCHEME_CURRENT)))
+    write_row(env, 0, "org", "acct", "local_move",
+             {"sessionId": "local_move", "cliSessionId": move_sid, "cwd": move_cwd})
+    write_row(env, 0, "org", "acct", "local_ev",
+             {"sessionId": "local_ev", "cliSessionId": "other", "cwd": "C:\\proj\\_ev",
+              "lastActivityAt": 2})
+    move_manifest = ct.plan_move(env, move_sid, target, ct.MoveFlags())
+
+    def hook(point):
+        if point == "after-journaled":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_move(env, move_manifest)
+    finally:
+        ct._crash_hook = None
+
+    pending = ct.nonterminal_ops(env)
+    assert len(pending) == 2
+    assert {o.manifest["op_type"] for o in pending} == {"sync", "move"}
+
+    import types
+    ns = types.SimpleNamespace(op_id=None, verbose=False)
+    # Before the fix this call raised KeyError('source_transcript') straight
+    # out of cmd_recover - unhandled, since main() only catches
+    # Refusal/LayoutError. It must now return cleanly: 1 means "unresolved
+    # ops remain", which is correct - neither op was resolved here.
+    assert ct.cmd_recover(env, ns) == 1

@@ -1378,6 +1378,9 @@ def classify_op(env, op):
     m = op.manifest
     status = m["status"]
 
+    if m.get("op_type") == "sync":
+        return classify_sync_op(env, op)
+
     def _src_state():
         transcript_present = os.path.isfile(m["source_transcript"])
         if not transcript_present:
@@ -1556,7 +1559,11 @@ def recover_op(env, op, direction):
     try:
         # I4: validate containment before ANY mutation, including the
         # scratch-dest unlink below - not just on execute_op's fresh runs.
-        _validate_manifest_paths(env, op.manifest)
+        # A sync manifest carries no source_transcript/sidecar_inventory/
+        # row["path"] for this validator to inspect - execute_sync_op does
+        # its own containment check inline, per-row, instead.
+        if op.manifest.get("op_type") != "sync":
+            _validate_manifest_paths(env, op.manifest)
 
         c = classify_op(env, op)
         if direction not in c["resolutions"]:
@@ -1564,6 +1571,16 @@ def recover_op(env, op, direction):
                           .format(direction, op.manifest["op_id"], c["note"],
                                   c["resolutions"] or "none - manual intervention"))
         m = op.manifest
+        if m.get("op_type") == "sync":
+            # A sync only ever adds rows, so there is no "back" - rolling
+            # forward re-enters execute_sync_op to finish the remaining
+            # writes; removing what it already wrote is undo_sync's job.
+            if direction != "forward":
+                raise Refusal("a sync can only be rolled forward; to remove the rows "
+                              "it wrote, use 'claude-code-threads undo'")
+            op.manifest["status"] = "journaled"
+            save_manifest(op)
+            return execute_sync_op(env, op)
         if direction == "back":
             _abort(env, op)
             return "rolled_back"
@@ -1969,15 +1986,15 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is "move" (or missing, which
-    # in practice never happens - every manifest sets op_type) is eligible
-    # as "the operation to undo". A completed *undo* op is itself terminal
-    # from cmd_undo's point of view - plan_undo always refuses an
-    # undo-of-undo ("to redo, run move again") - so selecting one here would
-    # only ever produce that refusal instead of reaching an older, still
-    # -undoable completed move underneath it.
+    # delta: only a completed op whose op_type is "move" or "sync" (or
+    # missing, which in practice never happens - every manifest sets
+    # op_type) is eligible as "the operation to undo". A completed *undo*
+    # op is itself terminal from cmd_undo's point of view - plan_undo
+    # always refuses an undo-of-undo ("to redo, run move again") - so
+    # selecting one here would only ever produce that refusal instead of
+    # reaching an older, still-undoable completed move/sync underneath it.
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
-                 and o.manifest.get("op_type", "move") == "move"]
+                 and o.manifest.get("op_type", "move") in ("move", "sync")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -1990,11 +2007,19 @@ def cmd_undo(env, ns):
         print(line if ns.verbose else redact(env, line))   # M1: redact the preview too
         return 0
     before_ids = {o.manifest["op_id"] for o in list_ops(env)}
-    final = run_undo(env, prior)
+    if prior.manifest.get("op_type") == "sync":
+        final = undo_sync(env, prior)
+    else:
+        final = run_undo(env, prior)
     print("result: " + final)
-    if final != "completed":
+    # undo_sync's own terminal status is "undone" (it mutates the completed
+    # sync op in place rather than journaling a fresh reversal op the way
+    # run_undo/execute_op do) - "completed" remains the success value for
+    # every move/undo op the engine drives.
+    success = final == "completed" or final == "undone"
+    if not success:
         _print_new_op_reason(env, ns, before_ids)
-    return 0 if final == "completed" else 1
+    return 0 if success else 1
 
 
 def cmd_recover(env, ns):
@@ -2404,6 +2429,55 @@ def run_sync(env, manifest):
         return final
     finally:
         release_lock(env)
+
+
+def classify_sync_op(env, op):
+    """Sync's recovery shape. A sync only ever adds rows, so there is no
+    'back' - rolling forward finishes the remaining writes, and removing what
+    it wrote is `undo`'s job, which checks for destination-side drift first."""
+    m = op.manifest
+    written = [r for r in m["rows"] if r.get("written")]
+    pending = [r for r in m["rows"] if not r.get("written")]
+    return {"status": m["status"], "source": "n/a", "dest": "n/a",
+            "resolutions": ["forward"] if m["status"] in NONTERMINAL else [],
+            "drifted_rows": [],
+            "note": "sync: {0} row(s) written, {1} pending; forward finishes them "
+                    "(use undo to remove what was written)"
+                    .format(len(written), len(pending))}
+
+
+def undo_sync(env, op):
+    """Delete exactly the rows this sync wrote - and only while they are still
+    byte-identical to what it wrote. If the destination account has since
+    opened the thread the app rewrites the row, and deleting it would discard
+    that account's own state."""
+    m = op.manifest
+    if m.get("op_type") != "sync":
+        raise Refusal("not a sync op: " + str(m.get("op_id")))
+    if m.get("status") != "completed":
+        raise Refusal("op {0} is '{1}', not 'completed'".format(
+            m.get("op_id"), m.get("status")))
+    drifted, removable = [], []
+    for r in m["rows"]:
+        if not r.get("written"):
+            continue
+        p = r["dest_path"]
+        if not os.path.exists(p):
+            continue                       # already gone; nothing to undo
+        with open(p, "rb") as fh:
+            cur = fh.read()
+        if cur == unb64(r["post_b64"]):
+            removable.append(p)
+        else:
+            drifted.append(r["title"])
+    if drifted:
+        raise Refusal("these synced rows have changed since the sync ({0}); the other "
+                      "account may have opened them. Refusing to delete them."
+                      .format(", ".join(drifted)))
+    for p in removable:
+        os.unlink(p)
+    set_status(op, "undone")
+    return "undone"
 
 
 if __name__ == "__main__":
