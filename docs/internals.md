@@ -207,6 +207,20 @@ only *probably* dormant can be neither written nor deleted from while the app is
 dry run labels a weakly-resolved source explicitly rather than printing the same
 `(email unknown)` an ordinary dormant-side line prints.
 
+**The dormant account's email is recoverable, which was not obvious.** `oauthAccount` names
+only the live account, so the destination printed as `(email unknown)` — eight hex characters
+to identify the account you are about to write into. But the desktop app runs local agent mode
+in a per-account sandbox and drops a Claude Code config inside it, at
+`local-agent-mode-sessions\<accountUuid>\<orgUuid>\**\.claude\.claude.json`, whose own
+`oauthAccount` names *that* account (observed on Windows, August 2026). `dormant_account_email`
+reads it and accepts the address only when the `accountUuid` inside matches the one being
+resolved — trusting an unrelated sandbox's email would mislabel an account, which is worse than
+no label. It is best-effort by design: the directory exists only for an account that has used
+local agent mode (of the two accounts it was found on, one had 109 such files and the other
+none), it is a nested detail of a feature this tool does not otherwise touch, and any failure
+degrades to `(email unknown)` rather than erroring. A recovered email also becomes matchable by
+`--to`.
+
 The related-but-separate rule is that `sync` refuses outright if it cannot identify the
 signed-in account at all, from neither `~/.claude.json` nor `config.json`: with no live account
 confirmed, there is nothing to check the named destination *against*. `--to` only narrows which

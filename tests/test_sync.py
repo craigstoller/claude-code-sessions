@@ -1874,3 +1874,63 @@ def test_drifted_rows_are_deduplicated(two_account_env, tmp_path):
     c = ct.classify_op(env, op)
     assert c["resolutions"] == ["back"]
     assert c["drifted_rows"] == ["Same Title"]
+
+
+# --------------------------- dormant-account email (found during the drill)
+
+
+DORMANT = "cccccccc-0000-0000-0000-000000000003"
+
+
+def _agent_mode_config(env, account_uuid, oauth):
+    """Write the per-account Claude Code config the desktop app drops inside
+    its local-agent-mode sandbox, at the nesting depth the real one uses."""
+    d = os.path.join(os.path.dirname(env.store_candidates[0]),
+                     "local-agent-mode-sessions", account_uuid,
+                     "dddddddd-0000-0000-0000-000000000004",
+                     "agent", "local_ditto_x", ".claude")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": oauth}, fh)
+    return d
+
+
+def test_dormant_account_email_is_recovered_from_the_agent_mode_config(
+        two_account_env, tmp_path):
+    """~/.claude.json names only the LIVE account, so the destination used to
+    print as '(email unknown)' - eight hex characters to identify the account
+    you are about to write into. The desktop app leaves a per-account config
+    in its local-agent-mode sandbox that names it."""
+    env, src, dst = two_account_env(tmp_path)
+    assert ct.dormant_account_email(env, DORMANT) == ""      # nothing there yet
+    _agent_mode_config(env, DORMANT, {"accountUuid": DORMANT,
+                                      "emailAddress": "other@example.com"})
+    assert ct.dormant_account_email(env, DORMANT) == "other@example.com"
+
+    source, dest = ct.resolve_sync_endpoints(env)
+    assert dest.email == "other@example.com"
+    # ...and naming the destination by that email now works.
+    assert ct.resolve_sync_endpoints(env, to="other@example.com")[1].path == dest.path
+
+
+def test_dormant_account_email_ignores_a_config_for_a_different_account(
+        two_account_env, tmp_path):
+    """Trusting the email without checking the uuid inside would let an
+    unrelated sandbox mislabel an account, which is worse than no label."""
+    env, src, dst = two_account_env(tmp_path)
+    _agent_mode_config(env, DORMANT, {"accountUuid": "somebody-else",
+                                      "emailAddress": "wrong@example.com"})
+    assert ct.dormant_account_email(env, DORMANT) == ""
+    assert ct.resolve_sync_endpoints(env)[1].email == ""
+
+
+def test_dormant_account_email_survives_a_corrupt_config(two_account_env, tmp_path):
+    """Best-effort means best-effort: a broken config downgrades the label,
+    it never fails the run."""
+    env, src, dst = two_account_env(tmp_path)
+    d = _agent_mode_config(env, DORMANT, {"accountUuid": DORMANT,
+                                          "emailAddress": "other@example.com"})
+    with open(os.path.join(d, ".claude.json"), "w", encoding="utf-8") as fh:
+        fh.write("{ not json")
+    assert ct.dormant_account_email(env, DORMANT) == ""
+    assert ct.resolve_sync_endpoints(env)[1].email == ""

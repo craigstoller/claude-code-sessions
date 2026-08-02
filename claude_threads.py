@@ -1970,8 +1970,9 @@ def build_parser():
     common(sp)
 
     sp = sub.add_parser("sync", help="copy thread listing rows to your other account")
-    sp.add_argument("--to", default="", metavar="UUID_SUBSTRING",
-                    help="destination account/org id substring (required if more than one exists)")
+    sp.add_argument("--to", default="", metavar="SUBSTRING",
+                    help="destination account id, org id, store path, or email "
+                         "(required if more than one exists)")
     sp.add_argument("--only", default="", metavar="SUBSTRING",
                     help="only threads whose title contains this")
     sp.add_argument("--include-deleted", action="append", default=[],
@@ -2292,6 +2293,51 @@ def _candidate_line(account_uuid, org_uuid, path):
     return "   {0}/{1}   {2}".format(account_uuid[:8], org_uuid[:8], path)
 
 
+_AGENT_MODE_DIR = "local-agent-mode-sessions"
+
+
+def dormant_account_email(env, account_uuid):
+    """Best-effort email for an account that is NOT signed in, or "".
+
+    `oauthAccount` in ~/.claude.json names only the live account, so for a
+    long time this returned nothing and the dry run printed "(email unknown)"
+    for the destination - eight hex characters to identify the account you are
+    about to write into, which is a poor safety surface for the one command
+    that touches a second account.
+
+    It is recoverable. The desktop app runs local agent mode inside a
+    per-account sandbox and drops a Claude Code config in it, at
+    `<AGENT_MODE_DIR>/<accountUuid>/<orgUuid>/**/.claude/.claude.json`, whose
+    own `oauthAccount` names THAT account. Observed on Windows, August 2026.
+
+    Deliberately best-effort, and it must stay that way: the directory only
+    exists for an account that has used local agent mode (of the two accounts
+    it was found on, one had 109 such files and the other none), it is a
+    nested implementation detail of a feature we do not otherwise touch, and
+    it can move. Any failure means "unknown", never an error - this only ever
+    improves a label.
+
+    The account uuid inside the file must match the one asked for. Reading a
+    config and trusting its email without that check would let an unrelated
+    sandbox mislabel an account, which is worse than no label at all.
+    """
+    for root in getattr(env, "store_candidates", ()) or ():
+        base = os.path.join(os.path.dirname(root), _AGENT_MODE_DIR, account_uuid)
+        for dirpath, dirnames, filenames in os.walk(base):
+            if ".claude.json" not in filenames:
+                continue
+            if os.path.basename(dirpath) != ".claude":
+                continue
+            try:
+                oa = (read_json(os.path.join(dirpath, ".claude.json"))
+                      or {}).get("oauthAccount") or {}
+            except (LayoutError, OSError, ValueError, AttributeError):
+                continue
+            if oa.get("accountUuid") == account_uuid and oa.get("emailAddress"):
+                return oa["emailAddress"]
+    return ""
+
+
 def resolve_sync_endpoints(env, to=None):
     """(source, destination). Source is the signed-in account; destination is
     the other store. Refuses rather than guessing - row-freshness is NEVER
@@ -2309,7 +2355,8 @@ def resolve_sync_endpoints(env, to=None):
             "which account is live we cannot verify the one you named is not it.\n"
             "Fix: sign in to the Claude desktop app so ~/.claude.json names the account.\n"
             "Stores found:\n" + listing)
-    others = [Account(a, o, "", p) for a, o, p in dirs if a != source.account_uuid]
+    others = [Account(a, o, dormant_account_email(env, a), p)
+              for a, o, p in dirs if a != source.account_uuid]
     if not others:
         raise Refusal("no other account store on this machine - nothing to sync into")
     if to:

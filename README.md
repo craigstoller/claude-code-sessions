@@ -87,9 +87,8 @@ claude-code-threads sync --apply
 There is only one copy of the conversation itself — shared, and carrying no account identity —
 so a synced thread opens and resumes normally under the other account. Without `--to`, the
 destination must be unambiguous: exactly one other account store on the machine, or `--to
-<substring>` naming one of several by its account id, org id, or **store path**. Not by email:
-the destination is an account you are not signed into, so its email is never recorded on disk for
-`sync` to match against (more on this below). The path is matchable because ids alone are not
+<substring>` naming one of several by its account id, org id, **store path**, or — when it can be
+recovered, see below — its email. The path is matchable because ids alone are not
 always enough — Windows exposes two store roots (the MSIX package path and the classic
 `%APPDATA%\Claude` path), and a machine that migrated between installers can hold the same
 account under both, in which case the path is the only thing that tells the two copies apart.
@@ -144,12 +143,17 @@ is always a preview will misread `sync --apply --json`.
   that case explicitly (`from  (from config.json)`, plus a warning line) instead of the ordinary
   `(email unknown)`, and `--apply`, `undo`, and `recover --back` all refuse in that state while
   they can see a running Claude process. Signing into the desktop app removes the check.
-- **`sync` cannot tell you the destination's email** — it isn't recorded anywhere on disk for an
-  account you aren't currently signed into, so a dry run prints `(email unknown)` for it. Both
-  endpoints print their account/org id prefix and their full store path instead, so you have a
-  physical folder to recognise: the home directory becomes `~` and each id is truncated to 8
-  characters (e.g. `~\AppData\...\claude-code-sessions\aaaaaaaa…\bbbbbbbb…`) unless you pass
-  `--verbose` for the paths and ids in full. Check the path, not just the email, before `--apply`.
+- **The destination's email is best-effort.** `~/.claude.json` names only the account you are
+  signed into, so for the *other* account `sync` looks in the per-account Claude Code config the
+  desktop app leaves inside its local-agent-mode sandbox
+  (`local-agent-mode-sessions\<accountUuid>\…\.claude\.claude.json`), and uses its email only if
+  the account id inside matches. That directory exists only for an account that has used local
+  agent mode, so it is not always there — when it isn't, the dry run prints `(email unknown)`.
+  Either way both endpoints also print their account/org id prefix and their full store path, so
+  you always have a physical folder to recognise: the home directory becomes `~` and each id is
+  truncated to 8 characters (e.g. `~\AppData\...\claude-code-sessions\aaaaaaaa…\bbbbbbbb…`)
+  unless you pass `--verbose` for the paths and ids in full. Check the path, not just the email,
+  before `--apply`.
 - A synced row is a **snapshot**: title and last-activity time live in the row itself, so a
   thread you keep using shows its copy-time title and sits at its copy-time position in the
   other account, indefinitely. Re-running does not refresh it — `sync` only ever adds rows that
