@@ -1271,18 +1271,21 @@ def test_weakly_resolved_apply_refuses_while_claude_is_running(two_account_env,
     re-check calls the same live_account, so it agrees. Since RULING 4 the
     running-app guard is no longer a fallback for this weaker resolution -
     it is the universal gate every mutation route takes, regardless of how
-    (or whether) the live account was resolved."""
+    (or whether) the live account was resolved. Post plan-review fix: the
+    guard now sits in run_sync itself, before the op is journaled at all -
+    a refused --apply must leave no stray 'journaled' op for doctor to flag
+    or recover to have to clear."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     _weaken(env)
     m = ct.plan_sync(env, ct.SyncFlags())
     _app_running(env)
+    n_ops_before = len(ct.list_ops(env))
     with pytest.raises(ct.Refusal, match="desktop app appears to be running") as exc_info:
         ct.run_sync(env, m)
     assert "close the desktop app" in str(exc_info.value)
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
-    op = ct.list_ops(env)[-1]
-    assert op.manifest["status"] == "journaled"    # refused before the row loop
+    assert len(ct.list_ops(env)) == n_ops_before    # refused before any op was journaled
 
 
 def test_weakly_resolved_apply_succeeds_when_claude_is_not_running(two_account_env,
@@ -1304,9 +1307,11 @@ def test_oauth_resolved_apply_takes_the_guard_too(two_account_env, tmp_path):
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     _app_running(env)
+    n_ops_before = len(ct.list_ops(env))
     with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
         ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+    assert len(ct.list_ops(env)) == n_ops_before    # refused before any op was journaled
 
 
 def test_undo_sync_of_a_weak_store_refuses_while_claude_is_running(two_account_env,
@@ -2048,16 +2053,20 @@ class TestGuardAllRoutes:
         # THE ruling test: resolution is strong (oauth, no config, no
         # disagreement) and the guard must fire anyway - and must fire
         # BEFORE anything lands (a guard placed after the row loop would
-        # also raise, so the refusal alone proves nothing).
+        # also raise, so the refusal alone proves nothing). Post
+        # plan-review fix: it must fire before the op is even journaled -
+        # otherwise every refused --apply leaves a stray 'journaled' op
+        # that doctor flags and recover has to clear, which is exactly the
+        # newly-common case (user forgot to close the desktop app).
         env, src, dst = two_account_env(tmp_path)
         self._syncable_row(env, src, write_transcript)
         env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
         manifest = ct.plan_sync(env, ct.SyncFlags())
+        n_ops_before = len(ct.list_ops(env))
         with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
             ct.run_sync(env, manifest)
         assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
-        op = ct.list_ops(env)[-1]
-        assert op.manifest["status"] == "journaled"    # refused before the row loop
+        assert len(ct.list_ops(env)) == n_ops_before    # no op created at all
 
     def test_oauth_resolved_undo_refuses_while_desktop_runs(
             self, two_account_env, write_transcript, tmp_path):
@@ -2119,3 +2128,29 @@ class TestGuardAllRoutes:
 
     def test_the_old_name_is_gone(self):
         assert not hasattr(ct, "_guard_weakly_resolved")
+
+    def test_recover_forward_still_refuses_while_desktop_runs(
+            self, two_account_env, tmp_path):
+        # Plan-review fix pins TWO gateways now: run_sync's new pre-journal
+        # guard protects a FRESH --apply (this class's other tests), but
+        # recover --forward re-enters execute_sync_op directly - it never
+        # calls run_sync, so its only protection is the execute-time guard
+        # that stayed exactly as reviewed. A crash-interrupted sync must
+        # still refuse to finish while the desktop app is running.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=2)
+        m = ct.plan_sync(env, ct.SyncFlags())
+
+        def hook(point):
+            if point == "sync-mid-write":
+                raise SimulatedCrash()
+        ct._crash_hook = hook
+        try:
+            with pytest.raises(SimulatedCrash):
+                ct.run_sync(env, m)
+        finally:
+            ct._crash_hook = None
+        op = ct.nonterminal_ops(env)[0]
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
+            ct.recover_op(env, op, "forward")

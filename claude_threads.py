@@ -2952,7 +2952,21 @@ def run_sync(env, manifest):
     Sync has no such single up-front pass - each row's dest_path is instead
     validated inline, immediately before that row is touched, inside
     execute_sync_op's write loop (there is no sidecar inventory or transcript
-    path here for a single shared validator to be worth factoring out)."""
+    path here for a single shared validator to be worth factoring out).
+
+    Plan-review fix (RULING 4 follow-up): _guard_mutation is checked here
+    too, before acquire_lock/new_op - the earliest clean point, so a refused
+    run creates no lock file and no op directory. execute_sync_op's own copy
+    of this guard fires too late to prevent that: it runs AFTER new_op has
+    already journaled the op, so every refusal there left a stray
+    'journaled' op behind - doctor flags it, recover has to clear it - and
+    the common case triggering this (desktop app left open) is exactly the
+    one RULING 4 made this guard fire on. execute_sync_op's guard still
+    stays, unchanged: it is the ONLY guard recover --forward gets, since
+    resuming a crash-interrupted op re-enters execute_sync_op directly and
+    never calls back through here.
+    """
+    _guard_mutation(env, "write to")
     acquire_lock(env, "pending")
     try:
         # "tally" is the report's data, not the operation's: it names every
