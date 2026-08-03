@@ -297,6 +297,20 @@ class TestClaudeRunningNarrowing:
         running = ct.claude_running(env)
         assert running and "unavailable" in running[0]
 
+    def test_posix_shim_with_args_is_recognised_as_cli(self, mkenv, tmp_path):
+        # REVIEW FINDING 1: `ps -A -o args=` reports the full command line,
+        # so an invocation through the shim carries trailing arguments and
+        # never matches an ENDS-WITH check. The marker must also match as a
+        # CONTAINS check (marker followed by a space). A desktop-ish control
+        # path with no shim marker must keep matching as the desktop app.
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [
+            (43, "/home/u/.local/bin/claude --resume x"),
+            (44, "/applications/claude.app/contents/macos/claude"),
+        ]
+        assert ct.claude_running(env) == [
+            "/applications/claude.app/contents/macos/claude"]
+
 
 def test_parse_proc_lines_prefers_path_falls_back_to_name_skips_garbage():
     out = ("12|Claude.exe|C:\\Program Files\\WindowsApps\\Claude_1\\app\\Claude.exe\n"
@@ -347,6 +361,24 @@ def test_default_lister_treats_empty_successful_output_as_unavailable(monkeypatc
     # rc 0 with nothing parseable: a real machine never has zero processes,
     # so an empty enumeration is unusable output, not an empty system
     import subprocess as sp
+
+    class R:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr(sp, "run", lambda cmd, **kw: R())
+    out = ct._default_process_lister()
+    assert out and out[0][0] == -1 and "unavailable" in out[0][1]
+
+
+def test_default_lister_posix_branch_reports_unavailable_on_empty_ps(monkeypatch):
+    # REVIEW FINDING 2: the POSIX branch's guarded return had zero coverage
+    # because every lister test above is skipif'd to win32 only. Force the
+    # POSIX branch by patching sys.platform itself (not skipif'd, runs on
+    # Windows CI too) so an rc-0/empty `ps` result is proven to still return
+    # the fail-closed sentinel rather than an empty "nothing running" list.
+    import subprocess as sp
+    monkeypatch.setattr(ct.sys, "platform", "linux")
 
     class R:
         returncode = 0

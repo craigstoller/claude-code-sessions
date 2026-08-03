@@ -625,12 +625,23 @@ def _is_cli_process(text):
     not substrings: a bare 'claude-code' substring test would excuse a
     desktop app installed under an unlucky parent directory (say, a user
     account literally named claude-code), silently disabling the guard.
+
+    POSIX `ps -A -o args=` reports the full command line, not just argv0, so
+    a shimmed invocation carries trailing arguments (".../.local/bin/claude
+    --resume x") and never matches an ENDS-WITH check. The shim marker is
+    therefore also checked as a CONTAINS match when followed by a space -
+    additive, every ENDS-WITH marker above still applies unchanged. A bare
+    argv0 "claude" with no path is deliberately left unclassifiable: with no
+    path segment to test, there is nothing to safely exclude, so it stays a
+    match (fail-safe).
     """
     text = text.replace("/", "\\")
     return ("\\appdata\\roaming\\claude\\claude-code\\" in text  # measured CLI home
             or "\\@anthropic-ai\\claude-code\\" in text          # npm install layout
             or text.endswith("\\.local\\bin\\claude.exe")
-            or text.endswith("\\.local\\bin\\claude"))   # POSIX shim, post-normalise
+            or text.endswith("\\.local\\bin\\claude")    # POSIX shim, post-normalise
+            or "\\.local\\bin\\claude.exe " in text       # POSIX shim, argv w/ args
+            or "\\.local\\bin\\claude " in text)
 
 
 def claude_running(env):
