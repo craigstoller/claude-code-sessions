@@ -2238,16 +2238,14 @@ class Account:
     org_uuid: str
     email: str
     path: str
-    # How live_account() decided this was the signed-in account, and therefore
-    # how much the whole no-process-guard design is entitled to trust it:
-    #   "oauth"  - ~/.claude.json's oauthAccount named it outright (strong).
-    #   "config" - only config.json's lastKnownAccountUuid named it. That
-    #              field's freshness across an account switch has never been
-    #              measured, so it can name the account the user switched
-    #              AWAY from - which would make the "other" store the live
-    #              one (weak; see _guard_weakly_resolved).
+    # How live_account() decided this was the signed-in account:
+    #   "oauth"  - ~/.claude.json's oauthAccount named it outright.
+    #   "config" - only config.json's lastKnownAccountUuid named it.
     #   ""       - not a live-account determination at all (every dormant
     #              candidate resolve_sync_endpoints builds).
+    # Since RULING 4 (2026-08-02) provenance buys no guard exemption - E4
+    # measured oauth stale across a real switch - it is kept for messages
+    # and diagnostics only; every mutation route takes _guard_mutation.
     resolved_from: str = ""
 
 
@@ -2340,13 +2338,11 @@ def live_account(env):
     that account there is no evidence which is live, so this refuses to
     guess and returns None rather than picking one.
 
-    The returned Account records WHICH of those two paths answered, in
-    `resolved_from`. That is not decoration: sync ships with no running-app
-    guard because it only ever writes the dormant store, and the config.json
-    fallback is not strong enough evidence to underwrite that on its own (its
-    freshness across an account switch has never been measured). Callers that
-    are about to mutate must therefore consult `resolved_from` - see
-    _guard_weakly_resolved.
+    The returned Account records WHICH path answered, in `resolved_from` -
+    kept for messages and diagnostics. It no longer gates anything: RULING 4
+    (2026-08-02) put the running-app check on every mutation route after E4
+    measured oauthAccount stale across a real switch (see _guard_mutation
+    and _identity_disagreement).
     """
     if _identity_disagreement(env):
         return None                    # fail closed - see _identity_disagreement
@@ -2387,42 +2383,48 @@ def live_account(env):
     return None
 
 
-def _guard_weakly_resolved(env, live, what):
-    """Refuse to `what` a store while Claude may be running, unless the live
-    account was named outright by ~/.claude.json's oauthAccount.
+def _guard_mutation(env, what):
+    """Refuse to WHAT another account's store while the Claude desktop app
+    is running. Applies to every mutation route, whatever named the live
+    account.
 
-    sync is the one mutating command with no running-app guard. That is only
-    safe because the destination is *guaranteed* to be the dormant account -
-    and live_account's config.json fallback does not deliver a guarantee. Its
-    lastKnownAccountUuid can name the account the user switched away from, in
-    which case the store sync picks as "the other one" is the account the app
-    is actively using; the execute-time re-check cannot catch that, because it
-    calls the same live_account and gets the same wrong answer.
-
-    So: keep the fallback usable, but back the weaker evidence with the
-    stronger check. A weakly-resolved live account (config.json, or no
-    determination at all) makes sync behave like move/undo/recover - it
-    refuses in the presence of a running Claude process. An oauthAccount
-    resolution is unchanged: the process lister is never even consulted.
-
-    `what` names the mutation for the message ("write to", "delete from").
+    RULING 4 (2026-08-02). The E4 verification measured ~/.claude.json's
+    oauthAccount STALE across a real desktop account switch while
+    config.json's lastKnownAccountUuid tracked it - the inverse of the
+    ordering this module shipped trusting, and the whole-branch review had
+    already built the opposite case synthetically. Either identity file can
+    be the stale one, so no file evidence is allowed to certify "the
+    destination is dormant" while the app runs; the oauth exemption this
+    function used to carry is gone. claude_running is narrowed to the
+    desktop app's own processes, so a Claude Code CLI session never trips
+    this.
     """
-    if live is not None and live.resolved_from == "oauth":
-        return
     running = claude_running(env)
     if not running:
         return
-    how = ("could not be identified at all just now" if live is None else
-           "was identified only from config.json's lastKnownAccountUuid, not from "
-           "a signed-in oauthAccount in ~/.claude.json")
+    dis = _identity_disagreement(env)
+    extra = ""
+    if dis:
+        extra = (
+            "\nAlso: ~/.claude.json ({0}) and config.json ({1}) disagree about the "
+            "signed-in account. Re-authenticate the CLI (run 'claude', then /login) "
+            "as the account you use, or switch the desktop app to it, so the two "
+            "agree.".format(dis[0][:8], dis[1][:8]))
+    if running[0] == _PROC_UNAVAILABLE:
+        # "Couldn't look" is never "nothing there" (Task 2), but it is also
+        # never "the app IS running" - that wording would be a lie here, and
+        # "close the desktop app" is misleading advice when what actually
+        # failed is reading the process list. Say what is really true.
+        raise Refusal(
+            "the running-process list could not be read, so whether the Claude "
+            "desktop app is running cannot be confirmed; refusing to {0} another "
+            "account's store while that is unavailable - re-run once the process "
+            "list can be read.{1}".format(what, extra))
     raise Refusal(
-        "the signed-in account {0}, so the destination is only probably the dormant "
-        "store - and Claude appears to be running ({1}). sync ships without a "
-        "process guard only because it KNOWS it is writing the dormant account; on "
-        "this weaker evidence it refuses to {2} another account's store. Close the "
-        "Claude app and re-run, or sign in to the desktop app so ~/.claude.json "
-        "names the account (which removes this check entirely)."
-        .format(how, running[0], what))
+        "the Claude desktop app appears to be running ({0}); refusing to {1} "
+        "another account's store while it is. No identity-file evidence can make "
+        "'the destination is dormant' certain enough to mutate under a running "
+        "app - close the desktop app and re-run.{2}".format(running[0], what, extra))
 
 
 def _candidate_line(account_uuid, org_uuid, path):
@@ -2816,34 +2818,25 @@ def execute_sync_op(env, op):
         raise LayoutError("execute_sync_op runs ops from 'journaled'; use recover "
                           "for interrupted ops")
 
-    # The whole no-process-guard design rests on sync only ever writing the
-    # dormant account's store (resolve_sync_endpoints picks it, never the
-    # live one). Re-check at execute time, not just at planning time, so a
-    # manifest that is stale - or was hand-edited between plan and run -
-    # can never land a write in the account the app is actively using. This
-    # check on m["dest_path"] only carries that guarantee transitively: it is
-    # the row loop's own ensure_contained call below - not this check alone -
-    # that stops an individually hand-edited row["dest_path"] from escaping
-    # the account this refusal just verified is safe to write.
+    # Two independent gates. The path comparison below catches a resolvable
+    # live account that IS the destination (a switch the identity files did
+    # register); _guard_mutation catches everything the files cannot prove -
+    # including the E4 case where they are stale or disagree - by refusing
+    # any write while the desktop app itself is running (RULING 4).
     # realpath on BOTH sides, not normpath: ensure_contained - the other half
     # of this guarantee, in the row loop below - resolves reparse points, and
     # this comparison has to agree with it. A junction makes the two disagree
-    # (dest realpath == live realpath while the normpath strings differ),
-    # which would silently skip the single most load-bearing refusal in the
-    # design. Everywhere else in this module treats reparse points as
-    # hostile; so does this.
+    # (dest realpath == live realpath while the normpath strings differ).
+    # Everywhere else in this module treats reparse points as hostile; so
+    # does this.
     live = live_account(env)
     if live is not None and os.path.normcase(os.path.realpath(m["dest_path"])) == \
             os.path.normcase(os.path.realpath(live.path)):
         raise Refusal(
             "destination resolves to the LIVE account ({0}); refusing - sync must "
-            "never write to the account that is currently live, which is exactly "
-            "why it ships with no process guard.".format(live.email or live.account_uuid))
-    # ...and the check above is only worth what live_account's evidence is
-    # worth. A live account resolved from config.json (or not resolved at
-    # all) cannot underwrite "the destination is definitely dormant", so this
-    # op falls back to the same running-app guard move/undo/recover use.
-    _guard_weakly_resolved(env, live, "write to")
+            "never write to the account that is currently live."
+            .format(live.email or live.account_uuid))
+    _guard_mutation(env, "write to")
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
 
@@ -3121,11 +3114,10 @@ def _sync_delete_targets(env, m):
 
     Two hard gates, checked up front - never "skip and continue", because
     they mean the op itself cannot be trusted, not just one row:
-    1. The same live-account re-check execute_sync_op makes on every write.
-       Sync ships with no process guard specifically because it re-verifies
-       live_account(env) against the destination at execute time, never
-       relying on planning-time state alone - a delete is exactly as
-       dangerous as a write here, and must carry the identical guarantee.
+    1. The same live-account re-check execute_sync_op makes on every write,
+       plus the same universal running-app guard (_guard_mutation, RULING
+       4) - a delete is exactly as dangerous as a write here, and must
+       carry the identical guarantee.
     2. The same containment execute_sync_op's write loop uses
        (ensure_contained plus the direct-child check), so a hand-edited or
        corrupted manifest row can never point this delete outside the
@@ -3148,12 +3140,10 @@ def _sync_delete_targets(env, m):
             "destination resolves to the LIVE account ({0}); refusing - undo, "
             "like sync, may only ever touch a dormant store, never the account "
             "that is currently live.".format(live.email or live.account_uuid))
-    # A weakly-resolved live account is exactly as dangerous here as it is on
-    # the write side (execute_sync_op) - a store that is only PROBABLY dormant
-    # must not be deleted from while the app might be running either. Both
-    # callers of this helper (undo_sync, recover_op's sync 'back' arm) inherit
-    # the guard from this one place, so neither can bypass it.
-    _guard_weakly_resolved(env, live, "delete from")
+    # The same guard as the write side (RULING 4: every mutation route,
+    # regardless of provenance). Both callers of this helper (undo_sync,
+    # recover_op's sync 'back' arm) inherit it from this one place.
+    _guard_mutation(env, "delete from")
     drifted, unreadable, removable = [], [], []
     for r in m["rows"]:
         if not r.get("written"):
@@ -3290,10 +3280,11 @@ def _print_sync_report(say, manifest):
     # --verbose), giving a cautious user a physical folder to recognise
     # instead of eight hex characters. Symmetric for the source.
     # A source resolved from config.json must never print the same
-    # "(email unknown)" an ordinary dormant-side line prints - that is the
-    # weaker determination the whole no-process-guard design rests on, and it
-    # would otherwise look identical to the normal case. Say where it came
-    # from, and say what --apply will now require.
+    # "(email unknown)" an ordinary dormant-side line prints - that would
+    # look identical to the normal case and hide how the account was
+    # identified. Say where it came from; since RULING 4 that provenance is
+    # a note for the user, not a gate - --apply's guard applies the same way
+    # regardless of resolved_from (see _guard_mutation).
     weak = manifest.get("source_resolved_from") == "config"
     say("from  {0:24} ({1}/{2})   signed in".format(
         "(from config.json)" if weak else
@@ -3302,8 +3293,9 @@ def _print_sync_report(say, manifest):
     say("      " + manifest["source_path"])
     if weak:
         say("      ! identified from config.json's lastKnownAccountUuid, not from a")
-        say("        signed-in oauthAccount - weaker evidence that this is really the")
-        say("        live account, so --apply will refuse while Claude is running.")
+        say("        signed-in oauthAccount - a provenance note only, not a stronger/")
+        say("        weaker distinction: --apply will refuse while Claude is running")
+        say("        either way (RULING 4).")
     say("to    {0:24} ({1}/{2})   signed out".format(
         manifest["dest_email"] or "(email unknown)",
         manifest["dest_account"][:8], manifest["dest_org"][:8]))

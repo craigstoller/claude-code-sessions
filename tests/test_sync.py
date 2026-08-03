@@ -389,8 +389,10 @@ def test_crash_mid_write_leaves_a_recoverable_op(two_account_env, tmp_path):
 
 
 def test_refuses_to_write_the_live_store(two_account_env, tmp_path):
-    """The no-process-guard design rests on only ever writing the dormant
-    store, so a destination that resolves to the live account is fatal."""
+    """The path-comparison check is absolute and independent of the
+    running-app guard (RULING 4, _guard_mutation): a destination that
+    resolves to the live account is fatal whether or not any process is
+    running."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     m = ct.plan_sync(env, ct.SyncFlags())
@@ -703,12 +705,12 @@ def test_cmd_recover_lists_sync_and_move_ops_without_a_traceback(
 
 
 def test_undo_sync_refuses_when_destination_is_the_live_account(two_account_env, tmp_path):
-    """Finding 1 (Critical): sync ships with no process guard specifically
-    because every write re-checks live_account(env) at execute time - a
-    stale manifest can never land a write in the account the app is
-    actively using. undo deletes from that same store and must carry the
-    identical guarantee, or 'sync A->B, sign into B, undo' unlinks listing
-    rows out from under a live app."""
+    """Finding 1 (Critical): every sync write re-checks live_account(env) at
+    execute time (independent of, and in addition to, the running-app guard
+    since RULING 4) - a stale manifest can never land a write in the account
+    the app is actively using. undo deletes from that same store and must
+    carry the identical guarantee, or 'sync A->B, sign into B, undo' unlinks
+    listing rows out from under a live app."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
@@ -1266,17 +1268,18 @@ def test_weakly_resolved_apply_refuses_while_claude_is_running(two_account_env,
                                                                tmp_path):
     """The hole: config.json can name the account the user switched AWAY
     from, making the "other" store the live one - and the execute-time
-    re-check calls the same live_account, so it agrees. On that evidence
-    sync must fall back to the process guard the other mutating commands
-    use, rather than writing another account's store while the app runs."""
+    re-check calls the same live_account, so it agrees. Since RULING 4 the
+    running-app guard is no longer a fallback for this weaker resolution -
+    it is the universal gate every mutation route takes, regardless of how
+    (or whether) the live account was resolved."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     _weaken(env)
     m = ct.plan_sync(env, ct.SyncFlags())
     _app_running(env)
-    with pytest.raises(ct.Refusal, match="config.json") as exc_info:
+    with pytest.raises(ct.Refusal, match="desktop app appears to be running") as exc_info:
         ct.run_sync(env, m)
-    assert "Close the Claude app" in str(exc_info.value)
+    assert "close the desktop app" in str(exc_info.value)
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
     op = ct.list_ops(env)[-1]
     assert op.manifest["status"] == "journaled"    # refused before the row loop
@@ -1293,21 +1296,17 @@ def test_weakly_resolved_apply_succeeds_when_claude_is_not_running(two_account_e
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == ["local_0.json"]
 
 
-def test_oauth_resolved_apply_never_consults_the_process_lister(two_account_env,
-                                                                tmp_path):
-    """An oauthAccount-resolved run is unchanged: no process guard at all.
-    The lister reports a running Claude, so if it were consulted the run
-    would refuse - it must never be called in the first place."""
+def test_oauth_resolved_apply_takes_the_guard_too(two_account_env, tmp_path):
+    """RULING 4 (2026-08-02) inverted the old contract here - an
+    oauthAccount-resolved run used to skip the process guard entirely. E4
+    measured oauthAccount STALE across a real desktop account switch, so
+    strong-looking provenance buys no exemption any more."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
-    calls = []
-
-    def lister():
-        calls.append(1)
-        return [(999999, "claude.exe")]
-    env.process_lister = lister
-    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
-    assert calls == []
+    _app_running(env)
+    with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
+        ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
 
 
 def test_undo_sync_of_a_weak_store_refuses_while_claude_is_running(two_account_env,
@@ -1320,7 +1319,7 @@ def test_undo_sync_of_a_weak_store_refuses_while_claude_is_running(two_account_e
     op = ct.list_ops(env)[-1]
     _weaken(env)
     _app_running(env)
-    with pytest.raises(ct.Refusal, match="config.json"):
+    with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
         ct.undo_sync(env, op)
     assert os.path.exists(os.path.join(dst, "local_0.json"))     # untouched
 
@@ -1350,7 +1349,7 @@ def test_recover_back_on_a_weak_store_refuses_while_claude_is_running(two_accoun
         fh.write('{"unexpected": true}')          # blocks forward -> back is offered
     _weaken(env)
     _app_running(env)
-    with pytest.raises(ct.Refusal, match="config.json"):
+    with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
         ct.recover_op(env, op, "back")
     assert os.path.exists(written_row["dest_path"])          # nothing deleted
 
@@ -2029,3 +2028,94 @@ class TestIdentityDisagreement:
         _write_desktop_config(env, "aaaaaaaa-0000-0000-0000-000000000001")
         live = ct.live_account(env)          # malformed oauth -> config fallback
         assert live is not None and live.resolved_from == "config"
+
+
+_DESKTOP_EXE = ("c:\\program files\\windowsapps\\"
+                "claude_1.24012.9.0_x64__pzs8sxrjxfjjc\\app\\claude.exe")
+_CLI_EXE = "c:\\users\\u\\appdata\\roaming\\claude\\claude-code\\2.1.219\\claude.exe"
+
+
+class TestGuardAllRoutes:
+    def _syncable_row(self, env, src, write_transcript):
+        sid = "11111111-2222-3333-4444-555555555555"
+        write_transcript(env, "proj", sid, [{"type": "user"}])
+        with open(os.path.join(src, "local_row1.json"), "w", encoding="utf-8") as fh:
+            json.dump({"sessionId": "local_row1", "cliSessionId": sid,
+                       "title": "guard test"}, fh)
+
+    def test_oauth_resolved_apply_refuses_while_desktop_runs(
+            self, two_account_env, write_transcript, tmp_path):
+        # THE ruling test: resolution is strong (oauth, no config, no
+        # disagreement) and the guard must fire anyway - and must fire
+        # BEFORE anything lands (a guard placed after the row loop would
+        # also raise, so the refusal alone proves nothing).
+        env, src, dst = two_account_env(tmp_path)
+        self._syncable_row(env, src, write_transcript)
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        manifest = ct.plan_sync(env, ct.SyncFlags())
+        with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
+            ct.run_sync(env, manifest)
+        assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+        op = ct.list_ops(env)[-1]
+        assert op.manifest["status"] == "journaled"    # refused before the row loop
+
+    def test_oauth_resolved_undo_refuses_while_desktop_runs(
+            self, two_account_env, write_transcript, tmp_path):
+        # the delete route under STRONG resolution - the weak-store undo
+        # test already exists; this is the exemption being removed
+        env, src, dst = two_account_env(tmp_path)
+        self._syncable_row(env, src, write_transcript)
+        assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+        op = ct.list_ops(env)[-1]
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
+            ct.undo_sync(env, op)
+        assert os.path.exists(os.path.join(dst, "local_row1.json"))   # untouched
+
+    def test_apply_proceeds_when_only_the_cli_runs(
+            self, two_account_env, write_transcript, tmp_path):
+        # PINNING TEST - green before and after this task. Pre-task it
+        # passes trivially (the oauth path never consults the lister);
+        # post-task it pins Task 2's narrowing against the guard rewrite:
+        # the guard now consults the lister and must still let a
+        # CLI-only process list through. The RED for the narrowing itself
+        # was Task 2's test_cli_paths_do_not_match.
+        env, src, dst = two_account_env(tmp_path)
+        self._syncable_row(env, src, write_transcript)
+        env.process_lister = lambda: [(99999, _CLI_EXE)]
+        manifest = ct.plan_sync(env, ct.SyncFlags())
+        assert ct.run_sync(env, manifest) == "completed"
+        assert os.path.exists(os.path.join(dst, "local_row1.json"))
+
+    def test_guard_message_names_disagreement_and_cli_reauth(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal) as exc:
+            ct._guard_mutation(env, "write to")
+        msg = str(exc.value)
+        assert "aaaaaaaa" in msg and "cccccccc" in msg and "/login" in msg
+
+    def test_guard_is_silent_when_nothing_runs(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        ct._guard_mutation(env, "write to")     # must not raise
+
+    def test_guard_message_when_process_list_is_unavailable(
+            self, two_account_env, tmp_path):
+        # Task 2's narrowing gives claude_running a sentinel entry
+        # (_PROC_UNAVAILABLE) when enumeration itself fails - "couldn't
+        # look" is never "nothing there". But the normal refusal wording
+        # ("the Claude desktop app appears to be running") would be a LIE
+        # here: nothing said the app is running, only that we don't know.
+        # The guard must say the process list was unavailable, not assert
+        # the app IS running.
+        env, src, dst = two_account_env(tmp_path)
+        env.process_lister = lambda: [(-1, ct._PROC_UNAVAILABLE)]
+        with pytest.raises(ct.Refusal) as exc:
+            ct._guard_mutation(env, "write to")
+        assert "unavailable" in str(exc.value)
+
+    def test_the_old_name_is_gone(self):
+        assert not hasattr(ct, "_guard_weakly_resolved")
