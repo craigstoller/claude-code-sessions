@@ -68,22 +68,74 @@ def default_env():
     )
 
 
+# Fail-closed sentinel: returned (with pid -1) whenever the process list
+# cannot be obtained. Contains "claude" so every guard's substring match
+# treats it as a possibly-running desktop app, and no CLI marker so the
+# narrowing never excuses it. "Couldn't look" is never "nothing there".
+_PROC_UNAVAILABLE = ("(process listing unavailable - treating the claude "
+                     "desktop app as possibly running)")
+
+
+def _parse_proc_lines(out):
+    """(pid, text) tuples from 'pid|name|path' lines (one process per line).
+
+    text is the lowercased executable path when the process reports one,
+    else the lowercased image name. Malformed lines are skipped - this
+    parses our own PowerShell command's output, so anything unexpected is
+    noise, not data.
+    """
+    result = []
+    for line in out.splitlines():
+        parts = line.strip().split("|", 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        text = (parts[2].strip() or parts[1].strip()).lower()
+        if text:
+            result.append((pid, text))
+    return result
+
+
 def _default_process_lister():
     """Running processes as (pid, text) tuples, text lowercased.
 
-    Windows `tasklist` cannot show full command lines, only the image name -
-    a node-hosted CLI (the `claude` command is a node.exe process, not an exe
-    named "claude") is therefore a known blind spot on Windows: it will not
-    match "claude" in the returned text. The mtime heuristic in plan_move is
-    the second layer that covers that gap. POSIX uses `ps ... args=` (full
-    command line, not just the executable name) specifically so a node-hosted
-    CLI process *is* visible there.
+    On Windows, text is the full executable path when CIM can supply it
+    (needed because BOTH the desktop app and the Claude Code CLI are now
+    image name claude.exe - measured 2026-08-02: the MSIX desktop at
+    ...\\WindowsApps\\Claude_...\\app\\Claude.exe and the CLI, a native
+    binary since ~2.x, at ...\\AppData\\Roaming\\Claude\\claude-code\\...\\
+    claude.exe. The old docstring's claim that a node-hosted CLI was
+    invisible to tasklist is obsolete). If PowerShell/CIM yields nothing
+    usable, fall back to name-only tasklist output - callers treat an
+    unclassifiable claude-named entry as the desktop app (fail closed).
+    Total enumeration failure returns the _PROC_UNAVAILABLE sentinel, never
+    [] - "couldn't look" is never "nothing there". POSIX uses
+    `ps ... args=` unchanged.
     """
     import subprocess
     try:
         if sys.platform == "win32":
-            out = subprocess.run(["tasklist", "/FO", "CSV"], capture_output=True,
-                                 text=True, timeout=15).stdout
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                     "Get-CimInstance Win32_Process | ForEach-Object "
+                     "{ '{0}|{1}|{2}' -f $_.ProcessId, $_.Name, $_.ExecutablePath }"],
+                    capture_output=True, text=True, timeout=15)
+                if proc.returncode == 0:
+                    parsed = _parse_proc_lines(proc.stdout)
+                    if parsed:
+                        return parsed
+                # empty or all-garbage CIM output falls through to tasklist
+            except (OSError, subprocess.SubprocessError):
+                pass
+            proc = subprocess.run(["tasklist", "/FO", "CSV"], capture_output=True,
+                                  text=True, timeout=15)
+            if proc.returncode != 0:
+                return [(-1, _PROC_UNAVAILABLE)]
+            out = proc.stdout
             result = []
             for line in out.splitlines()[1:]:
                 if not line.startswith('"'):
@@ -97,7 +149,7 @@ def _default_process_lister():
                 except ValueError:
                     continue
                 result.append((pid, name))
-            return result
+            return result if result else [(-1, _PROC_UNAVAILABLE)]
         out = subprocess.run(["ps", "-A", "-o", "pid=,args="], capture_output=True,
                              text=True, timeout=15).stdout
         result = []
@@ -111,9 +163,9 @@ def _default_process_lister():
             except ValueError:
                 continue
             result.append((pid, rest.strip().lower()))
-        return result
+        return result if result else [(-1, _PROC_UNAVAILABLE)]
     except Exception:
-        return []
+        return [(-1, _PROC_UNAVAILABLE)]
 
 
 # ---------------------------------------------------------------- 2. helpers
@@ -553,14 +605,48 @@ class MoveFlags:
 OUR_COMMANDS = ("claude-code-threads", "cc-threads")
 
 
+def _is_cli_process(text):
+    """True when TEXT (a lowercased lister entry) is the Claude Code CLI,
+    which must NOT count as the desktop app.
+
+    Recognised CLI locations (measured 2026-08-02):
+      ...\\appdata\\roaming\\claude\\claude-code\\<ver>\\claude.exe  (versioned binary;
+          also the backend the desktop spawns - harmless to exclude, because
+          it only exists while the desktop's own MSIX processes are running
+          and those still match)
+      ...\\.local\\bin\\claude.exe / .../.local/bin/claude            (the PATH shim)
+      any npm-style .../claude-code/... install
+
+    Everything else claude-named - the MSIX desktop, a non-MSIX desktop
+    install, or a bare image name the fallback lister could not resolve to
+    a path - stays a match: the guard fails closed on ambiguity.
+    Separators are normalised first so a forward-slash Windows path cannot
+    dodge the backslash patterns. The markers are precise path SEGMENTS,
+    not substrings: a bare 'claude-code' substring test would excuse a
+    desktop app installed under an unlucky parent directory (say, a user
+    account literally named claude-code), silently disabling the guard.
+    """
+    text = text.replace("/", "\\")
+    return ("\\appdata\\roaming\\claude\\claude-code\\" in text  # measured CLI home
+            or "\\@anthropic-ai\\claude-code\\" in text          # npm install layout
+            or text.endswith("\\.local\\bin\\claude.exe")
+            or text.endswith("\\.local\\bin\\claude"))   # POSIX shim, post-normalise
+
+
 def claude_running(env):
     my_pids = {os.getpid(), os.getppid()}
+    try:
+        procs = env.process_lister()
+    except Exception:
+        procs = [(-1, _PROC_UNAVAILABLE)]      # couldn't look != nothing there
     out = []
-    for pid, text in env.process_lister():
+    for pid, text in procs:
         if pid in my_pids:
             continue                       # never self-refuse on our own process
         if any(name in text for name in OUR_COMMANDS):
             continue                       # nor on another instance of this tool
+        if _is_cli_process(text):
+            continue                       # the Claude Code CLI, not the desktop app
         if "claude" in text:
             out.append(text)
     return out

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 import pytest
 
@@ -225,3 +226,132 @@ def test_malformed_row_anywhere_is_fatal(setup):
     open(bad, "w").write("{broken")
     with pytest.raises(ct.LayoutError):
         ct.plan_move(env, SID, target, flags())
+
+
+# ------------------------------------------- RULING 4: claude_running narrowing
+
+DESKTOP_EXE = ("c:\\program files\\windowsapps\\"
+               "claude_1.24012.9.0_x64__pzs8sxrjxfjjc\\app\\claude.exe")
+CLI_EXE = "c:\\users\\u\\appdata\\roaming\\claude\\claude-code\\2.1.219\\claude.exe"
+CLI_SHIM = "c:\\users\\u\\.local\\bin\\claude.exe"
+
+
+class TestClaudeRunningNarrowing:
+    def test_desktop_app_path_matches(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, DESKTOP_EXE)]
+        assert ct.claude_running(env) == [DESKTOP_EXE]
+
+    def test_cli_paths_do_not_match(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, CLI_EXE), (99998, CLI_SHIM)]
+        assert ct.claude_running(env) == []
+
+    def test_bare_image_name_fails_closed(self, mkenv, tmp_path):
+        # tasklist fallback yields names only; unclassifiable claude.exe
+        # counts as the desktop app, never as its absence
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, "claude.exe")]
+        assert ct.claude_running(env) == ["claude.exe"]
+
+    def test_non_msix_desktop_install_still_matches(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        exe = "c:\\users\\u\\appdata\\local\\programs\\claude\\claude.exe"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_desktop_under_an_unlucky_parent_dir_still_matches(self, mkenv, tmp_path):
+        # adversarial: a USER named claude-code must not turn their desktop
+        # app into a "CLI" and disable the guard - the CLI markers are path
+        # segments, not substrings
+        env = mkenv(tmp_path)
+        exe = "c:\\users\\claude-code\\appdata\\local\\programs\\claude\\claude.exe"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_desktop_under_a_bare_claude_claude_code_path_still_matches(
+            self, mkenv, tmp_path):
+        # adversarial: the CLI marker is anchored to the measured
+        # appdata\roaming location - a desktop binary under some other
+        # claude\claude-code directory must stay a desktop match
+        env = mkenv(tmp_path)
+        exe = "d:\\claude\\claude-code\\claude.exe"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+
+    def test_forward_slash_cli_path_is_still_the_cli(self, mkenv, tmp_path):
+        # separators must be normalised before matching - a forward-slash
+        # CLI path must not be misread as the desktop app
+        env = mkenv(tmp_path)
+        exe = "c:/users/u/appdata/roaming/claude/claude-code/2.1.219/claude.exe"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    def test_lister_that_raises_fails_closed(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+
+        def boom():
+            raise OSError("no process API here")
+        env.process_lister = boom
+        running = ct.claude_running(env)
+        assert running and "unavailable" in running[0]
+
+
+def test_parse_proc_lines_prefers_path_falls_back_to_name_skips_garbage():
+    out = ("12|Claude.exe|C:\\Program Files\\WindowsApps\\Claude_1\\app\\Claude.exe\n"
+           "13|svchost.exe|\n"
+           "not a pid line\n"
+           "x|bad.exe|c:\\bad\n")
+    assert ct._parse_proc_lines(out) == [
+        (12, "c:\\program files\\windowsapps\\claude_1\\app\\claude.exe"),
+        (13, "svchost.exe"),
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="windows lister branch")
+def test_default_lister_falls_back_to_tasklist_when_cim_is_garbage(monkeypatch):
+    import subprocess as sp
+    calls = []
+
+    class R:
+        def __init__(self, rc, out):
+            self.returncode = rc
+            self.stdout = out
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd[0])
+        if cmd[0] == "powershell":
+            return R(0, "no pipes in this output at all\n")
+        return R(0, '"Image Name","PID","Session","Num","Mem"\n'
+                    '"claude.exe","123","Console","1","9,000 K"\n')
+    monkeypatch.setattr(sp, "run", fake_run)
+    out = ct._default_process_lister()
+    assert calls == ["powershell", "tasklist"]
+    assert (123, "claude.exe") in out
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="windows lister branch")
+def test_default_lister_reports_unavailable_when_everything_fails(monkeypatch):
+    import subprocess as sp
+
+    def fake_run(cmd, **kw):
+        raise OSError("blocked")
+    monkeypatch.setattr(sp, "run", fake_run)
+    out = ct._default_process_lister()
+    assert out and out[0][0] == -1 and "unavailable" in out[0][1]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="windows lister branch")
+def test_default_lister_treats_empty_successful_output_as_unavailable(monkeypatch):
+    # rc 0 with nothing parseable: a real machine never has zero processes,
+    # so an empty enumeration is unusable output, not an empty system
+    import subprocess as sp
+
+    class R:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr(sp, "run", lambda cmd, **kw: R())
+    out = ct._default_process_lister()
+    assert out and out[0][0] == -1 and "unavailable" in out[0][1]
