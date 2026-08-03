@@ -5,6 +5,9 @@ Move a Claude Code conversation to a different project folder — safely.
 > **Unofficial.** Not affiliated with Anthropic. Reverse-engineered on-disk formats; fails
 > closed when it sees anything it doesn't recognize.
 
+**Companion read:** [The session that synced itself](docs/the-session-that-synced-itself.md)
+— what Claude Desktop actually keeps on disk, and why this tool is built out of refusals.
+
 ## The problem
 
 Claude Code and Claude Desktop file every thread under the working directory it was started
@@ -35,16 +38,21 @@ python claude_threads.py --help
 `move`, `undo`, `recover`, and every mutating `sync` route (`--apply`, `undo` of a completed
 sync, `recover --back` on a stuck one) all refuse while they can see the Claude desktop app
 running — whoever the identity files currently say is signed in. Closing the app first avoids
-the refusal and guarantees nothing is actively appending to the transcript or row you're about
-to touch. A running Claude Code CLI session does **not** count: it's recognised by its own
+the refusal and guarantees nothing is actively appending to the sidebar rows you're about to
+touch. A running Claude Code CLI session does **not** count: it's recognised by its own
 install path and excluded from the check, so an open `claude` session never blocks any of this.
+(For `move` specifically, a running CLI session *can* still be writing the transcript being
+relocated — the transcript-freshness check and the last-instant content re-verification cover
+that case; see Safety design.)
 If `~/.claude.json` (the CLI's identity file) and the desktop app's `config.json` disagree
 about which account is signed in, `sync` refuses to even plan — re-authenticate the CLI (run
 `claude`, then `/login`) as the account you use, or switch the desktop app to it, so the two
 files agree. Signing into the desktop app does **not** refresh `~/.claude.json`. A refused
 `sync --apply` (desktop app running) refuses **before anything is journaled** — no lock file,
 no op directory — so there's nothing left behind for `doctor` to flag or `recover` to clean up;
-just close the app and re-run.
+just close the app and re-run. One measured wrinkle: the desktop ships a helper for its Chrome
+extension (`chrome-native-host.exe`) that can outlive the app itself, and the guard counts it —
+if a refusal names that process, fully exit Chrome too (the refusal always names what it saw).
 
 ## Usage
 
@@ -149,7 +157,8 @@ is always a preview will misread `sync --apply --json`.
   `~/.claude.json`'s `oauthAccount` enough to skip the running-app check whenever that file
   named an account outright. A real desktop account switch measured `oauthAccount` staying
   *stale* while `config.json`'s `lastKnownAccountUuid` tracked the switch — the opposite of the
-  trust ordering that exemption assumed — so either identity file can be the stale one, and
+  trust ordering that exemption assumed — and a review had already constructed the reverse
+  (`config.json` stale, `oauthAccount` fresh) in a synthetic store: either identity file can be the stale one, and
   neither is trusted to certify "the destination is dormant" while the app is running. `--apply`,
   `undo`, and `recover --back` on a sync op therefore all refuse whenever the Claude desktop app
   is visible, whoever the files say is signed in. The dry run still labels a source resolved from
@@ -191,8 +200,9 @@ is always a preview will misread `sync --apply --json`.
   touching anything, copies to the destination, re-verifies the copy by hash, rewrites listing
   rows atomically, re-verifies both sides one last time, and only then deletes the source.
   Nothing is ever deleted while it is the only copy.
-- **`undo`** reverses the most recent completed move by running the same journaled protocol in
-  reverse.
+- **`undo`** reverses the most recent completed move or sync by running the same journaled
+  protocol in reverse (for a sync, that means deleting exactly the rows the op wrote, and only
+  while they still match what was written).
 - **`recover`** classifies and resolves any operation a crash or interruption left in a
   non-terminal state — nothing is left stranded.
 - **`sync`** only ever writes rows into the store of the account you are *not* currently signed
@@ -202,8 +212,9 @@ is always a preview will misread `sync --apply --json`.
   confirmed, unambiguous live account there is nothing to check that destination against. Every
   sync mutation — `--apply`, `undo`, and `recover --back` on a sync op — also refuses while it can
   see the Claude desktop app running, the same guard `move`/`undo`/`recover` use, applied
-  regardless of which identity file resolved the signed-in account: a real account switch has
-  been measured leaving *either* file stale, so no file evidence is trusted to certify the
+  regardless of which identity file resolved the signed-in account: staleness has been shown in
+  both directions (`oauthAccount` measured stale across a real account switch; `config.json`
+  stale in a review-constructed store), so no file evidence is trusted to certify the
   destination is dormant while the app is visible. A running Claude Code CLI does not count
   toward this — only the desktop app does.
 - **Refusal philosophy.** The tool fails closed: an unrecognized on-disk layout, an unreadable
@@ -214,7 +225,7 @@ is always a preview will misread `sync --apply --json`.
 
 | Platform | Status | Mutations |
 |---|---|---|
-| Windows 11 + Claude Desktop | verified 2026-07-31 (app 2.1.219) | read-only + mutations |
+| Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03 | read-only + mutations |
 | macOS / Linux desktop | unverified | read-only (+ mutations behind `--unverified-platform`) |
 | CLI-only machines (any OS) | transcript layout verified | mutations behind `--transcript-only` |
 
@@ -232,8 +243,9 @@ confirmed visible again, which is the finding that makes `sync`'s tombstone-skip
 (see `docs/internals.md`). The `sync` command itself is covered by its test suite and, as of
 2026-08-02, its own end-to-end `--apply` run against two real, live accounts: a row synced from
 one account opened in the other with its full conversation history intact. That run did not send
-a new turn through the synced row, so continuing the conversation from the destination account
-was not itself exercised by this verification.
+a new turn through the synced row; a second verification on 2026-08-03 closed that gap — a live
+session's own listing row was synced across accounts and the conversation was then continued
+from the destination account's sidebar, new turns flowing through the synced row.
 
 ## What's stored locally
 
@@ -282,6 +294,6 @@ window into `journaled`/`completed`/`rolled_back`.
 
 ## More
 
-Companion post: _(link pending)_.
+Companion post: [The session that synced itself](docs/the-session-that-synced-itself.md).
 
 MIT licensed — see [LICENSE](LICENSE).
