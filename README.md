@@ -41,7 +41,10 @@ install path and excluded from the check, so an open `claude` session never bloc
 If `~/.claude.json` (the CLI's identity file) and the desktop app's `config.json` disagree
 about which account is signed in, `sync` refuses to even plan — re-authenticate the CLI (run
 `claude`, then `/login`) as the account you use, or switch the desktop app to it, so the two
-files agree. Signing into the desktop app does **not** refresh `~/.claude.json`.
+files agree. Signing into the desktop app does **not** refresh `~/.claude.json`. A refused
+`sync --apply` (desktop app running) refuses **before anything is journaled** — no lock file,
+no op directory — so there's nothing left behind for `doctor` to flag or `recover` to clean up;
+just close the app and re-run.
 
 ## Usage
 
