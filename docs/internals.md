@@ -201,6 +201,17 @@ resolution is a fail-closed fallback, not an exemption.** A bare `"claude"` argv
 segment to test is deliberately left unclassified, and therefore still counts, on the same
 logic: with nothing to safely exclude, ambiguity resolves to "desktop."
 
+This narrowing has a cost: at the old, cruder name-only base, *any* claude-named process —
+including an ordinary open CLI session — blocked `move`/`undo`/`recover` too, so a transcript the
+CLI was actively appending to could never be relocated out from under it by accident; now a CLI
+session trips no guard at all, even though the CLI is exactly what's writing to the very
+transcript `move` deletes from its source location. What's left is layered, not gone:
+`plan_move`'s `MTIME_GUARD_SECONDS` heuristic (600 seconds, bypassable with `--force`) is now the
+*primary* defense against relocating a transcript an open CLI session may still be writing,
+backed by `execute_op`'s last-instant sha256 re-verification of the source immediately before it
+deletes anything — which only catches a CLI write landing in that narrow window after the fact
+(aborting the op, keeping both copies), not by preventing it.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via
@@ -221,8 +232,9 @@ Two costs were accepted deliberately here, not overlooked:
   narrowing never excuses it) instead of an empty list. Every guard built on `claude_running`
   refuses rather than fails open when the process list can't be read — this reaches beyond
   `sync`'s own guard to `move`'s guards too (`plan_move`'s pre-flight check, `execute_op`'s
-  last-instant revalidation before committing, and `run_undo`'s own check), since they all call
-  `claude_running` directly. `_guard_mutation` gives this specific case its own honest wording
+  last-instant revalidation before committing, `_finish_committed`'s guard before it deletes the
+  now-redundant source copy, and `run_undo`'s own check), since they all call `claude_running`
+  directly. `_guard_mutation` gives this specific case its own honest wording
   ("the running-process list could not be read... refusing to {what} another account's store
   while that is unavailable") rather than falsely claiming the app is running; `move`'s guards
   report it as an ordinary "Claude appears to be running" refusal, because to them the sentinel
