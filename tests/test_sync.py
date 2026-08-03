@@ -1093,6 +1093,12 @@ def test_cli_dry_run_prints_endpoints_and_writes_nothing(two_account_env, tmp_pa
     assert "me@example.com" in out
     assert "signed in" in out
     assert "dry run" in out.lower()
+    # Minor 5: the RULING 4 "--apply will refuse while Claude is running"
+    # warning used to live only inside the config-resolved (weak) branch of
+    # _print_sync_report, so a normal oauth-resolved dry run (this test's
+    # case) never printed it even though the guard applies identically
+    # either way. Every dry run must print it now.
+    assert "--apply will refuse while Claude is running" in out
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
 
 
@@ -2124,7 +2130,15 @@ class TestGuardAllRoutes:
         env.process_lister = lambda: [(-1, ct._PROC_UNAVAILABLE)]
         with pytest.raises(ct.Refusal) as exc:
             ct._guard_mutation(env, "write to")
-        assert "unavailable" in str(exc.value)
+        msg = str(exc.value)
+        # Assert on wording unique to the sentinel branch, not just
+        # "unavailable" - _PROC_UNAVAILABLE's own text contains that word
+        # and running[0] is interpolated into the GENERIC "appears to be
+        # running" message too, so a bare "unavailable" substring check
+        # passes even with the sentinel branch deleted (it would then fall
+        # through to the generic Refusal, which still quotes running[0]).
+        assert "could not be read" in msg
+        assert "appears to be running" not in msg
 
     def test_the_old_name_is_gone(self):
         assert not hasattr(ct, "_guard_weakly_resolved")
@@ -2154,3 +2168,115 @@ class TestGuardAllRoutes:
         env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
         with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
             ct.recover_op(env, op, "forward")
+
+
+# ------------------------------------------- Finding I1: disagreement, not
+# just "no evidence", must gate the dest-is-possibly-live checks too
+
+
+class TestDisagreementGuardsDestPossiblyLive:
+    """Task 1 made live_account() return None for a second, DIFFERENT reason:
+    not only "no evidence at all" (the original meaning, safe to proceed
+    when the destination doesn't match) but also "the identity files
+    disagree about which account is live" - and a disagreement is not "no
+    evidence", it's live evidence that either of two named accounts might
+    be the live one. execute_sync_op and _sync_delete_targets both treated
+    every None the same way (proceed unless dest == the resolved live
+    account), which is a regression once None can mean the second thing.
+    """
+
+    def test_undo_refuses_when_disagreement_names_dest_account(
+            self, two_account_env, tmp_path):
+        # The sync itself completes cleanly while the identity files still
+        # agree - the disagreement only appears AFTERWARDS, before undo
+        # runs, which is exactly the shape _sync_delete_targets' own
+        # execute-time re-check exists to catch.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+        op = ct.list_ops(env)[-1]
+        assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+        # config.json now names the DESTINATION account while oauth still
+        # names the source - the E4 shape, but this time the disagreement
+        # names the very store undo is about to delete from.
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        assert ct.live_account(env) is None
+        assert ct._identity_disagreement(env) == (
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            "cccccccc-0000-0000-0000-000000000003")
+
+        with pytest.raises(ct.Refusal) as exc:
+            ct.undo_sync(env, op)
+        msg = str(exc.value)
+        assert "disagree" in msg
+        assert "aaaaaaaa" in msg and "cccccccc" in msg
+        assert "/login" in msg
+        assert os.path.exists(os.path.join(dst, "local_0.json"))    # untouched
+
+    def test_execute_refuses_when_disagreement_names_dest_account(
+            self, two_account_env, tmp_path):
+        # Same shape on the write side: recover --forward re-enters
+        # execute_sync_op directly (never through run_sync/resolve_sync_
+        # endpoints), so a planned-and-journaled op is the realistic way
+        # the identity files can disagree by the time this runs. A direct
+        # execute_sync_op call on a journaled op is the idiom the existing
+        # suite already uses for exactly this shape (e.g.
+        # test_classify_survives_a_corrupt_or_missing_post_image).
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())      # planned while identity agrees
+        op = ct.new_op(env, m)                     # journaled
+
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        assert ct.live_account(env) is None
+
+        with pytest.raises(ct.Refusal) as exc:
+            ct.execute_sync_op(env, op)
+        msg = str(exc.value)
+        assert "disagree" in msg
+        assert "aaaaaaaa" in msg and "cccccccc" in msg
+        assert "/login" in msg
+        assert not os.path.exists(os.path.join(dst, "local_0.json"))
+        assert op.manifest["status"] == "journaled"     # never advanced
+
+    def test_disagreement_naming_other_accounts_does_not_block_a_third(
+            self, two_account_env, tmp_path):
+        # Guard against over-refusal: a disagreement names exactly two
+        # accounts. A destination that is neither of them - a third,
+        # uninvolved dormant account - must still proceed.
+        env, src, dst = two_account_env(tmp_path)
+        third = os.path.join(env.store_candidates[0],
+                             "eeeeeeee-0000-0000-0000-000000000005",
+                             "ffffffff-0000-0000-0000-000000000006")
+        os.makedirs(third)
+        _row(src, "local_0.json", "sid-0", "Thread 0")
+        _transcript(env, "sid-0")
+        m = ct.plan_sync(env, ct.SyncFlags(to="eeeeeeee"))    # while identity agrees
+        assert os.path.normcase(m["dest_path"]) == os.path.normcase(third)
+
+        # Disagreement between the source (a...) and the OTHER dormant
+        # account (c...) - neither is the third account this sync targets.
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        assert ct.live_account(env) is None
+        assert ct._identity_disagreement(env) is not None
+
+        assert ct.run_sync(env, m) == "completed"
+        assert os.path.exists(os.path.join(third, "local_0.json"))
+
+    def test_no_identity_evidence_at_execute_time_still_proceeds(
+            self, two_account_env, tmp_path):
+        # The ORIGINAL meaning of a None live account - genuinely no
+        # evidence, not a disagreement - must keep proceeding exactly as
+        # before Task 1. Only a disagreement is new grounds to refuse.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())      # planned while oauth resolves
+        op = ct.new_op(env, m)
+
+        os.unlink(os.path.join(env.home, ".claude.json"))   # oauth evidence gone
+        assert ct.live_account(env) is None
+        assert ct._identity_disagreement(env) is None        # genuinely no evidence
+
+        assert ct.execute_sync_op(env, op) == "completed"
+        assert os.path.exists(os.path.join(dst, "local_0.json"))

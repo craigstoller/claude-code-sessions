@@ -2427,6 +2427,58 @@ def _guard_mutation(env, what):
         "app - close the desktop app and re-run.{2}".format(running[0], what, extra))
 
 
+def _refuse_dest_possibly_live(env, live, dest_path, what, live_match_message):
+    """Shared by execute_sync_op and _sync_delete_targets: refuse when
+    dest_path might be the live account's store, by either of two
+    independent tests. Factored into one place so the two sites cannot
+    drift apart on this - the whole reason this helper exists.
+
+    1. live_account() resolved a live account outright, and dest_path IS
+       that account's store (realpath/normcase both sides, matching
+       ensure_contained - see the callers' own comments on junctions).
+       Unchanged from before Task 1: callers pass their own
+       `live_match_message` (a zero-arg callable, evaluated only on an
+       actual match - so it may safely assume `live` is not None) because
+       the two sites' wording differs (sync's write-side voice vs undo's
+       delete-side voice) and existing tests pin that wording.
+
+    2. live_account() returned None *because the identity files disagree*
+       (_identity_disagreement). Task 1 made None mean this too, not only
+       "no evidence at all" - and a disagreement is not "safe to proceed":
+       either of the two disagreeing accounts could be the one genuinely
+       live. So if dest_path resolves under EITHER named account's store on
+       disk, refuse, naming both 8-char id prefixes and the fix - mirroring
+       _guard_mutation's own disagreement note. dest_path under some THIRD
+       account's store (named by neither uuid) is not covered by this
+       disagreement at all and proceeds, same as today.
+
+    No disagreement and live is None (genuinely no evidence, e.g. no
+    identity file resolves anything) falls through both checks and
+    proceeds - unchanged from before Task 1.
+    """
+    real_dest = os.path.normcase(os.path.realpath(dest_path))
+    if live is not None:
+        if real_dest == os.path.normcase(os.path.realpath(live.path)):
+            raise Refusal(live_match_message())
+        return
+    dis = _identity_disagreement(env)
+    if dis is None:
+        return
+    oauth_uuid, config_uuid = dis
+    named_dirs = _account_dirs(env)
+    for acct_uuid in (oauth_uuid, config_uuid):
+        for a, o, p in named_dirs:
+            if a == acct_uuid and real_dest == os.path.normcase(os.path.realpath(p)):
+                raise Refusal(
+                    "~/.claude.json ({0}) and config.json ({1}) disagree about the "
+                    "signed-in account, so which one is actually live is unknowable "
+                    "from files alone; the destination matches the store of one of "
+                    "those two possibly-live accounts, so refusing to {2}. "
+                    "Re-authenticate the CLI (run 'claude', then /login) as the "
+                    "account you use, or switch the desktop app to it, so the two "
+                    "agree, then re-run.".format(oauth_uuid[:8], config_uuid[:8], what))
+
+
 def _candidate_line(account_uuid, org_uuid, path):
     """One line of a "which store did you mean" listing. The store path is
     part of it because the 8-char id prefixes alone are not always
@@ -2830,12 +2882,11 @@ def execute_sync_op(env, op):
     # Everywhere else in this module treats reparse points as hostile; so
     # does this.
     live = live_account(env)
-    if live is not None and os.path.normcase(os.path.realpath(m["dest_path"])) == \
-            os.path.normcase(os.path.realpath(live.path)):
-        raise Refusal(
-            "destination resolves to the LIVE account ({0}); refusing - sync must "
-            "never write to the account that is currently live."
-            .format(live.email or live.account_uuid))
+    _refuse_dest_possibly_live(
+        env, live, m["dest_path"], "write to",
+        lambda: "destination resolves to the LIVE account ({0}); refusing - sync must "
+                "never write to the account that is currently live."
+                .format(live.email or live.account_uuid))
     _guard_mutation(env, "write to")
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
@@ -3148,12 +3199,11 @@ def _sync_delete_targets(env, m):
     # realpath on both sides, matching execute_sync_op's write-side check and
     # ensure_contained below - see the note there on junctions.
     live = live_account(env)
-    if live is not None and os.path.normcase(os.path.realpath(m["dest_path"])) == \
-            os.path.normcase(os.path.realpath(live.path)):
-        raise Refusal(
-            "destination resolves to the LIVE account ({0}); refusing - undo, "
-            "like sync, may only ever touch a dormant store, never the account "
-            "that is currently live.".format(live.email or live.account_uuid))
+    _refuse_dest_possibly_live(
+        env, live, m["dest_path"], "delete from",
+        lambda: "destination resolves to the LIVE account ({0}); refusing - undo, "
+                "like sync, may only ever touch a dormant store, never the account "
+                "that is currently live.".format(live.email or live.account_uuid))
     # The same guard as the write side (RULING 4: every mutation route,
     # regardless of provenance). Both callers of this helper (undo_sync,
     # recover_op's sync 'back' arm) inherit it from this one place.
@@ -3308,8 +3358,13 @@ def _print_sync_report(say, manifest):
     if weak:
         say("      ! identified from config.json's lastKnownAccountUuid, not from a")
         say("        signed-in oauthAccount - a provenance note only, not a stronger/")
-        say("        weaker distinction: --apply will refuse while Claude is running")
-        say("        either way (RULING 4).")
+        say("        weaker distinction.")
+    # Minor 5: this used to sit inside `if weak:` above, so an ordinary
+    # oauth-resolved dry run never warned that --apply refuses while Claude
+    # is running - even though _guard_mutation (RULING 4) applies exactly
+    # the same way regardless of resolved_from. Every dry run prints it now;
+    # the weak-only provenance note above stays weak-only.
+    say("      --apply will refuse while Claude is running either way (RULING 4).")
     say("to    {0:24} ({1}/{2})   signed out".format(
         manifest["dest_email"] or "(email unknown)",
         manifest["dest_account"][:8], manifest["dest_org"][:8]))
