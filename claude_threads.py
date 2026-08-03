@@ -2189,6 +2189,47 @@ def _account_dirs(env):
     return out
 
 
+def _identity_disagreement(env):
+    """(oauth_uuid, config_uuid) when the two identity files name different
+    accounts; None otherwise.
+
+    Measured 2026-08-02 (E4 verification): across a real desktop account
+    switch, ~/.claude.json's oauthAccount stayed STALE while config.json's
+    lastKnownAccountUuid tracked the switch - the inverse of the trust
+    ordering this module shipped with. The whole-branch review had already
+    built the opposite case (config stale, oauth fresh) synthetically. So
+    either file can be the stale one; a disagreement between them means the
+    live account is genuinely unknowable from files, and callers must fail
+    closed rather than pick a side. The likely mechanism (unverified): the
+    CLI owns ~/.claude.json, the desktop owns config.json, so each kind of
+    sign-in freshens only its own file.
+
+    An unreadable or malformed file is NO SIGNAL, deliberately - oauth-only
+    and config-only are legitimate states, not failures, and after RULING 4
+    the safety of every mutation rests on the universal process guard
+    (_guard_mutation), not on this comparison. Both values must be
+    non-empty strings; anything else is treated as absent so a garbage
+    value can never traceback later inside a refusal message's [:8] slice.
+    """
+    try:
+        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
+            oauth = ((json.load(fh) or {}).get("oauthAccount") or {}).get("accountUuid")
+    except (OSError, ValueError, AttributeError, TypeError):
+        oauth = None
+    if not isinstance(oauth, str) or not oauth:
+        return None
+    for cand in env.store_candidates:
+        cfg = os.path.join(os.path.dirname(cand), "config.json")
+        try:
+            with open(cfg, encoding="utf-8") as fh:
+                last = (json.load(fh) or {}).get("lastKnownAccountUuid")
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if isinstance(last, str) and last and last != oauth:
+            return (oauth, last)
+    return None
+
+
 def live_account(env):
     """The signed-in account, named outright rather than guessed.
 
@@ -2210,10 +2251,14 @@ def live_account(env):
     are about to mutate must therefore consult `resolved_from` - see
     _guard_weakly_resolved.
     """
+    if _identity_disagreement(env):
+        return None                    # fail closed - see _identity_disagreement
     try:
         with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
             oa = (json.load(fh) or {}).get("oauthAccount") or {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError, TypeError):
+        oa = {}
+    if not isinstance(oa, dict):
         oa = {}
     dirs = _account_dirs(env)
     acct_uuid = oa.get("accountUuid")
@@ -2231,7 +2276,7 @@ def live_account(env):
         try:
             with open(cfg, encoding="utf-8") as fh:
                 last = (json.load(fh) or {}).get("lastKnownAccountUuid")
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError, TypeError):
             continue
         if last:
             matches = [(a, o, p) for a, o, p in dirs if a == last]
@@ -2347,13 +2392,27 @@ def resolve_sync_endpoints(env, to=None):
     source = live_account(env)
     if source is None:
         listing = "\n".join(_candidate_line(a, o, p) for a, o, p in dirs)
+        dis = _identity_disagreement(env)
+        if dis:
+            raise Refusal(
+                "cannot identify the signed-in account: ~/.claude.json's oauthAccount "
+                "({0}) and config.json's lastKnownAccountUuid ({1}) disagree, and either "
+                "can be the stale one - refusing to guess which store is live.\n"
+                "--to cannot override this: it names the destination, and without knowing\n"
+                "which account is live we cannot verify the one you named is not it.\n"
+                "Fix: re-authenticate the CLI (run 'claude', then /login) as the account\n"
+                "you are using, or switch the desktop app to that account, so the two\n"
+                "files agree.\n"
+                "Stores found:\n".format(dis[0][:8], dis[1][:8]) + listing)
         raise Refusal(
             "cannot identify the signed-in account from ~/.claude.json or config.json.\n"
             "Refusing to guess which store is live - naming the wrong one would write the\n"
-            "account the app is actively using, with no process guard to stop it.\n"
+            "account the app is actively using.\n"
             "--to cannot override this: it names the destination, and without knowing\n"
             "which account is live we cannot verify the one you named is not it.\n"
-            "Fix: sign in to the Claude desktop app so ~/.claude.json names the account.\n"
+            "Fix: sign in to the Claude desktop app (which writes config.json) or\n"
+            "authenticate the CLI (which writes ~/.claude.json) so one of them names\n"
+            "the account.\n"
             "Stores found:\n" + listing)
     others = [Account(a, o, dormant_account_email(env, a), p)
               for a, o, p in dirs if a != source.account_uuid]

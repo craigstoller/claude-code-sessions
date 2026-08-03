@@ -1934,3 +1934,98 @@ def test_dormant_account_email_survives_a_corrupt_config(two_account_env, tmp_pa
         fh.write("{ not json")
     assert ct.dormant_account_email(env, DORMANT) == ""
     assert ct.resolve_sync_endpoints(env)[1].email == ""
+
+
+# ---------------------------------------------------------------- RULING 4
+
+
+def _write_desktop_config(env, account_uuid):
+    """The desktop's config.json, next to the claude-code-sessions dir -
+    the exact location live_account() reads (os.path.dirname(candidate))."""
+    cfg = os.path.join(os.path.dirname(env.store_candidates[0]), "config.json")
+    with open(cfg, "w", encoding="utf-8") as fh:
+        json.dump({"lastKnownAccountUuid": account_uuid}, fh)
+
+
+class TestIdentityDisagreement:
+    def test_live_account_fails_closed_when_identity_files_disagree(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        # E4 shape: oauth says aaaa..., the desktop's config says cccc...
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        assert ct.live_account(env) is None
+
+    def test_identity_disagreement_reports_both_uuids(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        assert ct._identity_disagreement(env) == (
+            "aaaaaaaa-0000-0000-0000-000000000001",
+            "cccccccc-0000-0000-0000-000000000003")
+
+    def test_agreement_is_not_a_disagreement(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "aaaaaaaa-0000-0000-0000-000000000001")
+        assert ct._identity_disagreement(env) is None
+        live = ct.live_account(env)
+        assert live is not None and live.resolved_from == "oauth"
+
+    def test_oauth_alone_still_resolves(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)   # no config.json written
+        assert ct._identity_disagreement(env) is None
+        live = ct.live_account(env)
+        assert live is not None and live.resolved_from == "oauth"
+
+    def test_sync_refuses_on_disagreement_naming_both_and_the_cli_fix(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "cccccccc-0000-0000-0000-000000000003")
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env)
+        msg = str(exc.value)
+        assert "disagree" in msg
+        assert "aaaaaaaa" in msg and "cccccccc" in msg
+        assert "/login" in msg
+
+    def test_no_evidence_refusal_no_longer_promises_desktop_signin_alone(
+            self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        # one store dir so the listing is non-empty; no identity file at all
+        os.makedirs(os.path.join(env.store_candidates[0],
+                                 "aaaaaaaa-0000-0000-0000-000000000001",
+                                 "bbbbbbbb-0000-0000-0000-000000000002"))
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env)
+        # both freshening routes named. Assert on text only the NEW message
+        # carries - the old one also mentioned both filenames, so matching on
+        # those would pass against the unfixed code (no RED).
+        assert "authenticate the CLI" in str(exc.value)
+        assert "writes config.json" in str(exc.value)
+
+    def test_malformed_identity_file_is_no_signal_not_a_crash(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        # a list root makes ({} or {}).get-style code raise AttributeError;
+        # the helper must swallow the shape, not traceback
+        with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump([1, 2], fh)
+        assert ct._identity_disagreement(env) is None
+
+    def test_non_string_config_uuid_is_no_signal(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        cfg = os.path.join(os.path.dirname(env.store_candidates[0]), "config.json")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            json.dump({"lastKnownAccountUuid": 12345}, fh)
+        # a non-string uuid must not become a "disagreement" whose [:8]
+        # slice tracebacks inside a refusal message
+        assert ct._identity_disagreement(env) is None
+
+    def test_live_account_survives_a_malformed_identity_file(
+            self, two_account_env, tmp_path):
+        # end-to-end: live_account's own reads must be as shape-hardened as
+        # the helper's - a list root previously raised AttributeError there
+        env, src, dst = two_account_env(tmp_path)
+        with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump([1, 2], fh)
+        _write_desktop_config(env, "aaaaaaaa-0000-0000-0000-000000000001")
+        live = ct.live_account(env)          # malformed oauth -> config fallback
+        assert live is not None and live.resolved_from == "config"
