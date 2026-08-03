@@ -1,7 +1,7 @@
 import json
 import os
 
-import claude_threads as ct
+import claude_session_store as ct
 
 
 def test_real_row_shapes_load(mkenv, tmp_path, write_row):

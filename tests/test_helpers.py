@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-import claude_threads as ct
+import claude_session_store as ct
 
 
 def test_sha256_file(tmp_path):

@@ -1,33 +1,40 @@
-# claude-code-threads
+# claude-code-session-store
 
-Move a Claude Code conversation to a different project folder — safely.
+See your Claude Code sessions under your other Claude account on the same machine — and move
+sessions between project folders. Journaled, reversible, fails closed.
 
 > **Unofficial.** Not affiliated with Anthropic. Reverse-engineered on-disk formats; fails
 > closed when it sees anything it doesn't recognize.
 
 ## The problem
 
-Claude Code and Claude Desktop file every thread under the working directory it was started
-in, and there is no official way to move one to a different project after the fact — a thread
-started in the wrong folder is stuck there. `claude-code-threads` relocates the transcript and every
-listing row that points at it, verifying each side before touching the other, so the thread
-reopens cleanly in its new home.
+**Claude Desktop files its session list per account.** Switch logins and the sessions you
+started under the other one disappear from the sidebar. They are not gone: the conversation
+itself is a single shared file carrying no account identity at all, sitting untouched on your
+disk. Only the *listing row* — the sidebar entry pointing at it — is private to each login, and
+the app reads only the folder belonging to the account you are signed into right now. `sync`
+copies that row into your other account's store, so the session appears there too.
+
+**Separately, every session is filed under the directory it was started in**, and there is no
+official way to move one afterwards — a session begun in the wrong folder is stuck there.
+`move` relocates the transcript and every listing row that points at it, verifying each side
+before touching the other, so the session reopens cleanly in its new home.
 
 ## Install
 
 ```
-pipx install claude-code-threads
+pipx install claude-code-session-store
 ```
 
-This installs two identical commands: `claude-code-threads`, and `cc-threads` as a shorter
-alias for everyday use. Examples below use the long form; `cc-threads doctor` is the same
+This installs two identical commands: `claude-code-session-store`, and `cc-store` as a shorter
+alias for everyday use. Examples below use the long form; `cc-store doctor` is the same
 thing.
 
-Or download `claude_threads.py` and run it directly — the runtime has no dependencies beyond
+Or download `claude_session_store.py` and run it directly — the runtime has no dependencies beyond
 the Python 3.9+ standard library:
 
 ```
-python claude_threads.py --help
+python claude_session_store.py --help
 ```
 
 ## Before any move: close the Claude app.
@@ -47,41 +54,41 @@ Six commands. All mutating commands default to a dry run; add `--apply` to execu
 **`list`** — inventory threads, optionally filtered by a search term:
 
 ```
-claude-code-threads list gate
+claude-code-session-store list gate
 ```
 
 **`doctor`** — read-only health report (stale locks, unresolved operations, orphaned rows,
 encoding-scheme ambiguity):
 
 ```
-claude-code-threads doctor
+claude-code-session-store doctor
 ```
 
 **`move`** — relocate a thread to another project folder:
 
 ```
-claude-code-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
+claude-code-session-store move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
 ```
 
-Get the full id from `claude-code-threads list --full`.
+Get the full id from `claude-code-session-store list --full`.
 
 **`undo`** — reverse the most recent completed operation:
 
 ```
-claude-code-threads undo --apply
+claude-code-session-store undo --apply
 ```
 
 **`recover`** — resolve an operation left non-terminal by a crash or interruption:
 
 ```
-claude-code-threads recover
+claude-code-session-store recover
 ```
 
 **`sync`** — copy a thread's sidebar **listing row** from your signed-in account into your
 *other* Claude account's store on this machine, so it shows up in that account's sidebar too:
 
 ```
-claude-code-threads sync --apply
+claude-code-session-store sync --apply
 ```
 
 There is only one copy of the conversation itself — shared, and carrying no account identity —
@@ -216,7 +223,7 @@ accounts the way `move` has above.
 
 ## What's stored locally
 
-`~/.claude-code-threads/` holds the tool's own bookkeeping, never your conversation content:
+`~/.claude-code-session-store/` holds the tool's own bookkeeping, never your conversation content:
 
 - `ops/<op-id>/manifest.json` — the journal for each move/undo/recover/sync operation (paths,
   hashes, row pre-images, phase history). Rotated: the 10 most recent terminal operations are
@@ -226,7 +233,7 @@ accounts the way `move` has above.
   from-path, to-path, date), used to recognize your own past moves during future collision and
   encoding-evidence checks.
 
-To purge everything the tool has ever written, delete the whole `~/.claude-code-threads/` directory.
+To purge everything the tool has ever written, delete the whole `~/.claude-code-session-store/` directory.
 This does not touch any transcript or listing row — only the tool's own journal.
 
 **`--json` output is not redacted.** Plain-text output replaces your home directory with `~`

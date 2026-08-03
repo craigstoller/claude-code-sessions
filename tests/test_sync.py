@@ -4,7 +4,7 @@ import stat
 
 import pytest
 
-import claude_threads as ct
+import claude_session_store as ct
 
 
 def test_live_account_from_oauth(two_account_env, tmp_path):
@@ -1794,7 +1794,7 @@ def test_classify_survives_a_corrupt_or_missing_post_image(two_account_env, tmp_
 def test_tally_is_not_journaled_to_disk(two_account_env, tmp_path):
     """Minor: plan_sync returns tally inside the manifest, so every skipped
     thread's title - including the ones the destination deliberately DELETED
-    - was written into ~/.claude-code-threads. Nothing in execute/undo/recover
+    - was written into ~/.claude-code-session-store. Nothing in execute/undo/recover
     reads it."""
     env, src, dst = two_account_env(tmp_path)
     _row(src, "local_a.json", "sid-a", "Copy Me")

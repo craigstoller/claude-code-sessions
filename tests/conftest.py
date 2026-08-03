@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import claude_threads as ct
+import claude_session_store as ct
 
 
 @pytest.fixture
@@ -19,14 +19,14 @@ def mkenv():
             r = tmp_path / f"store{i}" / "claude-code-sessions"
             r.mkdir(parents=True)
             roots.append(str(r))
-        ops = home / ".claude-code-threads" / "ops"
+        ops = home / ".claude-code-session-store" / "ops"
         ops.mkdir(parents=True)
         return ct.Env(
             home=str(home),
             projects_root=str(projects),
             store_candidates=roots,
             ops_dir=str(ops),
-            moved_log=str(home / ".claude-code-threads" / "moved-log.jsonl"),
+            moved_log=str(home / ".claude-code-session-store" / "moved-log.jsonl"),
             is_windows=is_windows,
             process_lister=lambda: [],
             now=lambda: 1_800_000_000.0,
