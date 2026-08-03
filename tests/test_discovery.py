@@ -1,6 +1,6 @@
 import os
 
-import claude_session_store as ct
+import claude_threads as ct
 
 
 def test_found_single_root(mkenv, tmp_path):

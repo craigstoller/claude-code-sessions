@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-import claude_session_store as ct
+import claude_threads as ct
 from test_engine import SimulatedCrash  # reuse
 
 SID = "rec-sess"

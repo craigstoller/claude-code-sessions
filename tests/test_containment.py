@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-import claude_session_store as ct
+import claude_threads as ct
 
 
 def test_contained_ok(tmp_path):

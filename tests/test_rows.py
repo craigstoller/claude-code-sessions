@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-import claude_session_store as ct
+import claude_threads as ct
 
 
 def test_loads_rows_and_skips_non_rows(mkenv, tmp_path, write_row):

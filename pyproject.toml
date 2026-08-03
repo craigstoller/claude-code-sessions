@@ -3,16 +3,16 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-code-session-store"
+name = "claude-code-threads"
 version = "0.1.0"
-description = "Unofficial CLI for the local Claude Code session store: make a session visible under your other account on this machine, or move it between project folders. Fails closed; never guesses."
+description = "Unofficial CLI to inspect and relocate Claude Code threads on disk. Fails closed; never guesses."
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 
 [project.scripts]
-claude-code-session-store = "claude_session_store:main"
-cc-store = "claude_session_store:main"
+claude-code-threads = "claude_threads:main"
+cc-threads = "claude_threads:main"
 
 [tool.setuptools]
-py-modules = ["claude_session_store"]
+py-modules = ["claude_threads"]

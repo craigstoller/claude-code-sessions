@@ -1,4 +1,4 @@
-import claude_session_store as ct
+import claude_threads as ct
 
 
 def test_env_and_exceptions_exist(mkenv, tmp_path):

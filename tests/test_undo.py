@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-import claude_session_store as ct
+import claude_threads as ct
 from test_engine import SimulatedCrash  # reuse, matches test_recover.py precedent
 
 SID = "undo-sess"
