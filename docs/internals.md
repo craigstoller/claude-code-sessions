@@ -148,6 +148,114 @@ source thread they cover for exactly this reason. As far as we found, this is un
 elsewhere: a review of seven other Claude session-copying tools' source, READMEs, and docs
 turned up zero mentions of `deleted_*` files, "tombstone," or soft-deletion of any kind.
 
+## The identity-file model and the running-app guard
+
+*(describes this tool's own design, informed by measurements of the app's identity files —
+see `_identity_disagreement`, `live_account`, `claude_running`, `_is_cli_process`, and
+`_guard_mutation` in `claude_threads.py`)*
+
+Two files claim to name the signed-in account, and they have two different owners. The likely
+mechanism, consistent with what has been measured but not itself verified: the Claude Code CLI
+owns `~/.claude.json`, and the desktop app owns `config.json`'s `lastKnownAccountUuid`, so each
+kind of sign-in freshens only its own file.
+
+Staleness has been measured in **both** directions, which is why neither file is trusted alone:
+
+- **2026-08-02 (E4 verification):** across a real desktop account switch, `~/.claude.json`'s
+  `oauthAccount` stayed **stale** while `config.json`'s `lastKnownAccountUuid` tracked the
+  switch — the inverse of the trust ordering this tool originally shipped with.
+- **Whole-branch review (earlier):** the opposite case — `config.json` stale, `oauthAccount`
+  fresh — had already been built synthetically.
+
+So either file can be the one that's wrong, and there is no way to prefer one over the other
+from the files alone. `_identity_disagreement(env)` treats a disagreement between them as **no
+signal about which one is right**, not as something to break a tie on: `live_account()` returns
+`None` the moment the two disagree, and `resolve_sync_endpoints` (every route that plans a
+sync) refuses outright rather than guess, naming both files' 8-character id prefixes and the
+fix — re-authenticate the CLI (run `claude`, then `/login`) as the account in use, or switch the
+desktop app to it, so the two files agree.
+
+Agreement between the files is therefore read as **consistency, not liveness**: two files that
+happen to name the same account is weaker evidence than it looks, because both could still be
+stale in the same direction (e.g. both left over from before a switch neither has registered
+yet). The actual safety mechanism for every mutation is the running-app check
+(`_guard_mutation`), not the identity files — it applies unconditionally to every sync mutation
+route regardless of which file (or whether either) resolved the live account.
+
+### The process-narrowing rule
+
+`claude_running(env)` has to answer "is the *desktop app* running," not "is anything named
+claude running" — the Claude Code CLI is itself a native `claude.exe` (since ~2.x) sharing the
+desktop app's image name on Windows, so a literal name match would refuse every mutation while
+an ordinary CLI session is merely open. `_is_cli_process(text)` recognises the CLI by precise
+path **segments**, not substrings (a bare substring test would excuse a desktop app installed
+under an unlucky parent directory, e.g. a user account literally named `claude-code`): the
+versioned CLI home `...\appdata\roaming\claude\claude-code\<ver>\claude.exe`, an npm-style
+`...\@anthropic-ai\claude-code\...` install, and the `.local/bin/claude[.exe]` PATH shim —
+including a POSIX shim invoked with trailing arguments, since `ps -A -o args=` reports the
+whole command line and a shimmed invocation with arguments never satisfies an ends-with check;
+the shim marker is therefore also checked as a contains-match followed by a space. Everything
+else claude-named — the MSIX desktop, a non-MSIX desktop install, or a bare image name the
+fallback lister couldn't resolve to a path at all — counts as the desktop app: **name-only
+resolution is a fail-closed fallback, not an exemption.** A bare `"claude"` argv0 with no path
+segment to test is deliberately left unclassified, and therefore still counts, on the same
+logic: with nothing to safely exclude, ambiguity resolves to "desktop."
+
+### The lister, and its two deliberate costs
+
+`_default_process_lister()` resolves full executable paths on Windows via
+`Get-CimInstance Win32_Process` (through PowerShell), which is what makes the narrowing above
+possible at all — since both the desktop app and the CLI share the image name `claude.exe`,
+only the path tells them apart. If CIM produces nothing usable — an error, or a return code of
+0 with no parseable output (a real machine never legitimately reports zero processes) — it
+falls back to name-only `tasklist` output, where a claude-named entry with no resolvable path
+is treated as the desktop app per the narrowing rule above. POSIX uses `ps -A -o pid=,args=`
+unchanged.
+
+Two costs were accepted deliberately here, not overlooked:
+
+- **Total enumeration failure reads as "possibly running," never as "nothing running."** Any
+  unusable result on either platform — an exception, a non-zero return code, or a zero-return
+  empty result — returns the `_PROC_UNAVAILABLE` sentinel (text containing "claude" so every
+  guard's substring match treats it as a claude-named process, with no CLI marker so the
+  narrowing never excuses it) instead of an empty list. Every guard built on `claude_running`
+  refuses rather than fails open when the process list can't be read — this reaches beyond
+  `sync`'s own guard to `move`'s guards too (`plan_move`'s pre-flight check, `execute_op`'s
+  last-instant revalidation before committing, and `run_undo`'s own check), since they all call
+  `claude_running` directly. `_guard_mutation` gives this specific case its own honest wording
+  ("the running-process list could not be read... refusing to {what} another account's store
+  while that is unavailable") rather than falsely claiming the app is running; `move`'s guards
+  report it as an ordinary "Claude appears to be running" refusal, because to them the sentinel
+  is just another claude-named entry. `doctor` never calls `claude_running` itself — it is
+  read-only — but a refusal any of these guards raises leaves a non-terminal op behind that
+  `doctor` flags and `recover` has to resolve, so enumeration failure still surfaces there,
+  once removed.
+- **The CIM call spawns PowerShell**, adding roughly 0.3–1.5 s wherever `claude_running` is
+  consulted. That is every mutation gate — rare, human-paced operations — so this cost is
+  accepted as-is rather than cached or optimised away.
+
+### The accepted TOCTOU residual
+
+The guard checks **once**, at the gate it's called from. For `sync`: `run_sync` checks before
+journaling (the earliest clean point, so a refusal leaves no lock file and no op directory
+behind); `execute_sync_op` checks again at the top of its own run — the *only* guard a
+crash-resumed `recover --forward` gets, since resuming re-enters `execute_sync_op` directly
+rather than `run_sync`; `_sync_delete_targets` checks once, shared by `undo_sync` and
+`recover --back`. A desktop app that starts **after** the relevant check — mid-write,
+mid-delete — is not itself caught, because there is no second running-process check later in
+that same call. This is the same posture `move` already had: its own guards (`plan_move`'s
+check, and `execute_op`'s last-instant revalidation before committing) are each a single
+point-in-time check, not a continuous one.
+
+The second layer, for both commands, is the overwrite/drift refusal that already exists for a
+different reason: `_sync_write_rows` refuses if a destination row's bytes have changed since
+planning, and `_sync_delete_targets` (via `undo_sync`, or skipped rather than refused for
+`recover --back`) treats a row that has drifted since it wrote it as unsafe to delete. Neither
+check detects "the app is running" — each detects "the app already touched *this* row" — so
+they only close the gap when the app that started mid-operation happens to touch a row this run
+is also touching. An app that starts mid-write and never touches the rows in flight is a
+residual gap this design accepts rather than one it claims to close.
+
 ## `sync`'s journal, and how `recover`/`undo` treat it
 
 *(describes this tool's own design, not a reverse-engineered fact about the app)*
@@ -179,33 +287,24 @@ the thread, for instance) and overwriting it would discard that. The refusal lea
 
 **`sync` also re-confirms, at the moment it writes, that the destination is still the dormant
 account** — the same check that chose it at plan time (`resolve_sync_endpoints`), run again
-against `live_account()` at execute time. This is *why* `sync` can normally ship with no
-running-app guard, unlike `move`/`undo`/`recover`: those refuse in the presence of a running
-Claude process because they might be racing it, but `sync` never touches the account a running
-process would be using.
+against `live_account()` at execute time. This catches an account **switch** between planning
+and writing (or a hand-edited/stale manifest); it is the *same* determination run again, not an
+independent verification — if `live_account()` was wrong at plan time it is wrong again at
+execute time, and the two agree.
 
-Be precise about what that re-check buys, because it is easy to over-read. It calls the *same*
-`live_account()` and compares its answer to the manifest's destination, so it catches an account
-**switch** between planning and writing (or a hand-edited/stale manifest). It is **not** an
-independent verification of the original determination: if `live_account()` was wrong at plan
-time it is wrong again at execute time, and the two agree.
-
-That matters because `live_account()` has two evidence paths of very different strength:
-
-| Source | `Account.resolved_from` | Strength |
-|---|---|---|
-| `~/.claude.json` → `oauthAccount` | `"oauth"` | Names the account, org, and email outright. |
-| `config.json` → `lastKnownAccountUuid` | `"config"` | Names only the account half, and its freshness across an account switch has **never been measured** — it can still name the account you switched *away* from, which would make the "other" store the live one. |
-
-So the fallback stays usable, but it does not get to underwrite the no-process-guard design on
-its own. When `resolved_from` is `"config"` (or `live_account()` returns `None` outright at
-execute time), `_guard_weakly_resolved` applies the same running-app refusal the other mutating
-commands use — on the write side (`execute_sync_op`) *and* the delete side
-(`_sync_delete_targets`, shared by `undo_sync` and `recover`'s `back` arm), so a store that is
-only *probably* dormant can be neither written nor deleted from while the app is visible. When
-`resolved_from` is `"oauth"` nothing changes: the process lister is never even consulted. The
-dry run labels a weakly-resolved source explicitly rather than printing the same
-`(email unknown)` an ordinary dormant-side line prints.
+This tool originally treated that re-check as sufficient on its own whenever `live_account()`'s
+answer came from `~/.claude.json`'s `oauthAccount` (`Account.resolved_from == "oauth"`), on the
+reasoning that `oauthAccount` names the account, org, and email outright and so is strong
+evidence — `sync` shipped with no running-app guard for that case, only falling back to one when
+the weaker `config.json` evidence was all that was available. That reasoning held for the wrong
+file: see "The identity-file model and the running-app guard" below, where a real desktop
+account switch measured `oauthAccount` itself staying stale across it. Since **RULING 4**
+(2026-08-02), the running-app guard (`_guard_mutation`) applies to every sync mutation — the
+write side (`execute_sync_op`) and the delete side (`_sync_delete_targets`, shared by
+`undo_sync` and `recover`'s `back` arm) — regardless of `resolved_from`. `resolved_from` is kept
+on the resolved `Account` only for messages and diagnostics (the dry run still labels a source
+resolved from `config.json` rather than `oauthAccount` explicitly, e.g. `from  (from
+config.json)`), never as a guard exemption.
 
 **The dormant account's email is recoverable, which was not obvious.** `oauthAccount` names
 only the live account, so the destination printed as `(email unknown)` — eight hex characters

@@ -32,13 +32,16 @@ python claude_threads.py --help
 
 ## Before any move: close the Claude app.
 
-`move`, `undo`, and `recover` refuse to mutate anything while they can see a running Claude
-process, but closing the app first avoids the refusal and guarantees nothing is actively
-appending to the transcript you're about to relocate. (`sync` is the partial exception — see
-below: it never writes the account you're signed into, so it usually carries no such check.
-The exception to the exception is when it had to fall back to `config.json` to work out which
-account is signed in — weaker evidence, so it then requires the app closed like everything
-else.)
+`move`, `undo`, `recover`, and every mutating `sync` route (`--apply`, `undo` of a completed
+sync, `recover --back` on a stuck one) all refuse while they can see the Claude desktop app
+running — whoever the identity files currently say is signed in. Closing the app first avoids
+the refusal and guarantees nothing is actively appending to the transcript or row you're about
+to touch. A running Claude Code CLI session does **not** count: it's recognised by its own
+install path and excluded from the check, so an open `claude` session never blocks any of this.
+If `~/.claude.json` (the CLI's identity file) and the desktop app's `config.json` disagree
+about which account is signed in, `sync` refuses to even plan — re-authenticate the CLI (run
+`claude`, then `/login`) as the account you use, or switch the desktop app to it, so the two
+files agree. Signing into the desktop app does **not** refresh `~/.claude.json`.
 
 ## Usage
 
@@ -93,9 +96,13 @@ always enough — Windows exposes two store roots (the MSIX package path and the
 `%APPDATA%\Claude` path), and a machine that migrated between installers can hold the same
 account under both, in which case the path is the only thing that tells the two copies apart.
 Both "which store did you mean" refusals print the full path beside each candidate. `sync` refuses outright if it
-cannot tell which account is signed in, from either `~/.claude.json` or `config.json` — `--to`
+cannot tell which account is signed in — either because neither `~/.claude.json` nor
+`config.json` names one, or because the two disagree about which account it is. `--to`
 cannot substitute for that: it only narrows *which* dormant store to use, and if we don't know
-which account is live we cannot verify the one you named isn't it.
+which account is live we cannot verify the one you named isn't it. A disagreement prints both
+files' 8-character id prefixes; the fix is to re-authenticate the CLI (run `claude`, then
+`/login`) as the account you're using, or switch the desktop app to that account, so the two
+files agree.
 
 `--json` prints the plan by itself, the same as the default dry run. Combined with `--apply` it
 runs first and describes what actually happened instead — real `written` flags per row and a
@@ -131,18 +138,23 @@ is always a preview will misread `sync --apply --json`.
   grants** across the account boundary unchanged. The permission half is the more
   security-relevant of the two: use `--verbatim` only when you actually want the second account
   to inherit what the first one had allowed.
-- **It usually does not need the app closed, unlike `move`, `undo`, and `recover`.** `sync` only
-  ever writes the store you are *not* signed into, and re-checks that at the moment it writes,
-  not just when it planned. That re-check catches an account *switch* between planning and
-  writing; it is the same determination run again, not an independent second opinion, so it is
-  only as good as the evidence underneath it. When that evidence is `~/.claude.json`'s
-  `oauthAccount` — the normal case, where you are signed in — it is strong and no process check
-  applies. When `~/.claude.json` is missing or has no `oauthAccount` and `sync` has to fall back
-  to `config.json`'s `lastKnownAccountUuid`, it is weaker: that field can still name the account
-  you switched *away* from, which would make the "other" store the live one. A dry run labels
-  that case explicitly (`from  (from config.json)`, plus a warning line) instead of the ordinary
-  `(email unknown)`, and `--apply`, `undo`, and `recover --back` all refuse in that state while
-  they can see a running Claude process. Signing into the desktop app removes the check.
+- **It needs the app closed too, the same as `move`, `undo`, and `recover` — regardless of which
+  file resolved the signed-in account.** `sync` only ever writes the store you are *not* signed
+  into, and re-checks that at the moment it writes, not just when it planned; that re-check
+  catches an account *switch* between planning and writing, but it is the same determination run
+  again, not an independent second opinion. An earlier version of this tool trusted
+  `~/.claude.json`'s `oauthAccount` enough to skip the running-app check whenever that file
+  named an account outright. A real desktop account switch measured `oauthAccount` staying
+  *stale* while `config.json`'s `lastKnownAccountUuid` tracked the switch — the opposite of the
+  trust ordering that exemption assumed — so either identity file can be the stale one, and
+  neither is trusted to certify "the destination is dormant" while the app is running. `--apply`,
+  `undo`, and `recover --back` on a sync op therefore all refuse whenever the Claude desktop app
+  is visible, whoever the files say is signed in. The dry run still labels a source resolved from
+  `config.json` rather than `oauthAccount` (`from  (from config.json)`, plus a warning line) —
+  that's a provenance note now, not a stronger/weaker gate: the guard applies the same way either
+  side. A running Claude Code CLI session does not trip it — only the desktop app does. Closing
+  the desktop app removes the check; signing *into* it does not, since the check is about
+  whether its process is running, not which account it's signed into.
 - **The destination's email is best-effort.** `~/.claude.json` names only the account you are
   signed into, so for the *other* account `sync` looks in the per-account Claude Code config the
   desktop app leaves inside its local-agent-mode sandbox
@@ -181,12 +193,16 @@ is always a preview will misread `sync --apply --json`.
 - **`recover`** classifies and resolves any operation a crash or interruption left in a
   non-terminal state — nothing is left stranded.
 - **`sync`** only ever writes rows into the store of the account you are *not* currently signed
-  into, re-verifying that at the moment it writes as well as when it planned. That is also why
-  it refuses outright if it cannot identify which account is signed in at all: `--to` names a
-  destination, but without a confirmed live account there is nothing to check that destination
-  against. And when the only evidence for which account is live comes from `config.json` rather
-  than a signed-in `oauthAccount`, `sync` stops relying on that check alone and adds the same
-  running-app guard `move`/`undo`/`recover` use.
+  into, re-verifying that at the moment it writes as well as when it planned. It refuses outright
+  if it cannot identify which account is signed in at all, or if `~/.claude.json` and
+  `config.json` disagree about which account that is: `--to` names a destination, but without a
+  confirmed, unambiguous live account there is nothing to check that destination against. Every
+  sync mutation — `--apply`, `undo`, and `recover --back` on a sync op — also refuses while it can
+  see the Claude desktop app running, the same guard `move`/`undo`/`recover` use, applied
+  regardless of which identity file resolved the signed-in account: a real account switch has
+  been measured leaving *either* file stale, so no file evidence is trusted to certify the
+  destination is dormant while the app is visible. A running Claude Code CLI does not count
+  toward this — only the desktop app does.
 - **Refusal philosophy.** The tool fails closed: an unrecognized on-disk layout, an unreadable
   row, an ambiguous encoding scheme, or a running Claude process is a refusal, not a guess.
   "Couldn't look" is never treated as "nothing there."
@@ -210,9 +226,11 @@ reported no new findings and the journal held no unresolved operations.
 the command existed: rows copied by hand between them and confirmed visible in the destination's
 sidebar, and — separately — a deleted thread's row restored alongside its own deletion record and
 confirmed visible again, which is the finding that makes `sync`'s tombstone-skipping mandatory
-(see `docs/internals.md`). The `sync` command itself is covered by its test suite and a read-only
-dry run against a real store; it has not yet had its own end-to-end `--apply` run against two live
-accounts the way `move` has above.
+(see `docs/internals.md`). The `sync` command itself is covered by its test suite and, as of
+2026-08-02, its own end-to-end `--apply` run against two real, live accounts: a row synced from
+one account opened in the other with its full conversation history intact. That run did not send
+a new turn through the synced row, so continuing the conversation from the destination account
+was not itself exercised by this verification.
 
 ## What's stored locally
 
