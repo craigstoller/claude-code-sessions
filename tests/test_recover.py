@@ -71,7 +71,7 @@ def test_rollback_after_rewriting_crash(crashed):
 
 def test_committed_crash_forward_allows_growth(crashed):
     env, m, t = crashed("committed")
-    with open(m["dest_transcript"], "a") as fh:      # user resumed the moved thread
+    with open(m["dest_transcript"], "a") as fh:      # user resumed the moved session
         fh.write('{"resumed": true}\n')
     op = ct.nonterminal_ops(env)[0]
     c = ct.classify_op(env, op)

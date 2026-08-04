@@ -64,7 +64,7 @@ def test_missing_projects_root_no_crash(mkenv, tmp_path, capsys):
     shutil.rmtree(env.projects_root)
     rc = ct.cmd_list(env, ns())
     out = capsys.readouterr().out
-    assert rc == 0 and "no threads found" in out
+    assert rc == 0 and "no sessions found" in out
     rc = ct.cmd_doctor(env, ns())
     assert rc == 0
 
@@ -122,7 +122,7 @@ def test_cmd_list_empty(mkenv, tmp_path, capsys):
     env = mkenv(tmp_path)
     ct.cmd_list(env, ns())
     out = capsys.readouterr().out
-    assert "no threads found" in out
+    assert "no sessions found" in out
 
 
 def test_row_dedup_by_session_id(mkenv, tmp_path, write_row):

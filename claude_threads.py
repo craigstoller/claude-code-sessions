@@ -1,4 +1,4 @@
-"""claude-code-threads: inspect and relocate Claude Code threads on disk.
+"""claude-code-threads: inspect and relocate Claude Code sessions on disk.
 
 Unofficial. Fails closed: verifies the on-disk layout against evidence and
 refuses to mutate anything it cannot positively verify.
@@ -789,7 +789,7 @@ def plan_move(env, session_id, target, flags):
     if not my_rows:
         if disc.status == "found" and not flags.transcript_only:
             raise Refusal("no listing row references this transcript; moving it would "
-                          "orphan the desktop entry. If this thread was created by the "
+                          "orphan the desktop entry. If this session was created by the "
                           "CLI (not the desktop app), pass --transcript-only.")
         if disc.status == "absent" and not flags.transcript_only:
             raise Refusal("no desktop store found. If you don't use the desktop app, "
@@ -808,7 +808,7 @@ def plan_move(env, session_id, target, flags):
                       .format(", ".join(sorted(set(running))[:3])))
     age = env.now() - os.path.getmtime(source)
     if age < MTIME_GUARD_SECONDS and not flags.force:
-        raise Refusal("transcript was written {0:.0f} seconds ago - this thread may be "
+        raise Refusal("transcript was written {0:.0f} seconds ago - this session may be "
                       "open (checked because a recent mtime lasts ~10 minutes). Close "
                       "the app; pass --force only if you are sure this is stale."
                       .format(age))
@@ -1317,7 +1317,7 @@ def plan_undo(env, prior_op):
     """Build a reversal manifest for a completed move: source/dest swapped,
     row pre/post images swapped, same hashes. Every precondition here checks
     the CURRENT on-disk state against what the move journaled as its
-    post-state - any drift (the app resumed the moved thread, edited a row,
+    post-state - any drift (the app resumed the moved session, edited a row,
     etc.) means undoing would silently discard that activity, so it refuses
     instead of guessing. This is undo, not recover: growth at the
     destination is never accepted here the way `classify_op` accepts it for
@@ -1341,7 +1341,7 @@ def plan_undo(env, prior_op):
     # _abort's scratch rule treats a journaled/copying-phase destination as
     # tool-owned and deletes it unconditionally on rollback (no hash check);
     # a foreign file the user manually put back at that path - they restored
-    # and resumed the thread there by hand - would otherwise be destroyed
+    # and resumed the session there by hand - would otherwise be destroyed
     # the moment the copy's O_EXCL create fails. Mirror plan_move's own
     # destination-exists check here, before any op is even journaled.
     if os.path.exists(pm["source_transcript"]) or \
@@ -1903,7 +1903,7 @@ def cmd_list(env, ns):
         else:
             print(redact(env, line))
     if not items:
-        print("no threads found")
+        print("no sessions found")
     return 0
 
 
@@ -2021,7 +2021,7 @@ import argparse
 
 def build_parser():
     p = argparse.ArgumentParser(prog="claude-code-threads",
-        description="Inspect and relocate Claude Code threads on disk. Unofficial; "
+        description="Inspect and relocate Claude Code sessions on disk. Unofficial; "
                     "fails closed. Close the Claude app before any mutation.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -2029,7 +2029,7 @@ def build_parser():
         sp.add_argument("--verbose", action="store_true",
                         help="full paths and ids (default output is redacted)")
 
-    sp = sub.add_parser("list", help="inventory threads")
+    sp = sub.add_parser("list", help="inventory sessions")
     sp.add_argument("query", nargs="?", default="")
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
@@ -2040,7 +2040,7 @@ def build_parser():
     sp.add_argument("--json", action="store_true")
     common(sp)
 
-    sp = sub.add_parser("move", help="relocate a thread to another project folder")
+    sp = sub.add_parser("move", help="relocate a session to another project folder")
     sp.add_argument("session_id")
     sp.add_argument("target")
     sp.add_argument("--apply", action="store_true")
@@ -2066,12 +2066,12 @@ def build_parser():
     sp.add_argument("--apply", action="store_true")
     common(sp)
 
-    sp = sub.add_parser("sync", help="copy thread listing rows to your other account")
+    sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
                          "(required if more than one exists)")
     sp.add_argument("--only", default="", metavar="SUBSTRING",
-                    help="only threads whose title contains this")
+                    help="only sessions whose title contains this")
     sp.add_argument("--include-deleted", action="append", default=[],
                     dest="include_deleted", metavar="TITLE_OR_ID",
                     help="also copy this session even though the destination "
@@ -2624,12 +2624,12 @@ def _tombstone_ids(e):
     """Both ids a tombstone for this row could be filed under.
 
     The spec said `deleted_<cliSessionId>`, and that was what E4 measured. It
-    is not the whole truth. On this machine's own live store the thread titled
+    is not the whole truth. On this machine's own live store the session titled
     'E4 tombstone test' carries TWO tombstones: one named for its cliSessionId
     (bc7333f9...) and one named for its filename stem, i.e. its local id
     (747a0b6e...). So the app files deletions in both id spaces, and a skip
     that checks only the session id can miss a real deletion and resurrect a
-    thread the account's user deliberately removed - the first row of this
+    session the account's user deliberately removed - the first row of this
     design's own risk table.
 
     Checking both is safe in the direction that matters. A false positive
@@ -2643,19 +2643,19 @@ def _tombstone_ids(e):
 def _resolve_tombstone_overrides(entries, tombs, named):
     """Map each --include-deleted term to exactly ONE tombstoned source row.
 
-    The flag's contract is that it names a single thread and "never applies
+    The flag's contract is that it names a single session and "never applies
     blanket to a whole run" - but the match used to be a bare title substring
-    tested per row, so one term silently resurrected every tombstoned thread
+    tested per row, so one term silently resurrected every tombstoned session
     whose title happened to contain it (the reviewer got three from one
     term). Resolve each term against the tombstoned rows up front instead: a
     full id - either of the two a tombstone can be filed under, see
     _tombstone_ids - matches exactly; anything else is a title substring and
     must single one out. More than one match is a refusal that names the
-    candidates - resurrecting a deliberately deleted thread is the first row
+    candidates - resurrecting a deliberately deleted session is the first row
     of this design's own risk table and must never happen by accident.
 
     A term that matches nothing is deliberately NOT an error: the destination
-    may simply hold no tombstone for that thread, in which case the row is
+    may simply hold no tombstone for that session, in which case the row is
     copied by the ordinary rules and the report's "resurrected" section
     correctly stays empty. Nothing is claimed that did not happen.
 
@@ -2674,8 +2674,8 @@ def _resolve_tombstone_overrides(entries, tombs, named):
             listing = "\n".join("   {0}  (session {1})".format(e["title"], e["session_id"])
                                 for e in matched)
             raise Refusal(
-                "--include-deleted {0!r} matched {1} threads the destination account "
-                "deleted. It names ONE thread; it is not a blanket override. Re-run "
+                "--include-deleted {0!r} matched {1} sessions the destination account "
+                "deleted. It names ONE session; it is not a blanket override. Re-run "
                 "naming a full session id, or a title substring unique to one of:\n{2}"
                 .format(term, len(matched), listing))
         out.update(e["name"] for e in matched)
@@ -2975,7 +2975,7 @@ def _sync_write_rows(op, m, rows, per_save, budget):
             # select_sync_rows only picked rows that were ABSENT at the
             # destination at plan time. A row now present with DIFFERENT
             # bytes means the destination account changed it since planning
-            # (e.g. the user signed in and touched that thread) - rewriting
+            # (e.g. the user signed in and touched that session) - rewriting
             # over that would silently discard the change. execute_op
             # refuses on the equivalent drift rather than blindly
             # overwriting; do the same here, and leave the op non-terminal
@@ -3021,7 +3021,7 @@ def run_sync(env, manifest):
     acquire_lock(env, "pending")
     try:
         # "tally" is the report's data, not the operation's: it names every
-        # thread the run skipped - including the ones the destination account
+        # session the run skipped - including the ones the destination account
         # deliberately DELETED - and nothing in execute/undo/recover reads it.
         # Journaling it would write those titles to disk in ~/.claude-code-threads
         # for the lifetime of the op, so strip it from the copy that is
@@ -3249,7 +3249,7 @@ def _sync_unlink_all(paths):
 def undo_sync(env, op):
     """Delete exactly the rows this sync wrote - and only while they are still
     byte-identical to what it wrote. If the destination account has since
-    opened the thread the app rewrites the row, and deleting it would discard
+    opened the session the app rewrites the row, and deleting it would discard
     that account's own state. A row that cannot even be read is treated the
     same way - a surprise either way, so undo refuses rather than guessing.
     This is the deliberate asymmetry with recover_op's 'back' arm: undo is a
@@ -3393,7 +3393,7 @@ def _print_sync_report(say, manifest):
         say("   ... and {0} more".format(len(deleted_titles) - 15))
 
     # --include-deleted is the one thing this command does that the user
-    # cannot undo by simply deleting a row again - it brings back a thread
+    # cannot undo by simply deleting a row again - it brings back a session
     # they deliberately deleted, the first row of the design's own risk
     # table. It used to be the LEAST visible thing here: the rescued row
     # entered the plan with no marker and tally["deleted"] held only the
@@ -3402,7 +3402,7 @@ def _print_sync_report(say, manifest):
     resurrected = tally.get("resurrected") or []
     if resurrected:
         say("")
-        say("!! RESURRECTING {0} thread(s) the destination account DELETED "
+        say("!! RESURRECTING {0} session(s) the destination account DELETED "
             "(--include-deleted):".format(len(resurrected)))
         for title in resurrected[:15]:
             say("   !! {0}".format(title))

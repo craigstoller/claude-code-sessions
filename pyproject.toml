@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "claude-code-threads"
 version = "0.1.0"
-description = "Unofficial CLI to inspect and relocate Claude Code threads on disk. Fails closed; never guesses."
+description = "Unofficial CLI for Claude Code sessions on disk: make a session visible under your other Claude account on the same machine, or move one between project folders. Journaled, reversible, fails closed."
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}

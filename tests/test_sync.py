@@ -184,7 +184,7 @@ def test_selects_only_missing_rows_with_live_transcripts(two_account_env, tmp_pa
 
 def test_skips_sessions_the_destination_deleted(two_account_env, tmp_path):
     """E4: the app writes tombstones but does not honour them, so copying a
-    row for a tombstoned session resurrects a thread the user deleted."""
+    row for a tombstoned session resurrects a session the user deleted."""
     env, src, dst = two_account_env(tmp_path)
     _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
     with open(os.path.join(dst, "deleted_sid-a"), "w") as fh:
@@ -198,10 +198,10 @@ def test_skips_sessions_the_destination_deleted(two_account_env, tmp_path):
 def test_skips_a_tombstone_filed_under_the_rows_local_id(two_account_env, tmp_path):
     """The spec said tombstones are named `deleted_<cliSessionId>`, and E4
     measured one. That is not the whole truth: on the author's own live store
-    the thread 'E4 tombstone test' carries TWO tombstones - one for its
+    the session 'E4 tombstone test' carries TWO tombstones - one for its
     cliSessionId (bc7333f9...) and one for its filename stem, i.e. its local
     id (747a0b6e...). A skip that only checks the session id therefore misses
-    a real deletion and resurrects the thread."""
+    a real deletion and resurrects the session."""
     env, src, dst = two_account_env(tmp_path)
     _row(src, "local_747a0b6e.json", "bc7333f9", "E4 tombstone test")
     _transcript(env, "bc7333f9")
@@ -331,7 +331,7 @@ class SimulatedCrash(Exception):
 def _prepared(env, src, dst, n=2):
     for i in range(n):
         sid = "sid-%d" % i
-        _row(src, "local_%d.json" % i, sid, "Thread %d" % i)
+        _row(src, "local_%d.json" % i, sid, "Session %d" % i)
         _transcript(env, sid)
 
 
@@ -1476,13 +1476,13 @@ def _tombstoned(env, src, dst, titles):
 
 
 def test_include_deleted_refuses_an_ambiguous_term(two_account_env, tmp_path):
-    """The spec says the flag names ONE thread and "never applies blanket to
+    """The spec says the flag names ONE session and "never applies blanket to
     a whole run". A bare substring tested per row let one term resurrect
-    every tombstoned thread it happened to hit - the reviewer got three."""
+    every tombstoned session it happened to hit - the reviewer got three."""
     env, src, dst = two_account_env(tmp_path)
     _tombstoned(env, src, dst, ["Alpha", "Beta", "Gamma"])
     source, dest = ct.resolve_sync_endpoints(env)
-    with pytest.raises(ct.Refusal, match="matched 3 threads") as exc_info:
+    with pytest.raises(ct.Refusal, match="matched 3 sessions") as exc_info:
         ct.select_sync_rows(env, source, dest, ct.SyncFlags(include_deleted=("a",)))
     msg = str(exc_info.value)
     for title in ("Alpha", "Beta", "Gamma"):
@@ -1528,7 +1528,7 @@ def test_include_deleted_marks_the_row_and_fills_the_resurrected_tally(two_accou
 
 def test_cli_names_what_include_deleted_resurrects_before_the_copy_list(
         two_account_env, tmp_path, monkeypatch, capsys):
-    """Resurrecting a deliberately deleted thread is the first row of the
+    """Resurrecting a deliberately deleted session is the first row of the
     design's own risk table and was the least visible thing the command did:
     the report said nothing at all. It must now be named, unmissably, before
     the ordinary "to copy" list."""
@@ -1537,7 +1537,7 @@ def test_cli_names_what_include_deleted_resurrects_before_the_copy_list(
     monkeypatch.setattr(ct, "default_env", lambda: env)
     assert ct.main(["sync", "--include-deleted", "Alpha", "--verbose"]) == 0
     out = capsys.readouterr().out
-    assert "RESURRECTING 1 thread" in out
+    assert "RESURRECTING 1 session" in out
     assert out.index("RESURRECTING") < out.index("to copy")
     assert "!! Alpha" in out
     assert "kept deleted: Beta" in out          # the honoured one still reported
@@ -1550,7 +1550,7 @@ def test_cli_include_deleted_ambiguity_is_a_refusal_not_three_resurrections(
     monkeypatch.setattr(ct, "default_env", lambda: env)
     assert ct.main(["sync", "--include-deleted", "a", "--apply", "--verbose"]) == 1
     err = capsys.readouterr().err
-    assert "matched 3 threads" in err
+    assert "matched 3 sessions" in err
     assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
 
 
@@ -1803,7 +1803,7 @@ def test_classify_survives_a_corrupt_or_missing_post_image(two_account_env, tmp_
 
 def test_tally_is_not_journaled_to_disk(two_account_env, tmp_path):
     """Minor: plan_sync returns tally inside the manifest, so every skipped
-    thread's title - including the ones the destination deliberately DELETED
+    session's title - including the ones the destination deliberately DELETED
     - was written into ~/.claude-code-threads. Nothing in execute/undo/recover
     reads it."""
     env, src, dst = two_account_env(tmp_path)
@@ -2250,7 +2250,7 @@ class TestDisagreementGuardsDestPossiblyLive:
                              "eeeeeeee-0000-0000-0000-000000000005",
                              "ffffffff-0000-0000-0000-000000000006")
         os.makedirs(third)
-        _row(src, "local_0.json", "sid-0", "Thread 0")
+        _row(src, "local_0.json", "sid-0", "Session 0")
         _transcript(env, "sid-0")
         m = ct.plan_sync(env, ct.SyncFlags(to="eeeeeeee"))    # while identity agrees
         assert os.path.normcase(m["dest_path"]) == os.path.normcase(third)

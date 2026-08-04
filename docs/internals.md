@@ -1,4 +1,4 @@
-# Internals: how Claude Code / Claude Desktop store threads
+# Internals: how Claude Code / Claude Desktop store sessions
 
 This is background for anyone extending or auditing `claude-code-threads`, not a user guide. It
 describes the on-disk layout the tool depends on and refuses to guess about.
@@ -9,7 +9,7 @@ describes the on-disk layout the tool depends on and refuses to guess about.
 > hard-coding them (see `doctor` and the encoding-scheme detection below).
 >
 > Last confirmed end to end against a live store on **2026-07-31, Claude Desktop (Windows)
-> app 2.1.219**: a thread was relocated between projects, resumed by the app at its new
+> app 2.1.219**: a session was relocated between projects, resumed by the app at its new
 > location, and an interrupted move was recovered in both directions.
 
 ## Where things live
@@ -22,18 +22,18 @@ describes the on-disk layout the tool depends on and refuses to guess about.
 C:\Users\<you>\.claude\projects\<encoded-cwd>\<cliSessionId>.jsonl
 ```
 
-Some threads also have a folder of the same name beside the `.jsonl`, holding subagent
+Some sessions also have a folder of the same name beside the `.jsonl`, holding subagent
 transcripts. It travels with the file.
 
-**Listing metadata** — one JSON per thread, holding its title, `cwd`, timestamps, model, and
+**Listing metadata** — one JSON per session, holding its title, `cwd`, timestamps, model, and
 the `cliSessionId` pointing at the transcript above:
 
 ```
 C:\Users\<you>\AppData\Roaming\Claude\claude-code-sessions\<account-id>\<org-id>\local_<appSessionId>.json
 ```
 
-Also in that folder, and **not** thread metadata: `scheduled-tasks.json`, `deleted_<id>`
-markers for removed threads, and transient `*.json.tmp` files. Any bulk operation should glob
+Also in that folder, and **not** session metadata: `scheduled-tasks.json`, `deleted_<id>`
+markers for removed sessions, and transient `*.json.tmp` files. Any bulk operation should glob
 `local_*.json` specifically.
 
 **That `%APPDATA%` path does not exist for most processes.** Claude Desktop on Windows is an
@@ -50,7 +50,7 @@ view where `%APPDATA%\Claude` appears to exist. From an ordinary terminal it is 
 paths are the same bytes; resolving the real path on the virtual one lands on the `LocalCache`
 location. Resolve the `LocalCache` path first, fall back to `%APPDATA%`, and treat a missing
 store as a hard error rather than an empty result — a glob over a non-existent directory
-returns zero rows, which is indistinguishable from "this thread has no listing row" unless the
+returns zero rows, which is indistinguishable from "this session has no listing row" unless the
 absence is checked for explicitly.
 
 Note that `~/.claude/projects` is **not** redirected — it is an ordinary profile directory that
@@ -65,11 +65,11 @@ This is the part that is easy to get wrong, because the two layers behave differ
 
 | Layer | Shared or copied? | Consequence |
 |-------|-------------------|-------------|
-| Transcript (`.jsonl`) | **One genuinely shared file.** Carries no account identifier at all. | Any account whose listing points at it reads and writes the same bytes. Continuing a thread from one login and opening it from another login shows the new content immediately. |
-| Listing (`local_*.json`) | **Per-account copy.** | Which threads appear, plus title/timestamp/sort order, is private to each login and frozen at copy time. |
+| Transcript (`.jsonl`) | **One genuinely shared file.** Carries no account identifier at all. | Any account whose listing points at it reads and writes the same bytes. Continuing a session from one login and opening it from another login shows the new content immediately. |
+| Listing (`local_*.json`) | **Per-account copy.** | Which sessions appear, plus title/timestamp/sort order, is private to each login and frozen at copy time. |
 
-So relocating or copying a thread's listing entry is a **snapshot**, not a live sync of the
-conversation — a resumed thread's row goes stale elsewhere until re-copied. The conversation
+So relocating or copying a session's listing entry is a **snapshot**, not a live sync of the
+conversation — a resumed session's row goes stale elsewhere until re-copied. The conversation
 content itself was never copied; only the pointer to it was.
 
 ## The encoding rule
@@ -90,7 +90,7 @@ underscores. So `C:\Users\<you>\Projects\_Tools\my-project` becomes
 > **Do not hard-code this rule.** Derive it from folders the app itself created: take recent
 > `cwd` values out of the listing store, encode each under both schemes, and keep whichever
 > matches real directories on disk. Getting it wrong files a transcript where the app will never
-> look, and the thread vanishes from the sidebar. `claude-code-threads` does exactly this evidence
+> look, and the session vanishes from the sidebar. `claude-code-threads` does exactly this evidence
 > comparison before every move (see `scheme_evidence` / `choose_scheme`), and refuses to proceed
 > if the evidence is genuinely tied.
 
@@ -117,14 +117,14 @@ that still references it, which is a normal, expected state rather than corrupti
 
 *(observed July 2026, Claude Desktop (Windows); format may change)*
 
-Deleting a thread in the app writes a `deleted_<id>` file beside the listing rows, inside
+Deleting a session in the app writes a `deleted_<id>` file beside the listing rows, inside
 `<accountUuid>/<organizationUuid>/`. It is 13 bytes: an epoch-millisecond timestamp of the
 deletion. The listing row is **removed outright**, not blanked in place, and the **transcript
 is left on disk**.
 
 **`<id>` is not always the `cliSessionId`, which is the trap.** The obvious reading — and what
 the first measurement here recorded — is `deleted_<cliSessionId>`. That is incomplete. A
-thread on the author's own store carries *two* tombstones: one named for its `cliSessionId`
+session on the author's own store carries *two* tombstones: one named for its `cliSessionId`
 (`bc7333f9…`) and one named for its **local id**, the `local_<id>.json` filename stem
 (`747a0b6e…`). So deletions are filed in **both id spaces**, and anything that honours
 tombstones has to test both. Checking only the session id misses a real deletion silently;
@@ -136,15 +136,15 @@ Two further consequences that are easy to get wrong:
 - **They are per-account.** A deletion under one account says nothing about what another
   account should see — a tombstone lives inside the same per-account folder as the rows it's
   paired with, never anywhere shared.
-- **The app writes them but does not honour them.** Deleting a disposable thread, then
+- **The app writes them but does not honour them.** Deleting a disposable session, then
   restoring its backed-up listing row while leaving the tombstone in place, then relaunching the
-  app, showed the thread in the sidebar again. The tombstone survived the launch with its
+  app, showed the session in the sidebar again. The tombstone survived the launch with its
   contents unchanged — nothing consumed or pruned it.
 
 So any tool that copies listing rows between accounts must consult the *destination's*
-tombstones itself; nothing in the app stops a copy from resurrecting a thread the user
+tombstones itself; nothing in the app stops a copy from resurrecting a session the user
 deliberately deleted. `sync` (see the README) reads the destination's tombstones and skips any
-source thread they cover for exactly this reason. As far as we found, this is undocumented
+source session they cover for exactly this reason. As far as we found, this is undocumented
 elsewhere: a review of seven other Claude session-copying tools' source, READMEs, and docs
 turned up zero mentions of `deleted_*` files, "tombstone," or soft-deletion of any kind.
 
@@ -286,7 +286,7 @@ end of this section for exactly how fine-grained that record is). A run that fin
 copy never creates an operation at all — there is nothing to journal.
 
 What is journaled is the operation, not the report. `plan_sync` returns a `tally` of every
-thread the run skipped and why — including the ones the destination account deliberately deleted
+session the run skipped and why — including the ones the destination account deliberately deleted
 — for the CLI to print; `run_sync` strips it from the copy it journals, so those titles are never
 written into `~/.claude-code-threads/`. Nothing in execute/undo/recover reads it.
 
@@ -294,7 +294,7 @@ written into `~/.claude-code-threads/`. Nothing in execute/undo/recover reads it
 already byte-identical to what `sync` would write → leave it alone and mark the row done anyway;
 this is what makes re-running, or resuming a crashed run, safe. Present with *different* bytes →
 refuse, because the destination account has touched that row since the sync was planned (opened
-the thread, for instance) and overwriting it would discard that. The refusal leaves the op at
+the session, for instance) and overwriting it would discard that. The refusal leaves the op at
 `writing`, not a terminal status.
 
 **`sync` also re-confirms, at the moment it writes, that the destination is still the dormant

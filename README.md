@@ -1,20 +1,30 @@
 # claude-code-threads
 
-Move a Claude Code conversation to a different project folder — safely.
+See your Claude Code sessions under your other Claude account on the same machine — and move
+sessions between project folders. Journaled, reversible, fails closed.
 
 > **Unofficial.** Not affiliated with Anthropic. Reverse-engineered on-disk formats; fails
 > closed when it sees anything it doesn't recognize.
+>
+> **On the name:** Claude Code calls these *sessions*, and so does everything below. The tool
+> kept the name it shipped under; the two words mean the same thing here.
 
 **Companion read:** [The session that synced itself](docs/the-session-that-synced-itself.md)
 — what Claude Desktop actually keeps on disk, and why this tool is built out of refusals.
 
 ## The problem
 
-Claude Code and Claude Desktop file every thread under the working directory it was started
-in, and there is no official way to move one to a different project after the fact — a thread
-started in the wrong folder is stuck there. `claude-code-threads` relocates the transcript and every
-listing row that points at it, verifying each side before touching the other, so the thread
-reopens cleanly in its new home.
+**Claude Desktop files its session list per account.** Switch logins and the sessions you
+started under the other one disappear from the sidebar. They are not gone: the conversation
+itself is a single shared file carrying no account identity at all, sitting untouched on your
+disk. Only the *listing row* — the sidebar entry pointing at it — is private to each login, and
+the app reads only the folder belonging to the account you are signed into right now. `sync`
+copies that row into your other account's store, so the session shows up there too.
+
+**Separately, every session is filed under the directory it was started in**, and there is no
+official way to move one afterwards — a session begun in the wrong folder is stuck there.
+`move` relocates the transcript and every listing row that points at it, verifying each side
+before touching the other, so the session reopens cleanly in its new home.
 
 ## Install
 
@@ -58,7 +68,7 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 Six commands. All mutating commands default to a dry run; add `--apply` to execute.
 
-**`list`** — inventory threads, optionally filtered by a search term:
+**`list`** — inventory sessions, optionally filtered by a search term:
 
 ```
 claude-code-threads list gate
@@ -71,7 +81,7 @@ encoding-scheme ambiguity):
 claude-code-threads doctor
 ```
 
-**`move`** — relocate a thread to another project folder:
+**`move`** — relocate a session to another project folder:
 
 ```
 claude-code-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
@@ -91,7 +101,7 @@ claude-code-threads undo --apply
 claude-code-threads recover
 ```
 
-**`sync`** — copy a thread's sidebar **listing row** from your signed-in account into your
+**`sync`** — copy a session's sidebar **listing row** from your signed-in account into your
 *other* Claude account's store on this machine, so it shows up in that account's sidebar too:
 
 ```
@@ -99,7 +109,7 @@ claude-code-threads sync --apply
 ```
 
 There is only one copy of the conversation itself — shared, and carrying no account identity —
-so a synced thread opens and resumes normally under the other account. Without `--to`, the
+so a synced session opens and resumes normally under the other account. Without `--to`, the
 destination must be unambiguous: exactly one other account store on the machine, or `--to
 <substring>` naming one of several by its account id, org id, **store path**, or — when it can be
 recovered, see below — its email. The path is matchable because ids alone are not
@@ -120,18 +130,18 @@ runs first and describes what actually happened instead — real `written` flags
 `result` key, not the plan it would have executed. Automation that assumes `sync --json` output
 is always a preview will misread `sync --apply --json`.
 
-- **Threads you deleted in the destination stay deleted.** The app writes a small record
-  (`deleted_<id>`) when you delete a thread but does not consult it when a row for that thread
+- **Sessions you deleted in the destination stay deleted.** The app writes a small record
+  (`deleted_<id>`) when you delete a session but does not consult it when a row for that session
   reappears elsewhere — confirmed by restoring a deleted row alongside its own record and
-  reopening the app, which showed the thread again. `sync` reads the *destination's* records and
-  skips any source thread they cover, and names each skip in its report (`kept deleted: …`).
-  `--include-deleted "<title-or-id>"` overrides the skip for **one** named thread; it never
+  reopening the app, which showed the session again. `sync` reads the *destination's* records and
+  skips any source session they cover, and names each skip in its report (`kept deleted: …`).
+  `--include-deleted "<title-or-id>"` overrides the skip for **one** named session; it never
   applies to a whole run. The name must resolve unambiguously — a full id, or a title
-  substring matching exactly one deleted thread. (The app files a deletion under the thread's
+  substring matching exactly one deleted session. (The app files a deletion under its
   session id *or* under its local id, and `sync` honours both, so either id works here.) A substring that hits several is a refusal
   listing the candidates, not a silent multi-resurrection. Anything it does resurrect is printed
   under a `!! RESURRECTING …` heading *before* the list of rows to copy, and flagged again in
-  that list, so bringing back a thread you deliberately deleted is never something the command
+  that list, so bringing back a session you deliberately deleted is never something the command
   does quietly.
 - **Connector config and permission grants are not copied by default.** A row can carry a full
   snapshot of the account's connected MCP servers; across 432 real rows on this machine that
@@ -139,7 +149,7 @@ is always a preview will misread `sync --apply --json`.
   safe: on a real row it cut 132,264 bytes to 715 (99.5% smaller) with the sidebar entry,
   history, responses, and connectors all working normally afterward, under the account that owned
   them. That proves the *app* tolerates the field's absence — it does not prove the *destination
-  account* has the same connectors configured. A thread that relies on one opens fine either way
+  account* has the same connectors configured. A session that relies on one opens fine either way
   and fails at its first tool call if the integration isn't set up there too; set it up in the
   destination account. The default transform also **resets the row's permission state**
   (`alwaysAllowedReasons`, `sessionPermissionUpdates`, `chromePermissionMode`,
@@ -179,7 +189,7 @@ is always a preview will misread `sync --apply --json`.
   unless you pass `--verbose` for the paths and ids in full. Check the path, not just the email,
   before `--apply`.
 - A synced row is a **snapshot**: title and last-activity time live in the row itself, so a
-  thread you keep using shows its copy-time title and sits at its copy-time position in the
+  session you keep using shows its copy-time title and sits at its copy-time position in the
   other account, indefinitely. Re-running does not refresh it — `sync` only ever adds rows that
   are missing, never rewrites one that's already there. Refreshing a stale row (`--update`) is
   planned but not yet built.
@@ -188,7 +198,7 @@ is always a preview will misread `sync --apply --json`.
   exactly right for rows `sync` itself copied, since it copies the name along with the contents.
   But a destination row pointing at the same conversation under a *different* local id — one
   placed by an earlier hand-run script, say — is not detected, and `sync` would add a second row
-  for the same thread, showing it twice in that account's sidebar. Deleting the duplicate in the
+  for the same session, showing it twice in that account's sidebar. Deleting the duplicate in the
   app is enough to fix it.
 - Sign into the other account (or restart the app) to see the results.
 
@@ -230,7 +240,7 @@ is always a preview will misread `sync --apply --json`.
 | CLI-only machines (any OS) | transcript layout verified | mutations behind `--transcript-only` |
 
 The Windows row is an end-to-end check on a real store, not just a passing test suite:
-a disposable thread was moved between projects, the app was restarted and the thread
+a disposable session was moved between projects, the app was restarted and the session
 resumed at its new location, `undo` correctly **refused** once that resume had appended
 to the transcript (rather than discarding the new messages), and a deliberately
 interrupted move was resolved in both directions with `recover`. Afterwards `doctor`
@@ -238,7 +248,7 @@ reported no new findings and the journal held no unresolved operations.
 
 `sync`'s underlying mechanics were checked against two real, live accounts on this machine before
 the command existed: rows copied by hand between them and confirmed visible in the destination's
-sidebar, and — separately — a deleted thread's row restored alongside its own deletion record and
+sidebar, and — separately — a deleted session's row restored alongside its own deletion record and
 confirmed visible again, which is the finding that makes `sync`'s tombstone-skipping mandatory
 (see `docs/internals.md`). The `sync` command itself is covered by its test suite and, as of
 2026-08-02, its own end-to-end `--apply` run against two real, live accounts: a row synced from
