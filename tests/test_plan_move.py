@@ -81,12 +81,23 @@ def test_store_present_no_row_refuses_without_flag(setup, write_row):
     assert m["mode"] == "transcript_only"
 
 
-def test_nonwindows_desktop_needs_unverified_platform(setup):
+def test_nonwindows_desktop_mutation_refuses_with_no_override(setup):
+    """The store layout is verified on Windows only, and macOS reportedly has
+    two candidate layouts we have confirmed neither of. There is deliberately
+    no override: a flag would let a user waive a risk they cannot evaluate.
+    --transcript-only still works, because THAT layout is verified."""
     env, t, target = setup
     env.is_windows = False
-    with pytest.raises(ct.Refusal, match="unverified-platform"):
+    with pytest.raises(ct.Refusal, match="Windows-only"):
         ct.plan_move(env, SID, target, flags())
-    assert ct.plan_move(env, SID, target, flags(unverified_platform=True))["mode"] == "desktop"
+    assert not hasattr(flags(), "unverified_platform")   # the escape hatch is gone
+    # A session with NO desktop row (CLI-created) is still movable here, because
+    # the transcript layout IS verified cross-platform. Note --transcript-only
+    # does not force that mode - it only permits it when no row exists.
+    os.unlink([r.path for r in ct.load_rows(env.store_candidates)[0]
+               if r.cli_session_id == SID][0])
+    assert ct.plan_move(env, SID, target,
+                        flags(transcript_only=True))["mode"] == "transcript_only"
 
 
 def test_missing_and_ambiguous_transcript(setup, write_transcript):

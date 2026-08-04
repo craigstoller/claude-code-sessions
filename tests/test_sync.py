@@ -2280,3 +2280,43 @@ class TestDisagreementGuardsDestPossiblyLive:
 
         assert ct.execute_sync_op(env, op) == "completed"
         assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+
+# ------------------------------- platform gate on the sync mutation routes
+
+
+def test_sync_mutations_refuse_on_an_unverified_platform(two_account_env, tmp_path):
+    """The gap this closes: `is_windows` was checked in exactly one place -
+    inside plan_move - so every sync route (write, undo, recover --back) would
+    happily mutate a store on macOS whose layout has never been verified.
+    The guard now lives in _guard_mutation, which all three already call."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    env.is_windows = False
+
+    # planning is read-only and must still work - it is what a Mac user runs
+    # to produce the doctor/dry-run output we actually want from them.
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert len(m["rows"]) == 1
+
+    for what in ("write to", "delete from"):
+        with pytest.raises(ct.Refusal, match="Windows-only"):
+            ct._guard_mutation(env, what)
+
+    # and the executor itself refuses, before journaling anything
+    with pytest.raises(ct.Refusal, match="Windows-only"):
+        ct.run_sync(env, m)
+    assert [f for f in os.listdir(dst) if f.startswith("local_")] == []
+
+
+def test_platform_gate_has_no_override(two_account_env, tmp_path):
+    """Deliberately no flag: an override would let a user waive a risk they
+    have no way to evaluate, which inverts the fail-closed rule everywhere
+    else in this module."""
+    env, src, dst = two_account_env(tmp_path)
+    env.is_windows = False
+    assert not hasattr(ct.SyncFlags(), "unverified_platform")
+    with pytest.raises(ct.Refusal, match="Windows-only"):
+        ct._require_verified_platform(env, "write to")
+    env.is_windows = True
+    assert ct._require_verified_platform(env, "write to") is None   # no-op on Windows

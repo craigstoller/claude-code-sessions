@@ -237,8 +237,25 @@ is always a preview will misread `sync --apply --json`.
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03 | read-only + mutations |
-| macOS / Linux desktop | unverified | read-only (+ mutations behind `--unverified-platform`) |
-| CLI-only machines (any OS) | transcript layout verified | mutations behind `--transcript-only` |
+| macOS / Linux desktop | unverified | **read-only only** — desktop-store mutations refuse, with no override |
+| CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
+
+**On non-Windows, `move` and every `sync` route refuse to touch the desktop store, and there
+is no flag to override that.** The layout is confirmed on Windows only; macOS reportedly has
+two candidate layouts — the ordinary Application Support path and a sandboxed
+`~/Library/Containers/…` one — and neither has been confirmed here. An override would let you
+waive a risk you have no way to evaluate, which is the opposite of how every other refusal in
+this tool works.
+
+What *does* work there: `list` and `doctor`, which are read-only, and `move` for a session
+that has **no desktop listing row** — a CLI-created one — via `--transcript-only`, because the
+transcript layout is verified cross-platform. (Note `--transcript-only` does not force that
+mode; it permits it when no row exists. A session that *has* a desktop row is not movable on
+an unverified platform.)
+
+**If you're on macOS and want this supported:** `claude-code-sessions doctor --verbose` output
+in an issue is exactly what's needed. It's read-only, mutates nothing, and it reports the store
+roots found and the layout recognised — which is the whole of what's missing.
 
 The Windows row is an end-to-end check on a real store, not just a passing test suite:
 a disposable session was moved between projects, the app was restarted and the session

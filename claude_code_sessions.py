@@ -594,7 +594,6 @@ def sidecar_inventory(sidecar_dir):
 @dataclasses.dataclass
 class MoveFlags:
     transcript_only: bool = False
-    unverified_platform: bool = False
     row: list = ()
     yes: bool = False
     force: bool = False
@@ -797,9 +796,8 @@ def plan_move(env, session_id, target, flags):
                           "are unverified - absence may mean we looked in the wrong "
                           "place.)")
     mode = "desktop" if my_rows else "transcript_only"
-    if mode == "desktop" and not env.is_windows and not flags.unverified_platform:
-        raise Refusal("desktop-store mutations are unverified on this platform; pass "
-                      "--unverified-platform to proceed anyway.")
+    if mode == "desktop":
+        _require_verified_platform(env, "mutate")
 
     # 6. guards
     running = claude_running(env)
@@ -2045,8 +2043,6 @@ def build_parser():
     sp.add_argument("target")
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("--transcript-only", action="store_true", dest="transcript_only")
-    sp.add_argument("--unverified-platform", action="store_true",
-                    dest="unverified_platform")
     sp.add_argument("--row", action="append", default=[])
     sp.add_argument("--yes", action="store_true")
     sp.add_argument("--force", action="store_true")
@@ -2086,7 +2082,6 @@ def build_parser():
 
 def _flags_from(ns):
     return MoveFlags(transcript_only=ns.transcript_only,
-                     unverified_platform=ns.unverified_platform,
                      row=ns.row, yes=ns.yes, force=ns.force)
 
 
@@ -2383,6 +2378,32 @@ def live_account(env):
     return None
 
 
+def _require_verified_platform(env, what):
+    """Refuse desktop-store mutations on a platform whose layout is unverified.
+
+    There is deliberately NO override flag. The store layout is confirmed only
+    on Windows; macOS reportedly has two candidate layouts - the ordinary
+    Application Support path and a sandboxed ~/Library/Containers/... one - and
+    neither has been confirmed here. An override would let a user waive a risk
+    they have no way to evaluate, which inverts how every other refusal in this
+    module works: we fail closed on what we cannot verify rather than asking the
+    user to certify it for us.
+
+    Unaffected: read-only commands, and --transcript-only mutations - that
+    layout IS verified cross-platform.
+    """
+    if env.is_windows:
+        return
+    raise Refusal(
+        "desktop-store mutations are Windows-only for now - this platform's store "
+        "layout has never been verified, so refusing to {0} it. Read-only commands "
+        "(list, doctor) work here, and a session with no desktop listing row (a "
+        "CLI-created one) is still movable via --transcript-only, because THAT "
+        "layout is verified. On macOS and want the desktop store supported? "
+        "'claude-code-sessions doctor --verbose' output in an issue is exactly what "
+        "is needed - it is read-only and mutates nothing.".format(what))
+
+
 def _guard_mutation(env, what):
     """Refuse to WHAT another account's store while the Claude desktop app
     is running. Applies to every mutation route, whatever named the live
@@ -2399,6 +2420,7 @@ def _guard_mutation(env, what):
     desktop app's own processes, so a Claude Code CLI session never trips
     this.
     """
+    _require_verified_platform(env, what)
     running = claude_running(env)
     if not running:
         return
