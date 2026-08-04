@@ -236,9 +236,14 @@ is always a preview will misread `sync --apply --json`.
 
 | Platform | Status | Mutations |
 |---|---|---|
-| Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03 | read-only + mutations |
+| Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03; sync-undo drift refusal live 2026-08-04 | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** — desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
+
+The dates are measurements against specific builds — most recently Claude Desktop
+1.24012.11.0 (Microsoft Store install) and Claude Code CLI 2.1.220. The on-disk format has
+changed once already during this tool's own development; treat a much newer build as
+unverified territory.
 
 **On non-Windows, `move` and every `sync` route refuse to touch the desktop store, and there
 is no flag to override that.** The layout is confirmed on Windows only; macOS reportedly has
@@ -273,7 +278,10 @@ confirmed visible again, which is the finding that makes `sync`'s tombstone-skip
 one account opened in the other with its full conversation history intact. That run did not send
 a new turn through the synced row; a second verification on 2026-08-03 closed that gap — a live
 session's own listing row was synced across accounts and the conversation was then continued
-from the destination account's sidebar, new turns flowing through the synced row.
+from the destination account's sidebar, new turns flowing through the synced row. And on
+2026-08-04, `undo` of a synced row the destination account had since opened was refused on
+real data: the row no longer matched what the op journaled, so the drift refusal declined
+to delete it — exactly the designed behavior.
 
 ## What's stored locally
 
