@@ -1,6 +1,6 @@
 # Internals: how Claude Code / Claude Desktop store sessions
 
-This is background for anyone extending or auditing `claude-code-threads`, not a user guide. It
+This is background for anyone extending or auditing `claude-code-sessions`, not a user guide. It
 describes the on-disk layout the tool depends on and refuses to guess about.
 
 > Every claim below was **observed July 2026, app channel: Claude Desktop (Windows); format may
@@ -90,7 +90,7 @@ underscores. So `C:\Users\<you>\Projects\_Tools\my-project` becomes
 > **Do not hard-code this rule.** Derive it from folders the app itself created: take recent
 > `cwd` values out of the listing store, encode each under both schemes, and keep whichever
 > matches real directories on disk. Getting it wrong files a transcript where the app will never
-> look, and the session vanishes from the sidebar. `claude-code-threads` does exactly this evidence
+> look, and the session vanishes from the sidebar. `claude-code-sessions` does exactly this evidence
 > comparison before every move (see `scheme_evidence` / `choose_scheme`), and refuses to proceed
 > if the evidence is genuinely tied.
 
@@ -152,7 +152,7 @@ turned up zero mentions of `deleted_*` files, "tombstone," or soft-deletion of a
 
 *(describes this tool's own design, informed by measurements of the app's identity files —
 see `_identity_disagreement`, `live_account`, `claude_running`, `_is_cli_process`, and
-`_guard_mutation` in `claude_threads.py`)*
+`_guard_mutation` in `claude_code_sessions.py`)*
 
 Two files claim to name the signed-in account, and they have two different owners. The likely
 mechanism, consistent with what has been measured but not itself verified: the Claude Code CLI
@@ -288,7 +288,7 @@ copy never creates an operation at all — there is nothing to journal.
 What is journaled is the operation, not the report. `plan_sync` returns a `tally` of every
 session the run skipped and why — including the ones the destination account deliberately deleted
 — for the CLI to print; `run_sync` strips it from the copy it journals, so those titles are never
-written into `~/.claude-code-threads/`. Nothing in execute/undo/recover reads it.
+written into `~/.claude-code-journal/`. Nothing in execute/undo/recover reads it.
 
 **Every row is re-read immediately before it would be written.** Absent → write it. Present and
 already byte-identical to what `sync` would write → leave it alone and mark the row done anyway;

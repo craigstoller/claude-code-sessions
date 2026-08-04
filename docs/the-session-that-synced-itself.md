@@ -7,7 +7,7 @@ typed my next message from the other side. The conversation picked up where it l
 same history, same working state, now running under the destination account's own
 connectors and permissions rather than the source's.
 
-The tool that did it is [claude-code-threads](../README.md), a small CLI I built after
+The tool that did it is [claude-code-sessions](../README.md), a small CLI I built after
 spending a week measuring what Claude actually keeps on disk. Before it made that copy,
 it refused me — several times, for several different reasons, every one of them correct.
 By the end of the evening all four of its refusal types had fired in real use, and the
@@ -175,7 +175,7 @@ conversations, that's the property I care most about.
 
 ## What it is, and isn't
 
-[claude-code-threads](https://github.com/craigstoller/claude-code-threads) moves Claude
+[claude-code-sessions](https://github.com/craigstoller/claude-code-sessions) moves Claude
 Code conversations between project folders and syncs their sidebar entries between
 accounts on the same machine. Copies are additive-only, strip account-specific state, and
 skip any thread the destination account has deleted — honouring tombstones the app writes

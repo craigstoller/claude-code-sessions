@@ -1,4 +1,4 @@
-import claude_threads as ct
+import claude_code_sessions as ct
 
 
 def test_find_across_folders_including_worktrees(mkenv, tmp_path, write_transcript):

@@ -1,4 +1,4 @@
-# claude-code-threads
+# claude-code-sessions
 
 See your Claude Code sessions under your other Claude account on the same machine — and move
 sessions between project folders. Journaled, reversible, fails closed.
@@ -6,8 +6,9 @@ sessions between project folders. Journaled, reversible, fails closed.
 > **Unofficial.** Not affiliated with Anthropic. Reverse-engineered on-disk formats; fails
 > closed when it sees anything it doesn't recognize.
 >
-> **On the name:** Claude Code calls these *sessions*, and so does everything below. The tool
-> kept the name it shipped under; the two words mean the same thing here.
+> **Not to be confused with** `claude-code-sessions\` — the folder *Claude Desktop* keeps your
+> per-account session list in, which this tool reads. This tool's own bookkeeping lives in
+> `~/.claude-code-journal/` and is safe to delete.
 
 **Companion read:** [The session that synced itself](docs/the-session-that-synced-itself.md)
 — what Claude Desktop actually keeps on disk, and why this tool is built out of refusals.
@@ -29,18 +30,18 @@ before touching the other, so the session reopens cleanly in its new home.
 ## Install
 
 ```
-pipx install claude-code-threads
+pipx install claude-code-sessions
 ```
 
-This installs two identical commands: `claude-code-threads`, and `cc-threads` as a shorter
-alias for everyday use. Examples below use the long form; `cc-threads doctor` is the same
+This installs two identical commands: `claude-code-sessions`, and `ccs` as a shorter
+alias for everyday use. Examples below use the long form; `ccs doctor` is the same
 thing.
 
-Or download `claude_threads.py` and run it directly — the runtime has no dependencies beyond
+Or download `claude_code_sessions.py` and run it directly — the runtime has no dependencies beyond
 the Python 3.9+ standard library:
 
 ```
-python claude_threads.py --help
+python claude_code_sessions.py --help
 ```
 
 ## Before any move: close the Claude app.
@@ -71,41 +72,41 @@ Six commands. All mutating commands default to a dry run; add `--apply` to execu
 **`list`** — inventory sessions, optionally filtered by a search term:
 
 ```
-claude-code-threads list gate
+claude-code-sessions list gate
 ```
 
 **`doctor`** — read-only health report (stale locks, unresolved operations, orphaned rows,
 encoding-scheme ambiguity):
 
 ```
-claude-code-threads doctor
+claude-code-sessions doctor
 ```
 
 **`move`** — relocate a session to another project folder:
 
 ```
-claude-code-threads move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
+claude-code-sessions move 3c3c3eae-0e2f-4be4-9fba-407f06816f79 "C:\path\to\project" --apply
 ```
 
-Get the full id from `claude-code-threads list --full`.
+Get the full id from `claude-code-sessions list --full`.
 
 **`undo`** — reverse the most recent completed operation:
 
 ```
-claude-code-threads undo --apply
+claude-code-sessions undo --apply
 ```
 
 **`recover`** — resolve an operation left non-terminal by a crash or interruption:
 
 ```
-claude-code-threads recover
+claude-code-sessions recover
 ```
 
 **`sync`** — copy a session's sidebar **listing row** from your signed-in account into your
 *other* Claude account's store on this machine, so it shows up in that account's sidebar too:
 
 ```
-claude-code-threads sync --apply
+claude-code-sessions sync --apply
 ```
 
 There is only one copy of the conversation itself — shared, and carrying no account identity —
@@ -259,7 +260,7 @@ from the destination account's sidebar, new turns flowing through the synced row
 
 ## What's stored locally
 
-`~/.claude-code-threads/` holds the tool's own bookkeeping, never your conversation content:
+`~/.claude-code-journal/` holds the tool's own bookkeeping, never your conversation content:
 
 - `ops/<op-id>/manifest.json` — the journal for each move/undo/recover/sync operation (paths,
   hashes, row pre-images, phase history). Rotated: the 10 most recent terminal operations are
@@ -269,7 +270,7 @@ from the destination account's sidebar, new turns flowing through the synced row
   from-path, to-path, date), used to recognize your own past moves during future collision and
   encoding-evidence checks.
 
-To purge everything the tool has ever written, delete the whole `~/.claude-code-threads/` directory.
+To purge everything the tool has ever written, delete the whole `~/.claude-code-journal/` directory.
 This does not touch any transcript or listing row — only the tool's own journal.
 
 **`--json` output is not redacted.** Plain-text output replaces your home directory with `~`

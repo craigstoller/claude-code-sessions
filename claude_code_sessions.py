@@ -1,4 +1,4 @@
-"""claude-code-threads: inspect and relocate Claude Code sessions on disk.
+"""claude-code-sessions: inspect and relocate Claude Code sessions on disk.
 
 Unofficial. Fails closed: verifies the on-disk layout against evidence and
 refuses to mutate anything it cannot positively verify.
@@ -60,8 +60,8 @@ def default_env():
         home=home,
         projects_root=os.path.join(home, ".claude", "projects"),
         store_candidates=candidates,
-        ops_dir=os.path.join(home, ".claude-code-threads", "ops"),
-        moved_log=os.path.join(home, ".claude-code-threads", "moved-log.jsonl"),
+        ops_dir=os.path.join(home, ".claude-code-journal", "ops"),
+        moved_log=os.path.join(home, ".claude-code-journal", "moved-log.jsonl"),
         is_windows=(sys.platform == "win32"),
         process_lister=_default_process_lister,
         now=time.time,
@@ -486,8 +486,8 @@ def acquire_lock(env, op_id):
             holder_str = "pid {0}, op {1}".format(*holder)
         else:
             holder_str = "unknown holder"
-        raise Refusal("another claude-code-threads operation holds the lock ({0}). "
-                      "If it is dead, run: claude-code-threads recover".format(holder_str))
+        raise Refusal("another claude-code-sessions operation holds the lock ({0}). "
+                      "If it is dead, run: claude-code-sessions recover".format(holder_str))
     with os.fdopen(fd, "w") as fh:
         fh.write("{0} {1}".format(os.getpid(), op_id))
     return _lock_path(env)
@@ -602,7 +602,7 @@ class MoveFlags:
 
 # Our own console-script names. They contain "claude", so without this the
 # process guard below would see this very tool and refuse to run.
-OUR_COMMANDS = ("claude-code-threads", "cc-threads")
+OUR_COMMANDS = ("claude-code-sessions", "ccs")
 
 
 def _is_cli_process(text):
@@ -711,7 +711,7 @@ def plan_move(env, session_id, target, flags):
         if hits:
             raise Refusal("source and destination transcript are identical: "
                           "{0}".format(dest_transcript))
-        raise Refusal("No transcript found for {0}. Use 'claude-code-threads list' to find "
+        raise Refusal("No transcript found for {0}. Use 'claude-code-sessions list' to find "
                       "session ids.".format(session_id))
     if len(source_hits) > 1:
         raise Refusal("Ambiguous: transcript exists in several folders:\n  " +
@@ -723,7 +723,7 @@ def plan_move(env, session_id, target, flags):
         raise Refusal("target must be an existing directory: {0}".format(target))
     real_target = os.path.normcase(os.path.realpath(target))
     for forbidden in (os.path.join(env.home, ".claude"), os.path.dirname(env.ops_dir)):
-        # normcase both sides: on a first run ~/.claude-code-threads does not exist
+        # normcase both sides: on a first run ~/.claude-code-journal does not exist
         # yet, so realpath alone does not canonicalize case on Windows.
         fr = os.path.normcase(os.path.realpath(forbidden))
         if real_target == fr or real_target.startswith(fr + os.sep):
@@ -1050,7 +1050,7 @@ def _abort(env, op, delete_dest=True, trigger=None):
         m["drifted_rows"] = drifted_rows
         save_manifest(op)
         raise Refusal("rollback could not verify every file ({0}); nothing "
-                      "was changed. Use 'claude-code-threads recover' to "
+                      "was changed. Use 'claude-code-sessions recover' to "
                       "resolve.".format(", ".join(problems)))
 
     for r, pre_bytes in row_restores:
@@ -1074,7 +1074,7 @@ def _abort(env, op, delete_dest=True, trigger=None):
         raise Refusal(
             "rollback could not verify the source ({0}) against its journaled "
             "pre-state; the destination copy at {1} is being kept, not deleted "
-            "- nothing was lost, both copies remain. Run 'claude-code-threads "
+            "- nothing was lost, both copies remain. Run 'claude-code-sessions "
             "recover' to resolve.".format(m["source_transcript"], m["dest_transcript"]))
 
     if do_delete:
@@ -1265,7 +1265,7 @@ def execute_op(env, op):
         failures = _delete_inventoried_files(m["sidecar_source"], m["sidecar_inventory"])
         if failures:
             print("warning: move committed, but the old copy could not be fully "
-                  "removed ({0}). Run 'claude-code-threads recover' to finish deleting "
+                  "removed ({0}). Run 'claude-code-sessions recover' to finish deleting "
                   "it.".format(", ".join(p for p, _ in failures)))
             return "committed"
         _rmdirs_bottom_up(m["sidecar_source"])
@@ -1274,7 +1274,7 @@ def execute_op(env, op):
         os.unlink(m["source_transcript"])
     except OSError as exc:
         print("warning: move committed, but the old copy could not be fully "
-              "removed ({0}). Run 'claude-code-threads recover' to finish deleting "
+              "removed ({0}). Run 'claude-code-sessions recover' to finish deleting "
               "it.".format(exc))
         return "committed"
 
@@ -1426,7 +1426,7 @@ def run_undo(env, prior_op):
     (execute_op's own guard only fires at its last-instant revalidation,
     deep into the transaction) - and, like run_move/recover_op, it takes the
     single-instance lock FIRST, before doing any of its own checks, so two
-    concurrent claude-code-threads invocations can never race each other here.
+    concurrent claude-code-sessions invocations can never race each other here.
     On 'completed' the prior op is marked 'undone' and a moved-log entry
     cancels its 'move' entry; any other outcome (e.g. 'committed' if final
     cleanup could not fully finish, or 'rolled_back') leaves the prior op's
@@ -2007,9 +2007,9 @@ def cmd_doctor(env, ns):
         say("[observed] legacy-encoded folder {0} ({1} transcripts) is shadowed"
             .format(lf["folder"], lf["transcripts"]))
     for oid in rep["nonterminal_ops"]:
-        say("[observed] unresolved operation {0} - run: claude-code-threads recover".format(oid))
+        say("[observed] unresolved operation {0} - run: claude-code-sessions recover".format(oid))
     if rep["stale_lock"]:
-        say("[observed] stale lock - run: claude-code-threads recover")
+        say("[observed] stale lock - run: claude-code-sessions recover")
     if rep["exit_code"] == 2:
         say("[observed] unrecognized or unreadable state - please open an issue including the output above (paths and ids are redacted by default)")
     return rep["exit_code"]
@@ -2020,7 +2020,7 @@ import argparse
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="claude-code-threads",
+    p = argparse.ArgumentParser(prog="claude-code-sessions",
         description="Inspect and relocate Claude Code sessions on disk. Unofficial; "
                     "fails closed. Close the Claude app before any mutation.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -3023,7 +3023,7 @@ def run_sync(env, manifest):
         # "tally" is the report's data, not the operation's: it names every
         # session the run skipped - including the ones the destination account
         # deliberately DELETED - and nothing in execute/undo/recover reads it.
-        # Journaling it would write those titles to disk in ~/.claude-code-threads
+        # Journaling it would write those titles to disk in ~/.claude-code-journal
         # for the lifetime of the op, so strip it from the copy that is
         # journaled. The "rows" list (and every row dict in it) is still the
         # same object, so run_sync's caller keeps seeing `written` flags flip.
