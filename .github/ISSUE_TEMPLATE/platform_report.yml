@@ -1,0 +1,34 @@
+name: Platform store report (macOS / Linux)
+description: Help move your platform's row from "unverified" to "verified" — read-only doctor output is the whole ask.
+labels: [platform-report]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        On macOS and Linux this tool refuses all desktop-store mutations because the store
+        layout has only been confirmed on Windows. `doctor --verbose` reports the store
+        roots it found and the layout it recognised — which is exactly what's missing. It
+        is read-only and mutates nothing.
+
+        **Privacy note:** `--verbose` prints full paths, including your home directory and
+        your account/org UUIDs. The *layout* is what matters here, not your ids — feel
+        free to shorten each UUID to its first 8 characters before posting.
+  - type: textarea
+    id: doctor-verbose
+    attributes:
+      label: doctor --verbose output
+      description: Paste the output of `claude-code-sessions doctor --verbose`, redacted as much as you like so long as the path shapes survive.
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS and version
+      placeholder: macOS 15.2 (Apple Silicon)
+    validations:
+      required: true
+  - type: input
+    id: desktop-version
+    attributes:
+      label: Claude Desktop version and install source
+      placeholder: 1.x.x, direct download

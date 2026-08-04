@@ -10,7 +10,7 @@ sessions between project folders. Journaled, reversible, fails closed.
 > per-account session list in, which this tool reads. This tool's own bookkeeping lives in
 > `~/.claude-code-journal/` and is safe to delete.
 
-**Companion read:** [The session that synced itself](docs/the-session-that-synced-itself.md)
+**Companion read:** [The session that synced itself](https://github.com/craigstoller/claude-code-sessions/blob/main/docs/the-session-that-synced-itself.md)
 — what Claude Desktop actually keeps on disk, and why this tool is built out of refusals.
 
 ## The problem
@@ -320,8 +320,15 @@ window into `journaled`/`completed`/`rolled_back`.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
+## Reporting problems
+
+This is a one-person project and support is best-effort. The fastest reports to act on
+carry the failing command's plain-text output, `claude-code-sessions doctor` output, and —
+if an operation was involved — the journal op id; the issue templates ask for each. Please
+don't paste `--json` output into an issue: it is deliberately unredacted (see above).
+
 ## More
 
-Companion post: [The session that synced itself](docs/the-session-that-synced-itself.md).
+Companion post: [The session that synced itself](https://github.com/craigstoller/claude-code-sessions/blob/main/docs/the-session-that-synced-itself.md).
 
-MIT licensed — see [LICENSE](LICENSE).
+MIT licensed — see [LICENSE](https://github.com/craigstoller/claude-code-sessions/blob/main/LICENSE).

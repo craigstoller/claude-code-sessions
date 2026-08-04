@@ -1,0 +1,65 @@
+name: Bug report
+description: Something failed, refused when it shouldn't have, or left the store in a state you didn't expect.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before pasting anything:** use plain-text output, not `--json`. Plain text replaces
+        your home directory with `~` and truncates ids to 8 characters; `--json` is
+        deliberately unredacted — full paths, full ids, session titles. If you must include
+        `--json`, copy only the fields you mean to share.
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran (redact any session title you'd rather not share).
+      placeholder: ccs sync --apply
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Paste the command's plain-text output, and say what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doctor output
+      description: Paste the output of `claude-code-sessions doctor` (plain text, not `--json`).
+    validations:
+      required: true
+  - type: input
+    id: op-id
+    attributes:
+      label: Journal operation id
+      description: If an operation was involved — the op id the command printed, or the newest directory name under `~/.claude-code-journal/ops/`.
+      placeholder: 20260801T172431Z-db8828
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: install-variant
+    attributes:
+      label: Claude Desktop install variant (Windows)
+      description: Matters because the two installs keep their stores under different roots.
+      options:
+        - Classic installer (%APPDATA%\Claude)
+        - Microsoft Store / MSIX
+        - Both present (machine migrated between them)
+        - Not sure / not Windows
+  - type: input
+    id: versions
+    attributes:
+      label: Claude Desktop and CLI versions
+      description: Desktop version from its settings; CLI from `claude --version`.
