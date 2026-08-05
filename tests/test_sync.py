@@ -1,6 +1,5 @@
 import json
 import os
-import stat
 
 import pytest
 
@@ -531,19 +530,26 @@ def test_atomic_write_failure_becomes_a_refusal_not_a_traceback(two_account_env,
     Refusal/LayoutError (and only those get redact()'d before being printed),
     so a bare OSError would surface as an unredacted traceback exposing
     paths and account UUIDs. Provoke a real OSError rather than a mock: a
-    leftover, read-only <name>.ct-tmp scratch file at the write target
-    blocks atomic_write's own open() while the row itself is still absent -
-    so the pre-write existence check correctly treats it as new, and the
-    failure exercised is atomic_write's, not the read-check's."""
+    leftover <name>.ct-tmp at the write target blocks atomic_write's own
+    open() while the row itself is still absent - so the pre-write existence
+    check correctly treats it as new, and the failure exercised is
+    atomic_write's, not the read-check's.
+
+    The leftover is a DIRECTORY, not the read-only file this used to use.
+    chmod-based blocking is not a property of the filesystem, it is a
+    property of the user: root ignores the write bit, so under any root CI
+    container (verified in python:3.12-slim) the open() succeeded, no refusal
+    came, and the finally clause then died on the consumed scratch file. A
+    directory cannot be opened for writing by anyone - IsADirectoryError on
+    POSIX, PermissionError on Windows, both OSError - so the same real
+    failure is provoked for every user on both platforms."""
     env, src, dst = two_account_env(tmp_path)
     _row(src, "local_a.json", "sid-a", "Alpha")
     _transcript(env, "sid-a")
     m = ct.plan_sync(env, ct.SyncFlags())
     dest_path = m["rows"][0]["dest_path"]
     scratch = dest_path + ".ct-tmp"
-    with open(scratch, "wb") as fh:
-        fh.write(b"leftover")
-    os.chmod(scratch, stat.S_IREAD)
+    os.mkdir(scratch)
     try:
         with pytest.raises(ct.Refusal) as exc_info:
             ct.run_sync(env, m)
@@ -551,8 +557,7 @@ def test_atomic_write_failure_becomes_a_refusal_not_a_traceback(two_account_env,
         op = ct.list_ops(env)[-1]
         assert op.manifest["status"] == "writing"
     finally:
-        os.chmod(scratch, stat.S_IWRITE)
-        os.unlink(scratch)
+        os.rmdir(scratch)
 
 
 def test_undo_sync_removes_exactly_the_rows_it_wrote(two_account_env, tmp_path):
@@ -763,23 +768,42 @@ def test_undo_sync_refuses_when_locked(two_account_env, tmp_path):
     assert os.path.exists(os.path.join(dst, "local_0.json"))
 
 
-def test_undo_sync_wraps_unlink_failure_as_a_refusal(two_account_env, tmp_path):
+def test_undo_sync_wraps_unlink_failure_as_a_refusal(two_account_env, tmp_path,
+                                                     monkeypatch):
     """Finding 4 (Important): a bare OSError from os.unlink must never
     propagate raw - main() only catches Refusal/LayoutError, the exact
-    traceback defect this task exists to fix, now on the delete side."""
+    traceback defect this task exists to fix, now on the delete side.
+
+    The OSError is injected rather than provoked with permissions, which is a
+    deliberate departure from the sibling write-side tests (they leave a
+    read-only .ct-tmp in the way and let atomic_write's own open() fail, and
+    that stays honest on both platforms). Unlink is the one that does not
+    travel: POSIX checks the write bit on the containing DIRECTORY, not on the
+    file, so chmod(row_path, S_IREAD) blocked nothing on Linux - the delete
+    succeeded, no refusal came, and the test's own chmod-back cleanup then
+    died on the missing file. Making the directory read-only instead trades
+    one platform assumption for another, since it is a no-op for root and CI
+    containers often are root. What is under test here is how undo_sync wraps
+    an OSError, not which filesystem rule produced it."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=1)
     ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags()))
     op = ct.list_ops(env)[-1]
     row_path = op.manifest["rows"][0]["dest_path"]
-    os.chmod(row_path, stat.S_IREAD)              # Windows: unlink of a read-only
-    try:                                          # file raises PermissionError
-        with pytest.raises(ct.Refusal) as exc_info:
-            ct.undo_sync(env, op)
-        assert "could not remove" in str(exc_info.value)
-        assert os.path.exists(row_path)
-    finally:
-        os.chmod(row_path, stat.S_IWRITE)
+    real_unlink = os.unlink
+
+    def boom(p, *a, **kw):
+        # this row only - undo_sync unlinks the lock file too, and killing
+        # that would leave the env locked for the rest of the test session.
+        if os.path.normcase(str(p)) == os.path.normcase(row_path):
+            raise PermissionError("no")
+        return real_unlink(p, *a, **kw)
+
+    monkeypatch.setattr(os, "unlink", boom)
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.undo_sync(env, op)
+    assert "could not remove" in str(exc_info.value)
+    assert os.path.exists(row_path)
 
 
 def test_undo_sync_refuses_when_not_completed(two_account_env, tmp_path):
@@ -1405,16 +1429,16 @@ def test_json_plan_carries_the_live_account_provenance(two_account_env, tmp_path
 
 def test_stalled_sync_after_a_write_error_can_still_go_back(two_account_env, tmp_path):
     """The reviewer's first reproduction: a persistent write error (here a
-    read-only leftover .ct-tmp scratch file, which makes atomic_write fail
+    leftover .ct-tmp scratch DIRECTORY, which makes atomic_write's open() fail
     identically on every re-entry) used to leave the op at 'writing' with
-    every exit refusing."""
+    every exit refusing. A directory rather than a read-only file for the
+    reason given in test_atomic_write_failure_becomes_a_refusal_not_a_traceback:
+    the write bit blocks nobody when the test runs as root."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=2)
     m = ct.plan_sync(env, ct.SyncFlags())
     blocked = m["rows"][1]["dest_path"] + ".ct-tmp"
-    with open(blocked, "wb") as fh:
-        fh.write(b"leftover")
-    os.chmod(blocked, stat.S_IREAD)
+    os.mkdir(blocked)
     try:
         with pytest.raises(ct.Refusal, match="could not write"):
             ct.run_sync(env, m)
@@ -1430,11 +1454,10 @@ def test_stalled_sync_after_a_write_error_can_still_go_back(two_account_env, tmp
             ct.recover_op(env, op, "forward")
         assert ct.recover_op(env, op, "back") == "rolled_back"
         assert ct.nonterminal_ops(env) == []
-        # (the test's own read-only .ct-tmp is still there; it is not a row)
+        # (the test's own .ct-tmp directory is still there; it is not a row)
         assert [f for f in os.listdir(dst) if f.endswith(".json")] == []
     finally:
-        os.chmod(blocked, stat.S_IWRITE)
-        os.unlink(blocked)
+        os.rmdir(blocked)
 
 
 def test_stalled_sync_after_a_containment_error_can_still_go_back(two_account_env,

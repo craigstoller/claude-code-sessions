@@ -70,17 +70,26 @@ def test_missing_projects_root_no_crash(mkenv, tmp_path, capsys):
 
 
 def test_project_prefix_match(mkenv, tmp_path, write_transcript, write_row):
+    """Paths are built with the host's own separator rather than hard-coded
+    "C:\\work\\...". gather_list normalises `project` through
+    abspath/normpath, so a literal Windows path is absolute on Windows and
+    RELATIVE everywhere else - on POSIX it became <cwd>/C:\\work\\project-a,
+    matched none of the rows, and the test asserted an empty set against
+    {s1, s2}. Native separators exercise the same prefix logic on both."""
     env = mkenv(tmp_path)
-    write_row(env, 0, "o", "a", "local_1",
-              {"sessionId": "local_1", "cliSessionId": "s1", "cwd": "C:\\work\\project-a",
-               "lastActivityAt": 10})
-    write_row(env, 0, "o", "a", "local_2",
-              {"sessionId": "local_2", "cliSessionId": "s2", "cwd": "C:\\work\\project-a\\sub",
-               "lastActivityAt": 20})
-    write_row(env, 0, "o", "a", "local_3",
-              {"sessionId": "local_3", "cliSessionId": "s3", "cwd": "C:\\work\\other",
-               "lastActivityAt": 30})
-    items = ct.gather_list(env, project="C:\\work\\project-a")
+    work = tmp_path / "work"
+    proj = str(work / "project-a")
+    sub = str(work / "project-a" / "sub")
+    other = str(work / "other")
+    # shares the prefix but is NOT a subdirectory - this is what the trailing
+    # os.sep in gather_list's compare exists to exclude.
+    sibling = str(work / "project-a-extra")
+    for i, (sid, cwd) in enumerate([("s1", proj), ("s2", sub), ("s3", other),
+                                    ("s4", sibling)], start=1):
+        write_row(env, 0, "o", "a", "local_{0}".format(i),
+                  {"sessionId": "local_{0}".format(i), "cliSessionId": sid,
+                   "cwd": cwd, "lastActivityAt": i * 10})
+    items = ct.gather_list(env, project=proj)
     ids = {i["session_id"] for i in items}
     assert ids == {"s1", "s2"}
 

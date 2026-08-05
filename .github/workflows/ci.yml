@@ -5,6 +5,12 @@ on:
 jobs:
   test:
     strategy:
+      # Windows is the only platform where this tool's mutations are verified
+      # at all - everywhere else the desktop-store routes refuse outright - so
+      # a cancelled windows leg is the one result we cannot afford to lose.
+      # With fail-fast on, an ubuntu-only failure cancelled both windows legs
+      # and CI reported nothing about the platform that matters.
+      fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
         python: ["3.9", "3.12"]
