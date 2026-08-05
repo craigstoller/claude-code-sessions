@@ -2320,3 +2320,134 @@ def test_platform_gate_has_no_override(two_account_env, tmp_path):
         ct._require_verified_platform(env, "write to")
     env.is_windows = True
     assert ct._require_verified_platform(env, "write to") is None   # no-op on Windows
+
+
+# ------------------- the empty store that broke a working sync (August 2026)
+
+
+EMPTY_ORG = "eeeeeeee-0000-0000-0000-000000000007"
+
+
+def _empty_store_dir(env, account=DORMANT, org=EMPTY_ORG):
+    """The store directory the desktop app created and never filled: one
+    scheduled-tasks.json, zero listing rows. Observed on a real machine in
+    August 2026 - it appeared under the SAME dormant account as the real
+    290-file store, so the two candidates shared an account uuid and an email
+    and differed only in an org-id prefix."""
+    d = os.path.join(env.store_candidates[0], account, org)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "scheduled-tasks.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"tasks": []}')
+    return d
+
+
+def _line_containing(msg, needle):
+    hits = [ln for ln in msg.splitlines() if needle in ln]
+    assert len(hits) == 1, "expected one line holding {0!r}, got {1}".format(needle, hits)
+    return hits[0]
+
+
+def test_ambiguity_refusal_counts_the_listing_rows_in_each_candidate(
+        two_account_env, tmp_path):
+    """The regression this closes: an empty store directory turned a working,
+    unambiguous sync into a refusal listing two candidates that printed
+    identically apart from an org-id prefix. Nothing on either line said which
+    one held the sessions, so the refusal was a wall rather than a choice."""
+    env, src, dst = two_account_env(tmp_path)
+    empty = _empty_store_dir(env)
+    _row(dst, "local_a.json", "sid-a", "Alpha")
+    _row(dst, "local_b.json", "sid-b", "Bravo")
+
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    msg = str(exc_info.value)
+    assert "name one with --to" in msg
+    assert "(2 rows)" in _line_containing(msg, dst)
+    assert "(no listing rows)" in _line_containing(msg, empty)
+    assert "still listed, not ruled out" in msg      # and says why it kept it
+
+    # non-listing files must not be counted: the empty store's one file is a
+    # scheduled-tasks.json, which is exactly what made it look real.
+    assert "(1 row)" not in msg
+
+    os.unlink(os.path.join(dst, "local_b.json"))
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    msg = str(exc_info.value)
+    assert "(1 row)" in _line_containing(msg, dst)
+    assert "(1 rows)" not in msg
+
+
+def test_a_zero_row_candidate_is_listed_not_dropped(two_account_env, tmp_path):
+    """Auto-excluding empty stores would have made this refusal go away, and
+    would have been wrong: a store with no rows yet is a legitimate
+    destination the moment its account/org pair is signed in to. So the count
+    is evidence offered to the user, never a filter applied for them."""
+    env, src, dst = two_account_env(tmp_path)
+    empty = _empty_store_dir(env)
+
+    # still ambiguous - the empty candidate counts as a candidate
+    with pytest.raises(ct.Refusal, match="name one with --to"):
+        ct.resolve_sync_endpoints(env)
+    # ...and naming it works, which is the whole reason it stays listed
+    source, dest = ct.resolve_sync_endpoints(env, to="eeeeeeee")
+    assert os.path.normcase(source.path) == os.path.normcase(src)
+    assert os.path.normcase(dest.path) == os.path.normcase(empty)
+
+
+def test_the_to_ambiguity_refusal_counts_rows_too(two_account_env, tmp_path):
+    """Same wall, same fix: --to naming the shared account matches both orgs,
+    and 'be more specific' is useless without something to be specific about."""
+    env, src, dst = two_account_env(tmp_path)
+    empty = _empty_store_dir(env)
+    _row(dst, "local_a.json", "sid-a", "Alpha")
+
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env, to=DORMANT)
+    msg = str(exc_info.value)
+    assert "be more specific" in msg
+    assert "(1 row)" in _line_containing(msg, dst)
+    assert "(no listing rows)" in _line_containing(msg, empty)
+
+
+def test_the_stores_found_listing_counts_rows_too(two_account_env, tmp_path):
+    """The source-unidentifiable refusals list every store, the live one
+    included, and are read for the same reason: which of these is my real
+    store?"""
+    env, src, dst = two_account_env(tmp_path)
+    os.unlink(os.path.join(env.home, ".claude.json"))
+    _row(src, "local_a.json", "sid-a", "Alpha")
+
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    msg = str(exc_info.value)
+    assert "Stores found:" in msg
+    assert "(1 row)" in _line_containing(msg, src)
+    assert "(no listing rows)" in _line_containing(msg, dst)
+
+
+def test_an_unreadable_candidate_is_never_reported_as_empty(
+        two_account_env, tmp_path, monkeypatch):
+    """'Couldn't look' is never 'nothing there' - and here the mistake would
+    be worst: the store printed as empty is the one the user rules out, so an
+    unreadable real store labelled '(no listing rows)' would aim them at the
+    wrong destination. It must degrade to a refusal that says so, not to a
+    LayoutError that loses the listing."""
+    env, src, dst = two_account_env(tmp_path)
+    empty = _empty_store_dir(env)
+    _row(dst, "local_a.json", "sid-a", "Alpha")
+    real_listdir = os.listdir
+    blocked = os.path.normcase(dst)
+
+    def boom(p):
+        if os.path.normcase(str(p)) == blocked:
+            raise PermissionError("no")
+        return real_listdir(p)
+
+    monkeypatch.setattr(os, "listdir", boom)
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env)
+    msg = str(exc_info.value)
+    assert "name one with --to" in msg
+    assert "(row count unreadable)" in _line_containing(msg, dst)
+    assert "(no listing rows)" in _line_containing(msg, empty)

@@ -2501,14 +2501,79 @@ def _refuse_dest_possibly_live(env, live, dest_path, what, live_match_message):
                     "agree, then re-run.".format(oauth_uuid[:8], config_uuid[:8], what))
 
 
-def _candidate_line(account_uuid, org_uuid, path):
+def _listing_row_count(path):
+    """How many listing rows a candidate store holds, or None if the directory
+    could not be read.
+
+    Best-effort on purpose, like dormant_account_email: this only ever labels
+    a line inside a refusal that is already stopping the command, so a failed
+    listdir must not escalate into a LayoutError and replace an informative
+    refusal with a worse one. That is why it calls os.listdir directly rather
+    than _listdir_or_refuse - and it is not a hole in the fail-closed rule,
+    because nothing here decides anything; the refusal has already been
+    decided by the caller.
+
+    None must never be flattened to 0 by callers. "Couldn't look" is never
+    "nothing there", and here that mistake bites hardest: the store printed as
+    empty is the one the user will rule out, so labelling an unreadable
+    290-row store "no listing rows" would point them at the wrong destination
+    - the exact failure this count exists to prevent."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return None
+    return sum(1 for n in names if n.startswith("local_") and n.endswith(".json"))
+
+
+def _candidate_line(account_uuid, org_uuid, path, rows):
     """One line of a "which store did you mean" listing. The store path is
     part of it because the 8-char id prefixes alone are not always
     distinguishing: two store roots (Windows' MSIX path and the classic
     %APPDATA% path) can hold the same account, and telling the user to "be
     more specific" while showing two identical lines is a wall, not a
-    refusal. Redacted like everything else by main()'s redact()."""
-    return "   {0}/{1}   {2}".format(account_uuid[:8], org_uuid[:8], path)
+    refusal. Redacted like everything else by main()'s redact().
+
+    `rows` (from _listing_row_count) is on the line for the same reason the
+    path is. Observed August 2026: the desktop app created a store directory
+    holding exactly one file - scheduled-tasks.json, 87 bytes - and no listing
+    rows at all. That empty artifact became a second candidate and turned a
+    previously unambiguous sync into a refusal whose two lines differed only
+    in an org-id prefix, saying nothing about which held 290 sessions and
+    which held none. The path could not settle it either: both sat under the
+    same store root."""
+    if rows is None:
+        label = "(row count unreadable)"
+    elif rows == 0:
+        label = "(no listing rows)"
+    else:
+        label = "({0} row{1})".format(rows, "" if rows == 1 else "s")
+    return "   {0}/{1}   {2:<17}   {3}".format(
+        account_uuid[:8], org_uuid[:8], label, path)
+
+
+def _candidate_listing(items):
+    """The whole "which store did you mean" block: one _candidate_line per
+    (account, org, path) triple, plus a footnote when any candidate holds no
+    listing rows.
+
+    The footnote is there because the empty candidate is deliberately NOT
+    dropped from the list. Excluding zero-row stores would make the refusal
+    narrower rather than clearer, and would be wrong twice over: a store with
+    no rows yet becomes a legitimate destination the moment its account/org
+    pair is signed in to, and silently deciding for the user which stores are
+    real is the opposite of how the rest of this module behaves. So the count
+    is offered as evidence and the choice stays theirs."""
+    lines, any_empty = [], False
+    for account_uuid, org_uuid, path in items:
+        rows = _listing_row_count(path)
+        any_empty = any_empty or rows == 0
+        lines.append(_candidate_line(account_uuid, org_uuid, path, rows))
+    if any_empty:
+        lines.append(
+            "A store with no listing rows holds no sessions yet - the app created the\n"
+            "directory but never filled it. It is still listed, not ruled out: an empty\n"
+            "store becomes a real destination as soon as you sign in to that account.")
+    return "\n".join(lines)
 
 
 _AGENT_MODE_DIR = "local-agent-mode-sessions"
@@ -2564,7 +2629,7 @@ def resolve_sync_endpoints(env, to=None):
     dirs = _account_dirs(env)
     source = live_account(env)
     if source is None:
-        listing = "\n".join(_candidate_line(a, o, p) for a, o, p in dirs)
+        listing = _candidate_listing(dirs)
         dis = _identity_disagreement(env)
         if dis:
             raise Refusal(
@@ -2606,15 +2671,15 @@ def resolve_sync_endpoints(env, to=None):
         if not matched:
             raise Refusal("--to {0!r} matched no other account store".format(to))
         if len(matched) > 1:
-            listing = "\n".join(_candidate_line(c.account_uuid, c.org_uuid, c.path)
-                                for c in matched)
+            listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
+                                         for c in matched)
             raise Refusal("--to {0!r} matched {1} accounts; be more specific (a longer "
                           "id, or part of the store path):\n{2}"
                           .format(to, len(matched), listing))
         return source, matched[0]
     if len(others) > 1:
-        listing = "\n".join(_candidate_line(c.account_uuid, c.org_uuid, c.path)
-                            for c in others)
+        listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
+                                     for c in others)
         raise Refusal("more than one other account store; name one with --to:\n" + listing)
     return source, others[0]
 
