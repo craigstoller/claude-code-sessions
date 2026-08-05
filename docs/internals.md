@@ -338,6 +338,22 @@ confirmed, there is nothing to check the named destination *against*. `--to` onl
 dormant store to use among several; it cannot supply that missing certainty, and does not
 attempt to.
 
+**An empty store directory can manufacture ambiguity, so the candidate listing counts rows.**
+Observed August 2026: the desktop app created a store directory holding exactly one file —
+`scheduled-tasks.json`, 87 bytes — and no `local_*.json` rows at all. Because candidates are
+every `<accountUuid>\<organizationUuid>` pair on disk, that artifact became a second candidate
+and turned a previously unambiguous `sync` into a refusal. Worse, it sat under the *same*
+dormant account as the real 290-file store, so the two listed lines carried the same account
+uuid and the same email and differed only in an org-id prefix — nothing said which one held the
+sessions. `_candidate_line` now prints a listing-row count per candidate (`(262 rows)` vs `(no
+listing rows)`), and `_candidate_listing` appends a footnote explaining what an empty store is
+whenever one is listed. Zero-row candidates are deliberately **not** excluded: a store with no
+rows yet is a legitimate destination the moment its account/org pair is signed in to, and
+silently narrowing the choice is the opposite of the rest of this module. The count is evidence
+offered, never a filter applied. An unreadable directory reports `(row count unreadable)` and
+never `(no listing rows)` — "couldn't look" is never "nothing there", and here the store printed
+as empty is the one the user will rule out.
+
 **A stuck sync is recoverable, and `back` is always on the table.** A non-terminal sync op
 always offers `back`, and additionally offers `forward` whenever rolling forward still looks
 viable. `back` is unconditionally safe here — it only ever deletes rows the op recorded as
