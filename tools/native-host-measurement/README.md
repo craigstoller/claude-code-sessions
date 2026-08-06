@@ -100,3 +100,11 @@ kernel-file capture scoped to *the store roots, all processes* (a helper-only fi
 contain its own control), run from outside the desktop app's process tree so the
 app-closed/helper-surviving window can actually be held open. These scripts remain useful there
 as the cross-check and for generating the store-side positive control.
+
+**That run is now packaged: see [`elevated/RUNBOOK.md`](elevated/RUNBOOK.md).** One elevated
+command (`run-elevated-capture.ps1`) drives an unfiltered ProcMon backing-file capture through
+the protocol's enumerated workload with a timestamped checklist and a canary heartbeat as the
+loss probe; `analyze_capture.py` renders PASS / FAIL / INCONCLUSIVE per the acceptance
+endpoint. The analyzer's three verdict paths are exercised by synthetic captures (2026-08-07);
+the capture path itself requires elevation and is verified only by parsing until someone runs
+the ceremony.
