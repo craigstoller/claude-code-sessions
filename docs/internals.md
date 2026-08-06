@@ -298,6 +298,150 @@ backed by `execute_op`'s last-instant sha256 re-verification of the source immed
 deletes anything — which only catches a CLI write landing in that narrow window after the fact
 (aborting the op, keeping both copies), not by preventing it.
 
+### The Chrome native host, and why it still counts (measured 2026-08-05)
+
+The desktop app ships a helper for its Chrome extension —
+`...\Packages\Claude_<pkgid>\LocalCache\Roaming\Claude\ChromeNativeHost\chrome-native-host.exe`
+— which Chrome launches as a native-messaging host. It lives under the desktop's own package
+directory, so `"claude" in text` matches it and `_is_cli_process` does not excuse it (none of
+the CLI markers appear in that path). It therefore counts as the desktop app, and every
+mutation refuses while it is alive. That it can outlive the desktop app, making "close the
+desktop app" insufficient, is the field observation this section exists to re-examine — it
+comes from the earlier episode written up in `the-session-that-synced-itself.md`, not from the
+measurement below, which never ran with the app closed.
+
+Whether that cost is *necessary* was measured on **2026-08-05**. The verdict is
+**inconclusive, so the guard stays.**
+
+Measured against: helper `chrome-native-host.exe` version 0.1.0, 1,018,704 bytes, sha256
+`744187C7990FB3317CAD8345AE9EF17E7A0C1E2CCE9CF0A2C777B7F3D3D44D8A`; desktop package
+`Claude_1.25927.0.0_x64__pzs8sxrjxfjjc`; Chrome
+150.0.7871.189, extension `fcoeoabgfenejglbffodgkkbkcdhcgfn`; Windows 10.0.26200. The ruling is
+bound to those builds: a helper update invalidates it without changing the executable path, so
+re-measure rather than assume it carries forward.
+
+What was gathered, all of it pointing the same way but none of it sufficient:
+
+- **The binary contains no store path.** Extracting every ASCII and UTF-16 string from the
+  image yields no occurrence of `claude-code-sessions`, `sessions`, `Roaming`, `AppData`,
+  `projects`, or `jsonl`. Its only path-shaped strings are the components of its own log
+  location (`LOCALAPPDATA` / `Claude` / `Logs`), the pipe-name prefix
+  `claude-mcp-browser-bridge-`, and `CLAUDE_LOG_LEVEL`. This bounds *literals in this image*
+  and nothing more: a path can be composed at runtime from known-folder APIs, read from
+  configuration, or — the case that matters most for a message bridge — arrive in an IPC
+  payload. Absence of the literal is consistent with the helper never touching the store and
+  equally consistent with a store path it is *told*.
+- **Of the handles that resolved at 148 sampled instants over 304 s, none was under either
+  store root — but one handle per sample never resolved at all.** Enumerating the handle table
+  via `NtQuerySystemInformation` (`SystemExtendedHandleInformation`), filtered to File-type
+  handles and resolved with `NtQueryObject`, the helper resolved to six distinct named objects:
+  its own log (`%LOCALAPPDATA%\Claude\Logs\chrome-native-host.log`, granted `0x00120194` —
+  **append**, not overwrite), its own `ChromeNativeHost` directory (`0x00100020` — SYNCHRONIZE
+  plus TRAVERSE, no write bit), `\Device\CNG`, `\Device\ConDrv`, the Chrome native-messaging
+  *out* pipe, and the `claude-mcp-browser-bridge-<user>` pipe. Two limits are load-bearing and
+  must be read with the list, not after it: this is the set held *at the sampled instants*, not
+  the set it ever opens; and the one handle that timed out in **all 148 samples** is
+  unidentified, so the resolved list is not a complete inventory.
+- **Its own log records a message bridge**: create named pipe → main message loop → socket
+  server, and on `Chrome disconnected (EOF received)` → shut down. That is what the helper
+  *logs*, which is not the same as what it does; an unlogged write path is not excluded. It
+  does cover the Chrome-exit leg to the extent anything here does: nothing appears around
+  shutdown but the shutdown itself.
+
+Why that is *not* enough, which is the whole point of recording this:
+
+- **Handle sampling has no useful power against how this store is written.** Negative control:
+  449 samples over 120 s across all 26 claude-named processes caught **zero** processes holding
+  a handle under the store — during a window in which a directory watcher recorded **28** store
+  write events (≈4 atomic write transactions; a session row is written `.tmp` → write → rename,
+  which emits about seven events each). The writer is *inferred* to be the desktop app from the
+  event pattern and location (inside a live session directory under the account store); it was
+  not attributed by measurement, and the scan covered only claude-named processes. If that
+  inference holds, the writer was inside the scanned set and the method still scored zero.
+  A **resolver positive control** rules out one specific alternative — that the sampler cannot
+  see store paths at all: a child process holding a file open under the real store root was
+  detected on the first scan, at `0x0012019F`, exercising enumeration, cross-process
+  `DuplicateHandle`, `NtQueryObject` naming, path normalisation and root-matching. Note what
+  that control does *not* cover: it used a continuously held ordinary file, so it says nothing
+  about resolving a short-lived handle (which is the failure being explained) or a blocking
+  pipe handle (see the unresolved handle below). (Order of magnitude, on the unmeasured
+  assumption that each transaction holds its handle a few milliseconds: a duty cycle under
+  0.05% against a 3.7 Hz sampler puts the expected number of catches well below one, so
+  observing zero is the expected outcome even for a process that certainly writes. The
+  empirical 0-for-449 is the claim; the arithmetic only offers a mechanism for it.)
+  So the sampling licenses very little: it says essentially nothing about brief atomic access,
+  which is exactly the pattern in question, and — because of the unresolved handle below — it
+  cannot even fully exclude a *sustained* store handle.
+- **One handle per sample never resolved, and this is not a footnote.** `NtQueryObject` timed
+  out on exactly one of the helper's handles in all 148 samples — a *persistent* handle of
+  unknown identity. Its identity is *inferred* (Chrome creates both an `in` and an `out`
+  native-messaging pipe, and only `out` resolved) but not measured, and the inference is only
+  plausible, not established. Until that handle is identified, the otherwise tempting
+  conclusion "the helper holds no sustained handle under the store" is **not established** —
+  the one handle the method could never see is precisely a persistent one.
+- **The decisive lifecycle leg was not captured.** The condition the guard's cost is actually
+  paid under — desktop app closed, helper surviving — went unmeasured because the measuring
+  session was itself hosted by the desktop app (`pwsh` → CLI `claude.exe` → `Claude.exe`), so
+  closing the app terminates the measurement. That is a limitation of *this* setup, not of the
+  problem: a detached capture (Task Scheduler, or a shell started outside the app's process
+  tree) can hold the app-closed window open and is the obvious way to get this leg.
+- **The workload was not characterised.** Elapsed time is not exposure: the run does not record
+  how many native-messaging round trips, extension actions, reconnects, or helper restarts
+  occurred, so "304 s of observation" does not establish that the interesting code paths ran.
+- **The classic `%APPDATA%\Claude` path does not exist on the measured machine**, so its
+  behaviour is untested rather than cleared.
+- **No elevation was available**, so the instrument that would answer this directly — a
+  Procmon or ETW kernel-file trace, which is continuous *and* attributed — could not be run.
+  `logman` on `Microsoft-Windows-Kernel-File` returns access-denied unelevated, and Procmon
+  needs to load a driver.
+
+**What would license the exclusion.** "Never writes" is not empirically provable, and a rule
+that demands it is a permanent veto dressed as a standard — so the bar is stated as a bounded
+one.
+
+*Capture.* An **elevated** Procmon or ETW kernel-file capture scoped to *the store roots, all
+processes* — not filtered to `chrome-native-host.exe`, which is the mistake that would make the
+trace unable to contain its own control — retaining create/write/rename/disposition and
+set-information operations plus mapped-section writes, which a short operation allowlist
+misses. Run it from a session outside the desktop app's process tree (Task Scheduler or a
+detached shell), and record the dropped-event counters: a lossy trace is not a quiet one.
+
+*Workload.* Enumerate it rather than measuring wall-clock. At minimum, and repeated across
+trials: helper start, a stated number of native-messaging round trips of each message type the
+extension sends, a disconnect/reconnect cycle, the app-closed/helper-surviving window held open
+deliberately, and Chrome exit. The run must also record what it exercised, so a later reader
+can tell coverage from elapsed time.
+
+*Acceptance.* The endpoint is **no non-control mutation of either store root by any process**
+during the helper-only intervals — not "the helper issued no write." A message bridge can cause
+a write it does not perform, and mapped-page flushes are attributed to the memory manager
+rather than the requesting process, so a helper-scoped endpoint would pass while the store
+changed. The same capture must show it *does* record the desktop app's own store writes;
+without that control an empty result means nothing.
+
+*If it passes*, the exclusion must be bound to the binary that was measured, not to a
+directory name: match the parsed image path — exact basename `chrome-native-host.exe`, anchored
+under a `\packages\claude_*\localcache\roaming\claude\chromenativehost\` segment chain — and
+fail closed on anything else. A bare `\chromenativehost\` segment test is not enough: it would
+excuse any binary under any directory of that name, and because `_is_cli_process` sees an
+unparsed lister entry, it could also be satisfied by a command-line *argument*. Note too that
+the helper auto-updates in place, so a passing trace binds only the measured build; without a
+version or hash check the exclusion silently carries over to code nobody measured, which is the
+fail-open this whole section exists to avoid.
+
+The non-elevated harness these results came from is committed at
+`tools/native-host-measurement/` (handle sampler, negative control, resolver positive control).
+It cannot settle the question — that is the point of this section — but it is the cross-check
+and the store-side control for whoever runs the elevated capture, and its README records the
+two mistakes that make this measurement report a clean result by construction.
+
+Until then `chrome-native-host.exe` counts. Two tests in
+`tests/test_plan_move.py::TestClaudeRunningNarrowing` pin that — `test_chrome_native_host_still_counts`
+(the helper's path is returned by `claude_running`) and `test_chrome_native_host_is_not_read_as_the_cli`
+(it does not drift into `_is_cli_process`, whose markers it sits one path segment away from).
+They pin the *classification*, which is what a future refactor would break; they assert nothing
+about the helper's I/O, which is the open question above and not something a unit test can settle.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via

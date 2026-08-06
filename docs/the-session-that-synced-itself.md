@@ -143,10 +143,12 @@ would still pass with the feature deleted.
 
 One more thing the guards taught me about the app itself: after you close Claude Desktop,
 a helper it ships for its Chrome extension — `chrome-native-host.exe` — can keep running
-under the desktop's own package directory. The guard counts it (its write behaviour is
-unmeasured, so: fail closed), which means "close the app" is sometimes not enough — you
-have to fully exit Chrome too. The refusal names the surviving process, so you can see
-why you're being refused.
+under the desktop's own package directory. The guard counts it, which means "close the app"
+is sometimes not enough — you have to fully exit Chrome too. The refusal names the surviving
+process, so you can see why you're being refused. I later went looking for evidence that the
+helper never touches the store, so the guard could stop charging for it; I didn't find enough
+to act on, and the measurement that failed is written up in `internals.md` alongside the one
+that would settle it.
 
 ## The finale, replayed
 

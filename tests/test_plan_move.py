@@ -291,6 +291,30 @@ class TestClaudeRunningNarrowing:
         assert ct.claude_running(env) == [exe]
 
 
+    def test_chrome_native_host_still_counts(self, mkenv, tmp_path):
+        # The desktop app's Chrome-extension helper, which can outlive the app.
+        # A 2026-08-05 measurement (docs/internals.md, "The Chrome native host")
+        # could not establish that it never opens the store for write - handle
+        # sampling missed even the desktop app's own atomic writes, and the
+        # decisive leg (app closed, helper alive) went uncaptured - so it must
+        # keep counting. No exclusion without positive evidence.
+        env = mkenv(tmp_path)
+        exe = ("c:\\users\\u\\appdata\\local\\packages\\claude_pzs8sxrjxfjjc\\"
+               "localcache\\roaming\\claude\\chromenativehost\\"
+               "chrome-native-host.exe")
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_chrome_native_host_is_not_read_as_the_cli(self, mkenv, tmp_path):
+        # Guards the near miss: the helper's path contains BOTH "roaming\claude"
+        # and "claude", and sits one segment away from the CLI's marker. It must
+        # not drift into _is_cli_process, which is what an exclusion written as a
+        # substring test rather than a path-segment test would do.
+        exe = ("c:\\users\\u\\appdata\\local\\packages\\claude_pzs8sxrjxfjjc\\"
+               "localcache\\roaming\\claude\\chromenativehost\\"
+               "chrome-native-host.exe")
+        assert not ct._is_cli_process(exe)
+
     def test_forward_slash_cli_path_is_still_the_cli(self, mkenv, tmp_path):
         # separators must be normalised before matching - a forward-slash
         # CLI path must not be misread as the desktop app
