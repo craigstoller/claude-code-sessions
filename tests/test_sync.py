@@ -2474,3 +2474,585 @@ def test_an_unreadable_candidate_is_never_reported_as_empty(
     assert "name one with --to" in msg
     assert "(row count unreadable)" in _line_containing(msg, dst)
     assert "(no listing rows)" in _line_containing(msg, empty)
+
+
+# ------------------------------------------------------ RULING 5: sync --live
+
+
+SOURCE_ACCT = "aaaaaaaa-0000-0000-0000-000000000001"
+
+
+class TestLiveOverride:
+    """RULING 5: `--live` asserts which of the two DISAGREEING identity files
+    to believe about the account the desktop app is signed into. Never a bare
+    force flag: it must name the account (reusing --to's matching), works
+    only while the files disagree, is journaled as a certification that is
+    revalidated at every mutation the op ever performs, and leaves the
+    RULING 4 running-app guard completely untouched."""
+
+    def _e4(self, env):
+        """The E4 shape: oauth says a..., the desktop's config says c...."""
+        _write_desktop_config(env, DORMANT)
+
+    # ------------------------------------------------------ usability gate
+
+    def test_refused_when_files_agree(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, SOURCE_ACCT)
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="cccccccc")
+        msg = str(exc.value)
+        assert "do not currently disagree" in msg
+        assert "aaaaaaaa" in msg           # names the account that resolves
+
+    def test_refused_when_oauth_alone_resolves(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)     # no config.json at all
+        with pytest.raises(ct.Refusal, match="do not currently disagree"):
+            ct.resolve_sync_endpoints(env, live="cccccccc")
+
+    def test_refused_with_no_evidence_at_all(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        os.unlink(os.path.join(env.home, ".claude.json"))
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="cccccccc")
+        msg = str(exc.value)
+        assert "do not currently disagree" in msg
+        assert "cannot supply evidence" in msg    # not a lying "they agree"
+
+    def test_refused_in_the_config_only_two_org_state(self, two_account_env,
+                                                      tmp_path):
+        # live_account() is None here WITHOUT a disagreement (config-only
+        # evidence naming an account with two org dirs). The refusal must
+        # describe that state, not claim an agreement that does not exist.
+        env, src, dst = two_account_env(tmp_path)
+        os.unlink(os.path.join(env.home, ".claude.json"))
+        os.makedirs(os.path.join(env.store_candidates[0], SOURCE_ACCT,
+                                 "zzzzzzzz-0000-0000-0000-000000000009"))
+        _write_desktop_config(env, SOURCE_ACCT)
+        assert ct.live_account(env) is None
+        assert ct._identity_disagreement(env) is None
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="aaaaaaaa")
+        msg = str(exc.value)
+        assert "do not currently disagree" in msg
+        assert "resolves to" not in msg
+
+    def test_empty_or_whitespace_assertion_is_refused(self, two_account_env,
+                                                      tmp_path):
+        # substring containment would make "" or "  " match every candidate,
+        # which on a one-candidate machine is the bare force flag this
+        # design rejects.
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        with pytest.raises(ct.Refusal, match="name the account"):
+            ct.resolve_sync_endpoints(env, live="   ")
+
+    # ------------------------------------------------------------ matching
+
+    def test_asserting_the_config_named_account_resolves_endpoints(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        assert ct.live_account(env) is None       # the wall this flag opens
+        source, dest = ct.resolve_sync_endpoints(env, live="cccccccc")
+        assert source.account_uuid == DORMANT
+        assert source.resolved_from == "user"
+        assert os.path.normcase(source.path) == os.path.normcase(dst)
+        assert os.path.normcase(dest.path) == os.path.normcase(src)
+
+    def test_matching_by_recovered_email_works(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        _agent_mode_config(env, DORMANT, {"accountUuid": DORMANT,
+                                          "emailAddress": "other@example.com"})
+        source, dest = ct.resolve_sync_endpoints(env, live="other@example.com")
+        assert source.account_uuid == DORMANT
+        assert source.email == "other@example.com"
+
+    def test_ambiguous_assertion_lists_candidates(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        second = os.path.join(env.store_candidates[0], DORMANT,
+                              "eeeeeeee-0000-0000-0000-000000000007")
+        os.makedirs(second)
+        _row(dst, "local_a.json", "sid-a", "Alpha")
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live=DORMANT)
+        msg = str(exc.value)
+        assert "be more specific" in msg
+        assert "(1 row)" in _line_containing(msg, dst)
+        assert "(no listing rows)" in _line_containing(msg, second)
+        # ...and an org substring settles it, exactly like --to
+        source, _ = ct.resolve_sync_endpoints(env, live="dddddddd")
+        assert os.path.normcase(source.path) == os.path.normcase(dst)
+
+    def test_assertion_matching_neither_named_account_refuses(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        third = os.path.join(env.store_candidates[0],
+                             "eeeeeeee-0000-0000-0000-000000000005",
+                             "ffffffff-0000-0000-0000-000000000006")
+        os.makedirs(third)
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="eeeeeeee")
+        msg = str(exc.value)
+        assert "matched no store belonging to either account" in msg
+        assert "aaaaaaaa" in msg and "cccccccc" in msg
+        assert "something else" in msg
+        # a substring matching nothing at all gets the same refusal
+        with pytest.raises(ct.Refusal, match="matched no store"):
+            ct.resolve_sync_endpoints(env, live="zzzz-nope")
+
+    def test_a_named_account_with_no_store_is_called_out(self, two_account_env,
+                                                         tmp_path):
+        # config names an account with no store dir on disk. Asserting it can
+        # never match, and the refusal must say WHY rather than imply a typo.
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, "99999999-0000-0000-0000-000000000099")
+        assert ct._identity_disagreement(env) is not None
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="99999999")
+        assert "no store on disk" in str(exc.value)
+
+    # -------------------------------------------------- the manifest record
+
+    def test_manifest_records_the_certification_both_directions(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        cfg = os.path.join(os.path.dirname(env.store_candidates[0]),
+                           "config.json")
+
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        assert m["source_resolved_from"] == "user"
+        ov = m["live_override"]
+        assert ov["account"] == DORMANT
+        assert ov["pair"] == [SOURCE_ACCT, DORMANT]     # ordered: oauth, config
+        assert ov["overrode_file"] == "~/.claude.json"
+        assert ov["overrode_uuid"] == SOURCE_ACCT
+        assert os.path.normcase(ov["config_path"]) == os.path.normcase(cfg)
+
+        m2 = ct.plan_sync(env, ct.SyncFlags(live="aaaaaaaa"))
+        ov2 = m2["live_override"]
+        assert ov2["account"] == SOURCE_ACCT
+        assert ov2["pair"] == [SOURCE_ACCT, DORMANT]
+        assert ov2["overrode_file"] == "config.json"
+        assert ov2["overrode_uuid"] == DORMANT
+        assert os.path.normcase(ov2["config_path"]) == os.path.normcase(cfg)
+
+    def test_ordinary_plan_carries_no_override_key(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())
+        assert "live_override" not in m
+
+    # ------------------------------------- the apply path (E4, end to end)
+
+    def _c_row(self, env, dst):
+        sid = "11111111-2222-3333-4444-555555555555"
+        _row(dst, "local_c1.json", sid, "From c")
+        _transcript(env, sid)
+
+    def test_apply_writes_the_store_the_stale_file_named(self, two_account_env,
+                                                         tmp_path):
+        # oauth (stale) says a is live; the user certifies c. The sync must
+        # write into a's store - the very account oauth wrongly calls live,
+        # i.e. the account a file says is NOT dormant.
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        assert len(m["rows"]) == 1
+        assert ct.run_sync(env, m) == "completed"
+        assert os.path.exists(os.path.join(src, "local_c1.json"))
+
+    def test_ruling4_guard_is_untouched_by_live(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        n_ops = len(ct.list_ops(env))
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal, match="desktop app appears to be running"):
+            ct.run_sync(env, m)
+        assert not os.path.exists(os.path.join(src, "local_c1.json"))
+        assert len(ct.list_ops(env)) == n_ops          # nothing journaled
+        # the unreadable-process-list sentinel refuses too
+        env.process_lister = lambda: [(-1, ct._PROC_UNAVAILABLE)]
+        with pytest.raises(ct.Refusal, match="could not be read"):
+            ct.run_sync(env, m)
+
+    def test_guard_disagreement_note_says_live_does_not_lift_it(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal) as exc:
+            ct._guard_mutation(env, "write to")
+        assert "--live does not lift this guard" in str(exc.value)
+
+    def test_disagreement_refusal_advertises_live(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env)
+        assert "--live" in str(exc.value)
+
+    # ------------------------- lifecycle: undo / recover under certification
+
+    def _completed_live_sync(self, env, src, dst):
+        self._c_row(env, dst)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        assert ct.run_sync(env, m) == "completed"
+        assert os.path.exists(os.path.join(src, "local_c1.json"))
+        return ct.list_ops(env)[-1]
+
+    def test_undo_honors_the_persisting_certification(self, two_account_env,
+                                                      tmp_path):
+        # Without the certification honored on the delete side too, undo of a
+        # --live sync would refuse (the disagreement names the destination)
+        # and the sync would be irreversible in exactly the state the flag
+        # exists to handle.
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        assert ct.undo_sync(env, op) == "undone"
+        assert not os.path.exists(os.path.join(src, "local_c1.json"))
+
+    def test_undo_refuses_when_the_pair_direction_flipped(self, two_account_env,
+                                                          tmp_path):
+        # oauth and config have BOTH re-authenticated since, swapping claims:
+        # the world moved twice, and a twice-moved world is not the tie the
+        # user arbitrated. void -> refuse.
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        with open(os.path.join(env.home, ".claude.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {
+                "accountUuid": DORMANT,
+                "organizationUuid": "dddddddd-0000-0000-0000-000000000004",
+                "emailAddress": "other@example.com"}}, fh)
+        _write_desktop_config(env, SOURCE_ACCT)
+        assert ct._identity_disagreement(env) == (DORMANT, SOURCE_ACCT)
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.undo_sync(env, op)
+        assert os.path.exists(os.path.join(src, "local_c1.json"))   # untouched
+
+    def test_undo_refuses_when_the_disagreement_was_replaced(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        _write_desktop_config(env, "99999999-0000-0000-0000-000000000099")
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.undo_sync(env, op)
+        assert os.path.exists(os.path.join(src, "local_c1.json"))
+
+    def test_undo_refuses_when_files_agree_on_the_destination(
+            self, two_account_env, tmp_path):
+        # The user signed everything into the destination account: deleting
+        # rows out of the now-live store is exactly what this tool never
+        # does. The live-store protection, not the override machinery.
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        with open(os.path.join(env.home, ".claude.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {
+                "accountUuid": SOURCE_ACCT,
+                "organizationUuid": "bbbbbbbb-0000-0000-0000-000000000002",
+                "emailAddress": "me@example.com"}}, fh)
+        _write_desktop_config(env, SOURCE_ACCT)
+        with pytest.raises(ct.Refusal, match="LIVE account"):
+            ct.undo_sync(env, op)
+        assert os.path.exists(os.path.join(src, "local_c1.json"))
+
+    def test_undo_proceeds_when_files_agree_on_the_source(self, two_account_env,
+                                                          tmp_path):
+        # The world resolved in the certified direction (files agree on c):
+        # the certification is moot and ordinary rules bless the undo.
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        with open(os.path.join(env.home, ".claude.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {
+                "accountUuid": DORMANT,
+                "organizationUuid": "dddddddd-0000-0000-0000-000000000004",
+                "emailAddress": "other@example.com"}}, fh)
+        assert ct._identity_disagreement(env) is None    # config still says c
+        live = ct.live_account(env)
+        assert live is not None and live.account_uuid == DORMANT
+        assert ct.undo_sync(env, op) == "undone"
+
+    def test_undo_proceeds_on_single_file_resolution(self, two_account_env,
+                                                     tmp_path):
+        # One identity file vanishing voids the certification, but the
+        # surviving file resolves the source alone - the evidence level
+        # every uncertified sync already plans and executes on - so ordinary
+        # rules apply and undo proceeds. Accepted behavior, not an oversight.
+        env, src, dst = two_account_env(tmp_path)
+        op = self._completed_live_sync(env, src, dst)
+        os.unlink(os.path.join(env.home, ".claude.json"))  # oauth claim gone
+        live = ct.live_account(env)                # config alone resolves c
+        assert live is not None and live.resolved_from == "config"
+        assert ct.undo_sync(env, op) == "undone"
+
+    def test_void_certification_refuses_where_uncertified_would_proceed(
+            self, two_account_env, tmp_path):
+        # Contrast with the pinned no-evidence-proceeds test: an op that
+        # exists only because of a certification never executes in a state
+        # where the files can neither validate the assertion nor resolve an
+        # account at all.
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        op = ct.new_op(env, m)                 # journaled, not yet executed
+        os.unlink(os.path.join(env.home, ".claude.json"))
+        os.unlink(os.path.join(os.path.dirname(env.store_candidates[0]),
+                               "config.json"))     # no identity evidence left
+        assert ct.live_account(env) is None
+        assert ct._identity_disagreement(env) is None
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.execute_sync_op(env, op)
+        assert not os.path.exists(os.path.join(src, "local_c1.json"))
+        assert op.manifest["status"] == "journaled"
+
+    def _crashed_live_sync(self, env, src, dst):
+        for i in range(2):
+            sid = "sid-%d" % i
+            _row(dst, "local_%d.json" % i, sid, "Session %d" % i)
+            _transcript(env, sid)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+
+        def hook(point):
+            if point == "sync-mid-write":
+                raise SimulatedCrash()
+        ct._crash_hook = hook
+        try:
+            with pytest.raises(SimulatedCrash):
+                ct.run_sync(env, m)
+        finally:
+            ct._crash_hook = None
+        return ct.nonterminal_ops(env)[0]
+
+    def test_recover_forward_finishes_a_crashed_live_sync(self, two_account_env,
+                                                          tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        op = self._crashed_live_sync(env, src, dst)
+        assert ct.recover_op(env, op, "forward") == "completed"
+        assert os.path.exists(os.path.join(src, "local_0.json"))
+        assert os.path.exists(os.path.join(src, "local_1.json"))
+
+    def test_recover_back_removes_what_a_stuck_live_sync_wrote(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        op = self._crashed_live_sync(env, src, dst)
+        assert ct.recover_op(env, op, "back") == "rolled_back"
+        assert not os.path.exists(os.path.join(src, "local_0.json"))
+
+    def test_classify_notes_a_void_certification(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        op = self._crashed_live_sync(env, src, dst)
+        _write_desktop_config(env, "99999999-0000-0000-0000-000000000099")
+        c = ct.classify_sync_op(env, op)
+        assert "--live" in c["note"]
+        # ...and a VALID certification adds no such noise
+        _write_desktop_config(env, DORMANT)
+        c = ct.classify_sync_op(env, op)
+        assert "--live" not in c["note"]
+
+    # ------------------------------------------------ hand-edited manifests
+
+    def test_grafted_inconsistent_override_never_certifies(self, two_account_env,
+                                                           tmp_path):
+        # An op journaled WITHOUT --live gets a record grafted on whose
+        # `account` is not the manifest's own source_account: void, refuse.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())      # planned while oauth resolves
+        op = ct.new_op(env, m)
+        op.manifest["live_override"] = {
+            "account": DORMANT, "pair": [SOURCE_ACCT, DORMANT],
+            "overrode_file": "~/.claude.json", "overrode_uuid": SOURCE_ACCT,
+            "config_path": ""}
+        ct.save_manifest(op)
+        self._e4(env)                    # a real a-vs-c disagreement appears
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.execute_sync_op(env, op)
+        assert not os.path.exists(os.path.join(dst, "local_0.json"))
+
+    def test_wrong_but_well_typed_audit_fields_void_the_record(
+            self, two_account_env, tmp_path):
+        # Operative fields all consistent, but overrode_uuid names the
+        # asserted member instead of the overridden one: the record's audit
+        # story contradicts its operative story - void, refuse.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())
+        op = ct.new_op(env, m)
+        op.manifest["live_override"] = {
+            "account": SOURCE_ACCT, "pair": [SOURCE_ACCT, DORMANT],
+            "overrode_file": "config.json", "overrode_uuid": SOURCE_ACCT,
+            "config_path": ""}
+        ct.save_manifest(op)
+        self._e4(env)
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.execute_sync_op(env, op)
+
+    def test_a_fully_consistent_record_certifies_by_design(self, two_account_env,
+                                                           tmp_path):
+        # The accepted posture, stated in the ruling: a record that names the
+        # real, current disagreement in the current direction AND matches the
+        # manifest's own source unlocks exactly what the user could have
+        # authorized at the command line - nothing more, and RULING 4 still
+        # binds it.
+        env, src, dst = two_account_env(tmp_path)
+        _prepared(env, src, dst, n=1)
+        m = ct.plan_sync(env, ct.SyncFlags())
+        op = ct.new_op(env, m)
+        op.manifest["live_override"] = {
+            "account": SOURCE_ACCT, "pair": [SOURCE_ACCT, DORMANT],
+            "overrode_file": "config.json", "overrode_uuid": DORMANT,
+            "config_path": ""}
+        ct.save_manifest(op)
+        self._e4(env)
+        assert ct.execute_sync_op(env, op) == "completed"
+        assert os.path.exists(os.path.join(dst, "local_0.json"))
+
+    def test_garbage_override_key_is_void_not_absent(self, two_account_env,
+                                                     tmp_path):
+        # A third-account destination under a disagreement PROCEEDS for an
+        # uncertified op (pinned elsewhere). A present-but-garbage
+        # live_override must therefore refuse - treating garbage as "absent"
+        # would fail open through that exact proceed path.
+        env, src, dst = two_account_env(tmp_path)
+        third = os.path.join(env.store_candidates[0],
+                             "eeeeeeee-0000-0000-0000-000000000005",
+                             "ffffffff-0000-0000-0000-000000000006")
+        os.makedirs(third)
+        _row(src, "local_0.json", "sid-0", "Session 0")
+        _transcript(env, "sid-0")
+        m = ct.plan_sync(env, ct.SyncFlags(to="eeeeeeee"))
+        op = ct.new_op(env, m)
+        op.manifest["live_override"] = ["garbage"]
+        ct.save_manifest(op)
+        self._e4(env)
+        with pytest.raises(ct.Refusal, match="--live"):
+            ct.execute_sync_op(env, op)
+        assert not os.path.exists(os.path.join(third, "local_0.json"))
+
+    def test_malformed_override_shapes_refuse_never_traceback(
+            self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        op = ct.new_op(env, m)
+        good = op.manifest["live_override"]
+        for garbage in ("x", 42, [], {}, {"account": 7},
+                        {"account": DORMANT, "pair": "not-a-list"},
+                        dict(good, pair=list(reversed(good["pair"])))):
+            op.manifest["live_override"] = garbage
+            with pytest.raises(ct.Refusal, match="--live"):
+                ct.execute_sync_op(env, op)
+            assert op.manifest["status"] == "journaled"
+
+    # ------------------------------------------------------------ loudness
+
+    def test_dry_run_report_shouts_the_override(self, two_account_env, tmp_path):
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        lines = []
+        ct._print_sync_report(lines.append, m)
+        text = "\n".join(lines)
+        assert "LIVE-ACCOUNT OVERRIDE" in text
+        assert "--live" in text
+        assert "overriding ~/.claude.json" in text
+        assert "aaaaaaaa" in text                  # the stale claim's uuid
+        assert "RULING 4" in text                  # the guard warning stays
+
+    def test_report_derives_the_banner_from_pair_and_account(
+            self, two_account_env, tmp_path):
+        # Print-time derivation: a hand-edited overrode_file cannot make the
+        # banner lie (validation would refuse execution anyway; the report
+        # must not lie either, e.g. on a dry run over a doctored manifest).
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        m = ct.plan_sync(env, ct.SyncFlags(live="cccccccc"))
+        m["live_override"]["overrode_file"] = "config.json"          # a lie
+        lines = []
+        ct._print_sync_report(lines.append, m)
+        assert "overriding ~/.claude.json" in "\n".join(lines)   # derived truth
+
+    def test_apply_epilogue_names_the_override(self, two_account_env, tmp_path,
+                                               capsys, monkeypatch):
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        monkeypatch.setattr(ct, "default_env", lambda: env)
+        assert ct.main(["sync", "--live", "cccccccc", "--apply"]) == 0
+        out = capsys.readouterr().out
+        assert "LIVE-ACCOUNT OVERRIDE" in out
+        assert "live-account override used" in out
+        assert "copied" in out
+
+    def test_json_apply_banners_to_stderr_and_records_in_json(
+            self, two_account_env, tmp_path, capsys, monkeypatch):
+        # --json prints no report and executes first; the override must
+        # still be shouted BEFORE mutation - on stderr, keeping stdout pure
+        # JSON for the machine reader.
+        env, src, dst = two_account_env(tmp_path)
+        self._c_row(env, dst)
+        self._e4(env)
+        monkeypatch.setattr(ct, "default_env", lambda: env)
+        assert ct.main(["sync", "--live", "cccccccc", "--apply", "--json"]) == 0
+        captured = capsys.readouterr()
+        assert "LIVE-ACCOUNT OVERRIDE" in captured.err
+        data = json.loads(captured.out)
+        assert data["live_override"]["account"] == DORMANT
+        assert data["result"] == "completed"
+
+    def test_undo_prints_the_note_in_preview_and_before_apply(
+            self, two_account_env, tmp_path, capsys, monkeypatch):
+        env, src, dst = two_account_env(tmp_path)
+        self._completed_live_sync(env, src, dst)
+        monkeypatch.setattr(ct, "default_env", lambda: env)
+        assert ct.main(["undo"]) == 0
+        out = capsys.readouterr().out
+        assert "--live" in out                               # preview warns
+        assert ct.main(["undo", "--apply"]) == 0
+        out = capsys.readouterr().out
+        assert "--live" in out
+        assert out.index("--live") < out.index("result:")    # before mutation
+        assert not os.path.exists(os.path.join(src, "local_c1.json"))
+
+    def test_recover_prints_the_note_dry_and_applied(self, two_account_env,
+                                                     tmp_path, capsys,
+                                                     monkeypatch):
+        env, src, dst = two_account_env(tmp_path)
+        op = self._crashed_live_sync(env, src, dst)
+        op_id = op.manifest["op_id"]
+        monkeypatch.setattr(ct, "default_env", lambda: env)
+        assert ct.main(["recover", "--resolve", op_id, "--forward"]) == 0
+        out = capsys.readouterr().out
+        assert "--live" in out
+        assert "would resolve" in out
+        assert ct.main(["recover", "--resolve", op_id, "--forward",
+                        "--apply"]) == 0
+        out = capsys.readouterr().out
+        assert "--live" in out
+        assert out.index("--live") < out.index("result:")
+        assert os.path.exists(os.path.join(src, "local_1.json"))
+
+    # -------------------------------------------------------- parser/flags
+
+    def test_parser_wiring(self, capsys):
+        p = ct.build_parser()
+        assert p.parse_args(["sync", "--live", "x"]).live == "x"
+        assert p.parse_args(["sync"]).live == ""
+        for argv in (["undo", "--live", "x"], ["recover", "--live", "x"]):
+            with pytest.raises(SystemExit):
+                p.parse_args(argv)
+        capsys.readouterr()          # swallow argparse usage noise

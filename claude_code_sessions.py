@@ -2066,6 +2066,11 @@ def build_parser():
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
                          "(required if more than one exists)")
+    sp.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="when ~/.claude.json and config.json disagree about the "
+                         "signed-in account, assert which one the desktop app is "
+                         "signed into (id, org, path, or email substring; refused "
+                         "unless the files disagree - see RULING 5)")
     sp.add_argument("--only", default="", metavar="SUBSTRING",
                     help="only sessions whose title contains this")
     sp.add_argument("--include-deleted", action="append", default=[],
@@ -2154,6 +2159,11 @@ def cmd_undo(env, ns):
         raise Refusal("no completed operation to undo" +
                       (" with id " + ns.op_id if ns.op_id else ""))
     prior = candidates[-1]
+    # RULING 5: a sync op that ran under a --live certification says so on
+    # every route that can mutate under it, BEFORE it mutates - the --apply
+    # path skips the preview entirely, so the preview line alone would warn
+    # only the users who happened to dry-run first.
+    live_note = _live_override_note(prior.manifest)
     if not ns.apply:
         if prior.manifest.get("op_type") == "sync":
             # A sync manifest has no session_id - the move-shaped preview
@@ -2167,7 +2177,11 @@ def cmd_undo(env, ns):
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
         print(line if ns.verbose else redact(env, line))   # M1: redact the preview too
+        if live_note:
+            print(live_note if ns.verbose else redact(env, live_note))
         return 0
+    if live_note:
+        print(live_note if ns.verbose else redact(env, live_note))
     before_ids = {o.manifest["op_id"] for o in list_ops(env)}
     if prior.manifest.get("op_type") == "sync":
         final = undo_sync(env, prior)
@@ -2202,6 +2216,11 @@ def cmd_recover(env, ns):
     direction = "forward" if ns.forward else ("back" if ns.back else None)
     if direction is None:
         raise Refusal("--resolve needs --forward or --back")
+    # RULING 5: same pre-mutation note as cmd_undo - recover re-enters the
+    # certified op directly, so it must be exactly as loud about it.
+    live_note = _live_override_note(matches[0].manifest)
+    if live_note:
+        print(live_note if ns.verbose else redact(env, live_note))
     if not ns.apply:
         print("would resolve {0} {1}; pass --apply to execute".format(ns.op_id, direction))
         return 0
@@ -2236,6 +2255,8 @@ class Account:
     # How live_account() decided this was the signed-in account:
     #   "oauth"  - ~/.claude.json's oauthAccount named it outright.
     #   "config" - only config.json's lastKnownAccountUuid named it.
+    #   "user"   - the user asserted it with sync --live while the identity
+    #              files disagreed (RULING 5, _resolve_live_assertion).
     #   ""       - not a live-account determination at all (every dormant
     #              candidate resolve_sync_endpoints builds).
     # Since RULING 4 (2026-08-02) provenance buys no guard exemption - E4
@@ -2431,7 +2452,8 @@ def _guard_mutation(env, what):
             "\nAlso: ~/.claude.json ({0}) and config.json ({1}) disagree about the "
             "signed-in account. Re-authenticate the CLI (run 'claude', then /login) "
             "as the account you use, or switch the desktop app to it, so the two "
-            "agree.".format(dis[0][:8], dis[1][:8]))
+            "agree. --live does not lift this guard - close the app."
+            .format(dis[0][:8], dis[1][:8]))
     if running[0] == _PROC_UNAVAILABLE:
         # "Couldn't look" is never "nothing there" (Task 2), but it is also
         # never "the app IS running" - that wording would be a lie here, and
@@ -2449,7 +2471,70 @@ def _guard_mutation(env, what):
         "app - close the desktop app and re-run.{2}".format(running[0], what, extra))
 
 
-def _refuse_dest_possibly_live(env, live, dest_path, what, live_match_message):
+# _certified_live_account's three states (RULING 5). Tri-state on purpose:
+# "the certification didn't validate" must never quietly become "no
+# certification, proceed by the old rules" - the old rules PROCEED in the
+# no-evidence and third-account cases, and a voided certification falling
+# into a proceed path would be exactly the fail-open this module never
+# allows.
+_CERT_ABSENT, _CERT_VALID, _CERT_VOID = "absent", "valid", "void"
+
+
+def _certified_live_account(env, m):
+    """(state, account) for a sync manifest's --live certification (RULING 5).
+
+    The manifest key is the ONE piece of manifest content the executor
+    honors for an identity decision, and only after revalidating every part
+    of it against the identity files on disk, right now:
+
+    - _CERT_ABSENT: no "live_override" key. Behavior everywhere: exactly
+      the pre-RULING-5 rules, byte for byte.
+    - _CERT_VALID: a disagreement exists NOW; the recorded pair equals it
+      positionally (order deliberately significant - a flipped direction
+      means both files changed claims since planning, i.e. the world moved
+      twice, and a twice-moved world is not the tie the user arbitrated);
+      the asserted account is a member, equals the manifest's own
+      source_account, and the derivable audit fields (overrode_file,
+      overrode_uuid) tell the same story as the operative ones - an
+      internally inconsistent record never certifies, however well-typed.
+    - _CERT_VOID: the key is present but anything above failed, garbage
+      shapes included. Callers refuse (unless live_account() resolves, in
+      which case the ordinary live-match rules apply - see
+      _refuse_dest_possibly_live).
+
+    Exception-free in the _sync_row_drift style: wrong types, missing keys,
+    tuple-vs-list mismatches all classify as void, never raise.
+
+    NOT validated, deliberately: config_path - best-effort audit data in
+    the same class as source_resolved_from, not re-derivable on a machine
+    whose config roots changed since planning.
+    """
+    if "live_override" not in m:
+        return _CERT_ABSENT, None
+    ov = m.get("live_override")
+    if not isinstance(ov, dict):
+        return _CERT_VOID, None
+    acct = ov.get("account")
+    pair = ov.get("pair")
+    dis = _identity_disagreement(env)
+    if dis is None:
+        return _CERT_VOID, None
+    if not (isinstance(acct, str) and acct in dis):
+        return _CERT_VOID, None
+    if not isinstance(pair, (list, tuple)) or list(pair) != list(dis):
+        return _CERT_VOID, None
+    if acct != m.get("source_account"):
+        return _CERT_VOID, None
+    oauth_uuid, config_uuid = dis
+    expected = (("~/.claude.json", oauth_uuid) if acct == config_uuid
+                else ("config.json", config_uuid))
+    if (ov.get("overrode_file"), ov.get("overrode_uuid")) != expected:
+        return _CERT_VOID, None
+    return _CERT_VALID, acct
+
+
+def _refuse_dest_possibly_live(env, live, dest_path, what, live_match_message,
+                               cert=(_CERT_ABSENT, None)):
     """Shared by execute_sync_op and _sync_delete_targets: refuse when
     dest_path might be the live account's store, by either of two
     independent tests. Factored into one place so the two sites cannot
@@ -2477,20 +2562,54 @@ def _refuse_dest_possibly_live(env, live, dest_path, what, live_match_message):
     No disagreement and live is None (genuinely no evidence, e.g. no
     identity file resolves anything) falls through both checks and
     proceeds - unchanged from before Task 1.
+
+    CERT (RULING 5) is _certified_live_account's verdict on the manifest's
+    --live certification, and it modulates ONLY test 2:
+    - valid: the certified account is asserted-live, so a destination under
+      its store still refuses; the OTHER named account is asserted-dormant
+      and proceeds - the point of the flag; a third account proceeds as
+      today.
+    - void: refuse outright, before the disagreement test - a certified
+      operation never executes in a state where the files can neither
+      validate the assertion nor resolve an account. (When they DO resolve,
+      live is not None and test 1 already applied the ordinary rules; the
+      certification is moot, not honored.)
     """
     real_dest = os.path.normcase(os.path.realpath(dest_path))
     if live is not None:
         if real_dest == os.path.normcase(os.path.realpath(live.path)):
             raise Refusal(live_match_message())
         return
+    state, certified = cert
+    if state == _CERT_VOID:
+        dis = _identity_disagreement(env)
+        now = ("they now name a different disagreement ({0} vs {1}), or the "
+               "record does not match this operation".format(dis[0][:8], dis[1][:8])
+               if dis else
+               "they no longer disagree, and no account currently resolves")
+        raise Refusal(
+            "this operation carries a --live certification that no longer holds: "
+            "it was recorded against a specific disagreement between "
+            "~/.claude.json and config.json, and {0}; refusing to {1}. Re-plan "
+            "the sync, or restore an identity state the files can resolve, then "
+            "retry.".format(now, what))
     dis = _identity_disagreement(env)
     if dis is None:
         return
     oauth_uuid, config_uuid = dis
     named_dirs = _account_dirs(env)
     for acct_uuid in (oauth_uuid, config_uuid):
+        if state == _CERT_VALID and acct_uuid != certified:
+            continue        # asserted-dormant under the certification: allowed
         for a, o, p in named_dirs:
             if a == acct_uuid and real_dest == os.path.normcase(os.path.realpath(p)):
+                if state == _CERT_VALID:
+                    raise Refusal(
+                        "your --live assertion names {0} as the account the "
+                        "desktop app is signed into, and the destination is that "
+                        "very account's store; refusing to {1} - sync never "
+                        "touches the asserted-live store."
+                        .format(certified[:8], what))
                 raise Refusal(
                     "~/.claude.json ({0}) and config.json ({1}) disagree about the "
                     "signed-in account, so which one is actually live is unknowable "
@@ -2621,13 +2740,136 @@ def dormant_account_email(env, account_uuid):
     return ""
 
 
-def resolve_sync_endpoints(env, to=None):
+def _disagreeing_config_path(env, config_uuid):
+    """The config.json whose lastKnownAccountUuid carries CONFIG_UUID, or "".
+
+    A pure audit field for the live_override record (RULING 5): more than one
+    candidate config can exist on disk (the MSIX root and the classic
+    %APPDATA% root), and _identity_disagreement returns only uuids, so this
+    re-walks the same candidates in the same order to name the file the
+    certification was formed against. Best-effort and NOT part of
+    certification validity - see _certified_live_account."""
+    for cand in env.store_candidates:
+        cfg = os.path.join(os.path.dirname(cand), "config.json")
+        try:
+            with open(cfg, encoding="utf-8") as fh:
+                last = (json.load(fh) or {}).get("lastKnownAccountUuid")
+        except (OSError, ValueError, AttributeError, TypeError):
+            continue
+        if last == config_uuid:
+            return cfg
+    return ""
+
+
+def _resolve_live_assertion(env, live, dirs):
+    """The Account the user certifies as desktop-live via --live (RULING 5).
+
+    The certified fact is deliberately narrow: "this is the account the
+    Claude DESKTOP APP is currently signed into" - the liveness sync's
+    safety model actually cares about, since these are the desktop's stores
+    and the running-app guard is about the desktop's processes. The two
+    identity files can even both be right for their own application (CLI
+    authenticated to one account, desktop signed into another); there is
+    still exactly one desktop-liveness fact, and the user is its
+    authoritative source - they can simply look at the app. That is the
+    asymmetry with the rejected macOS layout override
+    (_require_verified_platform): a user cannot evaluate a store-layout
+    risk, but "which account is my desktop app on" they can.
+
+    Usable ONLY while the identity files disagree - the assertion arbitrates
+    a specific two-way tie, cross-checked against a file that already names
+    the account. With no disagreement it is refused: agreeing files make it
+    unnecessary, and the no-evidence and config-only-ambiguous-org states
+    would have it certify a bit no file corroborates at all.
+
+    Matching reuses --to's disambiguation semantics over the two named
+    accounts' on-disk stores, with one addition: an empty or whitespace-only
+    value is refused outright - substring containment would make it match
+    every candidate, which on a one-candidate machine is exactly the bare
+    force flag this design refuses to be.
+    """
+    if not live.strip():
+        raise Refusal(
+            "--live must name the account - an id, org, store-path or email "
+            "substring. An empty value would match every candidate, which is the "
+            "bare override this flag refuses to be.")
+    dis = _identity_disagreement(env)
+    if dis is None:
+        res = live_account(env)
+        if res is not None:
+            raise Refusal(
+                "--live arbitrates a disagreement between ~/.claude.json and "
+                "config.json, and they do not currently disagree - the signed-in "
+                "account already resolves to {0} without it. Re-run without "
+                "--live.".format(res.account_uuid[:8]))
+        raise Refusal(
+            "--live arbitrates a disagreement between ~/.claude.json and "
+            "config.json, and they do not currently disagree - there is not enough "
+            "identity evidence to resolve an account, and --live cannot supply "
+            "evidence no file corroborates. Fix: sign in to the Claude desktop app "
+            "(which writes config.json) or authenticate the CLI (run 'claude', "
+            "then /login) so a file names the account, then re-run without --live.")
+    oauth_uuid, config_uuid = dis
+    oauth_email = ""
+    try:
+        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
+            oa = (json.load(fh) or {}).get("oauthAccount") or {}
+        if isinstance(oa, dict) and oa.get("accountUuid") == oauth_uuid:
+            oauth_email = oa.get("emailAddress") or ""
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    cands = []
+    for a, o, p in dirs:
+        if a not in (oauth_uuid, config_uuid):
+            continue
+        email = ((oauth_email if a == oauth_uuid else "")
+                 or dormant_account_email(env, a))
+        cands.append(Account(a, o, email, p, "user"))
+    matched = [c for c in cands if live.lower() in
+               (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
+                c.path).lower()]
+    if len(matched) > 1:
+        listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
+                                     for c in matched)
+        raise Refusal("--live {0!r} matched {1} stores; be more specific (a longer "
+                      "id, or part of the store path):\n{2}"
+                      .format(live, len(matched), listing))
+    if not matched:
+        listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
+                                     for c in cands)
+        # A named account with NO store dir can never be matched, whatever
+        # the substring - say so per account rather than implying a typo.
+        for u in (oauth_uuid, config_uuid):
+            if not any(a == u for a, o, p in dirs):
+                extra = "   {0}/-          (no store on disk - cannot be the " \
+                        "sync source)".format(u[:8])
+                listing = (listing + "\n" + extra) if listing else extra
+        raise Refusal(
+            "--live {0!r} matched no store belonging to either account the "
+            "disagreeing identity files name ({1}, {2}). If it names some other "
+            "account: an account named by neither file is evidence of something "
+            "else being wrong - investigate before syncing. The two named "
+            "accounts' stores:\n{3}"
+            .format(live, oauth_uuid[:8], config_uuid[:8], listing))
+    return matched[0]
+
+
+def resolve_sync_endpoints(env, to=None, live=None):
     """(source, destination). Source is the signed-in account; destination is
     the other store. Refuses rather than guessing - row-freshness is NEVER
     used to choose, because sync's whole safety model is 'we only ever write
-    the dormant store', and a wrong guess writes the live one."""
+    the dormant store', and a wrong guess writes the live one.
+
+    LIVE (RULING 5) is the one sanctioned exception to "refuses rather than
+    guessing", and it is not a guess: while the identity files DISAGREE, the
+    user may assert outright which account the desktop app is signed into
+    (_resolve_live_assertion). Everything else - destination choice, --to
+    narrowing, every refusal - is unchanged."""
     dirs = _account_dirs(env)
-    source = live_account(env)
+    if live is not None:
+        source = _resolve_live_assertion(env, live, dirs)
+    else:
+        source = live_account(env)
     if source is None:
         listing = _candidate_listing(dirs)
         dis = _identity_disagreement(env)
@@ -2640,7 +2882,9 @@ def resolve_sync_endpoints(env, to=None):
                 "which account is live we cannot verify the one you named is not it.\n"
                 "Fix: re-authenticate the CLI (run 'claude', then /login) as the account\n"
                 "you are using, or switch the desktop app to that account, so the two\n"
-                "files agree.\n"
+                "files agree - or, if you know which account the desktop app is signed\n"
+                "into, assert it with --live <account-id, email, or store-path substring>\n"
+                "(RULING 5; the running-app guard still applies).\n"
                 "Stores found:\n".format(dis[0][:8], dis[1][:8]) + listing)
         raise Refusal(
             "cannot identify the signed-in account from ~/.claude.json or config.json.\n"
@@ -2690,6 +2934,7 @@ class SyncFlags:
     only: str = ""
     include_deleted: tuple = ()
     verbatim: bool = False
+    live: str = ""
 
 
 def _destination_tombstones(dest):
@@ -2884,9 +3129,38 @@ def transform_row(data, verbatim=False):
     return json.dumps(out, separators=(",", ":")).encode("utf-8"), removed, sorted(reset)
 
 
+def _live_override_record(env, source):
+    """The manifest record of a --live certification (RULING 5).
+
+    Redundant on purpose: `account` + `pair` are the operative fields the
+    executor revalidates; `overrode_file`/`overrode_uuid` restate what the
+    assertion overrode for the journal reader (they are re-derived, never
+    trusted, wherever they could mislead - see _live_override_derived and
+    _certified_live_account); `config_path` is best-effort audit only.
+
+    The disagreement is re-read here rather than threaded from
+    _resolve_live_assertion; if the files changed in the microseconds
+    between the two reads, fail closed rather than record a certification
+    about a state that no longer exists."""
+    dis = _identity_disagreement(env)
+    if dis is None or source.account_uuid not in dis:
+        raise Refusal("the identity files changed while this sync was being "
+                      "planned; re-run it.")
+    oauth_uuid, config_uuid = dis
+    if source.account_uuid == config_uuid:
+        overrode_file, overrode_uuid = "~/.claude.json", oauth_uuid
+    else:
+        overrode_file, overrode_uuid = "config.json", config_uuid
+    return {"account": source.account_uuid,
+            "pair": [oauth_uuid, config_uuid],     # ordered: oauth, config
+            "overrode_file": overrode_file, "overrode_uuid": overrode_uuid,
+            "config_path": _disagreeing_config_path(env, config_uuid)}
+
+
 def plan_sync(env, flags):
     """Build the sync manifest. Pure planning - writes nothing."""
-    source, dest = resolve_sync_endpoints(env, flags.to or None)
+    source, dest = resolve_sync_endpoints(env, flags.to or None,
+                                          flags.live or None)
     picked, tally = select_sync_rows(env, source, dest, flags)
     rows = []
     for cand in picked:
@@ -2900,18 +3174,25 @@ def plan_sync(env, flags):
                      # a deliberate deletion was overridden
                      "overrode_tombstone": bool(cand.get("overrode_tombstone")),
                      "written": False})
-    return {"op_type": "sync",
-            "source_account": source.account_uuid, "source_org": source.org_uuid,
-            "source_email": source.email, "source_path": source.path,
-            # Provenance of the live-account determination ("oauth"/"config"),
-            # so the CLI can say plainly which evidence this plan rests on and
-            # warn that --apply will need the app closed. The executor does
-            # NOT read this key - it re-derives live_account itself, which is
-            # what makes the guard unbypassable by a hand-edited manifest.
-            "source_resolved_from": source.resolved_from,
-            "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
-            "dest_email": dest.email, "dest_path": dest.path,
-            "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
+    out = {"op_type": "sync",
+           "source_account": source.account_uuid, "source_org": source.org_uuid,
+           "source_email": source.email, "source_path": source.path,
+           # Provenance of the live-account determination ("oauth"/"config"/
+           # "user"), so the CLI can say plainly which evidence this plan
+           # rests on and warn that --apply will need the app closed. The
+           # executor does NOT read this key - it re-derives live_account
+           # itself, which is what makes the guard unbypassable by a
+           # hand-edited manifest. (The "live_override" key below has a
+           # deliberately different contract: the executor DOES read it, but
+           # only after revalidating it against the identity files on disk -
+           # see _certified_live_account, RULING 5.)
+           "source_resolved_from": source.resolved_from,
+           "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
+           "dest_email": dest.email, "dest_path": dest.path,
+           "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
+    if source.resolved_from == "user":
+        out["live_override"] = _live_override_record(env, source)
+    return out
 
 
 # Journal-write budget for execute_sync_op's row loop.
@@ -2973,7 +3254,8 @@ def execute_sync_op(env, op):
         env, live, m["dest_path"], "write to",
         lambda: "destination resolves to the LIVE account ({0}); refusing - sync must "
                 "never write to the account that is currently live."
-                .format(live.email or live.account_uuid))
+                .format(live.email or live.account_uuid),
+        _certified_live_account(env, m))
     _guard_mutation(env, "write to")
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
@@ -3228,6 +3510,17 @@ def classify_sync_op(env, op):
                 "note": "sync: {0} row(s) written, {1} pending; forward finishes "
                         "them (use undo to remove what was written)"
                         .format(len(written), len(pending))}
+    # RULING 5: warn BEFORE the user picks a direction if this op's --live
+    # certification no longer validates - both directions go through gates
+    # that will refuse on it, and surprising them at execution when the
+    # listing could have said so is exactly what this note exists to avoid.
+    # Never raises (_certified_live_account classifies, it doesn't throw),
+    # which classify_op requires.
+    cert_note = ""
+    if "live_override" in m and _certified_live_account(env, m)[0] == _CERT_VOID:
+        cert_note = ("; NOTE: this op's --live certification no longer matches "
+                     "the identity files - forward/back will refuse until the "
+                     "identity state is restored or resolves (RULING 5)")
     pend_changed, pend_unreadable = _sync_drift_titles(pending)
     if pend_changed or pend_unreadable:
         blocking = pend_changed + pend_unreadable
@@ -3245,13 +3538,14 @@ def classify_sync_op(env, op):
         # printed line - listing the same title twice reads as two problems.
         # Order-preserving, unlike set().
         return {"status": m["status"], "source": "n/a", "dest": "n/a",
-                "resolutions": ["back"], "note": note,
+                "resolutions": ["back"], "note": note + cert_note,
                 "drifted_rows": list(dict.fromkeys(blocking + skipped))}
     return {"status": m["status"], "source": "n/a", "dest": "n/a",
             "resolutions": ["forward", "back"], "drifted_rows": [],
             "note": "sync: {0} row(s) written, {1} pending; forward finishes them, "
                     "back removes the {0} already written (use undo instead once "
-                    "the op has completed)".format(len(written), len(pending))}
+                    "the op has completed)".format(len(written), len(pending))
+                    + cert_note}
 
 
 def _sync_delete_targets(env, m):
@@ -3290,7 +3584,10 @@ def _sync_delete_targets(env, m):
         env, live, m["dest_path"], "delete from",
         lambda: "destination resolves to the LIVE account ({0}); refusing - undo, "
                 "like sync, may only ever touch a dormant store, never the account "
-                "that is currently live.".format(live.email or live.account_uuid))
+                "that is currently live. The synced rows can also be removed in "
+                "the app itself, or sign the desktop out of this account and "
+                "re-run.".format(live.email or live.account_uuid),
+        _certified_live_account(env, m))
     # The same guard as the write side (RULING 4: every mutation route,
     # regardless of provenance). Both callers of this helper (undo_sync,
     # recover_op's sync 'back' arm) inherit it from this one place.
@@ -3372,7 +3669,7 @@ def undo_sync(env, op):
 def cmd_sync(env, ns):
     flags = SyncFlags(to=ns.to, only=ns.only,
                       include_deleted=tuple(ns.include_deleted or ()),
-                      verbatim=ns.verbatim)
+                      verbatim=ns.verbatim, live=ns.live)
     manifest = plan_sync(env, flags)
 
     def say(line):
@@ -3388,6 +3685,13 @@ def cmd_sync(env, ns):
     # happened, not the plan it would have run.
     if not ns.json:
         _print_sync_report(say, manifest)
+    elif "live_override" in manifest:
+        # --json prints no report and (with --apply) executes first, so the
+        # override would otherwise mutate with no pre-mutation notice at
+        # all. Shout it on stderr - stdout stays pure JSON for the machine
+        # reader, which gets the live_override key in the manifest instead.
+        for line in _live_override_lines(manifest):
+            print(line if ns.verbose else redact(env, line), file=sys.stderr)
 
     # A zero-row plan skips run_sync regardless of --apply: there's nothing
     # to journal, and journaling an empty op anyway was a parked finding.
@@ -3415,9 +3719,80 @@ def cmd_sync(env, ns):
     # load-bearing here and easy to break by deep-copying "for safety".
     say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
     say("result     : {0}".format(final))
+    d = _live_override_derived(manifest)
+    if d is not None:
+        _, _, asserted_uuid, stale_file, stale_uuid = d
+        say("live-account override used: --live asserted {0}; {1} ({2}) was "
+            "overridden.".format(asserted_uuid[:8], stale_file, stale_uuid[:8]))
     say("Sign into {0} (or restart the app) to see them."
         .format(manifest["dest_email"] or "the other account"))
     return 0 if final == "completed" else 1
+
+
+def _live_override_derived(manifest):
+    """(oauth_uuid, config_uuid, asserted, stale_file, stale_uuid) from a
+    manifest's live_override, or None.
+
+    Derived from the operative fields (pair + account) at print time, NEVER
+    read from overrode_file/overrode_uuid - those exist for the journal
+    reader, and deriving here means no manifest edit can make any
+    human-facing line name the wrong file while the certification story
+    still looks plausible. Shape-hardened: garbage yields None, and the
+    caller prints nothing rather than something wrong."""
+    ov = manifest.get("live_override")
+    if not isinstance(ov, dict):
+        return None
+    pair = ov.get("pair")
+    asserted = ov.get("account")
+    if not (isinstance(pair, (list, tuple)) and len(pair) == 2
+            and all(isinstance(u, str) and u for u in pair)
+            and isinstance(asserted, str) and asserted in pair):
+        return None
+    oauth_uuid, config_uuid = pair
+    if asserted == config_uuid:
+        stale_file, stale_uuid = "~/.claude.json", oauth_uuid
+    else:
+        stale_file, stale_uuid = "config.json", config_uuid
+    return oauth_uuid, config_uuid, asserted, stale_file, stale_uuid
+
+
+def _live_override_lines(manifest):
+    """The banner _print_sync_report and cmd_sync's --json stderr path share.
+    Unmissable on purpose: the override is the one place this tool acts on a
+    user's word instead of file evidence, and the output must testify to
+    that (RULING 5)."""
+    d = _live_override_derived(manifest)
+    if d is None:
+        return []
+    oauth_uuid, config_uuid, asserted, stale_file, stale_uuid = d
+    return [
+        "      !! LIVE-ACCOUNT OVERRIDE: ~/.claude.json ({0}) and config.json "
+        "({1})".format(oauth_uuid[:8], config_uuid[:8]),
+        "      !! disagree about the signed-in account. Proceeding on your --live",
+        "      !! assertion that {0} is what the desktop app is signed "
+        "into,".format(asserted[:8]),
+        "      !! overriding {0} ({1}). If that is wrong, this sync would "
+        "write".format(stale_file, stale_uuid[:8]),
+        "      !! into the store of the account you actually use - stop now.",
+    ]
+
+
+def _live_override_note(m):
+    """One pre-mutation line for the undo/recover routes over a --live sync
+    op. Every command that can mutate under the certification says so BEFORE
+    it mutates - undo --apply skips the preview entirely, so warning there
+    after deletion would be too late (RULING 5)."""
+    if m.get("op_type") != "sync":
+        return ""
+    d = _live_override_derived(m)
+    if d is None:
+        return ""
+    _, _, asserted, stale_file, stale_uuid = d
+    return ("note: op {0} ran under a --live assertion that {1} is the "
+            "desktop-live account (overriding {2} {3}); this relies on that "
+            "certification, revalidated against the identity files before "
+            "anything is touched.".format(m.get("op_id", "?"), asserted[:8],
+                                          stale_file, stale_uuid[:8]))
 
 
 def _print_sync_report(say, manifest):
@@ -3437,15 +3812,21 @@ def _print_sync_report(say, manifest):
     # a note for the user, not a gate - --apply's guard applies the same way
     # regardless of resolved_from (see _guard_mutation).
     weak = manifest.get("source_resolved_from") == "config"
-    say("from  {0:24} ({1}/{2})   signed in".format(
+    asserted = (manifest.get("source_resolved_from") == "user"
+                and _live_override_derived(manifest) is not None)
+    say("from  {0:24} ({1}/{2})   signed in{3}".format(
         "(from config.json)" if weak else
         (manifest["source_email"] or "(email unknown)"),
-        manifest["source_account"][:8], manifest["source_org"][:8]))
+        manifest["source_account"][:8], manifest["source_org"][:8],
+        " (YOUR --live assertion)" if asserted else ""))
     say("      " + manifest["source_path"])
     if weak:
         say("      ! identified from config.json's lastKnownAccountUuid, not from a")
         say("        signed-in oauthAccount - a provenance note only, not a stronger/")
         say("        weaker distinction.")
+    if asserted:
+        for line in _live_override_lines(manifest):
+            say(line)
     # Minor 5: this used to sit inside `if weak:` above, so an ordinary
     # oauth-resolved dry run never warned that --apply refuses while Claude
     # is running - even though _guard_mutation (RULING 4) applies exactly

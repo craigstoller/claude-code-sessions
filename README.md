@@ -58,7 +58,9 @@ that case; see Safety design.)
 If `~/.claude.json` (the CLI's identity file) and the desktop app's `config.json` disagree
 about which account is signed in, `sync` refuses to even plan — re-authenticate the CLI (run
 `claude`, then `/login`) as the account you use, or switch the desktop app to it, so the two
-files agree. Signing into the desktop app does **not** refresh `~/.claude.json`. A refused
+files agree — or, if you know which account the desktop app is signed into, assert it with
+`sync --live <account>` (see the `sync` section below; the running-app guard still applies in
+full). Signing into the desktop app does **not** refresh `~/.claude.json`. A refused
 `sync --apply` (desktop app running) refuses **before anything is journaled** — no lock file,
 no op directory — so there's nothing left behind for `doctor` to flag or `recover` to clean up;
 just close the app and re-run. One measured wrinkle: the desktop ships a helper for its Chrome
@@ -125,6 +127,19 @@ which account is live we cannot verify the one you named isn't it. A disagreemen
 files' 8-character id prefixes; the fix is to re-authenticate the CLI (run `claude`, then
 `/login`) as the account you're using, or switch the desktop app to that account, so the two
 files agree.
+
+When the two files **disagree**, there is a faster path than `/login`: you know which account
+your desktop app is signed into, and `--live <substring>` asserts it (an account id, org id,
+store path, or email — the same matching as `--to`; ambiguity is a refusal listing the
+candidates). It is deliberately not a `--force`: it works *only* while the files disagree, it
+must name one of the two accounts they name (anything else is refused — an account neither
+file names is evidence of something else being wrong), and the dry run, apply, `--json`
+(stderr), `undo`, and `recover` output all shout that the override was used and which file it
+overrode. The assertion is journaled with the operation and re-checked against the identity
+files before every write, undo, or recover it ever performs; if the disagreement has changed
+or vanished by then, the operation refuses rather than trust a stale assertion. The
+running-app guard is completely unaffected: `--live --apply` still refuses while the desktop
+app is running. Design rationale in `docs/internals.md` (RULING 5).
 
 `--json` prints the plan by itself, the same as the default dry run. Combined with `--apply` it
 runs first and describes what actually happened instead — real `written` flags per row and a
@@ -220,10 +235,15 @@ is always a preview will misread `sync --apply --json`.
   into, re-verifying that at the moment it writes as well as when it planned. It refuses outright
   if it cannot identify which account is signed in at all, or if `~/.claude.json` and
   `config.json` disagree about which account that is: `--to` names a destination, but without a
-  confirmed, unambiguous live account there is nothing to check that destination against. Every
-  sync mutation — `--apply`, `undo`, and `recover --back` on a sync op — also refuses while it can
+  confirmed, unambiguous live account there is nothing to check that destination against. The
+  one sanctioned exception is `--live` (RULING 5 in `docs/internals.md`): while the files
+  *disagree*, you may assert by name which account the desktop app is signed into — a fact you
+  can verify and the files cannot — and the assertion is journaled, shouted in every output,
+  and re-checked against the identity files before every mutation the operation ever performs.
+  Every sync mutation — `--apply`, `undo`, and `recover --back` on a sync op — also refuses while it can
   see the Claude desktop app running, the same guard `move`/`undo`/`recover` use, applied
-  regardless of which identity file resolved the signed-in account: staleness has been shown in
+  regardless of which identity file resolved the signed-in account — and regardless of
+  `--live`, which never touches this guard: staleness has been shown in
   both directions (`oauthAccount` measured stale across a real account switch; `config.json`
   stale in a review-constructed store), so no file evidence is trusted to certify the
   destination is dormant while the app is visible. A running Claude Code CLI does not count

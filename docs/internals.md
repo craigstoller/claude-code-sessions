@@ -182,6 +182,92 @@ yet). The actual safety mechanism for every mutation is the running-app check
 (`_guard_mutation`), not the identity files — it applies unconditionally to every sync mutation
 route regardless of which file (or whether either) resolved the live account.
 
+### RULING 5: the user-certified liveness override (`sync --live`)
+
+*(2026-08-05. The one sanctioned exception to "refuses rather than guessing" — see
+`_resolve_live_assertion`, `_certified_live_account`, `_refuse_dest_possibly_live`, and
+`_live_override_record` in `claude_code_sessions.py`.)*
+
+The disagreement refusal above was never "the files are the safety" — the running-app guard
+(RULING 4) is what binds every mutation regardless of what the files say, and it is a
+point-in-time check with an accepted TOCTOU residual, not a proof. The refusal was "the tool
+will not *guess* between two claims it cannot rank." `sync --live <account>` does not add
+guessing; it adds the one witness who can rank them. The certified fact is defined narrowly:
+**"this is the account the Claude desktop app is currently signed into."** Desktop liveness —
+not CLI authentication — is what `sync`'s safety model cares about: these are the desktop's
+stores, and the guard is about the desktop's processes. The two files can even both be right
+for their own application (CLI authenticated to A, desktop signed into B — each owner
+freshening only its own file, per the likely mechanism above); there is still exactly one
+desktop-liveness fact, and the user is its authoritative source: they can look at the app.
+That is the asymmetry with the rejected macOS layout override (`_require_verified_platform`,
+which deliberately has **no** flag): a user cannot evaluate a store-layout risk, but "which
+account is my desktop app signed into" they can simply see. `/login` was always the user
+asserting a related fact slowly and by side effect — freshening one file until the two agree;
+`--live` is the same knowledge asserted directly.
+
+The constraints that keep it a certification rather than a `--force`:
+
+- **It must name the account** — id, org, path, or email substring, `--to`'s exact matching
+  semantics over the two named accounts' on-disk stores; ambiguity is a refusal listing
+  candidates (with row counts), and an empty or whitespace value is refused outright, since
+  substring containment would let it match everything.
+- **It must name one of the two accounts the files name.** The assertion arbitrates a specific
+  two-way tie, cross-checked against a file that already names that account. A substring
+  matching some third account is refused as evidence of something else being wrong; the
+  agreeing, no-evidence, and config-only-ambiguous-org states are refused too — there the
+  assertion would certify a bit no file corroborates at all.
+- **Fail-closed default unchanged**: without the flag, byte-for-byte today's refusals (which
+  now advertise `--live` as the fast path beside `/login`).
+- **RULING 4 untouched**: the guard never reads the manifest and applies unconditionally
+  before every mutation, `--live` or not. The flag converts only the identity refusal.
+- **Loud everywhere**: the dry run and apply print a `!! LIVE-ACCOUNT OVERRIDE` banner naming
+  the overridden file and its stale uuid; `--json` (which prints no report and executes first)
+  gets the banner on stderr while stdout stays machine-pure; `undo` and `recover` print a note
+  before mutating a certified op. All of it is derived at print time from the operative fields
+  (`pair` + `account`), so no manifest edit can make the output name the wrong file.
+
+The certification is journaled (`live_override`: the asserted account, the ordered
+`[oauth, config]` pair, the derivable overrode-file/uuid audit fields, and an unvalidated
+best-effort `config_path`) and **revalidated at every mutation the operation ever performs** —
+execute, `recover --forward`/`--back`, `undo` — by `_certified_live_account`, which is
+tri-state on purpose. *Absent* → exactly the pre-RULING-5 rules, so nothing changes for
+ordinary ops. *Valid* (the same ordered pair still on disk, the asserted account a member and
+equal to the manifest's own `source_account`, audit fields telling the same story) → the
+disagreement-names-the-destination refusal narrows: the certified account's own store still
+refuses, the other named account's store — the asserted-dormant one, the whole point —
+proceeds. *Void* (anything else, garbage shapes included) → refuse outright, unless
+`live_account()` now resolves, in which case the ordinary live-match rules apply in full — the
+certification is moot, not honored, and single-file resolution counts, because that is the
+evidence level every uncertified sync already plans and executes on. Order matters in the pair
+comparison: a flipped direction means both files changed claims since planning, and a
+twice-moved world is not the tie the user arbitrated.
+
+Two consequences recorded honestly rather than hidden:
+
+- **The hand-edited-manifest posture changes shape here.** `live_override` is the one manifest
+  key the executor honors for an identity decision — and only after revalidating all of it
+  against the identity files on disk at that moment. A fabricated record that names the real,
+  current disagreement in the current direction *and* matches the manifest's own source does
+  certify; what that unlocks is exactly the action the flag lets the user authorize from the
+  command line — a write into the asserted-dormant store while the app is closed — and nothing
+  else. RULING 4 stays out of reach of any manifest content.
+- **Same-pair recurrence is an accepted residual.** An ordered uuid pair is not a timestamp:
+  if the disagreement resolves and later re-forms identically while a non-terminal `--live` op
+  sits in the journal (or before an `undo`), revalidation cannot distinguish the re-formed tie
+  from one that never moved, and the certification is honored even though desktop liveness may
+  have flipped in between. Fingerprinting the identity files was rejected — `~/.claude.json`
+  is the CLI's whole config, rewritten constantly, so any interim CLI use would void the
+  record and make `undo` of a `--live` sync effectively impossible — and a TTL is an arbitrary
+  constant pretending to be knowledge. Bounded by the running-app guard on every mutation,
+  `doctor` flagging the non-terminal op the whole time, and the pre-mutation notes above.
+  Same posture as the TOCTOU residual below: named, not closed.
+
+One asymmetry worth naming: if the files come to agree on the *destination* account by undo
+time (the user actually signed into it), the ordinary live-match refusal now protects it and
+the `--live` sync cannot be undone by this tool. That is the live-store protection working,
+not a lockout — the refusal names the escape routes (delete the rows in the app itself, or
+sign the desktop out of that account and re-run).
+
 ### The process-narrowing rule
 
 `claude_running(env)` has to answer "is the *desktop app* running," not "is anything named
@@ -302,7 +388,9 @@ account** — the same check that chose it at plan time (`resolve_sync_endpoints
 against `live_account()` at execute time. This catches an account **switch** between planning
 and writing (or a hand-edited/stale manifest); it is the *same* determination run again, not an
 independent verification — if `live_account()` was wrong at plan time it is wrong again at
-execute time, and the two agree.
+execute time, and the two agree. A sync planned under `--live` adds one certified input to this
+re-check — the journaled `live_override` record, revalidated against the identity files at
+every mutation, never trusted from the manifest alone (RULING 5, above).
 
 This tool originally treated that re-check as sufficient on its own whenever `live_account()`'s
 answer came from `~/.claude.json`'s `oauthAccount` (`Account.resolved_from == "oauth"`), on the
@@ -336,7 +424,9 @@ The related-but-separate rule is that `sync` refuses outright if it cannot ident
 signed-in account at all, from neither `~/.claude.json` nor `config.json`: with no live account
 confirmed, there is nothing to check the named destination *against*. `--to` only narrows which
 dormant store to use among several; it cannot supply that missing certainty, and does not
-attempt to.
+attempt to. `--live` (RULING 5) cannot either — it arbitrates a *disagreement* between two
+claims that both exist, and is refused in the no-evidence state, where nothing on disk could
+corroborate the assertion.
 
 **An empty store directory can manufacture ambiguity, so the candidate listing counts rows.**
 Observed August 2026: the desktop app created a store directory holding exactly one file —
