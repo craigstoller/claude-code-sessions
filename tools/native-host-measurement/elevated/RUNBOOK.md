@@ -16,9 +16,11 @@ helper survives, then exercising the extension.
 
       winget install Microsoft.Sysinternals.ProcessMonitor
 
-- Chrome running with the Claude extension, desktop app running, and a few GB of free disk
-  (the unfiltered backing file can reach several GB for a 15-minute window; it is deleted
-  after CSV export unless you pass `-KeepPml`).
+- Chrome running with the Claude extension, desktop app running, and **generous free disk**:
+  the 2026-08-06 aborted run measured ~1 GB of backing file per minute unfiltered, so a full
+  ceremony plus CSV export can want 25–40 GB. The script preflights this and asks before
+  proceeding under 40 GB free. Backing-file segments are deleted after CSV export unless you
+  pass `-KeepPml`.
 
 ## The ceremony
 

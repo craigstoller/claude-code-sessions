@@ -30,6 +30,15 @@ if (-not $isAdmin) {
 $stamp   = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
 $outDir  = Join-Path $PSScriptRoot "capture-$stamp"
 New-Item -ItemType Directory -Path $outDir | Out-Null
+
+# Disk preflight: the 2026-08-06 aborted run wrote ~4.7 GB of PML in 5 minutes
+# unfiltered; a full ceremony plus CSV export wants real headroom.
+$free = (Get-PSDrive -Name (Split-Path -Qualifier $outDir).TrimEnd(':')).Free
+if ($free -lt 40GB) {
+    Write-Warning ("Only {0:N1} GB free on the output drive. An unfiltered 15-20 min capture " -f ($free / 1GB) +
+        "plus CSV export can want 25-40 GB. Type 'go' to proceed anyway, anything else to stop.")
+    if ((Read-Host '>>') -ne 'go') { throw "Stopped for disk headroom." }
+}
 $pml     = Join-Path $outDir 'capture.pml'
 $csv     = Join-Path $outDir 'capture.csv'
 $timelinePath = Join-Path $outDir 'workload-timeline.json'
@@ -62,11 +71,13 @@ Mark 'P0' 'store-roots' ($roots -join ' | ')
 
 # --- process probes ---------------------------------------------------------------
 function Get-DesktopAppProcs {
-    # The MSIX app family: any process whose image sits under \Packages\Claude_...,
-    # EXCEPT the helper itself (it survives the app by design and is probed separately).
+    # The MSIX app EXECUTES from the install root (C:\Program Files\WindowsApps\Claude_...),
+    # not from the \Packages\Claude_ DATA directory - matching the data path here is the
+    # bug that aborted the 2026-08-06 run (the app was undetectable by construction).
+    # The helper is the one Claude binary that runs from the data directory, so it can
+    # never match this and needs no exclusion.
     Get-Process -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and $_.Path -match '\\Packages\\Claude_' -and
-        $_.Path -notmatch '\\ChromeNativeHost\\chrome-native-host\.exe$'
+        $_.Path -and $_.Path -match '\\WindowsApps\\Claude_'
     }
 }
 function Get-HelperProcs {
@@ -79,6 +90,14 @@ function Wait-Until([scriptblock]$Cond, [string]$What, [int]$TimeoutSec = 600) {
     while (-not (& $Cond)) {
         if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) { throw "Timed out waiting for: $What" }
         Start-Sleep -Seconds 2
+    }
+}
+function Wait-HumanGate([scriptblock]$Cond, [string]$What) {
+    # For steps a human performs: never race a clock against a person. Re-prompt until
+    # the condition verifies or they explicitly abort.
+    while (-not (& $Cond)) {
+        $r = Ask "Not verified yet: $What. Press Enter to re-check, or type 'abort' to stop the run"
+        if ($r -eq 'abort') { throw "Operator aborted at: $What" }
     }
 }
 
@@ -154,7 +173,7 @@ try {
     Mark 'P1' 'begin'
     if (-not (Get-DesktopAppProcs)) {
         Ask "Desktop app not detected - open it, then press Enter"
-        Wait-Until { Get-DesktopAppProcs } 'desktop app to appear' 120
+        Wait-HumanGate { Get-DesktopAppProcs } 'desktop app running'
     }
     Mark 'P1' 'app-verified-running' ((Get-DesktopAppProcs | Measure-Object).Count.ToString() + ' procs')
     $d = Ask "Use the DESKTOP APP briefly (open a chat, send a throwaway message) so its own store writes land in the trace. Describe what you did"
@@ -166,7 +185,7 @@ try {
     Write-Host "`n=== PHASE 2 - close the desktop app; helper must SURVIVE ==="
     Mark 'P2' 'begin'
     Ask "Fully close the Claude desktop app now (system tray too). Press Enter when done"
-    Wait-Until { -not (Get-DesktopAppProcs) } 'desktop app processes to exit' 300
+    Wait-HumanGate { -not (Get-DesktopAppProcs) } 'desktop app fully exited'
     if (-not (Get-HelperProcs)) {
         Mark 'P2' 'HELPER-DIED-WITH-APP' 'decisive window unavailable this run'
         Write-Host "NOTE: helper exited with the app - the helper-only window did not occur. Continuing (the run still yields controls)."
@@ -187,7 +206,7 @@ try {
     Write-Host "`n=== PHASE 3 - exit Chrome fully; helper must EXIT ==="
     Mark 'P3' 'begin'
     Ask "Fully exit Chrome now (all windows; check the tray). Press Enter when done"
-    Wait-Until { -not (Get-HelperProcs) } 'helper to exit' 300
+    Wait-HumanGate { -not (Get-HelperProcs) } 'helper exited'
     Mark 'P3' 'helper-exited'
 }
 finally {
@@ -195,14 +214,19 @@ finally {
     Write-Host "`nStopping capture..."
     Set-Content -Path $canaryStop -Value 'stop'
     Receive-Job $canaryJob -Wait -ErrorAction SilentlyContinue | Out-Null; Remove-Job $canaryJob -Force -ErrorAction SilentlyContinue
-    & $procmon /Terminate | Out-Null
+    # Start-Process -Wait on both procmon calls: GUI processes detach from `&`, and the
+    # 2026-08-06 run marked 'csv-exported' 45 ms after launch while the real export was
+    # still running - the completion marks below are only truthful with -Wait.
+    Start-Process -FilePath $procmon -ArgumentList '/Terminate' -Wait
     Start-Sleep -Seconds 5
     Mark 'P4' 'capture-stopped'
-    Write-Host "Exporting CSV (this can take a while on a large trace)..."
-    & $procmon /AcceptEula /Quiet /OpenLog $pml /SaveAs $csv
-    Mark 'P4' 'csv-exported' $csv
+    Write-Host "Exporting CSV (minutes on a multi-GB trace; the run stays open until it finishes)..."
+    Start-Process -FilePath $procmon -ArgumentList '/AcceptEula', '/Quiet', '/OpenLog', $pml, '/SaveAs', $csv -Wait
+    Mark 'P4' 'csv-exported' ("{0} ({1:N0} bytes)" -f $csv, (Get-Item $csv -ErrorAction SilentlyContinue).Length)
     if (-not $KeepPml -and (Test-Path $csv) -and ((Get-Item $csv).Length -gt 0)) {
-        Remove-Item $pml -Force; Mark 'P4' 'pml-deleted' 'pass -KeepPml to retain'
+        # high-volume captures roll continuation segments (capture-1.pml, ...) - remove them all
+        Get-ChildItem (Join-Path $outDir 'capture*.pml') | Remove-Item -Force
+        Mark 'P4' 'pml-deleted' 'all segments; pass -KeepPml to retain'
     }
 }
 

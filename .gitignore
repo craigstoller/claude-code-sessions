@@ -3,3 +3,6 @@ __pycache__/
 dist/
 .pytest_cache/
 .superpowers/
+
+# elevated-capture output: multi-GB traces of machine-wide file activity - never commit
+tools/native-host-measurement/elevated/capture-*/
