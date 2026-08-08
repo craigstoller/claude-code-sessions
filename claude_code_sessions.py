@@ -643,6 +643,91 @@ def _is_cli_process(text):
             or "\\.local\\bin\\claude " in text)
 
 
+# RULING 6 (2026-08-07). The desktop app's Chrome-extension helper does not count
+# as the desktop app - but ONLY the exact binary that was measured.
+#
+# Measured by tools/native-host-measurement/watch_ceremony.py: across a 4m23s
+# helper-only window (desktop app confirmed gone, helper alive, extension round
+# trips performed inside it) followed by a graceful Chrome-EOF shutdown (the
+# helper closed itself, exit code 0), neither a continuous ReadDirectoryChangesW
+# watch nor a sha256 snapshot diff across the window recorded any mutation of the
+# store. Both instruments were needed: a pure mapped-section write produces no
+# directory-change notification at all. See docs/internals.md, "The Chrome native
+# host, and why it still counts" and its 2026-08-07 amendment - including the
+# standing caveat that this is ONE clean trial.
+#
+# The binding is the anchored package-path segment chain AND the binary's hash,
+# because the helper auto-updates in place: it changed under this very
+# investigation (744187C7... -> 711AD7E7..., same path, same byte length). A
+# path-only exclusion would therefore silently inherit trust for code nobody
+# measured. On any mismatch - different hash, unreadable file, a path that is not
+# the anchored chain - the helper COUNTS exactly as it did before, so the worst
+# case is the previous behaviour and never worse.
+_HELPER_SHA256 = "711ad7e7dec73aa58187479f5f99b13480df93ab1306bd171a61027d84fa81f1"
+_HELPER_PKG_ANCHOR = "\\packages\\claude_"
+_HELPER_DIR_ANCHOR = "\\localcache\\roaming\\claude\\chromenativehost\\"
+_HELPER_EXE = "\\chrome-native-host.exe"
+
+
+def _looks_like_chrome_helper(text):
+    """True when TEXT is the helper's own image path - not merely a mention of it.
+
+    ENDS-WITH on the basename is load-bearing: the lister hands this function an
+    unparsed entry, and on POSIX that can be a whole command line, so a
+    CONTAINS test could be satisfied by a command-line ARGUMENT naming the
+    helper. A trailing argument breaks the ends-with and the entry falls
+    through to counting, which is the safe direction.
+    """
+    text = text.replace("/", "\\")
+    return (_HELPER_PKG_ANCHOR in text and _HELPER_DIR_ANCHOR in text
+            and text.endswith(_HELPER_EXE))
+
+
+def _measured_helper_state(text):
+    """'measured' | 'changed' | 'unreadable' | None (not the helper at all).
+
+    Only 'measured' licenses the exclusion. Every other outcome counts, so a
+    helper we cannot hash is treated exactly like one we never measured -
+    "couldn't look" is never "nothing there".
+
+    Deliberately NOT cached on (path, size, mtime). An earlier revision did, and
+    it was a fail-open: the one helper update actually observed kept the SAME byte
+    length (1,018,704 both builds), so metadata is not content identity here, and a
+    same-size same-mtime replacement would have been served a stale "measured"
+    verdict for bytes nobody measured. Re-reading ~1 MB a few times per command is
+    cheap; carrying trust across an update is not.
+    """
+    if not _looks_like_chrome_helper(text):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(text, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        digest = h.hexdigest()
+    except OSError:
+        return "unreadable"
+    return "measured" if digest == _HELPER_SHA256 else "changed"
+
+
+def helper_hash_note(running):
+    """Explain a helper that is counted because it is not the measured build."""
+    for text in running:
+        state = _measured_helper_state(text)
+        if state in ("changed", "unreadable"):
+            return (
+                "\nNote: the process above is the desktop app's Chrome-extension "
+                "helper. A measured build of it is excluded from this guard, but this "
+                "one {0} - the helper auto-updates in place, so an exclusion cannot "
+                "carry over to code that was never measured. Closing Chrome clears "
+                "this. To restore the exclusion, re-measure with "
+                "tools/native-host-measurement/watch_ceremony.py (about 12 minutes) "
+                "and update _HELPER_SHA256.".format(
+                    "could not be read" if state == "unreadable"
+                    else "is a different binary"))
+    return ""
+
+
 def claude_running(env):
     my_pids = {os.getpid(), os.getppid()}
     try:
@@ -657,6 +742,8 @@ def claude_running(env):
             continue                       # nor on another instance of this tool
         if _is_cli_process(text):
             continue                       # the Claude Code CLI, not the desktop app
+        if _measured_helper_state(text) == "measured":
+            continue                       # RULING 6: the measured Chrome helper
         if "claude" in text:
             out.append(text)
     return out
@@ -2468,7 +2555,8 @@ def _guard_mutation(env, what):
         "the Claude desktop app appears to be running ({0}); refusing to {1} "
         "another account's store while it is. No identity-file evidence can make "
         "'the destination is dormant' certain enough to mutate under a running "
-        "app - close the desktop app and re-run.{2}".format(running[0], what, extra))
+        "app - close the desktop app and re-run.{2}{3}".format(
+            running[0], what, extra, helper_hash_note(running)))
 
 
 # _certified_live_account's three states (RULING 5). Tri-state on purpose:

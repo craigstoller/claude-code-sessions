@@ -292,12 +292,9 @@ class TestClaudeRunningNarrowing:
 
 
     def test_chrome_native_host_still_counts(self, mkenv, tmp_path):
-        # The desktop app's Chrome-extension helper, which can outlive the app.
-        # A 2026-08-05 measurement (docs/internals.md, "The Chrome native host")
-        # could not establish that it never opens the store for write - handle
-        # sampling missed even the desktop app's own atomic writes, and the
-        # decisive leg (app closed, helper alive) went uncaptured - so it must
-        # keep counting. No exclusion without positive evidence.
+        # RULING 6 excludes the helper only when the binary on disk hashes to the
+        # MEASURED build. This path does not exist, so the hash cannot be read and
+        # the helper counts - "couldn't look" is never "nothing there".
         env = mkenv(tmp_path)
         exe = ("c:\\users\\u\\appdata\\local\\packages\\claude_pzs8sxrjxfjjc\\"
                "localcache\\roaming\\claude\\chromenativehost\\"
@@ -314,6 +311,100 @@ class TestClaudeRunningNarrowing:
                "localcache\\roaming\\claude\\chromenativehost\\"
                "chrome-native-host.exe")
         assert not ct._is_cli_process(exe)
+
+    # --------------------------------------- RULING 6: the measured Chrome helper
+
+    @staticmethod
+    def _helper_on_disk(tmp_path, content=b"measured-helper-bytes"):
+        """A real file at a path carrying the anchored package segment chain.
+
+        Every directory is created LOWERCASE on purpose. The guard lowercases
+        lister entries and then stats that string, which is harmless on Windows
+        but not on the Linux CI legs: a path built under mixed-case directories
+        would not exist once lowercased, the hash would read as unreadable, and
+        these tests would fail there while passing here.
+        """
+        d = (tmp_path / "appdata" / "local" / "packages" / "claude_pzs8sxrjxfjjc"
+             / "localcache" / "roaming" / "claude" / "chromenativehost")
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "chrome-native-host.exe"
+        p.write_bytes(content)
+        return str(p).lower()
+
+    def test_measured_helper_is_excluded(self, mkenv, tmp_path, monkeypatch):
+        # The whole point of RULING 6: the build that was measured does not count,
+        # so a mutation no longer needs Chrome closed.
+        exe = self._helper_on_disk(tmp_path)
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    def test_updated_helper_counts_again(self, mkenv, tmp_path, monkeypatch):
+        # The helper auto-updates in place - observed changing mid-investigation
+        # (744187C7... -> 711AD7E7..., same path). An exclusion must NOT carry
+        # over to a binary nobody measured.
+        exe = self._helper_on_disk(tmp_path, b"a-different-build-entirely")
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_updated_helper_refusal_explains_itself(self, mkenv, tmp_path,
+                                                    monkeypatch):
+        exe = self._helper_on_disk(tmp_path, b"a-different-build-entirely")
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        note = ct.helper_hash_note([exe])
+        assert "different binary" in note and "watch_ceremony.py" in note
+
+    def test_helper_named_as_an_argument_does_not_dodge_the_guard(
+            self, mkenv, tmp_path, monkeypatch):
+        # The lister hands us an unparsed entry; on POSIX that can be a whole
+        # command line. A CONTAINS test would let a process merely MENTIONING the
+        # helper inherit its exclusion. Trailing args must break the match.
+        exe = self._helper_on_disk(tmp_path)
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        env = mkenv(tmp_path)
+        masquerade = exe + " --parent-window 0"
+        env.process_lister = lambda: [(99999, masquerade)]
+        assert ct.claude_running(env) == [masquerade]
+
+    def test_helper_basename_outside_the_package_chain_counts(
+            self, mkenv, tmp_path):
+        # Same basename, same-named parent directory, still claude-named - but NOT
+        # under \packages\claude_..., so the anchored chain does not match and the
+        # exclusion must not apply. Bound to the chain, never to a filename.
+        # No file is created on purpose: the anchor check must reject this before
+        # any hash is attempted, so a hash could not rescue it either.
+        env = mkenv(tmp_path)
+        exe = "d:\\claude\\chromenativehost\\chrome-native-host.exe"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_excluded_helper_does_not_excuse_the_desktop_app(
+            self, mkenv, tmp_path, monkeypatch):
+        # The exclusion must be per-process, never a blanket "Claude isn't
+        # running" - the desktop app beside it still stops every mutation.
+        exe = self._helper_on_disk(tmp_path)
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, exe), (99998, DESKTOP_EXE)]
+        assert ct.claude_running(env) == [DESKTOP_EXE]
 
     def test_forward_slash_cli_path_is_still_the_cli(self, mkenv, tmp_path):
         # separators must be normalised before matching - a forward-slash
