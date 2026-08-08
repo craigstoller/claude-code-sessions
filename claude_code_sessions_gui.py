@@ -1,32 +1,42 @@
-"""Double-clickable front end for `ccs sync` - no terminal, nothing to remember.
+"""Windowed front end for `ccs sync` - no terminal, nothing to remember.
+
+    ccs-gui                     open the window
+    ccs-gui --install-shortcut  put "Claude session sync" on the Desktop + Start Menu
+    ccs-gui --remove-shortcut   take them away again
+
+Installed as a GUI script (pyproject's [project.gui-scripts]), so the launcher
+runs under pythonw and no console window ever appears - the console-script
+equivalent would flash one on every double-click.
 
 Deliberately a THIN SHELL over the library, not a reimplementation: it calls
 plan_sync() and run_sync() exactly as the CLI does, so every refusal, guard, and
 safety property (RULING 4's running-app guard, RULING 5's --live certification,
 RULING 6's helper exclusion, tombstone skipping, dry-run-then-apply) behaves
-identically here. The GUI adds no path of its own into the store.
+identically here. It adds no path of its own into the store.
 
 Two rules it holds to:
   - Nothing is written until you press Apply. Opening the window plans only.
   - A refusal is shown verbatim, never summarised into something friendlier.
     The refusals in this tool carry the reason and the fix, and softening them
     would be the one place a GUI could do real harm.
-
-Saved as .pyw so Windows runs it without a console window. Create a shortcut
-with tools/install_shortcut.py.
 """
 
+import argparse
 import os
+import subprocess
 import sys
 import threading
 import traceback
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import tkinter as tk
-from tkinter import ttk, messagebox
-
 import claude_code_sessions as ccs
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    TK_ERROR = None
+except ImportError as _exc:            # tkinter is stdlib but packaged separately
+    tk = ttk = messagebox = None       # on some Linux distros (apt install python3-tk)
+    TK_ERROR = str(_exc)
 
 PAD = 10
 
@@ -290,7 +300,116 @@ class SyncApp:
         self.manifest = None
 
 
-def main():
+# ------------------------------------------------------------------- shortcuts
+
+SHORTCUT_NAME = "Claude session sync.lnk"
+
+
+def _psq(s):
+    """A PowerShell single-quoted literal. Backslashes are literal inside one,
+    which is exactly what a Windows path needs - Python's repr is NOT a
+    substitute, since it escapes for Python and PowerShell then takes the
+    doubled backslashes literally."""
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _shortcut_paths():
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    start = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
+                         "Start Menu", "Programs")
+    return [os.path.join(d, SHORTCUT_NAME) for d in (desktop, start)
+            if d and os.path.isdir(d)]
+
+
+def _launcher():
+    """The installed ccs-gui launcher, so a shortcut survives this file moving.
+
+    sys.executable is the launcher itself when frozen by a gui-script wrapper;
+    otherwise fall back to pythonw + this module, which is what a source
+    checkout has.
+    """
+    exe = sys.executable or ""
+    if os.path.basename(exe).lower().startswith("ccs-gui"):
+        return exe, ""
+    guess = os.path.join(os.path.dirname(exe), "ccs-gui.exe")
+    if os.path.isfile(guess):
+        return guess, ""
+    pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    return (pyw if os.path.isfile(pyw) else exe), os.path.abspath(__file__)
+
+
+def manage_shortcut(remove=False):
+    if os.name != "nt":
+        print("Shortcuts are Windows-only (as are this tool's store mutations).")
+        return 2
+    target, arg = _launcher()
+    done = []
+    for link in _shortcut_paths():
+        if remove:
+            try:
+                os.remove(link)
+                done.append("removed " + link)
+            except OSError:
+                pass
+            continue
+        # Arguments is set UNCONDITIONALLY, including to empty. CreateShortcut on
+        # an existing .lnk loads its current properties, so skipping this when
+        # there is no argument leaves a stale one behind - measured: after moving
+        # the GUI into the package, the target updated to ccs-gui.exe while
+        # Arguments still pointed at the old tools/sync_gui.pyw. The launcher
+        # would then be handed a path it rejects, with no console to show why.
+        quoted_arg = ('"' + arg + '"') if arg else ""
+        ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut({0});"
+              "$s.TargetPath = {1};"
+              "$s.Arguments = {2};"
+              "$s.WorkingDirectory = {3};"
+              "$s.IconLocation = {1};"
+              "$s.Description = 'Copy Claude sessions to your other account';"
+              "$s.Save()"
+              ).format(_psq(link), _psq(target), _psq(quoted_arg),
+                       _psq(os.path.dirname(target)))
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", ps], capture_output=True, text=True)
+        if r.returncode != 0:
+            print("failed:", link, r.stderr.strip())
+            return 1
+        done.append("created " + link)
+    for line in done:
+        print(line)
+    if not remove and done:
+        print('\nDouble-click "Claude session sync" to plan a sync. Nothing is '
+              "written until you press Apply.")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ccs-gui", description="Windowed front end for claude-code-sessions sync.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--install-shortcut", action="store_true",
+                   help="add Desktop + Start Menu shortcuts (Windows)")
+    g.add_argument("--remove-shortcut", action="store_true",
+                   help="remove those shortcuts")
+    ns = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if ns.install_shortcut or ns.remove_shortcut:
+        return manage_shortcut(remove=ns.remove_shortcut)
+
+    if TK_ERROR:
+        # A GUI script has no console to print to, so say it where it can be seen.
+        msg = ("This window needs tkinter, which is part of the Python standard "
+               "library but is packaged separately on some Linux distributions "
+               "(try: sudo apt install python3-tk).\n\n" + TK_ERROR)
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Add-Type -AssemblyName PresentationFramework;"
+                            "[System.Windows.MessageBox]::Show({0})".format(_psq(msg))],
+                           check=False)
+        except OSError:
+            pass
+        print(msg, file=sys.stderr)
+        return 2
+
     root = tk.Tk()
     try:
         SyncApp(root)

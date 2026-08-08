@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-code-sessions"
-version = "0.9.1"
+version = "0.9.2"
 description = "Unofficial CLI for Claude Code sessions on disk: make a session visible under your other Claude account on the same machine, or move one between project folders. Journaled, reversible, fails closed."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,5 +38,10 @@ Issues = "https://github.com/craigstoller/claude-code-sessions/issues"
 claude-code-sessions = "claude_code_sessions:main"
 ccs = "claude_code_sessions:main"
 
+# gui-scripts, not scripts: the launcher runs under pythonw, so double-clicking
+# a shortcut never flashes a console window. A console-script entry point would.
+[project.gui-scripts]
+ccs-gui = "claude_code_sessions_gui:main"
+
 [tool.setuptools]
-py-modules = ["claude_code_sessions"]
+py-modules = ["claude_code_sessions", "claude_code_sessions_gui"]

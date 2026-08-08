@@ -7,3 +7,5 @@ dist/
 # elevated-capture output: multi-GB traces of machine-wide file activity - never commit
 tools/native-host-measurement/elevated/capture-*/
 tools/native-host-measurement/watch-*/
+build/
+dist/
