@@ -81,6 +81,9 @@ class SyncApp:
         # about this machine, while "which account is signed in" changes every
         # time you switch. A remembered answer would be a stale assertion.
         self.live_choice = ""
+        # Bumped on every plan; a callback whose generation is stale is dropped
+        # rather than allowed to install a superseded manifest.
+        self.generation = 0
         root.title("Claude session sync")
         root.geometry("880x580")
         root.minsize(700, 460)
@@ -94,7 +97,23 @@ class SyncApp:
 
         self.detail = tk.StringVar(value="")
         ttk.Label(outer, textvariable=self.detail, wraplength=840, justify="left",
-                  foreground="#555").pack(anchor="w", pady=(4, PAD))
+                  foreground="#555").pack(anchor="w", pady=(4, 6))
+
+        # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
+        # rather than per-row checkboxes: checkboxes would mean assembling a
+        # subset here and handing plan_sync a selection it did not make, i.e. a
+        # second route into the store. This stays one route.
+        filt = ttk.Frame(outer)
+        filt.pack(fill="x", pady=(0, PAD))
+        ttk.Label(filt, text="Only sessions whose title contains:").pack(side="left")
+        self.only_var = tk.StringVar(value="")
+        self.only_entry = ttk.Entry(filt, textvariable=self.only_var, width=34)
+        self.only_entry.pack(side="left", padx=6)
+        self.only_entry.bind("<Return>", lambda _e: self.refresh())
+        self.filter_btn = ttk.Button(filt, text="Apply filter", command=self.refresh)
+        self.filter_btn.pack(side="left")
+        self.clear_btn = ttk.Button(filt, text="Clear", command=self._clear_filter)
+        self.clear_btn.pack(side="left", padx=(4, 0))
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
@@ -115,6 +134,8 @@ class SyncApp:
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
         self.refresh_btn.pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="Close", command=root.destroy).pack(side="left")
+        self.doctor_btn = ttk.Button(bar, text="Health check", command=self.on_doctor)
+        self.doctor_btn.pack(side="left", padx=(6, 0))
         self.forget_btn = ttk.Button(bar, text="Change destination",
                                      command=self.forget_destination)
         if self.dest_choice:
@@ -130,13 +151,19 @@ class SyncApp:
         self.text.configure(state="disabled")
 
     def busy(self, on):
-        # Undo is included: leaving it live during a plan or a copy let a click
-        # launch a competing worker - mutation locks then produce spurious
-        # refusals, an unlocked plan can read a half-undone destination, and the
-        # two callbacks overwrite each other's status text.
+        """Disable EVERY action while a worker runs - not a selected few.
+
+        Each control left live is a competing worker: mutation locks produce
+        spurious refusals, an unlocked plan can read a half-undone destination,
+        and callbacks overwrite each other's UI state. The health check was the
+        sharpest case - it clears self.manifest, so finishing mid-copy made the
+        apply callback fault on a manifest that had become None *after the rows
+        were already written*.
+        """
         state = "disabled" if on else "normal"
-        self.refresh_btn.configure(state=state)
-        self.undo_btn.configure(state=state)
+        for w in (self.refresh_btn, self.undo_btn, self.doctor_btn,
+                  self.only_entry, self.filter_btn, self.clear_btn):
+            w.configure(state=state)
 
     # ---------------------------------------------------------------- planning
     def refresh(self, keep_live=False):
@@ -148,24 +175,37 @@ class SyncApp:
         # being told.)
         if not keep_live:
             self.live_choice = ""
+        # Snapshot the filter on the UI thread and carry it through. Reading
+        # only_var again inside the worker or the callback let a quick A-then-B
+        # change install an A-selected manifest while the window described it as
+        # filtered by B - so Apply would copy something other than what was
+        # shown. The generation counter drops stale callbacks outright.
+        self.generation += 1
+        gen = self.generation
+        only = self.only_var.get().strip()
         self.busy(True)
         self.apply_btn.configure(state="disabled")
         self.status.set("Planning...")
         self.detail.set("")
         self.show([])
-        threading.Thread(target=self._plan_worker, daemon=True).start()
+        threading.Thread(target=self._plan_worker, args=(gen, only),
+                         daemon=True).start()
 
-    def _plan_worker(self):
+    def _plan_worker(self, gen, only):
         try:
-            flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice)
+            flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice,
+                                  only=only)
             manifest = ccs.plan_sync(self.env, flags)
-            self.root.after(0, self._plan_done, manifest, None)
+            self.root.after(0, self._plan_done, gen, only, manifest, None)
         except ccs.Refusal as exc:
-            self.root.after(0, self._plan_done, None, ("refusal", str(exc)))
+            self.root.after(0, self._plan_done, gen, only, None, ("refusal", str(exc)))
         except Exception:
-            self.root.after(0, self._plan_done, None, ("error", traceback.format_exc()))
+            self.root.after(0, self._plan_done, gen, only, None,
+                            ("error", traceback.format_exc()))
 
-    def _plan_done(self, manifest, problem):
+    def _plan_done(self, gen, only, manifest, problem):
+        if gen != self.generation:
+            return                       # superseded by a newer plan
         self.busy(False)
         if problem:
             kind, msg = problem
@@ -230,12 +270,23 @@ class SyncApp:
         # yesterday and want it back" is the same need, and the CLI was the
         # only answer to it before.
         self._sync_undo_button()
+        # A filter that hides candidates must say so on the status line, not only
+        # in the tally: "nothing to copy" reads as "you are up to date", which is
+        # a different and misleading statement when a filter caused it.
+        suffix = "  (filtered by “{0}”)".format(only) if only else ""
         if rows:
-            self.status.set("{0} session{1} ready to copy".format(
-                len(rows), "" if len(rows) == 1 else "s"))
+            self.status.set("{0} session{1} ready to copy{2}".format(
+                len(rows), "" if len(rows) == 1 else "s", suffix))
             self.detail.set("Nothing is written until you press Apply. The Claude "
                             "desktop app must be closed for that step.")
             self.apply_btn.configure(state="normal")
+        elif only:
+            # NOT "no titles match": a title can match and still not be copyable
+            # - already present, transcript gone, tombstoned. The tally above
+            # shows which, so claim only what is certain.
+            self.status.set("No sessions matching “{0}” are ready to copy".format(only))
+            self.detail.set("Any that matched but were skipped are counted above. "
+                            "Clear the filter to see everything.")
         else:
             self.status.set("Nothing to copy - the other account is up to date")
             self.detail.set("")
@@ -352,6 +403,100 @@ class SyncApp:
                        "the account you are using, or switch the desktop app, so the two "
                        "records agree.").pack(anchor="w")
         ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
+
+    def _clear_filter(self):
+        self.only_var.set("")
+        self.refresh()
+
+    # ----------------------------------------------------------------- doctor
+    @staticmethod
+    def doctor_lines(rep, home=""):
+        """The health report, findings first. Pure so it can be checked offline.
+
+        Ordered by what actually blocks or endangers a sync rather than by what
+        is numerous: an unresolved operation or a stale lock stops the next
+        mutation, while dozens of aged-out transcripts are routine. Reporting
+        them in report order would bury the one that matters.
+        """
+        blocking, notes = [], []
+        st0 = rep.get("stores") or {}
+        if st0.get("status") == "error":
+            # gather_doctor exits 2 here and every mutation fails closed -
+            # "couldn't look" is never "nothing there". Reporting this as merely
+            # informational would claim a sync is possible when it is not.
+            blocking.append("The session store could not be read: {0}. Mutations fail "
+                            "closed until this is resolved.".format(
+                                st0.get("detail") or "no detail reported"))
+        if rep.get("stale_lock"):
+            blocking.append("A stale lock is present - a previous run was interrupted. "
+                            "`ccs recover` resolves it.")
+        n = len(rep.get("nonterminal_ops") or [])
+        if n:
+            blocking.append("{0} operation(s) left unresolved by an interruption. "
+                            "`ccs recover` classifies and finishes them.".format(n))
+        if rep.get("row_errors"):
+            blocking.append("{0} listing row(s) are unreadable - mutations are blocked "
+                            "until they are readable again.".format(len(rep["row_errors"])))
+        if rep.get("unknown_layout"):
+            blocking.append("{0} unrecognised item(s) in the store layout. The tool "
+                            "fails closed on these.".format(len(rep["unknown_layout"])))
+
+        st = rep.get("stores") or {}
+        notes.append("store: {0}".format(st.get("status", "?")))
+        for r in (st.get("roots") or []):
+            notes.append("   " + (r.replace(home, "~") if home and r.startswith(home) else r))
+        notes.append("listing rows: {0}".format(rep.get("row_count", "?")))
+        for key, label in (
+                ("dead_rows", "rows whose transcript is gone (usually retention)"),
+                ("blank_rows", "rows with no transcript link"),
+                ("unlisted_transcripts", "transcripts with no listing row (normal for "
+                                         "CLI-created sessions)"),
+                ("legacy_folders", "legacy-layout folders")):
+            v = rep.get(key)
+            if v:
+                notes.append("{0}: {1}".format(label, len(v)))
+
+        out = []
+        if blocking:
+            out.append("NEEDS ATTENTION")
+            out += ["  - " + b for b in blocking]
+            out.append("")
+        else:
+            out += ["Nothing is blocking a sync.", ""]
+        out.append("Inventory")
+        out += ["  " + n for n in notes]
+        out += ["", "These counts are observations, not errors - see `ccs doctor` for the "
+                    "full report with its reasoning."]
+        return out
+
+    def on_doctor(self):
+        self.busy(True)
+        self.apply_btn.configure(state="disabled")
+        self.status.set("Checking...")
+        self.detail.set("")
+        threading.Thread(target=self._doctor_worker, daemon=True).start()
+
+    def _doctor_worker(self):
+        try:
+            rep = ccs.gather_doctor(self.env)
+            self.root.after(0, self._doctor_done, rep, None)
+        except Exception:
+            self.root.after(0, self._doctor_done, None, traceback.format_exc())
+
+    def _doctor_done(self, rep, err):
+        self.busy(False)
+        if err:
+            self.status.set("Health check failed")
+            self.detail.set("")
+            self.show([err])
+            return
+        lines = self.doctor_lines(rep, self.env.home)
+        blocking = lines and lines[0] == "NEEDS ATTENTION"
+        self.status.set("Health check: needs attention" if blocking
+                        else "Health check: nothing blocking a sync")
+        self.detail.set("Read-only - this changed nothing. Press Refresh to plan a sync.")
+        self.show(lines)
+        self.manifest = None      # the text area no longer shows a plan
 
     # ------------------------------------------------------------------- undo
     def _find_undoable_sync(self):
@@ -480,18 +625,23 @@ class SyncApp:
         self.busy(True)
         self.apply_btn.configure(state="disabled")
         self.status.set("Copying...")
-        threading.Thread(target=self._apply_worker, daemon=True).start()
+        threading.Thread(target=self._apply_worker, args=(self.manifest,),
+                         daemon=True).start()
 
-    def _apply_worker(self):
+    def _apply_worker(self, manifest):
+        # The manifest is passed in, not read from self, so a callback that runs
+        # concurrently cannot pull it out from under a copy that already wrote
+        # rows. (The health check used to do exactly that by clearing it.)
         try:
-            result = ccs.run_sync(self.env, self.manifest)
-            self.root.after(0, self._apply_done, result, None)
+            result = ccs.run_sync(self.env, manifest)
+            self.root.after(0, self._apply_done, manifest, result, None)
         except ccs.Refusal as exc:
-            self.root.after(0, self._apply_done, None, ("refusal", str(exc)))
+            self.root.after(0, self._apply_done, manifest, None, ("refusal", str(exc)))
         except Exception:
-            self.root.after(0, self._apply_done, None, ("error", traceback.format_exc()))
+            self.root.after(0, self._apply_done, manifest, None,
+                            ("error", traceback.format_exc()))
 
-    def _apply_done(self, result, problem):
+    def _apply_done(self, manifest, result, problem):
         self.busy(False)
         if problem:
             kind, msg = problem
@@ -503,7 +653,7 @@ class SyncApp:
             # is fixable in seconds - so leave Apply reachable after a Refresh.
             self.apply_btn.configure(state="disabled")
             return
-        written = sum(1 for r in (self.manifest.get("rows") or []) if r.get("written"))
+        written = sum(1 for r in (manifest.get("rows") or []) if r.get("written"))
         self.live_choice = ""            # an assertion covers one run, not a session
         self.status.set("Copied {0} session{1}".format(
             written, "" if written == 1 else "s"))
