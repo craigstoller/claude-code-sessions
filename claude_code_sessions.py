@@ -2747,7 +2747,18 @@ def _candidate_line(account_uuid, org_uuid, path, rows):
     previously unambiguous sync into a refusal whose two lines differed only
     in an org-id prefix, saying nothing about which held 290 sessions and
     which held none. The path could not settle it either: both sat under the
-    same store root."""
+    same store root.
+
+    `cross_org` marks a candidate that pairs its account with the org of the
+    account you are SIGNED IN AS. Observed 2026-08-08 on a two-account machine:
+    the store is filed per <account>/<org> PAIR, and all four combinations of
+    two accounts and two orgs existed on disk - but only the two pairing an
+    account with its OWN org held sessions (266 and 315 rows); both cross pairs
+    held none. That makes the tag a second discriminator, and one that works
+    where the row count cannot: a genuinely fresh second account also shows zero
+    rows, so "empty" alone does not separate scaffolding from new. Evidence
+    offered, never a filter applied - the pairing behaviour is an observation
+    about an undocumented layout, not a rule the app promises to keep."""
     if rows is None:
         label = "(row count unreadable)"
     elif rows == 0:
@@ -2758,7 +2769,7 @@ def _candidate_line(account_uuid, org_uuid, path, rows):
         account_uuid[:8], org_uuid[:8], label, path)
 
 
-def _candidate_listing(items):
+def _candidate_listing(items, live_org=None):
     """The whole "which store did you mean" block: one _candidate_line per
     (account, org, path) triple, plus a footnote when any candidate holds no
     listing rows.
@@ -2769,17 +2780,41 @@ def _candidate_listing(items):
     no rows yet becomes a legitimate destination the moment its account/org
     pair is signed in to, and silently deciding for the user which stores are
     real is the opposite of how the rest of this module behaves. So the count
-    is offered as evidence and the choice stays theirs."""
-    lines, any_empty = [], False
+    is offered as evidence and the choice stays theirs.
+
+    `live_org` (the signed-in account's organization, when one is resolved) adds
+    the second discriminator described in _candidate_line. It is optional because
+    the refusals raised BEFORE a live account is resolved - "stores found" when
+    neither identity file names one, and --live's own listings - have no
+    signed-in org to compare against, and inventing one there would be worse
+    than omitting the tag."""
+    lines, any_empty, any_cross = [], False, False
     for account_uuid, org_uuid, path in items:
         rows = _listing_row_count(path)
+        cross = bool(live_org) and org_uuid == live_org
         any_empty = any_empty or rows == 0
+        any_cross = any_cross or cross
         lines.append(_candidate_line(account_uuid, org_uuid, path, rows))
+        if cross:
+            # Its OWN line, not a suffix. A redacted store path already runs
+            # ~110 characters, so a trailing tag landed past column 155 and
+            # wrapped off-screen in any real terminal - present in the string,
+            # invisible to the reader, which is worse than absent.
+            lines.append("        ^ shares your signed-in org - the likelier "
+                         "scaffolding, see below")
     if any_empty:
         lines.append(
             "A store with no listing rows holds no sessions yet - the app created the\n"
             "directory but never filled it. It is still listed, not ruled out: an empty\n"
             "store becomes a real destination as soon as you sign in to that account.")
+    if any_cross:
+        lines.append(
+            "'shares your signed-in org' means that store pairs its account with the\n"
+            "ORGANIZATION of the account you are signed in as. Sessions are filed per\n"
+            "<account>/<org> pair, and on the machine this was measured on only the pairs\n"
+            "joining an account to its OWN org held any sessions. Such a store is the\n"
+            "likelier scaffolding artifact - but it is a hint from an undocumented layout,\n"
+            "not a rule, so it is flagged rather than hidden.")
     return "\n".join(lines)
 
 
@@ -2942,6 +2977,32 @@ def _resolve_live_assertion(env, live, dirs):
     return matched[0]
 
 
+def _authenticated_org(env, account_uuid):
+    """The organizationUuid oauthAccount NAMES for ACCOUNT_UUID, or None.
+
+    Deliberately NOT source.org_uuid, which is a resolved *directory* rather
+    than an authenticated fact: live_account falls back to the first dir under
+    the account when the named org has no dir yet, so that field can itself be
+    a cross-pair/scaffolding org. Tagging candidates against it would then flag
+    the REAL destination as "shares your signed-in org" and steer the user
+    toward the artifact - the precise opposite of the hint's purpose, in a
+    safety-sensitive choice.
+
+    Returns None whenever the org is not authenticated for this account -
+    including config.json-only resolution, which names the account half and
+    nothing about the org. No hint beats a wrong hint.
+    """
+    try:
+        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
+            oa = (json.load(fh) or {}).get("oauthAccount") or {}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(oa, dict) or oa.get("accountUuid") != account_uuid:
+        return None
+    org = oa.get("organizationUuid")
+    return org if isinstance(org, str) and org else None
+
+
 def resolve_sync_endpoints(env, to=None, live=None):
     """(source, destination). Source is the signed-in account; destination is
     the other store. Refuses rather than guessing - row-freshness is NEVER
@@ -3003,15 +3064,20 @@ def resolve_sync_endpoints(env, to=None, live=None):
         if not matched:
             raise Refusal("--to {0!r} matched no other account store".format(to))
         if len(matched) > 1:
-            listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
-                                         for c in matched)
+            listing = _candidate_listing(
+                ((c.account_uuid, c.org_uuid, c.path) for c in matched),
+                _authenticated_org(env, source.account_uuid))
             raise Refusal("--to {0!r} matched {1} accounts; be more specific (a longer "
                           "id, or part of the store path):\n{2}"
                           .format(to, len(matched), listing))
         return source, matched[0]
     if len(others) > 1:
-        listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
-                                     for c in others)
+        # The cross-pair discriminator - the one signal that still works when
+        # every candidate has zero rows (a genuinely fresh second account). Uses
+        # the AUTHENTICATED org, never source.org_uuid; see _authenticated_org.
+        listing = _candidate_listing(
+            ((c.account_uuid, c.org_uuid, c.path) for c in others),
+            _authenticated_org(env, source.account_uuid))
         raise Refusal("more than one other account store; name one with --to:\n" + listing)
     return source, others[0]
 

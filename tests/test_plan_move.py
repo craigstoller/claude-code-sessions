@@ -406,6 +406,63 @@ class TestClaudeRunningNarrowing:
         env.process_lister = lambda: [(99999, exe), (99998, DESKTOP_EXE)]
         assert ct.claude_running(env) == [DESKTOP_EXE]
 
+    # ------------------------- cross-org tagging in "which store did you mean"
+
+    def test_cross_org_candidate_is_tagged(self, tmp_path):
+        # Observed 2026-08-08: the store is filed per <account>/<org> PAIR, and a
+        # two-account machine carried all four combinations - but only the pairs
+        # joining an account to its OWN org held sessions. Flagging the cross pair
+        # is the discriminator that still works when every candidate has zero rows.
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        listing = ct._candidate_listing(
+            [("d0fcaa6f" + "0" * 24, "53346e14" + "0" * 24, str(tmp_path / "a")),
+             ("d0fcaa6f" + "0" * 24, "ef430bfb" + "0" * 24, str(tmp_path / "b"))],
+            live_org="53346e14" + "0" * 24)
+        rows = listing.splitlines()
+        cross_at = [i for i, l in enumerate(rows)
+                    if l.startswith("   d0fcaa6f/53346e14")]
+        own_at = [i for i, l in enumerate(rows)
+                  if l.startswith("   d0fcaa6f/ef430bfb")]
+        assert cross_at and own_at
+        # the marker is its own line directly UNDER the cross candidate: a
+        # trailing suffix landed past column 155 and wrapped off-screen
+        assert "shares your signed-in org" in rows[cross_at[0] + 1]
+        assert "shares your signed-in org" not in rows[own_at[0]]
+        assert "shares your signed-in org" not in rows[own_at[0] + 1]
+        assert "ORGANIZATION of the account you are signed in as" in listing
+
+    def test_authenticated_org_is_used_not_the_resolved_directory(self, mkenv,
+                                                                  tmp_path):
+        # live_account() falls back to the FIRST dir under the account when the
+        # authenticated org has no dir yet, so its org_uuid can itself be a
+        # cross-pair. Tagging against that would flag the real destination and
+        # steer the user to the artifact. Only oauthAccount's own org counts.
+        env = mkenv(tmp_path)
+        acct, org = "a" * 32, "b" * 32
+        with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {"accountUuid": acct,
+                                        "organizationUuid": org}}, fh)
+        assert ct._authenticated_org(env, acct) == org
+        # a different account: the file says nothing about it
+        assert ct._authenticated_org(env, "c" * 32) is None
+
+    def test_authenticated_org_absent_yields_no_hint(self, mkenv, tmp_path):
+        # config.json-only resolution names the account half and nothing about
+        # the org, so there is no signed-in org to compare against.
+        env = mkenv(tmp_path)
+        with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+            json.dump({"oauthAccount": {"accountUuid": "a" * 32}}, fh)
+        assert ct._authenticated_org(env, "a" * 32) is None
+
+    def test_no_cross_org_tag_without_a_resolved_live_org(self, tmp_path):
+        # The refusals raised BEFORE a live account is resolved have no signed-in
+        # org to compare against; they must not imply one.
+        (tmp_path / "a").mkdir()
+        listing = ct._candidate_listing(
+            [("d0fcaa6f" + "0" * 24, "53346e14" + "0" * 24, str(tmp_path / "a"))])
+        assert "[shares your signed-in org]" not in listing
+
     def test_forward_slash_cli_path_is_still_the_cli(self, mkenv, tmp_path):
         # separators must be normalised before matching - a forward-slash
         # CLI path must not be misread as the desktop app

@@ -298,6 +298,41 @@ backed by `execute_op`'s last-instant sha256 re-verification of the source immed
 deletes anything — which only catches a CLI write landing in that narrow window after the fact
 (aborting the op, keeping both copies), not by preventing it.
 
+### The account x org cross-pair, and why an empty store is ambiguous (2026-08-08)
+
+Sessions are filed per **`<accountUuid>/<organizationUuid>` pair**, not per account,
+which is why a machine with two accounts can present more than two candidate stores. On
+the machine measured, all four combinations of two accounts and two orgs existed on disk,
+and the split was clean:
+
+| store | rows |
+|---|---|
+| `d0fcaa6f/ef430bfb` — account with **its own** org | 266 |
+| `dd44e101/53346e14` — account with **its own** org | 315 |
+| `d0fcaa6f/53346e14` — **cross pair** | 0 |
+| `dd44e101/ef430bfb` — **cross pair** | 0 |
+
+Only the pairs joining an account to its own org ever held sessions. One cross pair was
+watched being created two minutes after a sync, containing exactly one file
+(`scheduled-tasks.json`) and no listing rows — so these appear to be scaffolding the app
+writes around account switches. *Appears to be*: the trigger was not isolated, and nothing
+documents the layout.
+
+This matters because **a zero-row store is genuinely ambiguous**. It is either scaffolding
+or a legitimately fresh second account that has not been used yet, and the row count alone
+cannot separate them — which is the one case where the count added in the 2026-08-05
+amendment is no help. The cross-pair test can: `resolve_sync_endpoints` has already
+resolved the signed-in account when it raises "more than one other account store", so it
+passes that account's org to `_candidate_listing`, which tags any candidate sharing it
+`[shares your signed-in org]`.
+
+Kept as evidence, never a filter, for the same reason the row count is: the pairing
+behaviour is an observation about an undocumented layout, not a rule the app has promised
+to keep, and a cross-pair store becomes a real destination the moment its account/org pair
+is signed in to. The tag is omitted entirely where no live account has been resolved (the
+"stores found" listing, and `--live`'s own refusals) — there is no signed-in org to compare
+against there, and implying one would be worse than saying nothing.
+
 ### The Chrome native host, and why it still counts (measured 2026-08-05)
 
 The desktop app ships a helper for its Chrome extension —

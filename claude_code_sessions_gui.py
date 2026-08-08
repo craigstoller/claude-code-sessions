@@ -215,16 +215,22 @@ class SyncApp:
 
             dd44e101/53346e14   (286 rows)          ~\\...\\dd44e101...\\53346e14...
 
-        so a line qualifies when its first token is 'a/b'. The row count stays in
-        the button text: it is what distinguishes the real store from the empty
-        directory the desktop app scaffolds, which is the whole reason that count
-        was added to the refusal.
+        The whole line becomes the button text, so the row count and any
+        [shares your signed-in org] tag travel with it - those are exactly what
+        distinguishes the real store from the empty directory the app scaffolds.
+
+        A LOOSE "first token contains a slash" test is not enough: the refusal's
+        own footnote contains the literal "<account>/<org> pair, and ...", which
+        such a test turns into a bogus button. Ids are 8-hex prefixes, so match
+        exactly that.
         """
+        import re
+        pat = re.compile(r"^[0-9a-f]{8}/[0-9a-f]{8}$")
         out = []
         for line in msg.splitlines():
             stripped = line.strip()
             parts = stripped.split()
-            if len(parts) >= 2 and parts[0].count("/") == 1:
+            if len(parts) >= 2 and pat.match(parts[0]):
                 out.append((parts[0].split("/")[1], stripped))
         return out
 
