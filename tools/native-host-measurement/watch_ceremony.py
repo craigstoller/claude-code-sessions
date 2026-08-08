@@ -69,10 +69,13 @@ kernel32.Process32FirstW.restype = wt.BOOL
 kernel32.Process32FirstW.argtypes = [wt.HANDLE, ctypes.c_void_p]
 kernel32.Process32NextW.restype = wt.BOOL
 kernel32.Process32NextW.argtypes = [wt.HANDLE, ctypes.c_void_p]
+kernel32.GetExitCodeProcess.restype = wt.BOOL
+kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SYNCHRONIZE = 0x00100000
 FILE_LIST_DIRECTORY = 0x0001
 FILE_SHARE_ALL = 0x07
 OPEN_EXISTING = 3
@@ -86,6 +89,10 @@ ACTIONS = {1: "ADDED", 2: "REMOVED", 3: "MODIFIED", 4: "RENAMED_OLD", 5: "RENAME
 APP_IMAGE_RE = r"\windowsapps\claude_"          # the MSIX app EXECUTES from here
 HELPER_TAIL = r"\chromenativehost\chrome-native-host.exe"
 CANARY_PREFIX = ".ccs-watch-canary-"
+# The mapped-write control's own file is control traffic too. The first run classified it
+# as REAL traffic, which meant our own control could satisfy the "watcher sees genuine
+# store writes" check -- a control validating itself.
+MAPPED_CONTROL_NAME = ".ccs-watch-canary-mapped-control.bin"
 HEARTBEAT_SECONDS = 20
 
 
@@ -143,6 +150,24 @@ def helper_procs(table=None):
     t = table if table is not None else process_table()
     return {pid: p for pid, (_, _, p) in t.items()
             if p and p.lower().endswith(HELPER_TAIL)}
+
+
+def open_exit_watch(pid):
+    """Handle kept open so the helper's exit CODE survives its death."""
+    return kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+
+
+def read_exit_code(handle):
+    """0 = the helper closed itself (Chrome EOF). Non-zero (typically 1) = it was
+    terminated, which skips the shutdown code this phase exists to observe."""
+    if not handle:
+        return None
+    code = wt.DWORD()
+    ok = kernel32.GetExitCodeProcess(wt.HANDLE(handle), ctypes.byref(code))
+    kernel32.CloseHandle(wt.HANDLE(handle))
+    if not ok:
+        return None
+    return int(code.value)
 
 
 def ancestry(pid, table):
@@ -313,7 +338,7 @@ def mapped_write_control(root, canaries):
     one is allowed to fail and voids the run when it does.
     """
     import mmap
-    name = "%smapped-control.bin" % CANARY_PREFIX
+    name = MAPPED_CONTROL_NAME
     path = os.path.join(root, name)
     try:
         with open(path, "wb") as fh:
@@ -425,6 +450,19 @@ def verdict(report):
         reasons.append("mapped-section write control was NOT caught by the snapshot "
                        "instrument -- the run cannot speak to the one mutation class "
                        "the watcher is known to miss")
+
+    # The protocol's workload enumerates Chrome exit. The helper shuts down on Chrome's
+    # EOF, and that shutdown path is a plausible write moment; TerminateProcess skips it
+    # entirely. The operator's account of how it ended is not evidence, so the exit code
+    # is read from a handle opened before it died.
+    xc = report.get("helper_exit_code")
+    if xc is None:
+        reasons.append("helper exit code unknown -- cannot tell a graceful Chrome-EOF "
+                       "shutdown from a termination, so the shutdown leg is unmeasured")
+    elif xc != 0:
+        reasons.append("helper exited with code %s, i.e. it was terminated rather than "
+                       "closing itself on Chrome EOF -- its shutdown path never ran, so "
+                       "this run cannot speak to writes during helper shutdown" % xc)
 
     if not (win_start and win_end):
         reasons.append("decisive window absent: " +
@@ -546,6 +584,7 @@ def run_ceremony(outdir, hold_minutes):
     phases, window_note = {}, None
     mapped_caught, window_snapshot_diff = False, None
     d1 = d2 = None
+    helper_watch, helper_exit = None, None
 
     def phase(name):
         phases[name] = now()
@@ -572,6 +611,9 @@ def run_ceremony(outdir, hold_minutes):
             window_note = "helper exited with the app; the helper-only window never occurred"
             print("NOTE:", window_note)
         else:
+            # Handle opened BEFORE the helper dies: an exit code is unreadable afterwards,
+            # and the operator's account of how it ended is not evidence.
+            helper_watch = open_exit_watch(list(helper_procs())[0])
             snap_start = {r: snapshot(r, hb.names) for r in roots}
             phase("app_closed_helper_alive")
             print("Holding the helper-only window for %d minute(s)." % hold_minutes)
@@ -589,10 +631,15 @@ def run_ceremony(outdir, hold_minutes):
                      "and how many?")
             phases["window_workload"] = d3
 
-            print("\n=== PHASE 3 - exit Chrome fully; the helper must EXIT ===")
+            print("\n=== PHASE 3 - exit Chrome; let the helper close ITSELF ===")
+            print("The helper shuts down when Chrome disconnects (EOF). Its shutdown path is")
+            print("a plausible moment for a write, which is why this leg exists.")
+            print("*** Do NOT End Task on chrome-native-host.exe. Killing it skips the very")
+            print("*** shutdown code this phase is here to observe.")
             ask("Fully exit Chrome now (all windows; check the tray). Press Enter when done")
             wait_gate(lambda: not helper_procs(), "helper exited")
             phase("helper_exited")
+            helper_exit = read_exit_code(helper_watch)
             snap_end = {r: snapshot(r, hb.names) for r in roots}
             merged = {"added": [], "removed": [], "changed": [], "errors": []}
             empty = {"files": {}, "errors": [{"where": "root", "error": "no snapshot"}]}
@@ -632,7 +679,8 @@ def run_ceremony(outdir, hold_minutes):
         "window_note": window_note,
         "mapped_write_control_caught": mapped_caught,
         "window_snapshot_diff": window_snapshot_diff,
-        "canary_names": sorted(hb.names),
+        "canary_names": sorted(hb.names) + [MAPPED_CONTROL_NAME],
+        "helper_exit_code": helper_exit,
         "workload": {"p1_app": d1, "p1_extension": d2,
                      "window_extension": phases.get("window_workload")},
         "watchers": [{"root": w.root, "live": w.live, "error": w.error,

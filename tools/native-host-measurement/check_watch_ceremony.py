@@ -23,6 +23,7 @@ def base(**over):
                    "app_closed_helper_alive": "2026-08-07T18:06:00.000+00:00",
                    "helper_exited": "2026-08-07T18:10:00.000+00:00"},
         "window_note": None,
+        "helper_exit_code": 0,
         "mapped_write_control_caught": True,
         "window_snapshot_diff": {"added": [], "removed": [], "changed": [], "errors": []},
         "watchers": [{"root": R, "live": True, "error": None, "overflows": [],
@@ -76,6 +77,10 @@ show("R6 per-root-canary-missing-in-window",
 show("R7 canary-lookalike-counts-as-real",
      base(events=base()["events"] + [
          ev("2026-08-07T18:08:00.000+00:00", r"acc\.ccs-watch-canary-evil.json")]), "FAIL")
+# the leg the real 2026-08-07 run lost: the helper was terminated, so its shutdown
+# code never ran and the run cannot speak to shutdown-time writes
+show("R8 terminated-helper-voids-run", base(helper_exit_code=1), "INCONCLUSIVE")
+show("R9 unknown-exit-code-voids-run", base(helper_exit_code=None), "INCONCLUSIVE")
 
 print("\n--- live: mapped-write control now runs the real snapshot pipeline ---")
 d = tempfile.mkdtemp(prefix="mc-")

@@ -540,6 +540,35 @@ pipeline, which is precisely why it passed while the pipeline was blind above 8 
 one is the lesson worth carrying: **a control that bypasses the instrument it certifies
 certifies nothing.**
 
+**First real run, 2026-08-07 — the alive-window question is answered; the shutdown leg is
+not.** Over a 4 m 44 s helper-only window (desktop app confirmed gone, helper alive, two
+extension round trips performed inside it), **both instruments were silent**: zero watcher
+events under the store, an empty snapshot diff with zero traversal errors, and zero buffer
+overflows. The controls held — 70 canary events inside the window, 42 genuine store writes
+observed in phase 1, mapped-write control caught by the snapshot pipeline. On the alive
+helper, this is the evidence the guard's cost was always waiting on.
+
+It does **not** license the exclusion, because the enumerated workload's last step did not
+happen: the helper was ended from Task Manager rather than allowed to close itself when Chrome
+disconnected. `TerminateProcess` skips the helper's entire shutdown path — and that path, which
+its own log describes as running on `Chrome disconnected (EOF received)`, is exactly the kind
+of moment a process flushes state. So *"does the helper write while alive?"* now has an answer;
+*"does it write while shutting down?"* does not, and a shutdown write is the more dangerous of
+the two, since it could land at the instant the tool decides the helper is gone.
+
+Two fixes came out of that run, both about not trusting narration. The phase-3 prompt said
+"the helper must EXIT", which reasonably reads as an instruction to kill it; it now says to let
+the helper close itself and warns explicitly against ending the task. And the runner no longer
+takes the operator's word for how it ended: it opens a handle to the helper **before** the
+window (an exit code is unreadable afterwards) and reads `GetExitCodeProcess`, treating a
+non-zero code — or an unknown one — as an unmeasured shutdown leg that voids the run. Re-scored
+under that rule, the 2026-08-07 run is **INCONCLUSIVE**, which is the honest label for it.
+
+A third wart the run exposed: the mapped-control's own file was classified as *real* traffic
+rather than control, so in principle our own control could have satisfied the "the watcher sees
+genuine store writes" check — a control validating itself. It is now control traffic. (The run
+was unaffected: 42 of its 43 phase-1 real events were genuine app writes.)
+
 *The binding rules for a PASS are unchanged* — anchored package-path segment chain **and** the
 measured binary's hash, failing closed on anything else. One observation strengthens the case
 for hashing over versioning: on 2026-08-07 the desktop app had updated from 1.25927.0.0 to
