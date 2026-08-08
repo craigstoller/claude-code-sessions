@@ -110,6 +110,8 @@ class SyncApp:
         self.apply_btn = ttk.Button(bar, text="Apply", command=self.on_apply,
                                     state="disabled")
         self.apply_btn.pack(side="right")
+        self.undo_btn = ttk.Button(bar, text="Undo last copy", command=self.on_undo)
+        self.undo_target = None          # (op_id, rows_written, destination label)
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
         self.refresh_btn.pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="Close", command=root.destroy).pack(side="left")
@@ -128,8 +130,13 @@ class SyncApp:
         self.text.configure(state="disabled")
 
     def busy(self, on):
+        # Undo is included: leaving it live during a plan or a copy let a click
+        # launch a competing worker - mutation locks then produce spurious
+        # refusals, an unlocked plan can read a half-undone destination, and the
+        # two callbacks overwrite each other's status text.
         state = "disabled" if on else "normal"
         self.refresh_btn.configure(state=state)
+        self.undo_btn.configure(state=state)
 
     # ---------------------------------------------------------------- planning
     def refresh(self, keep_live=False):
@@ -219,6 +226,10 @@ class SyncApp:
             lines = ["!! --live certification in effect", ""] + lines
 
         self.show(lines)
+        # Offered on every plan, not only right after an apply: "I synced
+        # yesterday and want it back" is the same need, and the CLI was the
+        # only answer to it before.
+        self._sync_undo_button()
         if rows:
             self.status.set("{0} session{1} ready to copy".format(
                 len(rows), "" if len(rows) == 1 else "s"))
@@ -342,6 +353,113 @@ class SyncApp:
                        "records agree.").pack(anchor="w")
         ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
 
+    # ------------------------------------------------------------------- undo
+    def _find_undoable_sync(self):
+        """(op_id, rows, dest) for the most recent completed op IF it is a sync.
+
+        Deliberately only the MOST RECENT completed move/sync, mirroring what
+        `ccs undo` would pick - so the button and the CLI can never disagree
+        about which operation "the last one" is. If that op is a move (done
+        from the CLI), no undo is offered here: this window does not do moves,
+        and quietly reaching past it to an older sync would undo something
+        other than what the user last did.
+        """
+        try:
+            ops = [o for o in ccs.list_ops(self.env)
+                   if o.manifest.get("status") == "completed"
+                   and o.manifest.get("op_type", "move") in ("move", "sync")]
+        except Exception:
+            return None
+        if not ops or ops[-1].manifest.get("op_type") != "sync":
+            return None
+        m = ops[-1].manifest
+        rows = sum(1 for r in m.get("rows", []) if r.get("written"))
+        if not rows:
+            return None
+        return (m["op_id"], rows,
+                m.get("dest_email") or (m.get("dest_account", "")[:8] + "…"),
+                ccs._live_override_note(m))
+
+    def _sync_undo_button(self):
+        self.undo_target = self._find_undoable_sync()
+        if self.undo_target:
+            self.undo_btn.configure(text="Undo last copy ({0} session{1})".format(
+                self.undo_target[1], "" if self.undo_target[1] == 1 else "s"))
+            self.undo_btn.pack(side="left", padx=(6, 0))
+        else:
+            self.undo_btn.pack_forget()
+
+    def on_undo(self):
+        if not self.undo_target:
+            return
+        op_id, rows, dest, live_note = self.undo_target
+        prompt = ("Remove the {0} listing row{1} copied into {2}?\n\nThis deletes only "
+                  "rows this tool wrote, and only while they still match what was "
+                  "written - if that account has since opened one, it refuses rather "
+                  "than discard the change. Conversations are never touched.".format(
+                      rows, "" if rows == 1 else "s", dest))
+        if live_note:
+            # RULING 5: every route that can mutate under a --live certification
+            # discloses it BEFORE mutating. The CLI prints this; a generic
+            # confirmation here would hide the premise the deletion rests on.
+            prompt += "\n\n" + live_note
+        if not messagebox.askokcancel("Undo the last copy?", prompt):
+            return
+        self.busy(True)
+        self.apply_btn.configure(state="disabled")
+        self.undo_btn.configure(state="disabled")
+        self.status.set("Undoing...")
+        threading.Thread(target=self._undo_worker, args=(op_id,), daemon=True).start()
+
+    def _undo_worker(self, op_id):
+        try:
+            # Re-check that this is STILL the latest eligible operation, not just
+            # that it exists. Another CLI move or sync can complete between the
+            # button being drawn and the confirmation being accepted; undoing the
+            # captured id then reaches behind a newer operation and disagrees with
+            # what `ccs undo` would pick.
+            current = self._find_undoable_sync()
+            if not current or current[0] != op_id:
+                raise ccs.Refusal(
+                    "another operation completed since this window last looked, so "
+                    "{0} is no longer the most recent one to undo. Nothing was "
+                    "touched - press Refresh to see the current state.".format(op_id))
+            ops = [o for o in ccs.list_ops(self.env)
+                   if o.manifest.get("op_id") == op_id]
+            if not ops:
+                raise ccs.Refusal("operation {0} is no longer in the journal".format(op_id))
+            result = ccs.undo_sync(self.env, ops[0])
+            self.root.after(0, self._undo_done, result, None)
+        except ccs.Refusal as exc:
+            self.root.after(0, self._undo_done, None, ("refusal", str(exc)))
+        except Exception:
+            self.root.after(0, self._undo_done, None, ("error", traceback.format_exc()))
+
+    def _undo_done(self, result, problem):
+        self.busy(False)
+        self.undo_btn.configure(state="normal")
+        if problem:
+            kind, msg = problem
+            # NOT "nothing was removed": _sync_unlink_all attempts every unlink
+            # and only raises after collecting failures, so a refusal can follow
+            # some rows having already been deleted. Claiming otherwise could
+            # leave a half-undone destination looking untouched.
+            self.status.set("Undo did not complete" if kind == "refusal"
+                            else "Something went wrong")
+            self.detail.set(
+                "The tool's own explanation is below. Press Refresh to see the "
+                "destination's current state before deciding what to do - a refusal "
+                "that names specific rows may have removed others first."
+                if kind == "refusal" else "")
+            self.show([msg])
+            self._sync_undo_button()
+            return
+        self.status.set("Undone - the copied rows were removed")
+        self.detail.set("The other account's sidebar is back to how it was. "
+                        "Press Refresh to plan again.")
+        self.show([])
+        self._sync_undo_button()
+
     def forget_destination(self):
         self.dest_choice = ""
         save_pref("")
@@ -390,8 +508,10 @@ class SyncApp:
         self.status.set("Copied {0} session{1}".format(
             written, "" if written == 1 else "s"))
         self.detail.set("Sign into the other account (or restart the app) to see them. "
-                        "`ccs undo --apply` reverses this.")
+                        "Changed your mind? Undo is the button below - a GUI should not "
+                        "send you to a terminal to reverse what it just did.")
         self.manifest = None
+        self._sync_undo_button()
 
 
 # ------------------------------------------------------------------- shortcuts
