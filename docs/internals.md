@@ -569,6 +569,37 @@ rather than control, so in principle our own control could have satisfied the "t
 genuine store writes" check — a control validating itself. It is now control traffic. (The run
 was unaffected: 42 of its 43 phase-1 real events were genuine app writes.)
 
+**Second run, 2026-08-07 — PASS, and the helper updated underneath it.** The re-run completed
+the workload: a 4 m 23 s helper-only window with the app confirmed gone and two extension round
+trips inside it, then Chrome closed normally and the helper **closed itself, exit code 0**, so
+the shutdown path this leg exists for actually ran. Both instruments silent: zero watcher
+events under the store, empty snapshot diff, zero traversal errors, zero overflows; controls
+held (65 in-window canary events, 35 genuine phase-1 store writes, mapped-write control caught
+by the pipeline). Under the protocol's terms this licenses an exclusion — for
+`711AD7E7DEC73AA58187479F5F99B13480DF93AB1306BD171A61027D84FA81F1`.
+
+That hash is **not** the one measured hours earlier the same day. The helper binary changed
+from `744187C7…` (mtime 2026-08-04) to `711AD7E7…` (mtime 2026-08-06) *between* the two runs —
+same byte length, different content — while its path stayed identical. The likely mechanism,
+consistent with the observation but not itself verified: the update was staged earlier and
+landed once the running helper exited, which is precisely what the first ceremony's
+Task-Manager kill caused. Two consequences worth stating plainly:
+
+- **The "helper unchanged across an app update" note recorded earlier that day is superseded.**
+  It was true at that instant and wrong as a generalization: the helper does update in place,
+  observed inside a single afternoon.
+- **This is the case the hash binding exists for, and it validates it** — but it also means a
+  hash-bound exclusion *lapses on every helper update*, restoring the guard (and the
+  Chrome-exit friction) until someone re-measures. That is the correct fail-closed direction:
+  an exclusion that survived an update would be trusting code nobody measured. The design
+  consequence is that the exclusion must fall back to *counting* the helper on any hash
+  mismatch, so the worst case is exactly today's behaviour and never worse.
+
+**Standing caveat on strength of evidence.** This is **one** clean trial. The protocol's
+workload clause asks for the enumerated actions "repeated across trials", and one PASS plus one
+alive-window-only run is not that. It is enough to license the exclusion under the acceptance
+rule as written; it is not enough to call the helper's behaviour characterised.
+
 *The binding rules for a PASS are unchanged* — anchored package-path segment chain **and** the
 measured binary's hash, failing closed on anything else. One observation strengthens the case
 for hashing over versioning: on 2026-08-07 the desktop app had updated from 1.25927.0.0 to
