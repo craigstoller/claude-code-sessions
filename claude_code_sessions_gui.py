@@ -77,6 +77,10 @@ class SyncApp:
         self.env = ccs.default_env()
         self.manifest = None
         self.dest_choice = load_pref()
+        # Never persisted, unlike dest_choice: the destination is a stable fact
+        # about this machine, while "which account is signed in" changes every
+        # time you switch. A remembered answer would be a stale assertion.
+        self.live_choice = ""
         root.title("Claude session sync")
         root.geometry("880x580")
         root.minsize(700, 460)
@@ -128,7 +132,15 @@ class SyncApp:
         self.refresh_btn.configure(state=state)
 
     # ---------------------------------------------------------------- planning
-    def refresh(self):
+    def refresh(self, keep_live=False):
+        # An explicit Refresh always re-asks which account is live. A --live
+        # assertion is a statement about RIGHT NOW, not a setting: keeping it
+        # across a deliberate re-look would let a stale answer survive an
+        # account switch, which is the very failure --live exists to prevent.
+        # (Only the picker re-plans with keep_live=True, immediately after
+        # being told.)
+        if not keep_live:
+            self.live_choice = ""
         self.busy(True)
         self.apply_btn.configure(state="disabled")
         self.status.set("Planning...")
@@ -138,7 +150,7 @@ class SyncApp:
 
     def _plan_worker(self):
         try:
-            flags = ccs.SyncFlags(to=self.dest_choice)
+            flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice)
             manifest = ccs.plan_sync(self.env, flags)
             self.root.after(0, self._plan_done, manifest, None)
         except ccs.Refusal as exc:
@@ -151,6 +163,15 @@ class SyncApp:
         if problem:
             kind, msg = problem
             self.manifest = None
+            if (kind == "refusal" and not self.live_choice
+                    and "cannot identify the signed-in account" in msg
+                    and "disagree" in msg):
+                self.status.set("Which account is Claude Desktop signed into?")
+                self.detail.set("The two files that record this disagree, and either can "
+                                "be the stale one - so the tool refuses to guess.")
+                self.show([msg])
+                self._offer_live_picker()
+                return
             if kind == "refusal" and "more than one other account store" in msg:
                 self.status.set("Which account should these sessions go to?")
                 self.detail.set("More than one other account store exists on this "
@@ -255,6 +276,72 @@ class SyncApp:
             ttk.Button(win, text=line, command=pick).pack(fill="x", padx=PAD, pady=2)
         ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
 
+    def _account_label(self, uuid):
+        """email (id) when the email can be recovered, else just the id."""
+        email = ""
+        try:
+            with open(os.path.join(self.env.home, ".claude.json"),
+                      encoding="utf-8") as fh:
+                import json
+                oa = (json.load(fh) or {}).get("oauthAccount") or {}
+            if isinstance(oa, dict) and oa.get("accountUuid") == uuid:
+                email = oa.get("emailAddress") or ""
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        email = email or ccs.dormant_account_email(self.env, uuid) or ""
+        return ("{0}  ({1}…)".format(email, uuid[:8]) if email
+                else "{0}…".format(uuid[:8]))
+
+    def _offer_live_picker(self):
+        """Turn the identity-disagreement refusal into an assertion, per RULING 5.
+
+        Deliberately NOT a "just proceed" button. The user is stating a fact -
+        which account the desktop app is signed into - so both candidates are
+        shown neutrally, neither is pre-selected, and the consequence is spelled
+        out: the OTHER store is the one that gets written.
+        """
+        dis = ccs._identity_disagreement(self.env)
+        if not dis:
+            return                       # shape changed: leave the raw refusal
+        # One button per STORE, not per account, and the asserted value is the
+        # store's path. An account can own several org directories - this very
+        # machine has two per account - and a bare account uuid then matches
+        # more than one store, which _resolve_live_assertion refuses. The user
+        # would have been stuck: live_choice is set, so this picker would not
+        # reopen, and there is no other way in the window to name an org.
+        stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env) if a in dis]
+        if not stores:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Which account is signed in?")
+        win.transient(self.root)
+        ttk.Label(win, padding=PAD, justify="left", wraplength=560,
+                  text="Claude Desktop and the Claude Code CLI disagree about which "
+                       "account is signed in, and either record can be the stale one.\n\n"
+                       "Tell it which store the DESKTOP APP is signed into right now. "
+                       "The OTHER one is what gets written, so an answer that is wrong "
+                       "writes the store you are actually using.\n\nThis is not "
+                       "remembered - it is asked again every time.").pack(anchor="w")
+        for a, o, p in stores:
+            rows = ccs._listing_row_count(p)
+            count = ("{0} rows".format(rows) if rows
+                     else "no listing rows" if rows == 0 else "row count unreadable")
+
+            def pick(path=p):
+                self.live_choice = path      # a full path matches exactly one store
+                win.destroy()
+                self.refresh(keep_live=True)
+            ttk.Button(win, command=pick,
+                       text="Signed in as  {0}   org {1}…   ({2})".format(
+                           self._account_label(a), o[:8], count)).pack(
+                               fill="x", padx=PAD, pady=3)
+        ttk.Label(win, padding=(PAD, 4), foreground="#555", wraplength=520,
+                  justify="left",
+                  text="Or cancel and fix it at the source: run 'claude' then /login as "
+                       "the account you are using, or switch the desktop app, so the two "
+                       "records agree.").pack(anchor="w")
+        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
+
     def forget_destination(self):
         self.dest_choice = ""
         save_pref("")
@@ -299,6 +386,7 @@ class SyncApp:
             self.apply_btn.configure(state="disabled")
             return
         written = sum(1 for r in (self.manifest.get("rows") or []) if r.get("written"))
+        self.live_choice = ""            # an assertion covers one run, not a session
         self.status.set("Copied {0} session{1}".format(
             written, "" if written == 1 else "s"))
         self.detail.set("Sign into the other account (or restart the app) to see them. "
