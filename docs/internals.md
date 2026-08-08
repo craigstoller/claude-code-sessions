@@ -442,6 +442,112 @@ Until then `chrome-native-host.exe` counts. Two tests in
 They pin the *classification*, which is what a future refactor would break; they assert nothing
 about the helper's I/O, which is the open question above and not something a unit test can settle.
 
+#### Amendment 2026-08-07 — the store-side watch replaces the elevated trace
+
+The *capture* clause above is superseded; the **acceptance endpoint is unchanged**. The
+instrument moved from an elevated kernel-file trace to two unprivileged store-side
+instruments, for one practical reason and one principled one.
+
+*Practical.* The elevated capture was built and run twice. Both runs died before the decisive
+window, and the second showed why the design was unusable: **9.1 GB/min** (52.7 GB in 5.8
+minutes), putting a full ceremony near 180 GB and a CSV export in the hours. Part of that was
+an implementation error — the protocol says *scoped to the store roots*, which is a **path**
+filter, and the first implementation read the neighbouring "not filtered to
+`chrome-native-host.exe`" clause as a blanket prohibition on filtering and captured
+machine-wide. But even filtered correctly, ProcMon needs elevation, and its filters cannot be
+set from a command line: they arrive through an undocumented binary `.pmc` that must be
+authored in the GUI. That is a lot of ceremony to answer a question about one directory.
+
+*Principled.* The endpoint is a statement about the **store**, not about the helper — "no
+non-control mutation of either store root by any process". Attribution is what a trace buys,
+and attribution is not what a PASS needs. It is only needed on a FAIL, to say *who*.
+
+**Two instruments, because one is measurably not enough:**
+
+- **A recursive `ReadDirectoryChangesW` watch** over each store root. Continuous, not sampled
+  — which is precisely the property handle sampling lacked, so millisecond-scale
+  `.tmp` → rename transactions cannot slip between observations. It time-localizes events to
+  the decisive window.
+- **A content snapshot (sha256 per file) taken at both window boundaries**, diffed. This
+  catches net change by *any* mechanism.
+
+**The measurement that forced the second instrument, and the reason a watcher-only design
+would have been a false-PASS generator.** A pure mapped-section write — `mmap`, write through
+the mapping, `flush`, close, to an existing file within its existing size — produces **no
+`ReadDirectoryChangesW` notification at all**. Not delayed: absent at 2, 5, 10, 20, 35 and 60
+seconds, with `FILE_NOTIFY_CHANGE_SIZE | LAST_WRITE | ATTRIBUTES | CREATION | SECURITY` in the
+filter (measured 2026-08-07). That is exactly the mutation class the original protocol singled
+out, and a watcher alone would have reported the window quiet. The snapshot diff catches it
+(verified in the same session: the diff reports the file `changed`). Neither instrument is
+redundant; the watcher says *when*, the snapshot says *whether*.
+
+**Five controls, each able to void a run** — a quiet result means nothing without all of them:
+
+| Control | What its failure would otherwise hide |
+|---|---|
+| Canary heartbeat (write-rename-delete under each root every 20 s) | A watcher that was never delivering |
+| Overflow detection (`ReadDirectoryChangesW` signals overflow by returning success with **zero bytes**, discarding the whole buffer) | A dropped interval, indistinguishable from a quiet one |
+| Phase-1 real traffic (genuine non-canary store writes must be observed while the app is open) | A watcher that sees only its own canary |
+| Mapped-write control (a real mapped-section write must be caught by the snapshot **pipeline**) | The one class the watcher provably misses |
+| Process-tree guard (the runner walks its own ancestry and refuses to start inside the app's tree) | The failure that lost the 2026-08-05 decisive leg — closing the app kills the measurement |
+
+Every control is per-root: one working watcher must not be able to vouch for a root whose own
+watcher delivered nothing. An overflow **anywhere in the run** voids it, not merely one inside
+the window — overflow timestamps record when the discard was *discovered*, and the discarded
+buffer may hold older events, so a near-boundary overflow cannot be safely excluded.
+
+**Residuals, recorded rather than hidden.**
+
+- **A PASS means "no mutation observed, and no net change between the window boundaries" — not
+  literally "no mutation."** The distinction is load-bearing here rather than pedantic: since a
+  mapped write produces no watcher event at all, a mapped write followed by restoration of the
+  original bytes is a *concrete* evasion route, not the merely-theoretical one an earlier draft
+  of this section called absurd. Nothing in the threat model motivates it, but the claim is
+  stated at the strength the instruments actually support.
+- **Watcher timestamps are delivery times, not mutation times.** Every event in one
+  `ReadDirectoryChangesW` buffer is stamped when the call returns, so an event near a phase
+  boundary can be filed on the wrong side of it.
+- **The phase-1 control shows the watcher sees real store traffic — not that the desktop app
+  caused it.** Any non-canary write satisfies it; the workload description is recorded as prose
+  and not validated.
+- **The watcher is unattributed**, so a FAIL says the store changed, not who changed it.
+  Attribution then needs the elevated trace, retained at
+  `tools/native-host-measurement/elevated/` as the diagnostic follow-up rather than the primary
+  instrument.
+- **The snapshot compares window boundaries**, so it cannot time-localize what it finds, and it
+  fingerprints file contents only — not directory state, ACLs, or alternate streams.
+
+The runner is `tools/native-host-measurement/watch_ceremony.py`; its verdict function is a pure
+function over a saved report (`--verdict report.json`), exercised by
+`check_watch_ceremony.py` beside it — PASS, both FAIL routes, every INCONCLUSIVE route, and a
+live check that the snapshot pipeline catches a mapped write to a 9 MB file. (Named `check_`
+rather than `test_` so `pytest` does not collect it: nothing under `tools/` runs in CI, and it
+exits with a status code rather than asserting.)
+
+**This amendment was independently reviewed before it was trusted, and the review found real
+false-PASS routes** (Codex, 2026-08-07; the second engine failed its model check twice, so this
+was single-engine and is weaker evidence than a two-engine pass). The material ones, all now
+fixed and pinned by tests: the snapshot hashed only files ≤ 8 MB and recorded size alone above
+that, so an in-place same-size mapped write to a large file changed *neither* instrument — a
+deterministic false PASS in exactly the class the second instrument exists for; control traffic
+was excluded by filename *substring*, carving out a namespace where a real store file could
+masquerade as a canary; a window the runner itself flagged as contaminated (app relaunched,
+helper exited early) still licensed a PASS because the contamination note was consulted only
+when a boundary was missing; snapshot traversal and read errors were recorded as ordinary
+manifest values, so a subtree unreadable at both boundaries cancelled out of the diff and read
+as quiet; and the mapped-write control hashed one file directly instead of running the snapshot
+pipeline, which is precisely why it passed while the pipeline was blind above 8 MB. That last
+one is the lesson worth carrying: **a control that bypasses the instrument it certifies
+certifies nothing.**
+
+*The binding rules for a PASS are unchanged* — anchored package-path segment chain **and** the
+measured binary's hash, failing closed on anything else. One observation strengthens the case
+for hashing over versioning: on 2026-08-07 the desktop app had updated from 1.25927.0.0 to
+**1.26832.0.0** while the helper binary was **byte-identical** (sha256 `744187C7…`, unchanged).
+A version-bound exclusion would have expired for no reason; a hash-bound one correctly
+survived. The converse — a helper update under a static app version — is the case the hash
+binding exists to catch.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via

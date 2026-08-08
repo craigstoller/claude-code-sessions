@@ -101,10 +101,28 @@ contain its own control), run from outside the desktop app's process tree so the
 app-closed/helper-surviving window can actually be held open. These scripts remain useful there
 as the cross-check and for generating the store-side positive control.
 
-**That run is now packaged: see [`elevated/RUNBOOK.md`](elevated/RUNBOOK.md).** One elevated
-command (`run-elevated-capture.ps1`) drives an unfiltered ProcMon backing-file capture through
-the protocol's enumerated workload with a timestamped checklist and a canary heartbeat as the
-loss probe; `analyze_capture.py` renders PASS / FAIL / INCONCLUSIVE per the acceptance
-endpoint. The analyzer's three verdict paths are exercised by synthetic captures (2026-08-07);
-the capture path itself requires elevation and is verified only by parsing until someone runs
-the ceremony.
+**Superseded 2026-08-07 — run [`watch_ceremony.py`](watch_ceremony.py) instead.** See the
+amendment in `docs/internals.md` ("the store-side watch replaces the elevated trace"). The
+elevated trace was built and run twice; it died before the decisive window both times and
+measured **9.1 GB/min**, putting a full ceremony near 180 GB. The endpoint is a statement about
+the store, not the helper, so attribution — the only thing a trace buys — is not what a PASS
+needs.
+
+```bash
+python watch_ceremony.py                 # the ceremony (no elevation; your own terminal)
+python watch_ceremony.py --verdict report.json   # re-render a verdict offline
+```
+
+Two instruments, because one is measurably not enough: a continuous `ReadDirectoryChangesW`
+watch (says *when*), plus a sha256 snapshot diff across the decisive window (says *whether*).
+**Measured 2026-08-07: a pure mapped-section write produces no directory-change notification at
+all — absent at 60 s** — which is the class the protocol singled out, so a watcher-only design
+would report such a window quiet. The snapshot catches it.
+
+Five controls can each void a run: canary heartbeat, buffer-overflow detection (overflow is
+signalled as success-with-zero-bytes and would otherwise look like quiet), phase-1 real
+traffic, the mapped-write control, and a process-tree guard that refuses to run inside the
+desktop app's own tree — the failure that lost the 2026-08-05 decisive leg.
+
+`elevated/` is retained as the **attribution** follow-up: a FAIL says the store changed, not
+who changed it, and that is when a trace earns its cost.
