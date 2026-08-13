@@ -33,9 +33,10 @@ before touching the other, so the session reopens cleanly in its new home.
 pipx install claude-code-sessions
 ```
 
-This installs two identical commands: `claude-code-sessions`, and `ccs` as a shorter
-alias for everyday use. Examples below use the long form; `ccs doctor` is the same
-thing.
+This installs three commands: `claude-code-sessions` and `ccs` (identical — the short one
+is for everyday use; examples below use the long form), plus `ccs-gui`, a window for
+people who would rather not use a terminal. Examples below are the CLI; see
+[A window instead of the CLI](#a-window-instead-of-the-cli).
 
 Or download `claude_code_sessions.py` and run it directly — the runtime has no dependencies beyond
 the Python 3.9+ standard library:
@@ -43,6 +44,28 @@ the Python 3.9+ standard library:
 ```
 python claude_code_sessions.py --help
 ```
+
+## A window instead of the CLI
+
+```
+ccs-gui                     open it
+ccs-gui --install-shortcut  add a Desktop + Start Menu shortcut (Windows)
+```
+
+It plans a sync, shows which account copies into which, the destination store and what
+would be copied — and **writes nothing until you press Apply**. It also carries Undo, a
+title filter (`sync --only`), and a health check (`doctor`, findings first).
+
+It is a thin shell over the same planning and execution the CLI uses, not a
+reimplementation, so every guard, refusal, and journal entry behaves identically — and a
+refusal is shown **verbatim** rather than summarised into something friendlier. Two things
+it deliberately does not offer, because the friction is the safeguard: `--verbatim` (which
+copies permission grants across an account boundary) and `--include-deleted` (which brings
+back a session you deleted). `move` is CLI-only for now.
+
+Registered as a GUI script, so nothing flashes a console window. It needs `tkinter` — part
+of the standard library, but packaged separately on some Linux distributions
+(`apt install python3-tk`).
 
 ## Before any move: close the Claude app.
 
