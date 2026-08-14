@@ -136,6 +136,11 @@ class SyncApp:
         ttk.Button(bar, text="Close", command=root.destroy).pack(side="left")
         self.doctor_btn = ttk.Button(bar, text="Health check", command=self.on_doctor)
         self.doctor_btn.pack(side="left", padx=(6, 0))
+        self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
+        self.trust_chk = ttk.Checkbutton(
+            bar, text="Let Chrome stay open", variable=self.trust_var,
+            command=self.on_toggle_trust)
+        self.trust_chk.pack(side="left", padx=(12, 0))
         self.forget_btn = ttk.Button(bar, text="Change destination",
                                      command=self.forget_destination)
         if self.dest_choice:
@@ -162,7 +167,8 @@ class SyncApp:
         """
         state = "disabled" if on else "normal"
         for w in (self.refresh_btn, self.undo_btn, self.doctor_btn,
-                  self.only_entry, self.filter_btn, self.clear_btn):
+                  self.only_entry, self.filter_btn, self.clear_btn,
+                  self.trust_chk):
             w.configure(state=state)
 
     # ---------------------------------------------------------------- planning
@@ -422,6 +428,47 @@ class SyncApp:
                        "the account you are using, or switch the desktop app, so the two "
                        "records agree.").pack(anchor="w")
         ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
+
+    def on_toggle_trust(self):
+        """RULING 7's opt-in, as a checkbox rather than "go create a file".
+
+        Turning it ON asks first and states the trade, because it loosens a
+        safety guard; turning it OFF is a return to the default and needs no
+        ceremony. The checkbox is re-read from disk afterwards rather than
+        trusted, so a failed write cannot leave the box looking enabled.
+        """
+        want = self.trust_var.get()
+        if want and not messagebox.askokcancel(
+                "Let Chrome stay open?",
+                "The desktop app's Chrome helper normally blocks writes unless it is "
+                "the exact build this tool measured - and it auto-updates every few "
+                "days, which is why Chrome keeps having to be closed.\n\n"
+                "Turning this on trusts ANY helper at the app's own path that Windows "
+                "reports as validly signed by Anthropic, PBC.\n\n"
+                "It is weaker than the default: a future Anthropic build that started "
+                "writing to the session store would be excused without anyone "
+                "measuring it. Unsigned, tampered, differently-signed and out-of-path "
+                "binaries still block.\n\n"
+                "The desktop app itself must still be closed either way."):
+            self.trust_var.set(False)
+            return
+        path = ccs.trust_signed_helper_path(self.env)
+        try:
+            if want:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write("Created from the claude-code-sessions window.\n"
+                             "Delete this file to revoke. See docs/internals.md, "
+                             "RULING 7.\n")
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError as exc:
+            messagebox.showerror("Could not change the setting", str(exc))
+        actual = ccs.signed_helper_trust_enabled(self.env)
+        self.trust_var.set(actual)
+        self.status.set("Chrome may stay open (the desktop app still cannot)"
+                        if actual else "Chrome must be closed again (the default)")
+        self.detail.set("")
 
     def _clear_filter(self):
         self.only_var.set("")

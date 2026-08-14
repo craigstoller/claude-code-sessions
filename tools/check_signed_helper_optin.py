@@ -100,6 +100,40 @@ if sys.platform == "win32":
     check("an unsigned file is not mistaken for signed",
           ccs._signed_helper_state(unsigned) == "unsigned")
 
+# ------------------------------------------------- the CLI toggle
+# The opt-in must be reachable without hand-creating a file: "go make this path"
+# is off-by-default policy delivered through a hostile mechanism.
+import argparse  # noqa: E402
+
+
+class NS(object):
+    def __init__(self, on=False, off=False):
+        self.on, self.off = on, off
+
+
+if os.path.exists(marker):
+    os.remove(marker)
+ccs.cmd_trust_signed_helper(env, NS())            # bare call must not enable
+check("bare invocation reports without enabling",
+      not ccs.signed_helper_trust_enabled(env))
+ccs.cmd_trust_signed_helper(env, NS(on=True))
+check("--on enables it", ccs.signed_helper_trust_enabled(env))
+check("  and the marker explains itself",
+      "RULING 7" in open(marker, encoding="utf-8").read())
+ccs.cmd_trust_signed_helper(env, NS(off=True))
+check("--off disables it", not ccs.signed_helper_trust_enabled(env))
+ccs.cmd_trust_signed_helper(env, NS(off=True))    # idempotent, no traceback
+check("--off twice is not an error", not ccs.signed_helper_trust_enabled(env))
+
+parser_ok = True
+try:
+    p = ccs.build_parser() if hasattr(ccs, "build_parser") else None
+except Exception:
+    parser_ok = False
+check("the subcommand is registered in the CLI dispatch",
+      "trust-signed-helper" in open(
+          os.path.join(REPO, "claude_code_sessions.py"), encoding="utf-8").read())
+
 shutil.rmtree(root, ignore_errors=True)
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
