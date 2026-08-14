@@ -702,7 +702,14 @@ def _looks_like_chrome_helper(text, env):
     """
     if not text:
         return False
-    norm = os.path.normcase(os.path.abspath(text.replace("/", "\\")))
+    # Separator folding is WINDOWS-ONLY. Doing it unconditionally turned a POSIX
+    # path into '\tmp\...' - a relative path that abspath then resolved against
+    # the cwd - so nothing ever matched and the Linux CI legs failed while
+    # Windows passed. Forward slashes still have to be folded on Windows, where a
+    # lister entry can legitimately carry them.
+    if os.sep == "\\":
+        text = text.replace("/", "\\")
+    norm = os.path.normcase(os.path.abspath(text))
     return norm in _expected_helper_paths(env)
 
 
