@@ -117,6 +117,31 @@ lines = gp.SyncApp.doctor_lines(
 check("an unreadable store is blocking", lines[0] == "NEEDS ATTENTION", lines[0])
 check("  and the reason is shown", any("access denied" in l for l in lines))
 
+# ------------------- the library/GUI contract for the destination picker
+# _candidate_listing puts a cross-pair warning on the line AFTER the candidate.
+# The picker must carry that note onto the button. It did not once: the marker
+# was moved off the candidate line to stop it wrapping in a terminal, and the
+# GUI silently lost it - so on a three-account machine every empty candidate
+# rendered identically and the wrong one was picked. Pin the contract.
+LIVE_ORG = "53346e14" + "0" * 24
+a1, a2 = "250c8128" + "0" * 24, "d0fcaa6f" + "0" * 24
+o_own = "d4e23045" + "0" * 24
+d1 = os.path.join(root, "s1"); d2 = os.path.join(root, "s2")
+os.makedirs(d1, exist_ok=True); os.makedirs(d2, exist_ok=True)
+listing = ccs._candidate_listing([(a1, LIVE_ORG, d1), (a1, o_own, d2)],
+                                 live_org=LIVE_ORG)
+cands = gp.SyncApp._candidates(listing)
+check("picker finds both candidates", len(cands) == 2, str(len(cands)))
+check("  each entry carries a note field", all(len(c) == 3 for c in cands))
+warned = [c for c in cands if c[2]]
+check("  exactly the cross pair is warned", len(warned) == 1, str(len(warned)))
+check("  and it is the one sharing the signed-in org",
+      warned and warned[0][0].startswith("53346e14"), warned[0][0] if warned else "-")
+check("  the warning text survives onto the button",
+      warned and "shares your signed-in org" in warned[0][2])
+check("  the footnote never becomes a button",
+      not any("<account>" in c[1] for c in cands))
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()
