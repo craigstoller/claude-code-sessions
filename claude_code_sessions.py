@@ -854,8 +854,8 @@ def helper_hash_note(running, env):
                     "usually not worth it. The alternative is to trust any helper at "
                     "this path that Windows reports as validly signed by Anthropic, "
                     "PBC - weaker than measured bytes, and OFF by default because it "
-                    "rests on evidence you have not examined. Turn it on by creating "
-                    "the file:\n   {0}".format(trust_signed_helper_path(env)))
+                    "rests on evidence you have not examined. Turn it on with:\n"
+                    "   claude-code-sessions trust-signed-helper --on")
             return note
     return ""
 
@@ -2288,6 +2288,14 @@ def build_parser():
     sp.add_argument("--apply", action="store_true")
     common(sp)
 
+    sp = sub.add_parser(
+        "trust-signed-helper",
+        help="let Chrome stay open by trusting the signed Chrome helper (opt-in)")
+    grp = sp.add_mutually_exclusive_group()
+    grp.add_argument("--on", action="store_true", help="enable it")
+    grp.add_argument("--off", action="store_true", help="disable it (the default)")
+    common(sp)
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -2424,6 +2432,49 @@ def cmd_undo(env, ns):
     return 0 if success else 1
 
 
+def cmd_trust_signed_helper(env, ns):
+    """Turn RULING 7's opt-in on or off, or report it. Bare invocation SHOWS the
+    state and changes nothing - a command whose whole job is loosening a guard
+    should not do it as a side effect of being run without arguments."""
+    path = trust_signed_helper_path(env)
+    if ns.on:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("Created by 'claude-code-sessions trust-signed-helper --on'.\n"
+                         "While this file exists, a Chrome helper at the app's own\n"
+                         "package path that Windows reports as validly signed by\n"
+                         "Anthropic, PBC does not block mutations, even when its bytes\n"
+                         "are not the build this tool measured. Delete it to revoke.\n"
+                         "See docs/internals.md, RULING 7.\n")
+        except OSError as exc:
+            raise Refusal("could not enable it: {0}".format(exc))
+        print("Signed-helper trust is ON. Chrome may stay open; the desktop app "
+              "still has to be closed.")
+        print("It is weaker than the default: trust moves from the exact measured "
+              "bytes to the publisher, so a future Anthropic build that started "
+              "touching the store would be excused without being measured.")
+        print("Revoke with --off (or delete the file it created).")
+        return 0
+    if ns.off:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise Refusal("could not disable it: {0}".format(exc))
+        print("Signed-helper trust is OFF (the default). Only the measured build "
+              "is excluded, so Chrome has to be closed whenever the helper has "
+              "updated.")
+        return 0
+    on = signed_helper_trust_enabled(env)
+    print("Signed-helper trust: {0}".format("ON" if on else "OFF (the default)"))
+    print("  marker: {0}".format(path))
+    print("  turn {0} with: claude-code-sessions trust-signed-helper --{0}"
+          .format("off" if on else "on"))
+    return 0
+
+
 def cmd_recover(env, ns):
     if clear_stale_lock(env):
         print("cleared a stale lock")
@@ -2461,7 +2512,8 @@ def main(argv=None):
     ns = build_parser().parse_args(argv)
     env = default_env()
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
-                "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync}
+                "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
+                "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
     except (Refusal, LayoutError) as exc:

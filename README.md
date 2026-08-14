@@ -77,12 +77,17 @@ be closed again until someone re-runs the ~12-minute measurement in
 `tools/native-host-measurement/`.
 
 If that trade isn't worth it to you, there is an opt-in: trust **any** helper at the app's
-own package path that Windows reports as validly signed by `Anthropic, PBC`. Create this
-file to enable it, delete it to revoke:
+own package path that Windows reports as validly signed by `Anthropic, PBC`.
 
 ```
-~/.claude-code-journal/trust-signed-helper
+claude-code-sessions trust-signed-helper          # show the current state
+claude-code-sessions trust-signed-helper --on     # enable it
+claude-code-sessions trust-signed-helper --off    # back to the default
 ```
+
+In the window it is the **"Let Chrome stay open"** checkbox, which explains the trade before
+enabling anything. Either way it is one marker file — `~/.claude-code-journal/trust-signed-helper`
+— so deleting that file also revokes it.
 
 It is off by default deliberately. It is weaker than the default — trust moves from "these
 exact measured bytes" to "this publisher", so a future Anthropic build that started touching
@@ -117,7 +122,9 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Six commands. All mutating commands default to a dry run; add `--apply` to execute.
+Seven commands. All mutating commands default to a dry run; add `--apply` to execute.
+(The seventh, `trust-signed-helper`, is the opt-in described above; it changes a setting,
+not your sessions.)
 
 **`list`** — inventory sessions, optionally filtered by a search term:
 
