@@ -669,21 +669,44 @@ _HELPER_DIR_ANCHOR = "\\localcache\\roaming\\claude\\chromenativehost\\"
 _HELPER_EXE = "\\chrome-native-host.exe"
 
 
-def _looks_like_chrome_helper(text):
-    """True when TEXT is the helper's own image path - not merely a mention of it.
+def _expected_helper_paths(env):
+    """The helper's real location(s), derived from the discovered store roots.
 
-    ENDS-WITH on the basename is load-bearing: the lister hands this function an
-    unparsed entry, and on POSIX that can be a whole command line, so a
-    CONTAINS test could be satisfied by a command-line ARGUMENT naming the
-    helper. A trailing argument breaks the ends-with and the entry falls
-    through to counting, which is the safe direction.
+    A store candidate is <...>\\Roaming\\Claude\\claude-code-sessions; the helper
+    is its sibling <...>\\Roaming\\Claude\\ChromeNativeHost\\chrome-native-host.exe.
+
+    Deriving this beats pattern-matching the path. An earlier version tested for
+    the SEGMENTS "\\packages\\claude_" and "\\localcache\\roaming\\claude\\
+    chromenativehost\\" anywhere in the string, which any fabricated path could
+    satisfy - so with the opt-in enabled, some other Anthropic-signed binary
+    copied to C:\\tmp\\packages\\claude_x\\localcache\\roaming\\claude\\
+    chromenativehost\\chrome-native-host.exe would have been excused. The
+    "out-of-path binaries still count" guarantee was not actually enforced.
     """
-    text = text.replace("/", "\\")
-    return (_HELPER_PKG_ANCHOR in text and _HELPER_DIR_ANCHOR in text
-            and text.endswith(_HELPER_EXE))
+    out = set()
+    for cand in getattr(env, "store_candidates", ()) or ():
+        parent = os.path.dirname(cand)
+        out.add(os.path.normcase(os.path.abspath(
+            os.path.join(parent, "ChromeNativeHost", "chrome-native-host.exe"))))
+    return out
 
 
-def _measured_helper_state(text):
+def _looks_like_chrome_helper(text, env):
+    """True when TEXT is the helper's own image path at a REAL store root.
+
+    Exact match against _expected_helper_paths, not a substring or segment test.
+    A lister entry carrying trailing arguments (POSIX `ps` reports whole command
+    lines) will not equal a path and therefore falls through to counting, which
+    is the safe direction - a process merely NAMING the helper must never
+    inherit its exclusion.
+    """
+    if not text:
+        return False
+    norm = os.path.normcase(os.path.abspath(text.replace("/", "\\")))
+    return norm in _expected_helper_paths(env)
+
+
+def _measured_helper_state(text, env):
     """'measured' | 'changed' | 'unreadable' | None (not the helper at all).
 
     Only 'measured' licenses the exclusion. Every other outcome counts, so a
@@ -697,7 +720,7 @@ def _measured_helper_state(text):
     verdict for bytes nobody measured. Re-reading ~1 MB a few times per command is
     cheap; carrying trust across an update is not.
     """
-    if not _looks_like_chrome_helper(text):
+    if not _looks_like_chrome_helper(text, env):
         return None
     try:
         h = hashlib.sha256()
@@ -710,12 +733,112 @@ def _measured_helper_state(text):
     return "measured" if digest == _HELPER_SHA256 else "changed"
 
 
-def helper_hash_note(running):
+# RULING 7 (2026-08-13). OPT-IN: trust a validly-signed Anthropic helper even when
+# its bytes are not the measured build.
+#
+# Why an option exists at all. RULING 6 binds to the measured hash, and the helper
+# auto-updates in place - three distinct builds were observed in eight days
+# (2026-08-04, 08-06, 08-11). A hash binding therefore buys ~2-4 days of
+# "Chrome may stay open" per ~12-minute re-measurement ceremony, which is a bad
+# enough trade that the exclusion decays back into the friction it removed. That
+# is not a safer outcome; it is the same friction plus dead code.
+#
+# What it trades. Trust moves from "these exact measured bytes" to "this
+# publisher". The residual risk is not forgery - it is that a FUTURE Anthropic
+# build of the helper starts touching the store and the signature excuses it
+# because nobody re-measured. Small (the measurement found a message bridge whose
+# image contains no store path at all, held no store handle, and produced no store
+# mutation across a 4m23s window under live extension traffic) but not zero.
+#
+# Why OPT-IN and not the default. This is a published tool, and other users have
+# not seen that measurement. Loosening the shipped default would hand them a
+# weaker guard silently, on evidence they never examined. The default therefore
+# stays RULING 6; only a deliberate, auditable act enables this.
+_TRUST_SIGNED_MARKER = "trust-signed-helper"
+_HELPER_PUBLISHER = "anthropic, pbc"
+
+
+def trust_signed_helper_path(env):
+    """The opt-in marker's path. Its EXISTENCE is the opt-in - no parsing, nothing
+    to typo, and `del` is a complete revocation."""
+    return os.path.join(os.path.dirname(env.ops_dir), _TRUST_SIGNED_MARKER)
+
+
+def signed_helper_trust_enabled(env):
+    try:
+        return os.path.isfile(trust_signed_helper_path(env))
+    except OSError:
+        return False            # cannot look -> not enabled (fail closed)
+
+
+def _authenticode_publisher(path):
+    """Signing subject iff Windows reports the signature VALID, else None.
+
+    Deliberately not cached. Caching on (path, size, mtime) is exactly the
+    fail-open review caught in the hash version: metadata is not identity, and a
+    same-size same-mtime replacement would be served a stale verdict. A ~0.3s
+    subprocess a few times per command is the cheaper mistake.
+    """
+    if sys.platform != "win32":
+        return None
+    import subprocess
+    ps = ("$ErrorActionPreference='Stop';"
+          "$s = Get-AuthenticodeSignature -LiteralPath '{0}';"
+          "if ($s.Status -eq 'Valid') {{ $s.SignerCertificate.Subject }}"
+          ).format(path.replace("'", "''"))
+    # pwsh FIRST, then Windows PowerShell. Measured 2026-08-13: on this machine
+    # `powershell` (5.1) fails with "the module could not be loaded" for
+    # Microsoft.PowerShell.Security, while pwsh 7 answers correctly - so trying
+    # only the always-present interpreter would report every helper unsigned and
+    # make the opt-in silently useless. Both are tried because neither is
+    # guaranteed: pwsh is not installed by default, and 5.1's security module can
+    # evidently be unavailable.
+    for exe in ("pwsh", "powershell"):
+        try:
+            proc = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            return proc.stdout.strip()
+    # No interpreter could verify. That is "couldn't look", which here means the
+    # helper keeps counting - the opt-in simply does not take effect.
+    return None
+
+
+def _dn_field(subject, key):
+    """One RDN value out of a certificate subject, quoted or bare."""
+    m = re.search(r'(?:^|,)\s*' + key + r'=(?:"([^"]*)"|([^,]*))', subject)
+    if not m:
+        return ""
+    return (m.group(1) if m.group(1) is not None else (m.group(2) or "")).strip()
+
+
+def _signed_helper_state(text):
+    """'signed' | 'unsigned', for a path already known to be the helper.
+
+    Only a VALID signature whose CN *and* O are EXACTLY the expected publisher
+    counts. A substring test was the first version and it was a hole: a valid
+    certificate for `CN="Not Anthropic, PBC"` - or any DN merely containing that
+    text in some other field - would have satisfied it, so the "differently
+    signed binaries still count" guarantee did not hold. Anything else, including
+    an unreadable verdict, returns 'unsigned' and therefore keeps counting.
+    """
+    subject = _authenticode_publisher(text)
+    if not subject:
+        return "unsigned"
+    cn = _dn_field(subject, "CN").lower()
+    org = _dn_field(subject, "O").lower()
+    return "signed" if cn == _HELPER_PUBLISHER and org == _HELPER_PUBLISHER else "unsigned"
+
+
+def helper_hash_note(running, env):
     """Explain a helper that is counted because it is not the measured build."""
     for text in running:
-        state = _measured_helper_state(text)
+        state = _measured_helper_state(text, env)
         if state in ("changed", "unreadable"):
-            return (
+            note = (
                 "\nNote: the process above is the desktop app's Chrome-extension "
                 "helper. A measured build of it is excluded from this guard, but this "
                 "one {0} - the helper auto-updates in place, so an exclusion cannot "
@@ -725,6 +848,15 @@ def helper_hash_note(running):
                 "and update _HELPER_SHA256.".format(
                     "could not be read" if state == "unreadable"
                     else "is a different binary"))
+            if not signed_helper_trust_enabled(env):
+                note += (
+                    "\nThe helper updates every few days, so re-measuring each time is "
+                    "usually not worth it. The alternative is to trust any helper at "
+                    "this path that Windows reports as validly signed by Anthropic, "
+                    "PBC - weaker than measured bytes, and OFF by default because it "
+                    "rests on evidence you have not examined. Turn it on by creating "
+                    "the file:\n   {0}".format(trust_signed_helper_path(env)))
+            return note
     return ""
 
 
@@ -742,8 +874,15 @@ def claude_running(env):
             continue                       # nor on another instance of this tool
         if _is_cli_process(text):
             continue                       # the Claude Code CLI, not the desktop app
-        if _measured_helper_state(text) == "measured":
+        helper = _measured_helper_state(text, env)
+        if helper == "measured":
             continue                       # RULING 6: the measured Chrome helper
+        if (helper == "changed" and signed_helper_trust_enabled(env)
+                and _signed_helper_state(text) == "signed"):
+            continue                       # RULING 7: opt-in, validly signed
+        # note "unreadable" is deliberately NOT eligible for RULING 7: a helper
+        # whose bytes cannot be read cannot be shown to be the file that was
+        # signature-checked, so it keeps counting under either ruling.
         if "claude" in text:
             out.append(text)
     return out
@@ -2556,7 +2695,7 @@ def _guard_mutation(env, what):
         "another account's store while it is. No identity-file evidence can make "
         "'the destination is dormant' certain enough to mutate under a running "
         "app - close the desktop app and re-run.{2}{3}".format(
-            running[0], what, extra, helper_hash_note(running)))
+            running[0], what, extra, helper_hash_note(running, env)))
 
 
 # _certified_live_account's three states (RULING 5). Tri-state on purpose:

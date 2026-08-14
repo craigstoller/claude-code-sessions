@@ -315,31 +315,42 @@ class TestClaudeRunningNarrowing:
     # --------------------------------------- RULING 6: the measured Chrome helper
 
     @staticmethod
-    def _helper_on_disk(tmp_path, content=b"measured-helper-bytes"):
-        """A real file at a path carrying the anchored package segment chain.
+    def _helper_on_disk(env, tmp_path, content=b"measured-helper-bytes"):
+        """A real file where the helper actually lives, DERIVED from the env's
+        store root rather than fabricated.
 
-        Every directory is created LOWERCASE on purpose. The guard lowercases
-        lister entries and then stats that string, which is harmless on Windows
-        but not on the Linux CI legs: a path built under mixed-case directories
-        would not exist once lowercased, the hash would read as unreadable, and
-        these tests would fail there while passing here.
+        The guard no longer accepts a path merely containing the expected
+        segments - that let any fabricated path pose as the helper - so a test
+        fixture must sit at the real derived location too.
+
+        Lowercase throughout on purpose: the guard lowercases lister entries and
+        then stats that string, harmless on Windows but not on the Linux CI legs,
+        where a mixed-case path would not exist once lowercased.
+
+        The store root is re-pointed under a "claude" parent so the derived helper
+        path CONTAINS "claude", as the real one does (...\\Roaming\\Claude\\
+        ChromeNativeHost\\...). The shared fixture's plain "store0" parent does
+        not, which made these tests pass for the wrong reason: the entry was
+        dropped by the claude-named filter before any helper logic ran.
         """
-        d = (tmp_path / "appdata" / "local" / "packages" / "claude_pzs8sxrjxfjjc"
-             / "localcache" / "roaming" / "claude" / "chromenativehost")
-        d.mkdir(parents=True, exist_ok=True)
-        p = d / "chrome-native-host.exe"
-        p.write_bytes(content)
-        return str(p).lower()
+        root = tmp_path / "claude" / "claude-code-sessions"
+        root.mkdir(parents=True, exist_ok=True)
+        env.store_candidates = [str(root).lower()]
+        p = sorted(ct._expected_helper_paths(env))[0]
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(content)
+        return p
 
     def test_measured_helper_is_excluded(self, mkenv, tmp_path, monkeypatch):
         # The whole point of RULING 6: the build that was measured does not count,
         # so a mutation no longer needs Chrome closed.
-        exe = self._helper_on_disk(tmp_path)
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path)
         import hashlib
         monkeypatch.setattr(
             ct, "_HELPER_SHA256",
             hashlib.sha256(b"measured-helper-bytes").hexdigest())
-        env = mkenv(tmp_path)
         env.process_lister = lambda: [(99999, exe)]
         assert ct.claude_running(env) == []
 
@@ -347,62 +358,86 @@ class TestClaudeRunningNarrowing:
         # The helper auto-updates in place - observed changing mid-investigation
         # (744187C7... -> 711AD7E7..., same path). An exclusion must NOT carry
         # over to a binary nobody measured.
-        exe = self._helper_on_disk(tmp_path, b"a-different-build-entirely")
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path, b"a-different-build-entirely")
         import hashlib
         monkeypatch.setattr(
             ct, "_HELPER_SHA256",
             hashlib.sha256(b"measured-helper-bytes").hexdigest())
-        env = mkenv(tmp_path)
         env.process_lister = lambda: [(99999, exe)]
         assert ct.claude_running(env) == [exe]
 
     def test_updated_helper_refusal_explains_itself(self, mkenv, tmp_path,
                                                     monkeypatch):
-        exe = self._helper_on_disk(tmp_path, b"a-different-build-entirely")
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path, b"a-different-build-entirely")
         import hashlib
         monkeypatch.setattr(
             ct, "_HELPER_SHA256",
             hashlib.sha256(b"measured-helper-bytes").hexdigest())
-        note = ct.helper_hash_note([exe])
+        note = ct.helper_hash_note([exe], env)
         assert "different binary" in note and "watch_ceremony.py" in note
+        # and it must offer the RULING 7 opt-in, since re-measuring every few
+        # days is the trade that made the exclusion decay in the first place
+        assert "trust-signed-helper" in note
 
     def test_helper_named_as_an_argument_does_not_dodge_the_guard(
             self, mkenv, tmp_path, monkeypatch):
         # The lister hands us an unparsed entry; on POSIX that can be a whole
         # command line. A CONTAINS test would let a process merely MENTIONING the
         # helper inherit its exclusion. Trailing args must break the match.
-        exe = self._helper_on_disk(tmp_path)
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path)
         import hashlib
         monkeypatch.setattr(
             ct, "_HELPER_SHA256",
             hashlib.sha256(b"measured-helper-bytes").hexdigest())
-        env = mkenv(tmp_path)
         masquerade = exe + " --parent-window 0"
         env.process_lister = lambda: [(99999, masquerade)]
         assert ct.claude_running(env) == [masquerade]
 
     def test_helper_basename_outside_the_package_chain_counts(
-            self, mkenv, tmp_path):
-        # Same basename, same-named parent directory, still claude-named - but NOT
-        # under \packages\claude_..., so the anchored chain does not match and the
-        # exclusion must not apply. Bound to the chain, never to a filename.
-        # No file is created on purpose: the anchor check must reject this before
-        # any hash is attempted, so a hash could not rescue it either.
+            self, mkenv, tmp_path, monkeypatch):
+        # A FABRICATED path carrying every segment the old test looked for, with
+        # the measured bytes at it. The helper is recognised by its location
+        # derived from the real store root, not by path fragments - so this must
+        # still count. Regression guard: the segment test this replaced would have
+        # excused any binary copied under a directory tree named to match.
         env = mkenv(tmp_path)
-        exe = "d:\\claude\\chromenativehost\\chrome-native-host.exe"
+        fake = (tmp_path / "tmp" / "packages" / "claude_x" / "localcache" /
+                "roaming" / "claude" / "chromenativehost")
+        fake.mkdir(parents=True)
+        p = fake / "chrome-native-host.exe"
+        p.write_bytes(b"measured-helper-bytes")
+        import hashlib
+        monkeypatch.setattr(
+            ct, "_HELPER_SHA256",
+            hashlib.sha256(b"measured-helper-bytes").hexdigest())
+        exe = str(p).lower()
         env.process_lister = lambda: [(99999, exe)]
         assert ct.claude_running(env) == [exe]
+
+    def test_signed_publisher_must_match_exactly(self):
+        # A substring test accepted a valid certificate for "Not Anthropic, PBC".
+        # CN and O must both equal the publisher.
+        good = 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, C=US'
+        impostor = 'CN="Not Anthropic, PBC", O="Not Anthropic, PBC", C=US'
+        smuggled = 'CN="Someone Else", O="Someone Else", OU="Anthropic, PBC"'
+        assert ct._dn_field(good, "CN") == "Anthropic, PBC"
+        assert ct._dn_field(impostor, "CN") == "Not Anthropic, PBC"
+        assert ct._dn_field(smuggled, "CN") == "Someone Else"
+        assert ct._dn_field(smuggled, "O") == "Someone Else"
 
     def test_excluded_helper_does_not_excuse_the_desktop_app(
             self, mkenv, tmp_path, monkeypatch):
         # The exclusion must be per-process, never a blanket "Claude isn't
         # running" - the desktop app beside it still stops every mutation.
-        exe = self._helper_on_disk(tmp_path)
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path)
         import hashlib
         monkeypatch.setattr(
             ct, "_HELPER_SHA256",
             hashlib.sha256(b"measured-helper-bytes").hexdigest())
-        env = mkenv(tmp_path)
         env.process_lister = lambda: [(99999, exe), (99998, DESKTOP_EXE)]
         assert ct.claude_running(env) == [DESKTOP_EXE]
 

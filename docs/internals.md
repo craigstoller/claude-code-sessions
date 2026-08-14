@@ -477,6 +477,72 @@ Until then `chrome-native-host.exe` counts. Two tests in
 They pin the *classification*, which is what a future refactor would break; they assert nothing
 about the helper's I/O, which is the open question above and not something a unit test can settle.
 
+#### RULING 7 (2026-08-13) — opt-in signature trust, because the hash binding decays
+
+RULING 6's exclusion binds to the measured build's sha256. That is the strictest possible
+binding and it is also, in practice, a slowly self-cancelling one: **the helper auto-updates
+in place, and three distinct builds were observed in eight days** — `744187C7…` (2026-08-04),
+`711AD7E7…` (08-06), `D0374C9B…` (08-11). Each update correctly fails closed, so the helper
+starts counting again and "close Chrome too" returns until someone re-runs the ~12-minute
+measurement ceremony.
+
+That trade is bad enough to be self-defeating: roughly 2–4 days of relief per ceremony means
+the feature is rationally abandoned, leaving the original friction *plus* dead code. This was
+observed directly — the exclusion lapsed on 08-11 and the next real sync attempt, on 08-13,
+was refused with the user believing the feature still worked.
+
+**The alternative binding.** The helper is Authenticode-signed: `CN="Anthropic, PBC"`, EV
+certificate, DigiCert-issued, and Windows reports the signature `Valid`. Binding to *anchored
+package path + valid signature by that publisher* survives routine updates while still failing
+closed on an unsigned binary, a tampered one (the signature breaks), one signed by anyone else,
+or one outside the package chain.
+
+**What it trades.** Trust moves from "these exact measured bytes" to "this publisher". The
+residual is not forgery — it is that a **future** Anthropic build of the helper begins touching
+the store and the signature excuses it, because nobody re-measured. Small, given what the
+measurement found (a message bridge whose image contains no store path, held no store handle,
+and produced no store mutation across a 4m23s window under live extension traffic), but real.
+
+**Why it is OPT-IN and not the default.** This is a published tool and its other users have
+not examined that measurement. Loosening the shipped default would hand them a weaker guard
+silently, on evidence they never saw. The default therefore remains RULING 6. The opt-in is the
+**existence of a marker file**, `~/.claude-code-journal/trust-signed-helper` — nothing to parse,
+nothing to typo, trivially auditable, and deleting it is a complete revocation. The refusal
+names the exact path to create when the helper is counted for a hash mismatch.
+
+**Boundaries, all pinned by `tools/check_signed_helper_optin.py`:** a measured build is excluded
+regardless of the opt-in; a changed build counts while opted out; changed + signed + opted in is
+excluded; changed + **unsigned** + opted in still counts; **`unreadable` never qualifies** even
+signed and opted in (a binary whose bytes cannot be read cannot be shown to be the file that was
+signature-checked); and the desktop app itself is never excused by any of it.
+
+Review closed two holes where the implementation was weaker than the paragraphs above, and both
+are worth recording because both made a *documented* guarantee false rather than merely
+imprecise. The publisher test was a **substring** match, so a valid certificate for
+`CN="Not Anthropic, PBC"` — or any DN carrying that text in some other field — satisfied it;
+it now parses the DN and requires CN *and* O to equal the publisher exactly. And the helper was
+recognised by **path fragments** (`\packages\claude_` plus `\localcache\roaming\claude\
+chromenativehost\` appearing anywhere), which any fabricated path satisfies, so with the opt-in
+enabled another Anthropic-signed binary copied to `C:\tmp\packages\claude_x\localcache\roaming\
+claude\chromenativehost\chrome-native-host.exe` would have been excused. The helper's location
+is now **derived** from the discovered store roots and matched exactly.
+
+**One limit that is not fixed, and applies to RULING 6 equally.** Both rulings check the file
+*at the path*, not the image the running process actually loaded. An attacker who can write to
+the app's own package directory could therefore leave a tampered helper running while placing a
+trusted binary at its path. That is accepted rather than solved: an adversary with write access
+to the desktop app's install directory can replace the desktop app itself, which no guard here
+could survive, so it sits outside this tool's threat model. The claim to make is "a tampered
+binary *at that path* still counts", not "a tampered running process is always detected".
+
+**Verification is deliberately un-cached and tries two interpreters.** Caching on
+`(path, size, mtime)` is precisely the fail-open review caught in the hash version. And measured
+2026-08-13: `powershell` (5.1) on this machine fails with *"the module could not be loaded"* for
+`Microsoft.PowerShell.Security`, while `pwsh` 7 answers correctly — so trying only the
+always-present interpreter would report every helper unsigned and make the opt-in silently
+useless. Both are tried; if neither can verify, that is "couldn't look", the helper keeps
+counting, and the opt-in simply does not take effect.
+
 #### Amendment 2026-08-07 — the store-side watch replaces the elevated trace
 
 The *capture* clause above is superseded; the **acceptance endpoint is unchanged**. The
