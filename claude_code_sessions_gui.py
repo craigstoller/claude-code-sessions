@@ -309,12 +309,23 @@ class SyncApp:
         """
         import re
         pat = re.compile(r"^[0-9a-f]{8}/[0-9a-f]{8}$")
+        lines = msg.splitlines()
         out = []
-        for line in msg.splitlines():
+        for i, line in enumerate(lines):
             stripped = line.strip()
             parts = stripped.split()
-            if len(parts) >= 2 and pat.match(parts[0]):
-                out.append((parts[0].split("/")[1], stripped))
+            if not (len(parts) >= 2 and pat.match(parts[0])):
+                continue
+            # A candidate's warning sits on the FOLLOWING line, as "^ ...", because
+            # a trailing suffix wrapped off-screen in a terminal. That fix silently
+            # cost the GUI its warning: this parser kept only candidate lines, so
+            # every button rendered unmarked and a cross pair looked exactly like
+            # the real store - which is precisely how an empty destination got
+            # picked on a three-account machine. Carry the note with the candidate.
+            note = ""
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("^"):
+                note = lines[i + 1].strip().lstrip("^").strip()
+            out.append((parts[0].split("/")[1], stripped, note))
         return out
 
     def _offer_destination_picker(self, msg):
@@ -324,18 +335,26 @@ class SyncApp:
         win = tk.Toplevel(self.root)
         win.title("Choose a destination")
         win.transient(self.root)
-        ttk.Label(win, padding=PAD, justify="left",
-                  text="More than one other account store on this machine.\n"
-                       "Pick the one whose sidebar should get these sessions.\n"
-                       "A store with no listing rows holds no sessions yet.").pack(
-                           anchor="w")
-        for token, line in cands:
+        header = ("More than one other account store on this machine.\n"
+                  "Pick the one whose sidebar should get these sessions.")
+        # Every candidate empty is the just-created-an-account case, where the row
+        # count cannot help at all. Say the one thing that reliably settles it
+        # rather than leaving the user to read uuids out of paths.
+        if all("(no listing rows)" in line for _t, line, _n in cands):
+            header += ("\n\nAll of them are empty, so row counts cannot tell them apart. "
+                       "The reliable way:\nsend one message in the new account, close the "
+                       "app, then press Refresh - the store\nthat gained a row is the "
+                       "right one.")
+        ttk.Label(win, padding=PAD, justify="left", wraplength=620,
+                  text=header).pack(anchor="w")
+        for token, line, note in cands:
+            text = line if not note else line + "\n     ⚠ " + note
             def pick(t=token):
                 self.dest_choice = t
                 save_pref(t)
                 win.destroy()
                 self.refresh()
-            ttk.Button(win, text=line, command=pick).pack(fill="x", padx=PAD, pady=2)
+            ttk.Button(win, text=text, command=pick).pack(fill="x", padx=PAD, pady=2)
         ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
 
     def _account_label(self, uuid):
