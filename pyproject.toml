@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-code-sessions"
-version = "0.9.4"
+version = "0.9.5"
 description = "Unofficial tool for Claude Code sessions on disk: make a session visible under your other Claude account on the same machine, or move one between project folders. Command line or GUI. Journaled, reversible, fails closed."
 readme = "README.md"
 requires-python = ">=3.9"
