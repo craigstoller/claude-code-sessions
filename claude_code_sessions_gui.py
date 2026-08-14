@@ -616,6 +616,7 @@ class SyncApp:
                 "that names specific rows may have removed others first."
                 if kind == "refusal" else "")
             self.show([msg])
+            messagebox.showwarning("Undo did not complete", msg)   # see _apply_done
             self._sync_undo_button()
             return
         self.status.set("Undone - the copied rows were removed")
@@ -668,6 +669,14 @@ class SyncApp:
                             else "Something went wrong")
             self.detail.set("The tool's own explanation:" if kind == "refusal" else "")
             self.show([msg])
+            # MODAL, not just pane text. A refusal after pressing Apply is the one
+            # message that must not be missable: in the CLI a refusal IS the whole
+            # output, while here it lands quietly below a status line - so a user
+            # who pressed Apply and then went to check the other account's sidebar
+            # saw "nothing was copied" and no evidence anything had objected.
+            messagebox.showwarning(
+                "Nothing was copied" if kind == "refusal" else "Something went wrong",
+                msg)
             # A refusal here is nearly always "the desktop app is running", which
             # is fixable in seconds - so leave Apply reachable after a Refresh.
             self.apply_btn.configure(state="disabled")
