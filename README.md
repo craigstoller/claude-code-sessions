@@ -67,6 +67,31 @@ Registered as a GUI script, so nothing flashes a console window. It needs `tkint
 of the standard library, but packaged separately on some Linux distributions
 (`apt install python3-tk`).
 
+## Optional: let Chrome stay open
+
+The desktop app ships a helper for its Chrome extension that can outlive the app, so the
+guard counts it and you have to close Chrome too. A measured build of that helper is
+excluded — but **the helper auto-updates every few days** (three builds in eight days, as
+measured), and each update correctly fails closed, so the exclusion lapses and Chrome has to
+be closed again until someone re-runs the ~12-minute measurement in
+`tools/native-host-measurement/`.
+
+If that trade isn't worth it to you, there is an opt-in: trust **any** helper at the app's
+own package path that Windows reports as validly signed by `Anthropic, PBC`. Create this
+file to enable it, delete it to revoke:
+
+```
+~/.claude-code-journal/trust-signed-helper
+```
+
+It is off by default deliberately. It is weaker than the default — trust moves from "these
+exact measured bytes" to "this publisher", so a future Anthropic build that started touching
+the store would be excused without being measured. That risk is small (the measurement found
+a message bridge that never touched the store) but it is real, and it rests on evidence you
+have not personally examined, which is why nothing enables it for you. An unsigned, tampered,
+differently-signed, or out-of-path binary still counts, as does one whose bytes can't be
+read. See `docs/internals.md`, RULING 7.
+
 ## Before any move: close the Claude app.
 
 `move`, `undo`, `recover`, and every mutating `sync` route (`--apply`, `undo` of a completed
