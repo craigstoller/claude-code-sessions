@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  Source for this repo's GitHub social preview image (Settings > General > Social preview).
+  Re-render: capture this page at exactly 1280x640 (e.g. chrome --headless --screenshot=out.png --window-size=1280,640 file:///...), downscale to 1280x640 if the capture is DPR-scaled, keep under 1 MB, then upload manually - there is no API for social previews.
+-->
+
+<html><head><meta charset="utf-8"><style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { width:1280px; height:640px; overflow:hidden; position:relative;
+    background:#160d0a; font-family:"Segoe UI",system-ui,sans-serif; }
+  .glow { position:absolute; right:-170px; top:-170px; width:820px; height:820px;
+    background:radial-gradient(circle, rgba(217,119,87,.24) 0%, rgba(217,119,87,0) 62%); }
+  .glow2 { position:absolute; left:-230px; bottom:-260px; width:700px; height:700px;
+    background:radial-gradient(circle, rgba(217,119,87,.10) 0%, rgba(217,119,87,0) 60%); }
+  .grid { position:absolute; inset:0;
+    background-image:linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size:48px 48px; }
+  .content { position:absolute; left:84px; top:128px; width:620px; }
+  .owner { font-family:ui-monospace,Consolas,monospace; font-size:26px; color:#a98d80; letter-spacing:.5px; }
+  h1 { font-family:ui-monospace,Consolas,monospace; font-size:57px; font-weight:700;
+    color:#faf3ef; margin-top:10px; letter-spacing:-1px; line-height:1.1; }
+  h1 .accent { color:#f29b78; }
+  .tag { margin-top:24px; font-size:30px; line-height:1.45; color:#cdb4a7; font-weight:350; }
+  .tag b { color:#f7e6dc; font-weight:600; }
+  .chips { position:absolute; left:84px; bottom:70px; display:flex; gap:14px; }
+  .chip { font-family:ui-monospace,Consolas,monospace; font-size:20px; color:#f0cebd;
+    border:1px solid rgba(242,155,120,.45); border-radius:999px; padding:9px 22px;
+    background:rgba(217,119,87,.10); }
+  .art { position:absolute; right:84px; top:50%; transform:translateY(-50%); }
+</style></head><body>
+  <div class="glow"></div><div class="glow2"></div><div class="grid"></div>
+  <div class="content">
+    <div class="owner">craigstoller /</div>
+    <h1>claude-code<br><span class="accent">-sessions</span></h1>
+    <div class="tag">Move <b>Claude Code sessions</b> between accounts and project folders on the same machine.</div>
+  </div>
+  <div class="chips">
+    <div class="chip">journaled</div><div class="chip">reversible</div><div class="chip">CLI + GUI</div>
+  </div>
+  <svg class="art" width="400" height="360" viewBox="0 0 400 360" fill="none">
+    <rect x="24" y="30" width="230" height="160" rx="14" fill="rgba(22,13,10,.75)" stroke="rgba(242,155,120,.5)" stroke-width="3.5"/>
+    <circle cx="50" cy="56" r="7" fill="rgba(242,155,120,.55)"/>
+    <circle cx="74" cy="56" r="7" fill="rgba(242,155,120,.32)"/>
+    <path d="M48 96 l26 22 -26 22 M92 140 h58" stroke="#e8b39a" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <rect x="146" y="170" width="230" height="160" rx="14" fill="rgba(22,13,10,.9)" stroke="#f29b78" stroke-width="4.5"/>
+    <circle cx="172" cy="196" r="7" fill="#f29b78"/>
+    <circle cx="196" cy="196" r="7" fill="rgba(242,155,120,.5)"/>
+    <path d="M170 236 l26 22 -26 22 M214 280 h58" stroke="#f6c4ab" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <path d="M282 120 c46 0 62 24 62 52" stroke="#f29b78" stroke-width="7" stroke-linecap="round" fill="none" stroke-dasharray="2 16"/>
+    <path d="M330 152 l14 22 l14 -22" stroke="#f29b78" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </svg>
+</body></html>
