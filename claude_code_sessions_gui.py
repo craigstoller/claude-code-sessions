@@ -261,6 +261,13 @@ class SyncApp:
         src = manifest.get("source_email") or manifest["source_account"][:8]
         dst = manifest.get("dest_email") or manifest["dest_account"][:8]
 
+        # A remembered email is marked, never passed off as freshly observed: it
+        # says what was true when that account was last signed in. The path below
+        # it stays the identifier that actually settles which store this is.
+        esrc = manifest.get("dest_email_source") or ""
+        if esrc.startswith("memo"):
+            _, _, seen = esrc.partition(":")
+            dst += "   (remembered{0})".format(", " + seen if seen else "")
         lines = ["from  {0}".format(src),
                  "      " + short(manifest["source_path"], home),
                  "",

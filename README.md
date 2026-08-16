@@ -369,6 +369,14 @@ to delete it — exactly the designed behavior.
 - `moved-log.jsonl` — a tiny, append-only, never-rotated record of completed moves (session id,
   from-path, to-path, date), used to recognize your own past moves during future collision and
   encoding-evidence checks.
+- `account-emails.json` — account uuid → the email that account had when it was **signed in**,
+  with the date seen. `~/.claude.json` names only the live account, so the destination of a sync
+  is precisely the account whose email is hardest to recover; but every account is the live one
+  sometimes, so syncing in both directions teaches the pair. A remembered email is **labelled as
+  remembered** wherever it is shown, because it says what was true when that account was last
+  signed in, not what is true now — the store path beside it remains the identifier to check.
+  Delete the file to forget everything; it is rebuilt as accounts are used.
+- `trust-signed-helper` — present only if you enabled the opt-in above.
 
 To purge everything the tool has ever written, delete the whole `~/.claude-code-journal/` directory.
 This does not touch any transcript or listing row — only the tool's own journal.
