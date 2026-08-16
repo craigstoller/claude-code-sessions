@@ -136,7 +136,13 @@ check("  each entry carries a note field", all(len(c) == 3 for c in cands))
 warned = [c for c in cands if c[2]]
 check("  exactly the cross pair is warned", len(warned) == 1, str(len(warned)))
 check("  and it is the one sharing the signed-in org",
-      warned and warned[0][0].startswith("53346e14"), warned[0][0] if warned else "-")
+      warned and warned[0][0].endswith("/53346e14"), warned[0][0] if warned else "-")
+# the candidate token must be the FULL account/org pair, not a bare org id: a
+# saved org id stopped being unique the moment a third account appeared, and
+# every plan then refused with Apply disabled
+check("  the token identifies an account AND an org",
+      all(c[0].count("/") == 1 and len(c[0].split("/")[0]) == 8 for c in cands),
+      cands[0][0])
 check("  the warning text survives onto the button",
       warned and "shares your signed-in org" in warned[0][2])
 check("  the footnote never becomes a button",
