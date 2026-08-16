@@ -225,6 +225,21 @@ class SyncApp:
                 self.show([msg])
                 self._offer_live_picker()
                 return
+            # A SAVED destination can go stale: an 8-char id that identified one
+            # store stops being unique the moment another account/org pair appears,
+            # and every plan then refuses with Apply disabled. Route that refusal to
+            # the same picker - otherwise the only way out is knowing about the
+            # "Change destination" button, which is not a recovery path anyone
+            # should have to guess at.
+            if kind == "refusal" and "be more specific" in msg and "matched" in msg:
+                self.status.set("The saved destination is no longer unique")
+                self.detail.set("It matches more than one store now - probably because "
+                                "an account was added. Pick the one you mean; the "
+                                "choice is saved as a full path, which cannot go "
+                                "ambiguous again.")
+                self.show([msg])
+                self._offer_destination_picker(msg)
+                return
             if kind == "refusal" and "more than one other account store" in msg:
                 self.status.set("Which account should these sessions go to?")
                 self.detail.set("More than one other account store exists on this "
@@ -331,8 +346,23 @@ class SyncApp:
             note = ""
             if i + 1 < len(lines) and lines[i + 1].strip().startswith("^"):
                 note = lines[i + 1].strip().lstrip("^").strip()
-            out.append((parts[0].split("/")[1], stripped, note))
+            out.append((parts[0], stripped, note))
         return out
+
+    def _resolve_pair(self, pair):
+        """'<acct8>/<org8>' -> that store's full path, or '' if it is not unique.
+
+        The pair is resolved against the real store list rather than saved as-is,
+        because BOTH halves are 8-character prefixes and neither is guaranteed
+        unique: saving a bare org id is what broke here - "ef430bfb" identified
+        one store until a third account appeared, then matched two and every plan
+        refused with a disabled Apply and no way forward in the window. A full
+        path is unique by construction.
+        """
+        acct, _, org = pair.partition("/")
+        hits = [p for a, o, p in ccs._account_dirs(self.env)
+                if a.startswith(acct) and o.startswith(org)]
+        return hits[0] if len(hits) == 1 else ""
 
     def _offer_destination_picker(self, msg):
         cands = self._candidates(msg)
@@ -353,11 +383,12 @@ class SyncApp:
                        "right one.")
         ttk.Label(win, padding=PAD, justify="left", wraplength=620,
                   text=header).pack(anchor="w")
-        for token, line, note in cands:
+        for pair, line, note in cands:
             text = line if not note else line + "\n     ⚠ " + note
-            def pick(t=token):
-                self.dest_choice = t
-                save_pref(t)
+            def pick(p=pair):
+                # Save the resolved PATH, not the id fragment shown on the button.
+                self.dest_choice = self._resolve_pair(p) or p
+                save_pref(self.dest_choice)
                 win.destroy()
                 self.refresh()
             ttk.Button(win, text=text, command=pick).pack(fill="x", padx=PAD, pady=2)
