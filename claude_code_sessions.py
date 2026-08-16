@@ -2548,6 +2548,12 @@ class Account:
     # measured oauth stale across a real switch - it is kept for messages
     # and diagnostics only; every mutation route takes _guard_mutation.
     resolved_from: str = ""
+    # Where `email` came from, for a DORMANT account: "sandbox" (re-derived from
+    # the app's own per-account config, so current), "memo:<date>" (recorded by
+    # this tool when that account was last signed in - good enough to recognise
+    # a destination, but not an observation of right now), or "" (unknown, or a
+    # live account whose email came from ~/.claude.json).
+    email_source: str = ""
 
 
 def _listdir_or_refuse(path, what):
@@ -3019,6 +3025,91 @@ def _candidate_listing(items, live_org=None):
 _AGENT_MODE_DIR = "local-agent-mode-sessions"
 
 
+_EMAIL_MEMO = "account-emails.json"
+
+
+def _email_memo_path(env):
+    return os.path.join(os.path.dirname(env.ops_dir), _EMAIL_MEMO)
+
+
+def remember_account_email(env, account_uuid, email):
+    """Record the email of an account seen SIGNED IN, for later use as a label.
+
+    ~/.claude.json names only the live account, so the destination of a sync
+    is exactly the account whose email is hardest to recover. But every account
+    is the live one sometimes: sync from A to B today, from B to A tomorrow, and
+    the pair is learned. This turns "the account you sync into is a hex prefix"
+    into a self-healing problem rather than a permanent one.
+
+    Best-effort in both directions - a failure to record, or a corrupt memo, is
+    never an error. This only ever improves a label; the store path printed
+    beside it is the identifier that actually matters, and the README says so.
+    """
+    if not account_uuid or not email:
+        return
+    path = _email_memo_path(env)
+    try:
+        memo = read_json(path) or {}
+        if not isinstance(memo, dict):
+            memo = {}
+    except (LayoutError, OSError, ValueError, AttributeError):
+        memo = {}
+    prior = memo.get(account_uuid)
+    if isinstance(prior, dict) and prior.get("email") == email:
+        return                      # unchanged - do not rewrite for a timestamp
+    import time as _time
+    memo[account_uuid] = {"email": email,
+                          "seen": _time.strftime("%Y-%m-%d", _time.gmtime())}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(memo, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def remembered_account_email(env, account_uuid):
+    """(email, date_seen) previously recorded for ACCOUNT_UUID, or ("", "").
+
+    Every field is type-checked before it is returned. The file is ordinary JSON
+    that a user may edit or a disk may mangle, so a record like
+    {"email": 123} is possible - and returning that would push a non-string into
+    a "memo:" + seen concatenation and into the --to match string, turning a
+    best-effort LABEL into an uncaught TypeError. Anything unexpected is simply
+    unknown, which is what this promises.
+    """
+    try:
+        memo = read_json(_email_memo_path(env)) or {}
+        rec = memo.get(account_uuid) if isinstance(memo, dict) else None
+        if isinstance(rec, dict):
+            email, seen = rec.get("email"), rec.get("seen", "")
+            if isinstance(email, str) and email:
+                return email, seen if isinstance(seen, str) else ""
+    except (LayoutError, OSError, ValueError, AttributeError):
+        pass
+    return "", ""
+
+
+def account_email(env, account_uuid):
+    """(email, source) for a dormant account. source: 'sandbox'|'memo'|''.
+
+    The sandbox lookup is preferred because it is re-derived from the app's own
+    files every time, so it cannot go stale. The memo is a record of what was
+    true when that account was last signed in, which is good enough to
+    RECOGNISE a destination but is not evidence about right now - callers label
+    it, rather than passing it off as freshly observed.
+    """
+    email = dormant_account_email(env, account_uuid)
+    if email:
+        return email, "sandbox"
+    email, seen = remembered_account_email(env, account_uuid)
+    if email:
+        return email, "memo:" + seen if seen else "memo"
+    return "", ""
+
+
 def dormant_account_email(env, account_uuid):
     """Best-effort email for an account that is NOT signed in, or "".
 
@@ -3143,9 +3234,9 @@ def _resolve_live_assertion(env, live, dirs):
     for a, o, p in dirs:
         if a not in (oauth_uuid, config_uuid):
             continue
-        email = ((oauth_email if a == oauth_uuid else "")
-                 or dormant_account_email(env, a))
-        cands.append(Account(a, o, email, p, "user"))
+        email, src = ((oauth_email, "") if a == oauth_uuid and oauth_email
+                      else account_email(env, a))
+        cands.append(Account(a, o, email, p, "user", src))
     matched = [c for c in cands if live.lower() in
                (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
                 c.path).lower()]
@@ -3243,8 +3334,12 @@ def resolve_sync_endpoints(env, to=None, live=None):
             "authenticate the CLI (which writes ~/.claude.json) so one of them names\n"
             "the account.\n"
             "Stores found:\n" + listing)
-    others = [Account(a, o, dormant_account_email(env, a), p)
-              for a, o, p in dirs if a != source.account_uuid]
+    others = []
+    for a, o, p in dirs:
+        if a == source.account_uuid:
+            continue
+        email, src = account_email(env, a)
+        others.append(Account(a, o, email, p, "", src))
     if not others:
         raise Refusal("no other account store on this machine - nothing to sync into")
     if to:
@@ -3540,7 +3635,8 @@ def plan_sync(env, flags):
            # see _certified_live_account, RULING 5.)
            "source_resolved_from": source.resolved_from,
            "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
-           "dest_email": dest.email, "dest_path": dest.path,
+           "dest_email": dest.email, "dest_email_source": dest.email_source,
+           "dest_path": dest.path,
            "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
     if source.resolved_from == "user":
         out["live_override"] = _live_override_record(env, source)
@@ -3739,6 +3835,13 @@ def run_sync(env, manifest):
     never calls back through here.
     """
     _guard_mutation(env, "write to")
+    # Learn the live account's email HERE, not while planning. plan_sync
+    # documents "writes nothing", and both the dry run and the GUI's plan
+    # promise the same - creating a memo file during a preview would break a
+    # guarantee this tool makes loudly, to save a label. An apply is already a
+    # write, and applying is how accounts get used, so the memo still fills in.
+    remember_account_email(env, manifest.get("source_account"),
+                           manifest.get("source_email"))
     acquire_lock(env, "pending")
     try:
         # "tally" is the report's data, not the operation's: it names every
@@ -4189,6 +4292,16 @@ def _print_sync_report(say, manifest):
         manifest["dest_email"] or "(email unknown)",
         manifest["dest_account"][:8], manifest["dest_org"][:8]))
     say("      " + manifest["dest_path"])
+    # A remembered email is labelled rather than passed off as freshly observed:
+    # it says what was true when that account was last signed in, which is enough
+    # to RECOGNISE a destination but is not evidence about right now. The path
+    # above remains the identifier to check.
+    src = manifest.get("dest_email_source") or ""
+    if src.startswith("memo"):
+        _, _, seen = src.partition(":")
+        say("      (email remembered from when this account was last signed in{0}"
+            " - the path above is what identifies it)".format(
+                ", " + seen if seen else ""))
     say("")
 
     tally = manifest["tally"]
