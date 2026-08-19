@@ -1918,19 +1918,25 @@ def recover_op(env, op, direction):
                 # SKIPPED, never deleted, and the rest are removed; the
                 # blocking pending row itself is never even considered,
                 # because this op never wrote it.
-                drifted, unreadable, removable = _sync_delete_targets(env, m)
+                drifted, unreadable, removable, restorable =                     _sync_delete_targets(env, m)
                 _sync_unlink_all(removable)
+                _sync_restore_all(restorable)
                 skipped = drifted + unreadable
+                # Restores are reversals too: an interrupted update whose rows
+                # were all refreshed removes nothing yet undoes everything, and
+                # reporting that as "removed nothing" would send the user off to
+                # forward-then-undo an op that is already reversed.
+                reversed_n = len(removable) + len(restorable)
                 # Same reporting mechanism _abort already uses for move -
                 # cmd_recover's existing _print_abort_reason picks this up for
                 # free once status is non-"completed".
                 if skipped:
                     op.manifest["abort_reason"] = (
-                        "back removed {0} row(s) it could verify; left {1} "
+                        "back reversed {0} row(s) it could verify; left {1} "
                         "untouched because {2}".format(
-                            len(removable), len(skipped),
+                            reversed_n, len(skipped),
                             _drift_clause(drifted, unreadable)))
-                elif not removable:
+                elif not reversed_n:
                     # Say so out loud rather than printing a bare
                     # "rolled_back". This is reachable and it is a trap: a
                     # hard kill (not an exception - those journal on the way
@@ -2318,6 +2324,10 @@ def build_parser():
                     dest="include_deleted", metavar="TITLE_OR_ID",
                     help="also copy this session even though the destination "
                          "deleted it (names one session; not a blanket switch)")
+    sp.add_argument("--update", action="store_true",
+                    help="also REFRESH rows that already exist in the destination, "
+                         "replacing their stale title/last-activity snapshot. This "
+                         "is the only sync route that overwrites rather than adds")
     sp.add_argument("--verbatim", action="store_true",
                     help="copy rows unchanged instead of stripping connector config")
     sp.add_argument("--apply", action="store_true")
@@ -3378,6 +3388,10 @@ def resolve_sync_endpoints(env, to=None, live=None):
 @dataclasses.dataclass
 class SyncFlags:
     to: str = ""
+    # RULING 8: refresh rows that already exist at the destination. Every other
+    # sync route only ADDS; this is the single path that can overwrite, so it is
+    # opt-in per run and never implied.
+    update: bool = False
     only: str = ""
     include_deleted: tuple = ()
     verbatim: bool = False
@@ -3478,7 +3492,7 @@ def select_sync_rows(env, source, dest, flags):
     row for the same conversation under a different local id is not detected.
     """
     tally = {"present": [], "no_transcript": [], "deleted": [], "unreadable": [],
-             "filtered": [], "resurrected": []}
+             "filtered": [], "resurrected": [], "unchanged": []}
     have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
@@ -3515,8 +3529,22 @@ def select_sync_rows(env, source, dest, flags):
             tally["filtered"].append(title)
             continue
         if name in have:
-            tally["present"].append(title)
-            continue
+            if not flags.update:
+                tally["present"].append(title)
+                continue
+            # --update: the row exists, so this is a REFRESH. Capture the
+            # destination's current bytes as the pre-image; plan_sync drops the
+            # row if the transform turns out to produce identical bytes, and
+            # execute refuses if these bytes change between planning and writing.
+            try:
+                with open(os.path.join(dest.path, name), "rb") as fh:
+                    pre = fh.read()
+            except OSError:
+                # Cannot read what we would overwrite - never treat that as
+                # "safe to replace". Same fail-closed rule as everywhere else.
+                tally["unreadable"].append(title)
+                continue
+            e["pre"] = pre
         if not sid or not find_transcripts(env.projects_root, sid):
             tally["no_transcript"].append(title)
             continue
@@ -3532,7 +3560,9 @@ def select_sync_rows(env, source, dest, flags):
         picked.append({"name": name, "src_path": e["src_path"], "data": e["data"],
                        "session_id": sid, "title": title,
                        "last_activity": e["last_activity"],
-                       "overrode_tombstone": overrode})
+                       "overrode_tombstone": overrode,
+                       # bytes currently at the destination, for a refresh only
+                       "pre": e.get("pre")})
     picked.sort(key=lambda r: r["last_activity"], reverse=True)
     return picked, tally
 
@@ -3612,7 +3642,16 @@ def plan_sync(env, flags):
     rows = []
     for cand in picked:
         blob, removed, reset = transform_row(cand["data"], flags.verbatim)
+        pre = cand.get("pre")
+        if pre is not None and pre == blob:
+            # A refresh that would write the identical bytes is not a refresh.
+            # Dropping it here keeps the plan honest about what --update will
+            # actually overwrite, and keeps a no-op run from journaling one.
+            tally["unchanged"].append(cand["title"])
+            continue
         rows.append({"name": cand["name"],
+                     "pre_b64": b64(pre) if pre is not None else None,
+                     "is_update": pre is not None,
                      "dest_path": os.path.join(dest.path, cand["name"]),
                      "post_b64": b64(blob), "session_id": cand["session_id"],
                      "title": cand["title"], "removed": removed, "reset": reset,
@@ -3711,9 +3750,14 @@ def execute_sync_op(env, op):
     set_status(op, "writing")
     rows = m["rows"]
     # What one save_manifest costs, estimated once rather than measured per
-    # row: the manifest is dominated by the rows' base64 post-images, and
-    # flipping a `written` flag does not change its size materially.
-    per_save = sum(len(r.get("post_b64") or "") for r in rows) + 4096
+    # row: the manifest is dominated by the rows' base64 images, and flipping a
+    # `written` flag does not change its size materially. BOTH images count - a
+    # refresh carries a pre-image too, and on rows whose connector config the
+    # default transform strips, the pre-image is the larger of the two. Counting
+    # only post-images there under-estimates every save and defeats the byte
+    # budget that exists to stop a big run looking like a hang.
+    per_save = sum(len(r.get("post_b64") or "") + len(r.get("pre_b64") or "")
+                   for r in rows) + 4096
     budget = SYNC_JOURNAL_BYTE_BUDGET
     try:
         _sync_write_rows(op, m, rows, per_save, budget)
@@ -3777,7 +3821,45 @@ def _sync_write_rows(op, m, rows, per_save, budget):
                 "for changes since planning: {2}. The op is left at 'writing' "
                 "- resolve the row, then re-run.".format(
                     r["name"], r["session_id"], exc))
-        if current is None:
+        # is_update, NOT truthiness of pre_b64: a zero-byte destination row
+        # encodes to "", which is falsy, and would silently demote a refresh to
+        # an add - which then refuses because "a different row is already there".
+        pre = unb64(r.get("pre_b64") or "") if r.get("is_update") else None
+        if pre is not None:
+            # A REFRESH (RULING 8). The row existed at plan time and we intend to
+            # overwrite it, so "present with different bytes" is no longer proof
+            # of drift - the question is whether it still holds the SAME bytes we
+            # planned against.
+            if current is None:
+                # It was there when planned and is gone now: the destination
+                # account deleted this session. Writing would resurrect it, which
+                # is precisely what the tombstone skip exists to prevent.
+                raise Refusal(
+                    "destination row {0!r} (session {1}) was deleted since this "
+                    "refresh was planned; re-creating it would resurrect a session "
+                    "that account removed. The op is left at 'writing' - re-run to "
+                    "re-plan without it.".format(r["name"], r["session_id"]))
+            if current == post:
+                r["written"] = True      # already refreshed; nothing to do
+                if budget >= per_save:
+                    budget -= per_save
+                    save_manifest(op)
+                continue
+            if current != pre:
+                raise Refusal(
+                    "destination row {0!r} (session {1}) changed since this refresh "
+                    "was planned - it no longer matches the copy this op measured, "
+                    "so overwriting it would discard whatever changed it. The op is "
+                    "left at 'writing' - re-run to re-plan against its current "
+                    "state.".format(r["name"], r["session_id"]))
+            try:
+                atomic_write(r["dest_path"], post)
+            except OSError as exc:
+                raise Refusal(
+                    "could not refresh destination row {0!r} (session {1}): {2}"
+                    .format(r["name"], r["session_id"], exc))
+            _maybe_crash("sync-write-before-save")
+        elif current is None:
             try:
                 atomic_write(r["dest_path"], post)
             except OSError as exc:
@@ -3890,6 +3972,12 @@ def _sync_row_drift(r):
         post = unb64(r["post_b64"])
     except (KeyError, ValueError):
         return "unreadable"
+    pre = None
+    if r.get("is_update"):
+        try:
+            pre = unb64(r.get("pre_b64") or "")
+        except ValueError:
+            return "unreadable"
     try:
         with open(r["dest_path"], "rb") as fh:
             cur = fh.read()
@@ -3897,7 +3985,16 @@ def _sync_row_drift(r):
         return "absent"
     except OSError:
         return "unreadable"
-    return "match" if cur == post else "drifted"
+    if cur == post:
+        return "match"
+    if pre is not None and cur == pre:
+        # A REFRESH this op has not performed yet: the row still holds exactly
+        # the bytes the plan measured. Without this state an interrupted update
+        # classified every untouched row as "drifted", which withdrew `forward`
+        # and left back-then-replan as the only exit from an op that was in fact
+        # perfectly resumable.
+        return "pristine"
+    return "drifted"
 
 
 def _sync_drift_titles(rows):
@@ -4029,8 +4126,10 @@ def _sync_delete_targets(env, m):
     'match' is removable. 'drifted' and 'unreadable' are reported
     separately - neither is ever deleted.
 
-    Returns (drifted_titles, unreadable_titles, removable_paths). Deletes
-    nothing itself.
+    Returns (drifted_titles, unreadable_titles, removable_paths,
+    restorable_pairs). Writes and deletes nothing itself. `restorable_pairs`
+    is [(dest_path, original_bytes)] for rows this op REFRESHED (RULING 8),
+    whose reversal is restoring the pre-image rather than deleting the file.
     """
     # realpath on both sides, matching execute_sync_op's write-side check and
     # ensure_contained below - see the note there on junctions.
@@ -4047,7 +4146,7 @@ def _sync_delete_targets(env, m):
     # regardless of provenance). Both callers of this helper (undo_sync,
     # recover_op's sync 'back' arm) inherit it from this one place.
     _guard_mutation(env, "delete from")
-    drifted, unreadable, removable = [], [], []
+    drifted, unreadable, removable, restorable = [], [], [], []
     for r in m["rows"]:
         if not r.get("written"):
             continue
@@ -4057,15 +4156,50 @@ def _sync_delete_targets(env, m):
                 "row dest_path {0!r} is not a direct child of the destination "
                 "store {1!r}; refusing".format(r["dest_path"], m["dest_path"]))
         state = _sync_row_drift(r)
+        if state == "pristine":
+            continue                       # untouched refresh - already original
         if state == "absent":
-            continue                       # confirmed absent - nothing to undo
+            # Nothing to undo. For a REFRESH this also means the destination
+            # deleted the session after we rewrote it - putting the old bytes
+            # back would resurrect it, so absent is skipped there too.
+            continue
         elif state == "match":
-            removable.append(r["dest_path"])
+            # "match" means the row still holds exactly what this op wrote. For
+            # an added row the reversal is deletion; for a refreshed one it is
+            # putting the measured pre-image back. Same evidence, different act.
+            if r.get("is_update"):
+                try:
+                    restorable.append((r["dest_path"], unb64(r.get("pre_b64") or "")))
+                except (KeyError, ValueError):
+                    unreadable.append(r["title"])   # cannot rebuild the original
+            else:
+                removable.append(r["dest_path"])
         elif state == "drifted":
             drifted.append(r["title"])
         else:                              # "unreadable"
             unreadable.append(r["title"])
-    return drifted, unreadable, removable
+    return drifted, unreadable, removable, restorable
+
+
+def _sync_restore_all(pairs):
+    """Put every measured pre-image back, attempting all of them even if some
+    fail, and report every failure together - the same shape as
+    _sync_unlink_all, and for the same reason: stopping at the first failure
+    would leave a reversal half-applied with no record of the rest.
+
+    atomic_write, not a plain write: a reversal interrupted mid-file would
+    leave a row that is neither the refreshed version nor the original, which
+    is worse than either.
+    """
+    failures = []
+    for path, blob in pairs:
+        try:
+            atomic_write(path, blob)
+        except OSError as exc:
+            failures.append((path, exc))
+    if failures:
+        raise Refusal("could not restore {0}".format(
+            ", ".join("{0} ({1})".format(p, exc) for p, exc in failures)))
 
 
 def _sync_unlink_all(paths):
@@ -4086,8 +4220,9 @@ def _sync_unlink_all(paths):
 
 
 def undo_sync(env, op):
-    """Delete exactly the rows this sync wrote - and only while they are still
-    byte-identical to what it wrote. If the destination account has since
+    """Reverse exactly what this sync did - and only while every row is still
+    byte-identical to what it wrote. Rows it ADDED are deleted; rows it
+    REFRESHED (RULING 8) are restored to the pre-image the plan measured. If the destination account has since
     opened the session the app rewrites the row, and deleting it would discard
     that account's own state. A row that cannot even be read is treated the
     same way - a surprise either way, so undo refuses rather than guessing.
@@ -4108,12 +4243,15 @@ def undo_sync(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
-        drifted, unreadable, removable = _sync_delete_targets(env, m)
+        drifted, unreadable, removable, restorable = _sync_delete_targets(env, m)
         if drifted or unreadable:
             raise Refusal("these synced rows {0}; the other account may have opened "
-                          "them. Refusing to delete any of them."
+                          "them. Refusing to change any of them."
                           .format(_drift_clause(drifted, unreadable)))
         _sync_unlink_all(removable)
+        # Restores come after deletions so a failure part-way leaves the simpler
+        # half done, and _sync_restore_all reports every failure together.
+        _sync_restore_all(restorable)
         set_status(op, "undone")
         rotate_ops(env)
         return "undone"
@@ -4121,8 +4259,24 @@ def undo_sync(env, op):
         release_lock(env)
 
 
+def _public_manifest(m):
+    """The manifest with refresh pre-images removed, for --json.
+
+    `pre_b64` is the destination row VERBATIM - including the
+    `remoteMcpServersConfig` and permission state the default transform strips
+    precisely so they are not carried around. It belongs in the private journal,
+    which is what undo restores from; printing it to stdout would let ordinary
+    automation log another account's connector configuration without anyone
+    asking for --verbatim.
+    """
+    out = dict(m)
+    out["rows"] = [{k: v for k, v in r.items() if k != "pre_b64"}
+                   for r in m.get("rows", [])]
+    return out
+
+
 def cmd_sync(env, ns):
-    flags = SyncFlags(to=ns.to, only=ns.only,
+    flags = SyncFlags(to=ns.to, only=ns.only, update=ns.update,
                       include_deleted=tuple(ns.include_deleted or ()),
                       verbatim=ns.verbatim, live=ns.live)
     manifest = plan_sync(env, flags)
@@ -4157,7 +4311,7 @@ def cmd_sync(env, ns):
     if ns.json:
         if final is not None:
             manifest["result"] = final
-        print(json.dumps(manifest, indent=1))
+        print(json.dumps(_public_manifest(manifest), indent=1))
         return 0 if final in (None, "completed") else 1
 
     if not manifest["rows"]:
@@ -4309,7 +4463,8 @@ def _print_sync_report(say, manifest):
               ("no_transcript", "skipped, transcript gone"),
               ("deleted", "skipped, deleted in the destination"),
               ("unreadable", "skipped, unreadable row"),
-              ("filtered", "skipped, did not match --only")]
+              ("filtered", "skipped, did not match --only"),
+              ("unchanged", "already identical, nothing to refresh")]
     for key, label in LABELS:
         items = tally.get(key) or []
         if items:
@@ -4343,11 +4498,29 @@ def _print_sync_report(say, manifest):
             say("   ... and {0} more".format(len(resurrected) - 15))
         say("")
 
-    say("{0:36}: {1}".format("to copy", len(manifest["rows"])))
-    for r in manifest["rows"][:15]:
+    # Refreshes are the only thing this tool does that OVERWRITES rather than
+    # adds, so they are listed separately and first, the same treatment
+    # --include-deleted gets above. A user must never discover after the fact
+    # that "to copy" quietly included rewriting rows that were already there.
+    refreshes = [r for r in manifest["rows"] if r.get("is_update")]
+    adds = [r for r in manifest["rows"] if not r.get("is_update")]
+    if refreshes:
+        say("")
+        say("!! OVERWRITING {0} row(s) that already exist in the destination "
+            "(--update):".format(len(refreshes)))
+        for r in refreshes[:15]:
+            say("   !! {0}".format(r["title"]))
+        if len(refreshes) > 15:
+            say("   ... and {0} more".format(len(refreshes) - 15))
+        say("   undo restores the exact bytes replaced; a row the destination has")
+        say("   changed since planning is refused, never overwritten.")
+        say("")
+
+    say("{0:36}: {1}".format("to copy", len(adds)))
+    for r in adds[:15]:
         say("   {0}{1}".format("!! " if r.get("overrode_tombstone") else "", r["title"]))
-    if len(manifest["rows"]) > 15:
-        say("   ... and {0} more".format(len(manifest["rows"]) - 15))
+    if len(adds) > 15:
+        say("   ... and {0} more".format(len(adds) - 15))
 
 
 if __name__ == "__main__":
