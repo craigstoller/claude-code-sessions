@@ -259,11 +259,14 @@ is always a preview will misread `sync --apply --json`.
   truncated to 8 characters (e.g. `~\AppData\...\claude-code-sessions\aaaaaaaa…\bbbbbbbb…`)
   unless you pass `--verbose` for the paths and ids in full. Check the path, not just the email,
   before `--apply`.
-- A synced row is a **snapshot**: title and last-activity time live in the row itself, so a
-  session you keep using shows its copy-time title and sits at its copy-time position in the
-  other account, indefinitely. Re-running does not refresh it — `sync` only ever adds rows that
-  are missing, never rewrites one that's already there. Refreshing a stale row (`--update`) is
-  planned but not yet built.
+- A synced row is a **snapshot**: title, last-activity time and turn count live in the row
+  itself, so a session you keep using shows its copy-time state in the other account. **`sync
+  --update` refreshes those rows** — it is the only route that overwrites rather than adds, so
+  it is opt-in per run (an unticked checkbox in the window) and lists every overwrite before
+  doing it. A row the destination account changed since planning is refused, never
+  overwritten, and `undo` puts the exact replaced bytes back. The conversation itself was never
+  stale: there is one shared transcript, and only the sidebar's snapshot of it goes out of
+  date.
 - **"Already there" is decided by filename, not by conversation.** A row counts as present in the
   destination when a file of the *same name* (`local_<appSessionId>.json`) exists there. That is
   exactly right for rows `sync` itself copied, since it copies the name along with the contents.
@@ -403,11 +406,9 @@ window into `journaled`/`completed`/`rolled_back`.
 
 ## Roadmap
 
-- **`sync --update`** (refreshing a previously synced row that the destination account has kept
-  using) is deferred, not dismissed. Refreshing means overwriting a row the destination account
-  may have changed itself since the copy — the one place `sync` could destroy something instead
-  of just adding to it — so it needs the same drift-refusal treatment `undo` already has before
-  it ships.
+- **`sync --update` shipped in 0.9.9** with the drift-refusal treatment this entry asked for:
+  the plan records the destination's current bytes, the write refuses if they moved since, and
+  `undo` restores them exactly. See `docs/internals.md`, RULING 8.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 

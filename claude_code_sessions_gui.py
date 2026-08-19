@@ -114,6 +114,14 @@ class SyncApp:
         self.filter_btn.pack(side="left")
         self.clear_btn = ttk.Button(filt, text="Clear", command=self._clear_filter)
         self.clear_btn.pack(side="left", padx=(4, 0))
+        # RULING 8. Unticked every time the window opens: this is the only
+        # control here that overwrites rather than adds, so it is a decision
+        # for one run, never a remembered preference.
+        self.update_var = tk.BooleanVar(value=False)
+        self.update_chk = ttk.Checkbutton(
+            filt, text="Also refresh rows already there", variable=self.update_var,
+            command=self.refresh)
+        self.update_chk.pack(side="left", padx=(16, 0))
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
@@ -168,7 +176,7 @@ class SyncApp:
         state = "disabled" if on else "normal"
         for w in (self.refresh_btn, self.undo_btn, self.doctor_btn,
                   self.only_entry, self.filter_btn, self.clear_btn,
-                  self.trust_chk):
+                  self.trust_chk, self.update_chk):
             w.configure(state=state)
 
     # ---------------------------------------------------------------- planning
@@ -194,13 +202,14 @@ class SyncApp:
         self.status.set("Planning...")
         self.detail.set("")
         self.show([])
-        threading.Thread(target=self._plan_worker, args=(gen, only),
+        threading.Thread(target=self._plan_worker,
+                         args=(gen, only, self.update_var.get()),
                          daemon=True).start()
 
-    def _plan_worker(self, gen, only):
+    def _plan_worker(self, gen, only, update):
         try:
             flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice,
-                                  only=only)
+                                  only=only, update=update)
             manifest = ccs.plan_sync(self.env, flags)
             self.root.after(0, self._plan_done, gen, only, manifest, None)
         except ccs.Refusal as exc:
@@ -286,8 +295,18 @@ class SyncApp:
             count = len(val) if isinstance(val, (list, tuple, set)) else val
             if count:
                 lines.append("{0:<38}: {1}".format(label, count))
-        lines += ["{0:<38}: {1}".format("to copy", len(rows)), ""]
-        for r in rows:
+        refreshes = [r for r in rows if r.get("is_update")]
+        adds = [r for r in rows if not r.get("is_update")]
+        if refreshes:
+            lines += ["!! OVERWRITING {0} row(s) already in the destination"
+                      .format(len(refreshes)),
+                      "   undo restores the exact bytes replaced; a row that account",
+                      "   changed since planning is refused, never overwritten.", ""]
+            lines += ["   !! " + (r.get("title") or r.get("session_id", ""))[:88]
+                      for r in refreshes]
+            lines.append("")
+        lines += ["{0:<38}: {1}".format("to copy", len(adds)), ""]
+        for r in adds:
             lines.append("   " + (r.get("title") or r.get("session_id", ""))[:90])
 
         if manifest.get("live_override"):
@@ -721,6 +740,15 @@ class SyncApp:
             return
         n = len(self.manifest.get("rows") or [])
         dst = self.manifest.get("dest_email") or self.manifest["dest_account"][:8]
+        n_upd = sum(1 for r in (self.manifest.get("rows") or []) if r.get("is_update"))
+        if n_upd and not messagebox.askokcancel(
+                "Overwrite existing rows?",
+                "{0} of these {1} row(s) ALREADY EXIST in {2} and will be "
+                "overwritten with the newer copy.\n\nUndo restores the exact bytes "
+                "replaced. A row that account has changed since this plan was made "
+                "is refused rather than overwritten.\n\nContinue?".format(
+                    n_upd, n, dst)):
+            return
         if not messagebox.askokcancel(
                 "Copy sessions?",
                 "Copy {0} session{1} into {2}?\n\nThis adds listing rows to that "

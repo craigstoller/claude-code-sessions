@@ -69,8 +69,11 @@ This is the part that is easy to get wrong, because the two layers behave differ
 | Listing (`local_*.json`) | **Per-account copy.** | Which sessions appear, plus title/timestamp/sort order, is private to each login and frozen at copy time. |
 
 So relocating or copying a session's listing entry is a **snapshot**, not a live sync of the
-conversation — a resumed session's row goes stale elsewhere until re-copied. The conversation
-content itself was never copied; only the pointer to it was.
+conversation — a resumed session's row goes stale elsewhere until refreshed (`sync --update`,
+RULING 8; before that existed, re-running sync skipped it as "already present" and it stayed
+stale forever). The conversation content itself was never copied; only the pointer to it was,
+which is why a stale row never means stale *content*: the transcript is shared and current, and
+only the sidebar's snapshot of its title, position and turn count is out of date.
 
 ## The encoding rule
 
@@ -476,6 +479,47 @@ Until then `chrome-native-host.exe` counts. Two tests in
 (it does not drift into `_is_cli_process`, whose markers it sits one path segment away from).
 They pin the *classification*, which is what a future refactor would break; they assert nothing
 about the helper's I/O, which is the open question above and not something a unit test can settle.
+
+#### RULING 8 (2026-08-19) — `sync --update`, the only route that overwrites
+
+Every other thing `sync` does only ADDS. A row already present at the destination was skipped
+as `present`, and re-running never refreshed it. That is not a corner case: a session used
+after it was copied leaves the other account holding a snapshot forever. Measured on the real
+machine, one session's row existed in three stores at once with **16, 13 and 10 completed
+turns** — three frozen moments of the same conversation — while the single shared transcript
+behind them held 3,115 current lines. Re-syncing changed nothing, because the row was
+"already there".
+
+`--update` refreshes such rows. It is opt-in per run, never implied, and in the window it is
+an unticked checkbox that is never remembered — a decision for one run.
+
+**What makes overwriting safe enough to offer.** The plan records the destination's CURRENT
+bytes as a `pre_b64` pre-image alongside the post-image it intends to write, and every later
+step is a comparison against it:
+
+| at write time the destination holds | what happens |
+|---|---|
+| exactly the pre-image | overwrite — this is the refresh |
+| the post-image already | nothing; recorded as written |
+| anything else | **refused** — it changed since planning, so overwriting would discard that |
+| nothing (deleted) | **refused** — writing would resurrect a session that account removed |
+
+**Undo restores rather than deletes.** For an added row the reversal is deletion; for a
+refreshed one it is putting the measured pre-image back, byte for byte, via `atomic_write` so
+an interrupted reversal cannot leave a row that is neither version. The existing drift rule is
+unchanged and does the work: reversal only proceeds while the row still holds exactly what the
+op wrote, so once that account has touched it, undo refuses instead of clobbering.
+
+**Byte equality, deliberately.** A refresh whose post-image equals the pre-image is dropped as
+`unchanged` rather than journaled. The comparison is raw bytes, not semantics: a row the app
+serialised differently but means the same by is treated as a refresh, because "these two rows
+say the same thing" is not a judgement this tool is willing to make immediately before
+overwriting one.
+
+**Visibility.** Overwrites are listed separately and FIRST, under `!! OVERWRITING n row(s)`,
+the same unmissable treatment `--include-deleted` gets — a user must never learn afterwards
+that "to copy" quietly included rewriting rows that were already there. The window shows the
+same split and asks a second, separate confirmation naming the count before any refresh.
 
 #### RULING 7 (2026-08-13) — opt-in signature trust, because the hash binding decays
 
