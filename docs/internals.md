@@ -75,6 +75,64 @@ stale forever). The conversation content itself was never copied; only the point
 which is why a stale row never means stale *content*: the transcript is shared and current, and
 only the sidebar's snapshot of its title, position and turn count is out of date.
 
+**Verified end to end on a real machine, 2026-08-19** — this had been a design claim, argued
+from layout, and it was worth stopping to actually test because a user reported the opposite
+("the sessions were there, but they're not updated with the latest chat history"). Three
+accounts, 346 sessions present in more than one of them:
+
+- **320 of those sessions resolve to exactly one transcript on disk. None resolve to more
+  than one.** There is no per-account copy of a conversation to fall out of date.
+- A listing row's complete key set is metadata — `title`, `cwd`, `model`, `completedTurns`,
+  `lastActivityAt`, permission and MCP fields. **No messages, no transcript excerpt, and no
+  offset, cursor or checkpoint into the conversation.** There is nothing in a row with which
+  the app *could* truncate history.
+- The decisive test: session "LinkedIn project structure", whose row read **28 Jun** in two
+  accounts and **3 Aug** in the third — 36 days apart. Opened under one of the stale rows, the
+  full 3 August exchange rendered, including the five messages that postdate the row's own
+  timestamp by more than a month.
+
+**So `completedTurns` must not be read as a measure of how much conversation exists**, and the
+number is a trap for exactly that reason: rows for one session read 17/33/33 against a
+transcript holding **472** typed messages, and another read 33/37 against **52**. It counts
+something internal (turns since a context compaction, most likely) and matches nothing a user
+can see on screen.
+
+What a stale row costs is therefore **not the content of the conversation it points at**.
+
+**But it can point at a DIFFERENT conversation — and that is the case that matters most
+(measured 2026-08-19, and it corrects the paragraph above).** A row's filename is the *app's*
+session id (`local_<appSessionId>.json`), which is stable across runs, while `cliSessionId` —
+the transcript it resolves to — changes when a session is resumed as a new CLI run. So one
+session slot accumulates several transcripts over time, and **each account's row records
+whichever one that account last saw**. Two accounts can hold the same filename pointing at
+entirely different conversations:
+
+```
+local_a00afbc1-….json   in craig@foundryside.co    -> 0678aca4  17.9 MB, 1386 msgs, last used 19 Aug
+local_a00afbc1-….json   in claude@craigstoller.com -> c92ae7b1  13.0 MB,  738 msgs, last used 14 Aug
+```
+
+Both are titled "KRIS-REVIEW session Pacific Sound". Opening it under the second account does
+not show a truncated version of the first — it shows **a different conversation**, complete and
+current as of its own last use. To a user that is indistinguishable from "my history is behind",
+and it is the far more serious failure: the newer conversation is intact on disk but
+**unreachable from that account's sidebar**. On this machine, **15 of 333 shared rows** were in
+that state, with the newer conversation on the foundryside side for 9 and the other side for 6.
+
+Two consequences worth stating plainly:
+
+- **`--update` is not cosmetic.** Rewriting the row rewrites its `cliSessionId`, which is what
+  restores access to the newer conversation. This is the strongest reason the feature exists.
+- **Direction is critical, and the wrong direction is destructive.** Refreshing *from* the
+  account holding the older pointer overwrites the row that pointed at the newer conversation,
+  making it unreachable from there too. `--newer-only` is what prevents that, and this is the
+  case it was really built for — not tidiness. Undo restores the pointer, but only while the
+  op remains in the journal.
+
+The secondary cost is still real and still worth fixing: a stale row keeps an old title and
+sorts by an old `lastActivityAt`, so a session used this week sits weeks down the other
+account's list under a name it has outgrown.
+
 ## The encoding rule
 
 *(observed July 2026, Claude Desktop (Windows); format may change)*
@@ -483,19 +541,49 @@ about the helper's I/O, which is the open question above and not something a uni
 #### RULING 8 (2026-08-19) — `sync --update`, the only route that overwrites
 
 Every other thing `sync` does only ADDS. A row already present at the destination was skipped
-as `present`, and re-running never refreshed it. That is not a corner case: a session used
-after it was copied leaves the other account holding a snapshot forever. Measured on the real
-machine, one session's row existed in three stores at once with **16, 13 and 10 completed
-turns** — three frozen moments of the same conversation — while the single shared transcript
-behind them held 3,115 current lines. Re-syncing changed nothing, because the row was
-"already there".
+as `present`, and re-running never refreshed it. `--update` refreshes such rows. It is opt-in
+per run, never implied, and in the window it is an unticked checkbox that is never remembered.
 
-`--update` refreshes such rows. It is opt-in per run, never implied, and in the window it is
-an unticked checkbox that is never remembered — a decision for one run.
+This section is consolidated from six same-day amendments — four rounds of adversarial peer
+review over the code, then two rounds of the author actually using it. That order matters, and
+the record of what each found is kept at the end under *How the rules above were arrived at*,
+because the pattern is more instructive than any individual fix.
 
-**What makes overwriting safe enough to offer.** The plan records the destination's CURRENT
-bytes as a `pre_b64` pre-image alongside the post-image it intends to write, and every later
-step is a comparison against it:
+##### What a listing row actually is
+
+Not a snapshot. A **pointer**, wrapped in metadata.
+
+- The row's **filename** is the *app's* session id. It survives a session being resumed.
+- The **`cliSessionId` inside it** names the transcript, and changes on **every new CLI run**.
+
+So one sidebar entry accumulates several transcripts over its life, and each account's row
+records whichever one *that account* last saw. Two accounts holding the same filename can
+therefore point at **entirely different conversations**. Opening the entry under the stale
+account does not show a truncated version of the other — it shows a different conversation,
+complete and current as of its own last use, which to a user is indistinguishable from "my
+history is behind". Measured on the reporting machine: **15 of 333 shared rows**, with the
+newer conversation on one side for 9 and the other for 6.
+
+Two things follow, and they are the whole reason this ruling is not cosmetic:
+
+- **Refreshing a row can restore access to a newer conversation** — that is the strongest
+  argument for the feature.
+- **Refreshing in the wrong direction can take that access away**, and if no other account
+  points at the displaced conversation it becomes reachable from nowhere. The transcript
+  survives on disk, findable by nothing.
+
+What *cannot* happen: a stale row hiding part of the conversation it points at. There is one
+shared transcript per `cliSessionId` and a row carries no message data — no excerpt, no
+offset, no cursor. Verified by opening a session under a row 36 days stale and getting its full
+current conversation. Relatedly, **`completedTurns` is not a message count** and must never be
+presented as one: rows reading 17/33/33 sat in front of a transcript holding 472 typed
+messages, and 33/37 in front of 52. It tracks something internal, most likely turns since a
+context compaction.
+
+##### What makes overwriting safe enough to offer
+
+The plan records the destination's CURRENT bytes as a `pre_b64` pre-image alongside the
+post-image it intends to write, and every later step is a comparison against it:
 
 | at write time the destination holds | what happens |
 |---|---|
@@ -504,22 +592,147 @@ step is a comparison against it:
 | anything else | **refused** — it changed since planning, so overwriting would discard that |
 | nothing (deleted) | **refused** — writing would resurrect a session that account removed |
 
-**Undo restores rather than deletes.** For an added row the reversal is deletion; for a
-refreshed one it is putting the measured pre-image back, byte for byte, via `atomic_write` so
-an interrupted reversal cannot leave a row that is neither version. The existing drift rule is
-unchanged and does the work: reversal only proceeds while the row still holds exactly what the
-op wrote, so once that account has touched it, undo refuses instead of clobbering.
-
 **Byte equality, deliberately.** A refresh whose post-image equals the pre-image is dropped as
-`unchanged` rather than journaled. The comparison is raw bytes, not semantics: a row the app
-serialised differently but means the same by is treated as a refresh, because "these two rows
-say the same thing" is not a judgement this tool is willing to make immediately before
-overwriting one.
+`unchanged`. The comparison is raw bytes, not semantics: "these two rows say the same thing" is
+not a judgement this tool will make immediately before overwriting one.
 
-**Visibility.** Overwrites are listed separately and FIRST, under `!! OVERWRITING n row(s)`,
-the same unmissable treatment `--include-deleted` gets — a user must never learn afterwards
-that "to copy" quietly included rewriting rows that were already there. The window shows the
-same split and asks a second, separate confirmation naming the count before any refresh.
+**Undo restores rather than deletes.** For an added row the reversal is deletion; for a
+refreshed one it is putting the measured pre-image back byte for byte via `atomic_write`, so an
+interrupted reversal cannot leave a row that is neither version. Reversal only proceeds while
+the row still holds exactly what the op wrote — once that account has touched it, undo refuses.
+
+**The undo window is bounded.** `pre_b64` lives only in the journalled manifest and
+`rotate_ops` keeps the ten most recent terminal ops, after which the pre-image is pruned and
+the overwrite is unrecoverable. The overwrite block and the window's confirmation both say so.
+
+##### Which rows a refresh will and will not send
+
+Three qualifiers, because "refresh everything in one direction" is almost never what anyone
+means once more than two accounts exist.
+
+- **`--newer-only`** (window: *"only where mine is newer"*, **ticked by default** — the one
+  default here that is not "do nothing", safe because it can only ever send *fewer* rows).
+  Sends only rows this account's copy is **strictly** newer than. Holds back three distinct
+  cases under their own tallies, each named row by row rather than counted:
+  `held_older` (their copy is newer), `held_same` (same moment — a row can differ while its
+  timestamp does not, because `model`, `permissionMode` and the MCP fields drift without any
+  activity), and `held_unknown` (either side's timestamp unreadable — *only what is newer* is a
+  claim, and it cannot be made).
+- **`--allow-orphan`** (window: *"allow hiding a conversation"*, **off by default**). A refresh
+  that changes which conversation the row opens is detected (`swaps_conversation`, tallied
+  under `swapping`) and reported on its own line — *"opens a DIFFERENT conversation
+  afterwards"* — never as a title refresh. `_other_pointers` then scans every store except the
+  destination to ask whether anything else still points at the displaced conversation. If
+  nothing does, the refresh is **held back and named** under `held_orphan` unless this flag is
+  given. This is the mirror of `--include-deleted`: that one resurrects something deliberately
+  removed, this one removes access to something never deleted. A store that cannot be *read*
+  yields `"unknown"`, never "nothing there".
+- **`--only`**, the ordinary title filter, which is usually the right answer for "I just want
+  this one session".
+
+Held back rather than refused outright: a refusal would block every other row in the run, and
+the point of naming them is that the user should not have to adjudicate a wall of titles.
+
+**Visibility.** Overwrites are listed separately and FIRST under `!! OVERWRITING n row(s)`, the
+same unmissable treatment `--include-deleted` gets. Each row carries its direction (*moves it
+BACKWARDS* / *could not be determined*) and, where relevant, its swap line. The block names
+what the destination's row actually **loses** — computed by diffing its own pre-image against
+the post-image, not from the transform's source-side lists — and the window shows all of it,
+plus a second confirmation naming the counts.
+
+##### Hard-won invariants
+
+Each of these was a real defect. They are stated as rules because each one generalises.
+
+**Evidence and ownership**
+
+- **`written` is an intention journalled *after* the write, so it is not proof.** A hard kill
+  between `atomic_write` returning and the manifest save leaves a row holding this op's bytes
+  while the manifest denies it. `_sync_delete_targets` consults the disk too: state `match`
+  means the file holds exactly this op's post-image.
+- **Matching bytes are not proof of authorship.** `transform_row` is deterministic, so a later
+  op planned over unchanged source mints an identical post-image. Ownership needs an **order**:
+  `_sync_paths_claimed_elsewhere` counts only ops *later* than this one (by `_op_sort_key`), so
+  the latest claimant owns the row. A symmetric check is not a fix — it deadlocks both parties.
+- **A reversed op withdraws its claim.** `undone`/`rolled_back` ops are excluded, or their
+  leftover flags would block every later legitimate reversal of the same row, permanently.
+- **Evidence must outlive what it protects.** `rotate_ops` holds back a terminal sync op whose
+  written rows share a destination path with any nonterminal one — a stalled op is never
+  pruned, so its claimant must not age out from under it.
+
+**Fail closed, everywhere, on the same rule**
+
+- **"Could not look" is never "nothing there"** — an unreadable destination row, an unreadable
+  store during orphan detection, an unreadable timestamp on either side of the newer-check.
+- **A corrupt manifest refuses; it does not crash.** `_sync_pre_image` fails on a missing key
+  and on an explicit null while keeping `""` valid as a genuine zero-byte pre-image; `post_b64`
+  and the journal byte budget both type-check rather than raising `AttributeError`/`TypeError`
+  out of code whose contract is "never raises".
+- **A damaged flag reads the safe way.** `_row_is_refresh` accepts `is_update` **or** a present
+  `pre_b64`, because a refresh that lost its flag would otherwise be reversed by *deletion*.
+- **A fix that overcorrects is still a defect.** `r.get("pre_b64") or ""` fixed the zero-byte
+  case and simultaneously turned a *missing* key into an empty pre-image, so undo would have
+  written a zero-byte file over the row.
+
+**State machines must agree**
+
+- **Every state one function can produce, another must handle.** An absent *pending refresh* is
+  a third blocking state (`deleted`): `_sync_write_rows` refuses to resurrect it on every
+  re-entry, so offering `forward` was a dead end. For an *add*, absent is ordinary resumption.
+- **An interrupted refresh stays resumable** — the `pristine` state (row still holds the
+  pre-image) exists so an untouched pending row is not mistaken for drift.
+- **Reversal attempts both halves.** `_sync_reverse_all` unlinks and restores in one pass and
+  reports every failure together; sequentially, one locked added row left every refreshed row
+  stranded in its overwritten state.
+
+**Say what is actually true**
+
+- **The pre-image is the other account's row verbatim**, including the connector config the
+  transform strips precisely so it is not carried. `_public_manifest` keeps it out of `--json`;
+  it belongs only in the private journal, which is what undo restores from.
+- **Never describe an action as something milder than it is.** A refresh replaces the *whole*
+  row, not "the stale title/last-activity snapshot"; `--update` never claimed to compare
+  recency yet the window said "the newer copy"; the conflict refusal advised deleting the row
+  in the app, which for a refresh destroys the session rather than reversing anything.
+- **An assertion asked too often stops being read.** The `--live` answer now holds for the
+  window session, is cleared on apply, and is changeable from a button beside Refresh —
+  visible state rather than state re-demanded on every replan.
+
+##### Accepted residuals
+
+- **Read-then-write.** `_sync_write_rows` reads, compares, then writes; `atomic_write` is an
+  indivisible replacement, not a compare-and-swap. The honest claim is "refuses on drift
+  observed at check time". Closing it needs a primitive this layout does not offer. See
+  *The accepted TOCTOU residual*.
+- **Sibling hard-kill.** An op that writes an identical post-image and is killed *before*
+  journalling `written` leaves no claim, so a stalled op can still reverse its write. Closing
+  it needs a write-intent record before every `atomic_write` — the per-row manifest rewrite
+  `SYNC_JOURNAL_BYTE_BUDGET` exists to avoid.
+- **Ownership orders by creation, not by write.** An op created first but rolled *forward*
+  after a later op completed is treated as the earlier claimant. Still exactly one owner.
+
+##### How the rules above were arrived at
+
+Four rounds of a four-engine panel (Codex, Gemini, DeepSeek, Kimi) over the diff, then the
+author using the result on a real three-account machine.
+
+**Each review round found a defect in the previous round's fix** — the disk-evidence rule broke
+cross-op ownership, the ownership check was dead code in `undo`, the fix for that was symmetric
+and deadlocked. That is the value of re-running a panel rather than stopping at "no blockers",
+and the shape to expect: fixes that are correct in their own frame and wrong one frame out.
+
+**But no review round questioned the premise**, because every engine saw only the diff and a
+design doc that shared the mistake. The belief that a stale row cost titles and sort order —
+not access to conversations — survived all four rounds intact. It died the first time a user
+said "that doesn't sound cosmetic to me", twice, after being told it was. Two consequences
+worth carrying forward: **run the cheap empirical test before building the thing** (this one
+took thirty seconds), and when a user reports something the model of the system says is
+impossible, the model is the more likely thing to be wrong.
+
+**Two defects were found only by running it on real data**, never by review: `--newer-only`
+originally meant "not older", which let 248 timestamp-identical rows through; and the pointer
+swap, which turned 18 apparently-routine refreshes into 6 conversation swaps of which 5 would
+have hidden a conversation entirely.
 
 #### RULING 7 (2026-08-13) — opt-in signature trust, because the hash binding decays
 
@@ -808,6 +1021,19 @@ check detects "the app is running" — each detects "the app already touched *th
 they only close the gap when the app that started mid-operation happens to touch a row this run
 is also touching. An app that starts mid-write and never touches the rows in flight is a
 residual gap this design accepts rather than one it claims to close.
+
+**And they do not fully close it even for a row both are touching** (added 2026-08-19 — every
+engine on RULING 8's review panel raised this independently). `_sync_write_rows` *reads* the
+destination row, compares it with the pre-image, and *then* calls `atomic_write`: those are
+separate steps, and `atomic_write` guarantees an indivisible replacement, not a
+compare-and-swap. A write landing in that window is overwritten with no refusal. The same
+shape exists in reverse on the reversal path, where `_sync_delete_targets` classifies rows and
+`_sync_unlink_all` / `_sync_restore_all` mutate them afterwards. So the honest claim is
+**"refuses on drift observed at check time"**, not "cannot overwrite a row that changed". The
+window is microseconds wide behind a guard that already requires the app to be closed, and
+closing it properly needs a compare-and-swap primitive this file layout does not offer —
+accepted, but stated rather than implied. RULING 8 raises what it costs: before `--update` the
+worst case in that window was failing to add a row; now it is discarding a concurrent edit.
 
 ## `sync`'s journal, and how `recover`/`undo` treat it
 

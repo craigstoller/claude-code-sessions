@@ -264,9 +264,30 @@ is always a preview will misread `sync --apply --json`.
   --update` refreshes those rows** — it is the only route that overwrites rather than adds, so
   it is opt-in per run (an unticked checkbox in the window) and lists every overwrite before
   doing it. A row the destination account changed since planning is refused, never
-  overwritten, and `undo` puts the exact replaced bytes back. The conversation itself was never
-  stale: there is one shared transcript, and only the sidebar's snapshot of it goes out of
-  date.
+  overwritten, and `undo` puts the exact replaced bytes back — for as long as the operation
+  stays in the journal, which keeps the ten most recent finished ops. Two things worth knowing
+  before you tick it: a refresh replaces the **whole** row with this account's copy, not just
+  its title and timestamp; and because each account keeps its own snapshot, the copy you are
+  overwriting is not automatically the older one, so any refresh that would move the other
+  account *backwards* is called out by name in the plan — and **`--newer-only`** (in the
+  window, "only where mine is newer", ticked by default) holds those back instead of sending
+  them, along with any whose direction cannot be determined. Both sets are listed by name, so
+  you can see exactly what was not sent. **A stale row never truncates the conversation it
+  points at — but it can point at an entirely different one.** A row's filename is the app's
+  session id, which survives being resumed, while the transcript it names changes on each new
+  run; each account records whichever transcript it last saw. So the same sidebar entry can be
+  a 1,386-message conversation from today in one account and a different 738-message one from
+  last week in another — the newer one intact on disk but unreachable from that sidebar. On a
+  real three-account machine, 15 of 333 shared rows were in exactly that state. **That is the
+  strongest reason `--update` exists**, and the reason direction matters: refreshing *from* the
+  account holding the older pointer hides the newer conversation from the account that had it,
+  which is what `--newer-only` prevents. The plan says which refreshes **open a different
+  conversation** rather than just updating a title, and if the conversation being displaced is
+  reachable from no other account, that refresh is **held back and named** unless you pass
+  `--allow-orphan` (window: "allow hiding a conversation", off by default) — the mirror of
+  `--include-deleted`, for the case where a refresh takes access away instead of updating
+  something. (`completedTurns` is not a count of your conversation and should not be read as
+  one: rows showing 17 and 33 sat in front of a transcript holding 472 messages.)
 - **"Already there" is decided by filename, not by conversation.** A row counts as present in the
   destination when a file of the *same name* (`local_<appSessionId>.json`) exists there. That is
   exactly right for rows `sync` itself copied, since it copies the name along with the contents.

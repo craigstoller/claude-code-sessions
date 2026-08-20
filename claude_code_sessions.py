@@ -458,9 +458,43 @@ def nonterminal_ops(env):
 
 def rotate_ops(env):
     import shutil
-    terminal = [o for o in list_ops(env) if o.manifest.get("status") in TERMINAL]
+    ops = list_ops(env)
+    terminal = [o for o in ops if o.manifest.get("status") in TERMINAL]
+    # Paths a still-unfinished sync op could later try to reverse. A terminal op
+    # that wrote one of them is the EVIDENCE _sync_paths_claimed_elsewhere needs
+    # to stop that reversal clobbering its work, and pruning it would delete the
+    # evidence while leaving the stalled op alive forever (nonterminal ops are
+    # never rotated). Ten more finished ops and the protection would silently
+    # expire - on exactly the "came back to a stuck op weeks later" case recover
+    # exists for. So keep a claimant for as long as anything could collide with
+    # it; this holds back only ops that actually share a destination row.
+    live = set()
+    for o in ops:
+        om = o.manifest
+        if om.get("op_type") != "sync" or om.get("status") not in NONTERMINAL:
+            continue
+        for r in om.get("rows") or []:
+            p = r.get("dest_path")
+            if isinstance(p, str):
+                live.add(os.path.normcase(os.path.abspath(p)))
+
+    def _collides(op):
+        om = op.manifest
+        if not live or om.get("op_type") != "sync":
+            return False
+        if om.get("status") in ("undone", "rolled_back"):
+            return False          # claim withdrawn; nothing left to protect
+        for r in om.get("rows") or []:
+            p = r.get("dest_path")
+            if r.get("written") and isinstance(p, str) \
+                    and os.path.normcase(os.path.abspath(p)) in live:
+                return True
+        return False
+
     pruned = []
     for op in terminal[:-10]:
+        if _collides(op):
+            continue
         try:
             shutil.rmtree(op.op_dir)
             pruned.append(op.manifest["op_id"])
@@ -1915,13 +1949,18 @@ def recover_op(env, op, direction):
                 # dead end this resolution exists to close (recover back
                 # refuses, recover forward refuses, undo refuses:
                 # permanently stuck). So a row this op cannot verify is
-                # SKIPPED, never deleted, and the rest are removed; the
-                # blocking pending row itself is never even considered,
-                # because this op never wrote it.
-                drifted, unreadable, removable, restorable =                     _sync_delete_targets(env, m)
-                _sync_unlink_all(removable)
-                _sync_restore_all(restorable)
-                skipped = drifted + unreadable
+                # SKIPPED, never deleted, and the rest are reversed; a
+                # blocking pending row is still never considered, because
+                # its state is drifted/deleted/unreadable rather than the
+                # "match" that would prove this op wrote it.
+                (drifted, unreadable, removable,
+                 restorable, claimed) = _sync_delete_targets(env, m)
+                _sync_reverse_all(removable, restorable)
+                # `claimed` rows belong to another op's journal, so back leaves
+                # them alone - the same skip-rather-than-refuse rule the other
+                # unverifiable states get here, for the same reason: back must
+                # always reach a terminal status.
+                skipped = drifted + unreadable + claimed
                 # Restores are reversals too: an interrupted update whose rows
                 # were all refreshed removes nothing yet undoes everything, and
                 # reporting that as "removed nothing" would send the user off to
@@ -1931,26 +1970,31 @@ def recover_op(env, op, direction):
                 # cmd_recover's existing _print_abort_reason picks this up for
                 # free once status is non-"completed".
                 if skipped:
+                    why = _drift_clause(drifted, unreadable)
+                    if claimed:
+                        why += (" and " if why else "") + (
+                            "were written again by a later operation, which owns "
+                            "them now and would have its work undone ({0})".format(
+                                ", ".join(claimed)))
                     op.manifest["abort_reason"] = (
                         "back reversed {0} row(s) it could verify; left {1} "
-                        "untouched because {2}".format(
-                            reversed_n, len(skipped),
-                            _drift_clause(drifted, unreadable)))
+                        "untouched because they {2}".format(
+                            reversed_n, len(skipped), why))
                 elif not reversed_n:
                     # Say so out loud rather than printing a bare
-                    # "rolled_back". This is reachable and it is a trap: a
-                    # hard kill (not an exception - those journal on the way
-                    # out) during a batched run can leave rows on disk that
-                    # the manifest never marked written, and 'back' only
-                    # removes rows it can see it wrote. Name the forward
-                    # route, because it is the one that cleans them up.
+                    # "rolled_back". Narrower than it used to be: this branch
+                    # once also caught the hard-kill case, where rows landed on
+                    # disk but the manifest never recorded them and 'back'
+                    # walked past every one - so it named the forward route as
+                    # the way to pick them up. _sync_delete_targets now reads
+                    # the disk rather than trusting that flag alone, so those
+                    # rows are reversed here instead. What is left is the
+                    # genuine nothing-to-do case.
                     op.manifest["abort_reason"] = (
-                        "back removed nothing - this op's manifest records no "
-                        "row as written. If rows did land in the destination, "
-                        "'recover --resolve {0} --forward --apply' will "
-                        "recognise and record them, after which 'undo --id {0} "
-                        "--apply' removes them exactly."
-                        .format(m["op_id"]))
+                        "back reversed nothing - no row in this op's destination "
+                        "still holds what it wrote, so there was nothing to take "
+                        "back. The op is closed; re-run sync if the rows are "
+                        "still wanted.")
                 set_status(op, "rolled_back")
                 rotate_ops(env)
                 return "rolled_back"
@@ -2326,8 +2370,22 @@ def build_parser():
                          "deleted it (names one session; not a blanket switch)")
     sp.add_argument("--update", action="store_true",
                     help="also REFRESH rows that already exist in the destination, "
-                         "replacing their stale title/last-activity snapshot. This "
+                         "replacing the WHOLE row with the source account's copy "
+                         "(not just its stale title/last-activity snapshot). This "
                          "is the only sync route that overwrites rather than adds")
+    sp.add_argument("--newer-only", action="store_true", dest="newer_only",
+                    help="with --update, refresh ONLY rows this account's copy is "
+                         "strictly newer than. Holds back rows whose destination "
+                         "copy is newer, rows of the same age (a row can differ in "
+                         "per-account settings without either side being newer), "
+                         "and rows whose direction cannot be determined. Narrows "
+                         "--update; does nothing without it")
+    sp.add_argument("--allow-orphan", action="store_true", dest="allow_orphan",
+                    help="permit a refresh that would leave the conversation it "
+                         "displaces unreachable from every account. A row points at "
+                         "a transcript, and two accounts can point at different "
+                         "ones; without this, such a refresh is held back and named "
+                         "rather than silently hiding a conversation")
     sp.add_argument("--verbatim", action="store_true",
                     help="copy rows unchanged instead of stripping connector config")
     sp.add_argument("--apply", action="store_true")
@@ -3392,6 +3450,18 @@ class SyncFlags:
     # sync route only ADDS; this is the single path that can overwrite, so it is
     # opt-in per run and never implied.
     update: bool = False
+    # RULING 8, amended: refresh ONLY the rows this account's copy is demonstrably
+    # newer than. Narrows `update`, never widens it - with update off there are no
+    # refreshes for it to act on. A row whose direction cannot be established is
+    # skipped too: "only what is newer" is a claim, and an unreadable timestamp on
+    # either side means the claim cannot be made.
+    newer_only: bool = False
+    # Permit a refresh that would leave the conversation it displaces
+    # unreachable from every account. Held back by default because it is the
+    # one outcome of a refresh that removes access to something rather than
+    # updating it - the same treatment --include-deleted's resurrection gets,
+    # from the other direction.
+    allow_orphan: bool = False
     only: str = ""
     include_deleted: tuple = ()
     verbatim: bool = False
@@ -3475,6 +3545,75 @@ def _resolve_tombstone_overrides(entries, tombs, named):
     return out
 
 
+def _activity_of(d):
+    """lastActivityAt out of a PARSED row, or None if it is missing or not a
+    number. Both sides of the newer-copy comparison go through this, because
+    plan_sync compares them with `>`: letting a string through on either side
+    turns one malformed row into a TypeError that kills the whole plan."""
+    if not isinstance(d, dict):
+        return None
+    v = d.get("lastActivityAt")
+    # bool is an int subclass and is never a timestamp - exclude it explicitly.
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return v
+
+
+def _row_activity(blob):
+    """lastActivityAt out of a raw row's bytes, or None if it cannot be read.
+
+    None means "could not tell", and callers must never collapse that into
+    "older" - the whole point of reading this field is to notice a refresh
+    that would move a row BACKWARDS, and an unparseable row is exactly the
+    case where that judgement is unavailable.
+    """
+    try:
+        return _activity_of(json.loads(blob.decode("utf-8")))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None
+
+
+def _sync_pre_image(r):
+    """The measured pre-image bytes of a REFRESH row (RULING 8).
+
+    Fails closed on a manifest that cannot supply one: a MISSING `pre_b64`
+    raises KeyError and an explicit null raises ValueError, both of which
+    every caller already classifies as "unreadable". An empty STRING is
+    valid and returns b"" - a zero-byte destination row is a real state,
+    and telling it apart from "no pre-image at all" is the entire reason
+    this is a function rather than `r.get("pre_b64") or ""`.
+
+    That idiom is what this replaces. It was introduced to stop a zero-byte
+    pre-image being demoted to an add, and it did - but `.get()` turns a
+    missing key into "" too, so the `except KeyError` guarding the reversal
+    path could never fire and undo would have written a ZERO-BYTE file over
+    the destination row instead of refusing. Fail-open, in the one module
+    whose whole posture is fail-closed.
+    """
+    raw = r["pre_b64"]                    # missing -> KeyError -> "unreadable"
+    if not isinstance(raw, str):
+        # None, or any non-string a hand-edited manifest can carry (a number,
+        # a list). unb64 would raise AttributeError on `.encode`, which none of
+        # the callers catch and main() does not either - a traceback instead of
+        # a refusal, on the one code path whose job is to fail closed.
+        raise ValueError("pre_b64 is {0!r}, not a base64 string".format(type(raw).__name__))
+    return unb64(raw)                     # "" is a legitimate zero-byte row
+
+
+def _row_is_refresh(r):
+    """Whether a sync row is a REFRESH rather than an add.
+
+    `is_update` OR a present `pre_b64` - either one is enough, deliberately.
+    Testing only `is_update` fails OPEN on a damaged manifest: a completed
+    refresh that lost that flag (or had it flipped false) while keeping its
+    pre-image classifies as an add, and the reversal path then DELETES the
+    destination row instead of restoring it. Both fields are written together
+    by plan_sync, so disagreement means corruption, and the safe reading of a
+    corrupt row is the one that never deletes.
+    """
+    return bool(r.get("is_update")) or r.get("pre_b64") is not None
+
+
 def select_sync_rows(env, source, dest, flags):
     """Which source rows are eligible to copy, and why the rest were skipped.
 
@@ -3492,7 +3631,18 @@ def select_sync_rows(env, source, dest, flags):
     row for the same conversation under a different local id is not detected.
     """
     tally = {"present": [], "no_transcript": [], "deleted": [], "unreadable": [],
-             "filtered": [], "resurrected": [], "unchanged": []}
+             "filtered": [], "resurrected": [], "unchanged": [],
+             # refreshes whose destination row is NEWER than the source's, or
+             # whose age could not be read - filled in by plan_sync, which is
+             # where the two sides are finally compared
+             "regressing": [], "activity_unknown": [],
+             # refreshes --newer-only declined to make: the destination's copy
+             # was newer, or which one is newer could not be established
+             "held_older": [], "held_same": [], "held_unknown": [],
+             # refreshes that change WHICH conversation the row opens, and the
+             # subset of those held back because the displaced conversation
+             # would be left unreachable from every account
+             "swapping": [], "held_orphan": []}
     have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
@@ -3519,7 +3669,24 @@ def select_sync_rows(env, source, dest, flags):
                         # in both spaces - see _tombstone_ids.
                         "local_id": name[len("local_"):-len(".json")],
                         "title": d.get("title") or "(untitled)",
-                        "last_activity": d.get("lastActivityAt") or 0})
+                        # Through the same type check the destination side gets.
+                        # plan_sync compares the two with `>`, so a source row
+                        # carrying a STRING lastActivityAt raised TypeError and
+                        # killed the whole plan - every row, not just that one -
+                        # as a raw traceback, since main() catches only Refusal
+                        # and LayoutError. Newly reachable with --update: the
+                        # pre-existing sort only compares when two rows disagree
+                        # on type, while this fires on a single-row plan.
+                        # None, NOT 0, when it cannot be read. `or 0` made every
+                        # such row compare as older than any real destination
+                        # timestamp, so plan_sync flagged it "destination copy is
+                        # NEWER; this moves it BACKWARDS" whether or not that was
+                        # true - collapsing "could not tell" into a definite
+                        # direction, which is the one thing _row_activity's
+                        # docstring says callers must never do. Alarmist rather
+                        # than dangerous, but a warning that fires on unknown
+                        # input is a warning nobody can act on.
+                        "last_activity": _activity_of(d)})
     overridden = _resolve_tombstone_overrides(entries, tombs, flags.include_deleted)
 
     picked = []
@@ -3545,6 +3712,14 @@ def select_sync_rows(env, source, dest, flags):
                 tally["unreadable"].append(title)
                 continue
             e["pre"] = pre
+            # The destination's OWN last-activity, for the newer-copy check in
+            # plan_sync. A row is a per-account snapshot of a shared
+            # transcript, so the live account's copy is not automatically the
+            # fresher one: measured on this machine, one session's row held
+            # 16, 13 and 10 completed turns in three different stores. Without
+            # this the refresh silently regresses a destination that was used
+            # more recently than the source.
+            e["pre_activity"] = _row_activity(pre)
         if not sid or not find_transcripts(env.projects_root, sid):
             tally["no_transcript"].append(title)
             continue
@@ -3562,8 +3737,13 @@ def select_sync_rows(env, source, dest, flags):
                        "last_activity": e["last_activity"],
                        "overrode_tombstone": overrode,
                        # bytes currently at the destination, for a refresh only
-                       "pre": e.get("pre")})
-    picked.sort(key=lambda r: r["last_activity"], reverse=True)
+                       "pre": e.get("pre"),
+                       "pre_activity": e.get("pre_activity")})
+    # An unreadable timestamp is None now, which cannot be compared with a
+    # number - sort it to the far end rather than letting one malformed row
+    # raise TypeError and take the whole plan down with it.
+    picked.sort(key=lambda r: (r["last_activity"] is not None,
+                               r["last_activity"] or 0), reverse=True)
     return picked, tally
 
 
@@ -3580,6 +3760,94 @@ SYNC_STRIP = ("remoteMcpServersConfig", "enabledMcpTools", "bridgeSessionIds",
 # app dislikes the defaults the failure mode is a re-prompt, not a leak.
 SYNC_RESET = {"alwaysAllowedReasons": [], "sessionPermissionUpdates": [],
               "chromePermissionMode": None, "chromeTabGroupId": None}
+
+
+def _pointed_session(blob):
+    """The cliSessionId a raw row resolves to, or None if it cannot be read."""
+    try:
+        d = json.loads(blob.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    sid = d.get("cliSessionId")
+    return sid if isinstance(sid, str) and sid else None
+
+
+def _other_pointers(env, dest_path):
+    """{cliSessionId: [store labels]} for every store EXCEPT dest_path.
+
+    Answers the only question that matters before repointing a row: if this
+    account stops pointing at a conversation, does anything else still point at
+    it? A row is not just a stale snapshot, it is a POINTER - its filename is
+    the app's session id, which survives a resume, while the cliSessionId it
+    names changes on each new CLI run. So one sidebar entry accumulates several
+    transcripts over time and each account records whichever it last saw.
+    Overwriting such a row swaps which conversation that account can open, and
+    if no other account holds the displaced one it becomes unreachable from
+    every sidebar - present on disk, findable by nothing.
+
+    Built lazily and only when a plan actually contains a pointer swap: it is a
+    full read of every other store, which is the same order of work
+    select_sync_rows already does, but there is no reason to pay it otherwise.
+    """
+    real_dest = os.path.realpath(dest_path)
+    out = {}
+    for acct, org, path in _account_dirs(env):
+        if os.path.realpath(path) == real_dest:
+            continue
+        label = "{0}/{1}".format(acct[:8], org[:8])
+        try:
+            names = os.listdir(path)
+        except OSError:
+            # Fail CLOSED: a store we cannot read might hold the displaced
+            # conversation, so we must not report it as orphaned. Recorded
+            # under a sentinel the caller treats as "cannot rule it out".
+            out.setdefault(None, []).append(label)
+            continue
+        for name in names:
+            if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            try:
+                d = read_json(os.path.join(path, name))
+            except (LayoutError, OSError, ValueError):
+                continue
+            if isinstance(d, dict):
+                sid = d.get("cliSessionId")
+                if isinstance(sid, str) and sid:
+                    out.setdefault(sid, []).append(label)
+    return out
+
+
+def _refresh_field_loss(pre, post):
+    """(dropped, reset) top-level keys the DESTINATION's row loses when a
+    refresh replaces PRE with POST, or (None, None) if either side cannot be
+    parsed - "could not tell", never an empty list.
+
+    This is deliberately NOT transform_row's `removed`/`reset`, which the
+    overwrite block used to print. Those describe what the transform took out
+    of the SOURCE row, and labelling them "fields dropped from the
+    destination's row" was wrong in both directions: a destination row
+    carrying its own `remoteMcpServersConfig` while the source had none
+    produced an empty list and printed nothing - silently losing exactly the
+    per-account connector config SYNC_STRIP exists to keep out of transit -
+    while a source-only stripped field was announced as a loss the destination
+    never had. The pre-image needed to answer the question properly is already
+    in hand, so ask it of the two rows actually involved.
+    """
+    try:
+        a = json.loads(pre.decode("utf-8"))
+        b = json.loads(post.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return None, None
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return None, None
+    dropped = sorted(k for k in a if k not in b)
+    # Present on both sides, but the refresh puts this tool's default back over
+    # something the destination account had set itself.
+    reset = sorted(k for k, default in SYNC_RESET.items()
+                   if k in a and k in b and b[k] == default and a[k] != default)
+    return dropped, reset
 
 
 def transform_row(data, verbatim=False):
@@ -3649,9 +3917,84 @@ def plan_sync(env, flags):
             # actually overwrite, and keeps a no-op run from journaling one.
             tally["unchanged"].append(cand["title"])
             continue
+        # Which way does this refresh move the row? Only meaningful when both
+        # sides can be read; "unknown" is tracked separately and never folded
+        # into "fine", for the same reason an unreadable row is never treated
+        # as absent anywhere else in this module.
+        pre_act = cand.get("pre_activity")
+        src_act = cand.get("last_activity")
+        regresses = False
+        dest_dropped, dest_reset = (None, None)
+        if pre is not None:
+            dest_dropped, dest_reset = _refresh_field_loss(pre, blob)
+            # Unknown on EITHER side is unknown, full stop. Only the destination
+            # side used to reach this state; an unreadable source timestamp was
+            # silently treated as age zero, which made every such row look like
+            # a regression.
+            if pre_act is None or src_act is None:
+                tally["activity_unknown"].append(cand["title"])
+                if flags.newer_only:
+                    # Cannot show it is newer, so it is not sent. Tallied under
+                    # its own heading rather than folded into "held back as
+                    # older" - the user asked for newer, and "we could not tell"
+                    # is a different answer from "it was older".
+                    tally["held_unknown"].append(cand["title"])
+                    continue
+            elif pre_act > src_act:
+                regresses = True
+                tally["regressing"].append(cand["title"])
+                if flags.newer_only:
+                    tally["held_older"].append(cand["title"])
+                    continue
+            elif pre_act == src_act and flags.newer_only:
+                # Same moment on both sides, so there is nothing newer to send -
+                # and "only what is newer" has to mean STRICTLY newer, not
+                # "not older". The distinction is not academic: a row counts as
+                # needing a refresh when its BYTES differ, and rows can differ
+                # while their timestamps match, because `model`,
+                # `permissionMode`, `chromePermissionMode` and the MCP fields
+                # are per-account settings that drift without any activity.
+                # Measured on a real machine the first time this flag was run in
+                # anger: 36 rows genuinely older, 11 genuinely newer - and 248
+                # timestamp-identical rows that the first version happily
+                # overwrote, carrying one account's model and permission choices
+                # into another to fix nothing at all.
+                tally["held_same"].append(cand["title"])
+                continue
+        # Does this refresh change WHICH CONVERSATION the row opens? A row's
+        # filename is the app's session id and survives a resume, while the
+        # cliSessionId inside it names the transcript and changes on each new
+        # CLI run - so the two accounts can hold the same entry pointing at
+        # different conversations, and overwriting it swaps which one that
+        # account can reach. Categorically different from refreshing a title,
+        # and it must never be presented as the same thing.
+        pre_sid = _pointed_session(pre) if pre is not None else None
+        post_sid = _pointed_session(blob)
+        swaps = bool(pre_sid and post_sid and pre_sid != post_sid)
+        if swaps:
+            tally["swapping"].append(cand["title"])
         rows.append({"name": cand["name"],
                      "pre_b64": b64(pre) if pre is not None else None,
                      "is_update": pre is not None,
+                     # the pointer, and the conversation this row would stop
+                     # opening. displaced_orphan is filled in after the loop,
+                     # once it is known whether a swap actually occurs.
+                     "swaps_conversation": swaps,
+                     "displaced_session": pre_sid if swaps else None,
+                     "displaced_orphan": None,
+                     # carried per row so the report, --json and the window can
+                     # each say which overwrites move a row backwards without
+                     # re-deriving it
+                     "pre_activity": pre_act if pre is not None else None,
+                     "regresses": regresses,
+                     # either side unreadable - carried explicitly so the report
+                     # and the window do not have to re-derive "unknown" from a
+                     # null pre_activity, which no longer covers the source side
+                     "activity_unknown": pre is not None
+                     and (pre_act is None or src_act is None),
+                     # what the DESTINATION's row loses, measured against its
+                     # own pre-image - not transform_row's source-side lists
+                     "dest_dropped": dest_dropped, "dest_reset": dest_reset,
                      "dest_path": os.path.join(dest.path, cand["name"]),
                      "post_b64": b64(blob), "session_id": cand["session_id"],
                      "title": cand["title"], "removed": removed, "reset": reset,
@@ -3660,6 +4003,38 @@ def plan_sync(env, flags):
                      # a deliberate deletion was overridden
                      "overrode_tombstone": bool(cand.get("overrode_tombstone")),
                      "written": False})
+
+    # Second pass, and only when it can matter: for every row that swaps which
+    # conversation it opens, is the DISPLACED one still reachable from some
+    # other account? If not, this write makes it unreachable from every
+    # sidebar - the transcript survives on disk with nothing pointing at it.
+    # That is the genuinely destructive case hiding inside "refresh a row", and
+    # until this pass existed the plan presented it identically to a title
+    # update. Measured on a real machine: of 18 rows a --newer-only run would
+    # have written, 6 swapped the conversation and 5 of those orphaned it.
+    if any(r["swaps_conversation"] for r in rows):
+        pointers = _other_pointers(env, dest.path)
+        unreadable_store = None in pointers
+        kept = []
+        for r in rows:
+            if not r["swaps_conversation"]:
+                kept.append(r)
+                continue
+            sid = r["displaced_session"]
+            if sid in pointers:
+                r["displaced_orphan"] = False          # another account holds it
+            elif unreadable_store:
+                # A store we could not read might be the one holding it. Never
+                # treat "could not look" as "nothing there" - the same rule the
+                # rest of this module runs on - so this counts as at risk.
+                r["displaced_orphan"] = "unknown"
+            else:
+                r["displaced_orphan"] = True
+            if r["displaced_orphan"] and not flags.allow_orphan:
+                tally["held_orphan"].append(r["title"])
+                continue
+            kept.append(r)
+        rows = kept
     out = {"op_type": "sync",
            "source_account": source.account_uuid, "source_org": source.org_uuid,
            "source_email": source.email, "source_path": source.path,
@@ -3676,7 +4051,8 @@ def plan_sync(env, flags):
            "dest_account": dest.account_uuid, "dest_org": dest.org_uuid,
            "dest_email": dest.email, "dest_email_source": dest.email_source,
            "dest_path": dest.path,
-           "verbatim": bool(flags.verbatim), "rows": rows, "tally": tally}
+           "verbatim": bool(flags.verbatim), "update": bool(flags.update),
+           "newer_only": bool(flags.newer_only), "rows": rows, "tally": tally}
     if source.resolved_from == "user":
         out["live_override"] = _live_override_record(env, source)
     return out
@@ -3756,7 +4132,14 @@ def execute_sync_op(env, op):
     # default transform strips, the pre-image is the larger of the two. Counting
     # only post-images there under-estimates every save and defeats the byte
     # budget that exists to stop a big run looking like a hang.
-    per_save = sum(len(r.get("post_b64") or "") + len(r.get("pre_b64") or "")
+    # isinstance, not `or ""`: a corrupt manifest carrying a NUMBER in either
+    # image makes `123 or ""` evaluate to 123 and len() raise TypeError - and
+    # this runs BEFORE the write loop, so it would crash out past the very
+    # refusal _sync_pre_image exists to produce. A size estimate has no business
+    # being the thing that decides whether the tool fails closed.
+    def _b64len(v):
+        return len(v) if isinstance(v, str) else 0
+    per_save = sum(_b64len(r.get("post_b64")) + _b64len(r.get("pre_b64"))
                    for r in rows) + 4096
     budget = SYNC_JOURNAL_BYTE_BUDGET
     try:
@@ -3824,7 +4207,22 @@ def _sync_write_rows(op, m, rows, per_save, budget):
         # is_update, NOT truthiness of pre_b64: a zero-byte destination row
         # encodes to "", which is falsy, and would silently demote a refresh to
         # an add - which then refuses because "a different row is already there".
-        pre = unb64(r.get("pre_b64") or "") if r.get("is_update") else None
+        # _sync_pre_image keeps that distinction while still failing closed on a
+        # manifest that has no pre-image at all; main() catches neither KeyError
+        # nor binascii.Error, so turn both into a Refusal here rather than a
+        # traceback (_sync_row_drift classifies the same input "unreadable").
+        pre = None
+        if _row_is_refresh(r):
+            try:
+                pre = _sync_pre_image(r)
+            except (KeyError, ValueError) as exc:
+                raise Refusal(
+                    "row {0!r} (session {1}) is marked as a refresh but its "
+                    "journalled pre-image cannot be read ({2}); refusing rather "
+                    "than overwriting a row whose original bytes this op could "
+                    "no longer restore. Use 'recover --resolve {3} --back' to "
+                    "reverse what did land.".format(
+                        r["name"], r["session_id"], exc, m.get("op_id", "")))
         if pre is not None:
             # A REFRESH (RULING 8). The row existed at plan time and we intend to
             # overwrite it, so "present with different bytes" is no longer proof
@@ -3969,14 +4367,21 @@ def _sync_row_drift(r):
     forward, and it must never be deleted either.
     """
     try:
-        post = unb64(r["post_b64"])
+        raw_post = r["post_b64"]
+        if not isinstance(raw_post, str):
+            # Same trap _sync_pre_image closes, on the other image: unb64 calls
+            # .encode, so a number here raises AttributeError, which this except
+            # does not catch and main() does not either - a traceback out of the
+            # one function whose contract is "never raises".
+            raise ValueError("post_b64 is not a base64 string")
+        post = unb64(raw_post)
     except (KeyError, ValueError):
         return "unreadable"
     pre = None
-    if r.get("is_update"):
+    if _row_is_refresh(r):
         try:
-            pre = unb64(r.get("pre_b64") or "")
-        except ValueError:
+            pre = _sync_pre_image(r)
+        except (KeyError, ValueError):
             return "unreadable"
     try:
         with open(r["dest_path"], "rb") as fh:
@@ -3998,35 +4403,57 @@ def _sync_row_drift(r):
 
 
 def _sync_drift_titles(rows):
-    """(changed_titles, unreadable_titles) for ROWS, via _sync_row_drift.
-    Read-only and exception-safe."""
-    changed, unreadable = [], []
+    """(changed, unreadable, deleted) titles for ROWS, via _sync_row_drift.
+    Read-only and exception-safe.
+
+    `deleted` is REFRESH rows whose destination row is now gone, and it is a
+    third category rather than part of `changed` for two reasons: it blocks
+    for a different cause (nothing edited the row - that account removed it),
+    and it is only blocking for a refresh. For an ADD row "absent" is the
+    ordinary resumption state, which forward completes by simply writing it.
+
+    That asymmetry is the bug this split exists to close. Collecting only
+    "drifted" and "unreadable" left an absent PENDING REFRESH looking like no
+    drift at all, so classify_sync_op offered ["forward", "back"] and told the
+    user "forward finishes them" - while _sync_write_rows refuses that exact
+    row on every re-entry, by design, because re-creating it would resurrect a
+    session the destination account deleted. Forward could never complete, and
+    the recovery listing pointed straight at it: the same dead end 'back'
+    exists to close, reopened for a state RULING 8 introduced.
+    """
+    changed, unreadable, deleted = [], [], []
     for r in rows:
         state = _sync_row_drift(r)
         if state == "drifted":
             changed.append(r["title"])
         elif state == "unreadable":
             unreadable.append(r["title"])
-    return changed, unreadable
+        elif state == "absent" and _row_is_refresh(r):
+            deleted.append(r["title"])
+    return changed, unreadable, deleted
 
 
-def _drift_clause(changed, unreadable):
-    """A note/refusal fragment naming drifted vs unreadable rows separately.
-    'Changed' is only true of one of them - conflating the two would falsely
-    claim an unreadable row 'changed' when the real reason is a permission
-    or I/O error."""
+def _drift_clause(changed, unreadable, deleted=()):
+    """A note/refusal fragment naming drifted vs unreadable vs deleted rows
+    separately. 'Changed' is only true of one of them - conflating them would
+    falsely claim an unreadable row 'changed' when the real reason is a
+    permission or I/O error, or that a row someone deleted was edited."""
     parts = []
     if changed:
         parts.append("changed since this sync was planned ({0})".format(", ".join(changed)))
     if unreadable:
         parts.append("could not be read ({0})".format(", ".join(unreadable)))
+    if deleted:
+        parts.append("were deleted by that account since this refresh was "
+                     "planned ({0})".format(", ".join(deleted)))
     return " and ".join(parts)
 
 
 def classify_sync_op(env, op):
-    """Sync's recovery shape. A sync only ever adds rows, so 'back' does not
-    normally exist - forward finishes the remaining writes, and removing
-    what was written is `undo`'s job. The one exception: if a destination
+    """Sync's recovery shape. Forward finishes the remaining writes, and
+    reversing what was written is `undo`'s job - removing an added row, and
+    (since RULING 8) restoring a refreshed one to the bytes it replaced. The
+    one exception: if a destination
     row changes underneath a still-in-flight sync, forward can never
     complete (execute_sync_op refuses on that exact row every time it
     re-enters), so offering it forever would be a dead end - 'back' becomes
@@ -4052,6 +4479,15 @@ def classify_sync_op(env, op):
     already offer two resolutions where both are safe; follow that shape:
     ["forward", "back"] normally, ["back"] alone when a drifted or
     unreadable pending row makes forward impossible.
+
+    RULING 8 added a third way for forward to be impossible, and it needed
+    its own state: a pending REFRESH whose destination row has since been
+    DELETED. _sync_write_rows refuses that row on every re-entry rather than
+    resurrecting a session the destination account removed, so forward can
+    never complete - but "absent" reads as no drift, so it used to classify
+    as ["forward", "back"] with a note promising "forward finishes them".
+    _sync_drift_titles now reports it as a third category (deleted), blocking
+    for a refresh and still perfectly resumable for an add.
     """
     m = op.manifest
     written = [r for r in m["rows"] if r.get("written")]
@@ -4060,7 +4496,8 @@ def classify_sync_op(env, op):
         return {"status": m["status"], "source": "n/a", "dest": "n/a",
                 "resolutions": [], "drifted_rows": [],
                 "note": "sync: {0} row(s) written, {1} pending; forward finishes "
-                        "them (use undo to remove what was written)"
+                        "them (use undo to reverse what was written - added rows "
+                        "are removed, refreshed ones restored to their original bytes)"
                         .format(len(written), len(pending))}
     # RULING 5: warn BEFORE the user picks a direction if this op's --live
     # certification no longer validates - both directions go through gates
@@ -4073,18 +4510,19 @@ def classify_sync_op(env, op):
         cert_note = ("; NOTE: this op's --live certification no longer matches "
                      "the identity files - forward/back will refuse until the "
                      "identity state is restored or resolves (RULING 5)")
-    pend_changed, pend_unreadable = _sync_drift_titles(pending)
-    if pend_changed or pend_unreadable:
-        blocking = pend_changed + pend_unreadable
-        skip_changed, skip_unreadable = _sync_drift_titles(written)
-        skipped = skip_changed + skip_unreadable
+    pend_changed, pend_unreadable, pend_deleted = _sync_drift_titles(pending)
+    if pend_changed or pend_unreadable or pend_deleted:
+        blocking = pend_changed + pend_unreadable + pend_deleted
+        skip_changed, skip_unreadable, skip_deleted = _sync_drift_titles(written)
+        skipped = skip_changed + skip_unreadable + skip_deleted
         note = ("sync: destination row(s) {0}; it can no longer be rolled "
-                "forward - 'back' removes the row(s) this op safely can"
-                .format(_drift_clause(pend_changed, pend_unreadable)))
+                "forward - 'back' reverses the row(s) this op safely can"
+                .format(_drift_clause(pend_changed, pend_unreadable, pend_deleted)))
         if skipped:
             note += ("; it will also skip {0} already-written row(s) it cannot "
                      "verify ({1})".format(len(skipped),
-                                           _drift_clause(skip_changed, skip_unreadable)))
+                                           _drift_clause(skip_changed, skip_unreadable,
+                                                         skip_deleted)))
         # dict.fromkeys, not a bare concatenation: a pending row and a
         # written row can share a title, and this list reaches cmd_recover's
         # printed line - listing the same title twice reads as two problems.
@@ -4095,9 +4533,81 @@ def classify_sync_op(env, op):
     return {"status": m["status"], "source": "n/a", "dest": "n/a",
             "resolutions": ["forward", "back"], "drifted_rows": [],
             "note": "sync: {0} row(s) written, {1} pending; forward finishes them, "
-                    "back removes the {0} already written (use undo instead once "
+                    "back reverses the {0} already written - removing added rows "
+                    "and restoring refreshed ones (use undo instead once "
                     "the op has completed)".format(len(written), len(pending))
                     + cert_note}
+
+
+def _sync_paths_claimed_elsewhere(env, m):
+    """Destination paths some OTHER op's journal records having written.
+
+    The disk-evidence rule below - "the file holds this op's post-image, so
+    this op wrote it" - is sound only while nobody else can mint those bytes.
+    Somebody can. transform_row is a deterministic function of the source row,
+    so a LATER sync planned over the same unchanged source produces a
+    byte-identical post-image. The sequence is ordinary rather than exotic, and
+    it is the one this tool's own recovery advice walks a user into:
+
+      1. `sync --update --apply` stalls mid-loop (an I/O error, a containment
+         refusal), leaving later rows unwritten and the op at "writing".
+      2. The user re-runs. The new op plans the same rows - same pre-image,
+         same post-image - and completes.
+      3. The user clears the stuck op with `recover --back`, exactly as
+         classify_sync_op tells them to.
+
+    At step 3 those rows read `not written` and `match`, so without this check
+    the stalled op reverses the completed one's work: unlinking a row the other
+    op added, or restoring a stale pre-image over a refresh it completed. No
+    refusal fires, and the completed op's journal still says "completed".
+
+    Cheap enough to do unconditionally: the journal keeps ten terminal ops plus
+    whatever is live, so this is one pass over a bounded set, built once per
+    _sync_delete_targets call rather than per ambiguous row.
+    """
+    mine_id = m.get("op_id")
+    mine_key = _op_sort_key(m)
+    out = set()
+    for o in list_ops(env):
+        om = o.manifest
+        if om.get("op_id") == mine_id or om.get("op_type") != "sync":
+            continue
+        # ORDERING, not mere existence. Without it the check is symmetric: two
+        # ops that both journal the same path each see the other as a claimant,
+        # so BOTH refuse undo and the row can never be reversed through the
+        # journal at all - a mutual lockout whose only escape is deleting the
+        # row in the app, which for a refresh destroys the session instead of
+        # restoring what was replaced. It also refused the one reversal that
+        # was still correct: when B refreshes V0->V1, that account rewrites the
+        # row to V2, and C re-plans (pre=V2, post=V1) and completes, C holds the
+        # only copy of V2 - refusing C's undo strands the destination's own
+        # newer state with no route back.
+        #
+        # So the LATEST op to claim a path owns it: a later claimant supersedes
+        # this op (refuse), an earlier one was superseded BY it (proceed).
+        # Exactly one of any two ops is later, so a lockout is impossible.
+        # _op_sort_key is the module's existing op ordering - creation time then
+        # op_id, the same key list_ops sorts by - reused rather than inventing a
+        # second notion of "newer". Residual: it orders by creation, not by the
+        # moment each row was written, so an op created first but rolled FORWARD
+        # after a later op completed is treated as the earlier claimant. It
+        # still yields one owner and one refusal, never two of either.
+        if _op_sort_key(om) < mine_key:
+            continue
+        # A reversed op has WITHDRAWN its claim: "undone"/"rolled_back" mean
+        # its rows were deleted or put back, so it no longer owns anything.
+        # Without this filter the flags it left behind would block a later
+        # op's legitimate reversal forever - C completes, C is undone, D
+        # re-adds the same row, and undo of D refuses because C's dead
+        # manifest still says written. Fails the wrong way: a stale claim
+        # that cannot be cleared is as bad as no claim at all.
+        if om.get("status") in ("undone", "rolled_back"):
+            continue
+        for r in om.get("rows") or []:
+            p = r.get("dest_path")
+            if r.get("written") and isinstance(p, str):
+                out.add(os.path.normcase(os.path.abspath(p)))
+    return out
 
 
 def _sync_delete_targets(env, m):
@@ -4121,15 +4631,22 @@ def _sync_delete_targets(env, m):
        corrupted manifest row can never point this delete outside the
        destination store.
 
-    Per row, via _sync_row_drift: a row this op never wrote (`written` is
-    not True) is never considered. 'absent' is skipped as already-undone.
-    'match' is removable. 'drifted' and 'unreadable' are reported
-    separately - neither is ever deleted.
+    Per row, via _sync_row_drift: a row is considered when the manifest says
+    this op wrote it, OR when the file itself still holds this op's exact
+    post-image (see the note in the loop - `written` is journalled after the
+    write, so a hard kill in between leaves the flag unset on a row that did
+    land). 'absent' is skipped as already-undone. 'match' is removable for an
+    add and restorable for a refresh. 'pristine' is an untouched refresh, so
+    there is nothing to put back. 'drifted' and 'unreadable' are reported
+    separately - neither is ever deleted or restored over.
 
     Returns (drifted_titles, unreadable_titles, removable_paths,
-    restorable_pairs). Writes and deletes nothing itself. `restorable_pairs`
-    is [(dest_path, original_bytes)] for rows this op REFRESHED (RULING 8),
-    whose reversal is restoring the pre-image rather than deleting the file.
+    restorable_pairs, claimed_titles). Writes and deletes nothing itself.
+    `restorable_pairs` is [(dest_path, original_bytes)] for rows this op
+    REFRESHED (RULING 8), whose reversal is restoring the pre-image rather
+    than deleting the file. `claimed_titles` is rows whose bytes match but
+    which another op's journal records writing - ambiguous ownership, so
+    neither reversed nor silently dropped (undo refuses, back skips).
     """
     # realpath on both sides, matching execute_sync_op's write-side check and
     # ensure_contained below - see the note there on junctions.
@@ -4146,16 +4663,82 @@ def _sync_delete_targets(env, m):
     # regardless of provenance). Both callers of this helper (undo_sync,
     # recover_op's sync 'back' arm) inherit it from this one place.
     _guard_mutation(env, "delete from")
-    drifted, unreadable, removable, restorable = [], [], [], []
+    drifted, unreadable, removable, restorable, claimed = [], [], [], [], []
+    elsewhere = _sync_paths_claimed_elsewhere(env, m)
     for r in m["rows"]:
-        if not r.get("written"):
+        written = bool(r.get("written"))
+        # Containment BEFORE the row is classified, because classifying opens
+        # its dest_path: a hand-edited manifest must not be able to get this
+        # helper to read a file outside the destination store.
+        #
+        # An uncontained row is fatal only if this op RECORDED writing it -
+        # then the manifest is untrustworthy about a mutation that really
+        # happened, and refusing is the only safe answer. An uncontained row
+        # this op never wrote is simply not ours, and raising on it would
+        # reopen the dead end 'back' exists to close: a row-containment
+        # LayoutError is one of the ways a sync stalls in the first place, so
+        # back must still be able to reverse the rows that did land beside it.
+        try:
+            real_dest = ensure_contained(r["dest_path"], [m["dest_path"]])
+            direct_child = os.path.dirname(real_dest) == os.path.realpath(m["dest_path"])
+        except LayoutError:
+            if written:
+                raise
             continue
-        real_dest = ensure_contained(r["dest_path"], [m["dest_path"]])
-        if os.path.dirname(real_dest) != os.path.realpath(m["dest_path"]):
-            raise LayoutError(
-                "row dest_path {0!r} is not a direct child of the destination "
-                "store {1!r}; refusing".format(r["dest_path"], m["dest_path"]))
+        if not direct_child:
+            if written:
+                raise LayoutError(
+                    "row dest_path {0!r} is not a direct child of the destination "
+                    "store {1!r}; refusing".format(r["dest_path"], m["dest_path"]))
+            continue
         state = _sync_row_drift(r)
+        # `written` is an intention journalled AFTER the write, so it is not the
+        # only evidence this op wrote a row - and on its own it is not safe
+        # evidence either. execute_sync_op sets r["written"] and saves the
+        # manifest only after atomic_write has already returned; a hard kill in
+        # that window (power loss, SIGKILL - the one case its docstring admits
+        # the journal can lose the tail of the record) leaves the row holding
+        # the post-image while the manifest still says it was never written.
+        #
+        # For an ADD that stranded a stray row `back` claimed to have removed.
+        # For a REFRESH it is worse and is why this changed: the destination row
+        # keeps bytes this op wrote, the measured pre-image sits unused in the
+        # journal, and `back` reports success having restored nothing - an
+        # overwrite the user explicitly asked to reverse, silently kept.
+        #
+        # So consult the disk, which holds better evidence than the flag: state
+        # "match" means the file currently holds exactly this op's post-image,
+        # and for a refresh plan_sync guarantees post != pre (identical rows are
+        # dropped as "unchanged"), so those bytes cannot be the original either.
+        # Anything else on an unattempted row is genuinely not ours to reverse.
+        if not written and state != "match":
+            continue
+        # Ownership, checked for EVERY row whose bytes match - not just the
+        # unwritten ones. The first version of this check sat inside the
+        # `not written` branch, which made it dead code in the arm that needed
+        # it most: undo_sync only ever runs on a "completed" op, where every
+        # row is written, so `claimed` was always empty there and undo's
+        # conflict refusal could never fire. Both harmful sequences run through
+        # a WRITTEN row:
+        #   - B stalls on row R; C completes R; classify offers B `forward`
+        #     ("forward finishes them"), which sees current == post and marks R
+        #     written. Two completed ops now journal the same path, and
+        #     undo(B) unlinks the row C added.
+        #   - B refreshes V0 -> V1; that account uses the session and the app
+        #     rewrites R to V2; C re-plans (pre=V2, post=V1) and completes;
+        #     undo(B) restores V0 over C's refresh, and C's own undo is then
+        #     permanently refused because R is neither its post nor its pre.
+        # Same rule either way: matching bytes are not proof of current
+        # ownership when a LATER op records writing the same path. Note this is
+        # only about who may REVERSE the row - _sync_write_rows still adopts a
+        # row that already holds its post-image rather than refusing, because a
+        # refusal there would make `forward` permanently impossible on a row
+        # classify_sync_op still offers to roll forward, which is exactly the
+        # dead end the previous two rounds closed. Ordering settles ownership
+        # without reopening it.
+        if state == "match" and os.path.normcase(os.path.abspath(r["dest_path"])) in elsewhere:
+            claimed.append(r["title"])
+            continue
         if state == "pristine":
             continue                       # untouched refresh - already original
         if state == "absent":
@@ -4167,9 +4750,9 @@ def _sync_delete_targets(env, m):
             # "match" means the row still holds exactly what this op wrote. For
             # an added row the reversal is deletion; for a refreshed one it is
             # putting the measured pre-image back. Same evidence, different act.
-            if r.get("is_update"):
+            if _row_is_refresh(r):
                 try:
-                    restorable.append((r["dest_path"], unb64(r.get("pre_b64") or "")))
+                    restorable.append((r["dest_path"], _sync_pre_image(r)))
                 except (KeyError, ValueError):
                     unreadable.append(r["title"])   # cannot rebuild the original
             else:
@@ -4178,7 +4761,7 @@ def _sync_delete_targets(env, m):
             drifted.append(r["title"])
         else:                              # "unreadable"
             unreadable.append(r["title"])
-    return drifted, unreadable, removable, restorable
+    return drifted, unreadable, removable, restorable, claimed
 
 
 def _sync_restore_all(pairs):
@@ -4219,6 +4802,36 @@ def _sync_unlink_all(paths):
             ", ".join("{0} ({1})".format(p, exc) for p, exc in failures)))
 
 
+def _sync_reverse_all(removable, restorable):
+    """Both halves of a reversal, in one pass that always attempts both.
+
+    Each half already refuses to stop at its own first failure, for the stated
+    reason that a half-applied reversal with no record of the rest is the worst
+    outcome. Calling them in sequence quietly gave up exactly that guarantee
+    ACROSS the two: _sync_unlink_all raising on one locked added row meant
+    _sync_restore_all never ran at all, so every refreshed row stayed in its
+    overwritten state - held hostage by an unrelated file, and reported as a
+    failure to *remove* something, which does not hint that restores were
+    skipped. Deletions still go first (the simpler half, and the one whose
+    failure is most often transient), but a failure in either is collected and
+    both are attempted before anything is raised.
+    """
+    failures = []
+    for p in removable:
+        try:
+            os.unlink(p)
+        except OSError as exc:
+            failures.append(("remove {0}".format(p), exc))
+    for path, blob in restorable:
+        try:
+            atomic_write(path, blob)
+        except OSError as exc:
+            failures.append(("restore {0}".format(path), exc))
+    if failures:
+        raise Refusal("could not {0}".format(
+            ", ".join("{0} ({1})".format(what, exc) for what, exc in failures)))
+
+
 def undo_sync(env, op):
     """Reverse exactly what this sync did - and only while every row is still
     byte-identical to what it wrote. Rows it ADDED are deleted; rows it
@@ -4243,15 +4856,28 @@ def undo_sync(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
-        drifted, unreadable, removable, restorable = _sync_delete_targets(env, m)
+        (drifted, unreadable, removable,
+         restorable, claimed) = _sync_delete_targets(env, m)
         if drifted or unreadable:
             raise Refusal("these synced rows {0}; the other account may have opened "
                           "them. Refusing to change any of them."
                           .format(_drift_clause(drifted, unreadable)))
-        _sync_unlink_all(removable)
-        # Restores come after deletions so a failure part-way leaves the simpler
-        # half done, and _sync_restore_all reports every failure together.
-        _sync_restore_all(restorable)
+        if claimed:
+            # A completed op should have every row journalled as written, so
+            # reaching here means the manifest and the journal disagree about
+            # who owns a row. undo is the all-or-nothing arm: stop and ask.
+            raise Refusal(
+                "a later operation has since written these rows ({0}), so this op "
+                "no longer owns them - reversing would undo that operation's work "
+                "instead. Undo that operation instead ('list --ops' names it); it "
+                "holds the bytes these rows had when IT ran, which is the state "
+                "immediately before its own write. Do NOT delete a refreshed row "
+                "in the app to reverse it: that removes the session from that "
+                "account altogether rather than putting back what was replaced."
+                .format(", ".join(claimed)))
+        # One pass, both halves always attempted - a locked added row must not
+        # leave every refreshed row stranded in its overwritten state.
+        _sync_reverse_all(removable, restorable)
         set_status(op, "undone")
         rotate_ops(env)
         return "undone"
@@ -4277,6 +4903,7 @@ def _public_manifest(m):
 
 def cmd_sync(env, ns):
     flags = SyncFlags(to=ns.to, only=ns.only, update=ns.update,
+                      newer_only=ns.newer_only, allow_orphan=ns.allow_orphan,
                       include_deleted=tuple(ns.include_deleted or ()),
                       verbatim=ns.verbatim, live=ns.live)
     manifest = plan_sync(env, flags)
@@ -4326,7 +4953,14 @@ def cmd_sync(env, ns):
     # manifest, so the "rows" list and every row dict inside it are shared
     # between the caller's manifest and the journaled one. That coupling is
     # load-bearing here and easy to break by deep-copying "for safety".
-    say("\ncopied     : {0}".format(sum(1 for r in manifest["rows"] if r.get("written"))))
+    # Split the count: a refreshed row was not "copied" in the sense the rest
+    # of this report uses, and folding the two together hid the overwrites in
+    # a number the user reads as "rows added".
+    done = [r for r in manifest["rows"] if r.get("written")]
+    n_upd = sum(1 for r in done if r.get("is_update"))
+    say("\ncopied     : {0}".format(len(done) - n_upd))
+    if n_upd:
+        say("refreshed  : {0}".format(n_upd))
     say("result     : {0}".format(final))
     d = _live_override_derived(manifest)
     if d is not None:
@@ -4464,7 +5098,12 @@ def _print_sync_report(say, manifest):
               ("deleted", "skipped, deleted in the destination"),
               ("unreadable", "skipped, unreadable row"),
               ("filtered", "skipped, did not match --only"),
-              ("unchanged", "already identical, nothing to refresh")]
+              ("unchanged", "already identical, nothing to refresh"),
+              ("held_older", "held back, their copy is NEWER (--newer-only)"),
+              ("held_same", "held back, same age - nothing newer to send"),
+              ("held_orphan", "held back, would HIDE a conversation"),
+              ("swapping", "refreshes that change WHICH conversation opens"),
+              ("held_unknown", "held back, could not tell which is newer")]
     for key, label in LABELS:
         items = tally.get(key) or []
         if items:
@@ -4479,6 +5118,21 @@ def _print_sync_report(say, manifest):
         say("   kept deleted: {0}".format(title))
     if len(deleted_titles) > 15:
         say("   ... and {0} more".format(len(deleted_titles) - 15))
+
+    # Name what --newer-only declined to send. A count alone would leave the
+    # user unable to tell a correct hold-back from a wrong one, and the whole
+    # point of the flag is that they no longer have to eyeball every row.
+    for key, label in (("held_older", "not sent, their copy is newer"),
+                       ("held_unknown", "not sent, direction unknown"),
+                       ("held_orphan", "NOT SENT, would hide a conversation")):
+        held = tally.get(key) or []
+        for title in held[:15]:
+            say("   {0}: {1}".format(label, title))
+        if len(held) > 15:
+            say("   ... and {0} more".format(len(held) - 15))
+    if manifest.get("newer_only") and not manifest.get("update"):
+        say("   (--newer-only had nothing to act on: it narrows --update, "
+            "which was not given)")
 
     # --include-deleted is the one thing this command does that the user
     # cannot undo by simply deleting a row again - it brings back a session
@@ -4509,11 +5163,55 @@ def _print_sync_report(say, manifest):
         say("!! OVERWRITING {0} row(s) that already exist in the destination "
             "(--update):".format(len(refreshes)))
         for r in refreshes[:15]:
-            say("   !! {0}".format(r["title"]))
+            # Name the direction per row. A refresh is not automatically an
+            # upgrade: rows are per-account snapshots of one shared transcript,
+            # so the dormant copy can be the more recently used one, and
+            # overwriting it moves that account BACKWARDS.
+            if r.get("regresses"):
+                mark = "  <- destination copy is NEWER; this moves it BACKWARDS"
+            elif r.get("activity_unknown"):
+                mark = "  <- which copy is newer could not be determined"
+            else:
+                mark = ""
+            say("   !! {0}{1}".format(r["title"], mark))
+            # A pointer swap is not a metadata refresh and must not read like
+            # one: after this write that entry opens a DIFFERENT conversation.
+            if r.get("swaps_conversation"):
+                orph = r.get("displaced_orphan")
+                fate = ("and NOTHING else points at it - it becomes unreachable "
+                        "from every account" if orph is True else
+                        "and it could not be confirmed reachable elsewhere"
+                        if orph == "unknown" else
+                        "it stays reachable from another account")
+                say("      ^ opens a DIFFERENT conversation afterwards; the one it "
+                    "opens now ({0}) {1}".format(
+                        (r.get("displaced_session") or "?")[:8], fate))
         if len(refreshes) > 15:
             say("   ... and {0} more".format(len(refreshes) - 15))
+        # What a refresh actually replaces. It is not a field-level patch of
+        # the title and timestamp: the whole row is rewritten from the source's
+        # transformed bytes, so anything the default transform strips or resets
+        # is dropped from the DESTINATION's copy too. Say so before doing it -
+        # the per-row `removed`/`reset` lists are already computed.
+        # Measured against each destination row's OWN pre-image, so this names
+        # what that account actually loses - including fields it had and the
+        # source never did, which the source-side lists could not see.
+        dropped = sorted({k for r in refreshes for k in (r.get("dest_dropped") or [])})
+        reset = sorted({k for r in refreshes for k in (r.get("dest_reset") or [])})
+        unknown = sum(1 for r in refreshes if r.get("dest_dropped") is None)
+        say("   each refresh replaces the WHOLE row with the source's copy, not just")
+        say("   its title and last-activity time.")
+        if dropped:
+            say("   fields the destination's row loses: {0}".format(", ".join(dropped)))
+        if reset:
+            say("   fields reset over that account's own setting: {0}".format(", ".join(reset)))
+        if unknown:
+            say("   {0} row(s) could not be compared field by field - the whole row "
+                "is still replaced.".format(unknown))
         say("   undo restores the exact bytes replaced; a row the destination has")
         say("   changed since planning is refused, never overwritten.")
+        say("   that undo lasts only while this op is in the journal - the ten most")
+        say("   recent finished ops are kept, older ones are pruned with their images.")
         say("")
 
     say("{0:36}: {1}".format("to copy", len(adds)))
