@@ -429,7 +429,11 @@ window into `journaled`/`completed`/`rolled_back`.
 
 - **`sync --update` shipped in 0.9.9** with the drift-refusal treatment this entry asked for:
   the plan records the destination's current bytes, the write refuses if they moved since, and
-  `undo` restores them exactly. See `docs/internals.md`, RULING 8.
+  `undo` restores them exactly. It turned out to matter more than "refresh a stale title": a
+  row is a **pointer** to a transcript, and two accounts can point at different ones, so
+  `--update` can restore access to a newer conversation — or, in the wrong direction, hide one.
+  Hence `--newer-only` (on by default in the window) and `--allow-orphan` (off). See
+  `docs/internals.md`, RULING 8.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
