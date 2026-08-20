@@ -120,8 +120,31 @@ class SyncApp:
         self.update_var = tk.BooleanVar(value=False)
         self.update_chk = ttk.Checkbutton(
             filt, text="Also refresh rows already there", variable=self.update_var,
-            command=self.refresh)
+            command=self._on_update_toggle)
         self.update_chk.pack(side="left", padx=(16, 0))
+        # Ticked BY DEFAULT, and the one default in this window that is not
+        # "do nothing". Refreshing everything is almost never what someone
+        # means: each account's rows are a snapshot of when THAT account last
+        # opened a session, so a bulk refresh sends whichever account you
+        # happen to be signed into over the top of the others - measured on
+        # this machine, one direction had 11 rows genuinely newer and 28 that
+        # would have gone backwards. Safe to default on because it can only
+        # ever send FEWER rows than the box above it.
+        self.newer_var = tk.BooleanVar(value=True)
+        self.newer_chk = ttk.Checkbutton(
+            filt, text="only where mine is newer", variable=self.newer_var,
+            command=self.refresh, state="disabled")
+        self.newer_chk.pack(side="left", padx=(6, 0))
+        # Off by default and never remembered. A row is a POINTER to a
+        # conversation, and two accounts can point at different ones, so a
+        # refresh can leave the displaced conversation reachable from nowhere.
+        # That is the one outcome of a refresh that takes access away instead
+        # of updating something, which is why it needs saying yes to.
+        self.orphan_var = tk.BooleanVar(value=False)
+        self.orphan_chk = ttk.Checkbutton(
+            filt, text="allow hiding a conversation", variable=self.orphan_var,
+            command=self.refresh, state="disabled")
+        self.orphan_chk.pack(side="left", padx=(6, 0))
 
         body = ttk.Frame(outer)
         body.pack(fill="both", expand=True)
@@ -153,6 +176,12 @@ class SyncApp:
                                      command=self.forget_destination)
         if self.dest_choice:
             self.forget_btn.pack(side="left", padx=(6, 0))
+        # Only shown while a --live assertion is in force. It is the escape
+        # hatch that lets the assertion persist across replans safely: the
+        # answer stops being re-demanded every time, and stays changeable on
+        # purpose rather than by accident.
+        self.live_btn = ttk.Button(bar, text="Change signed-in account",
+                                   command=self.forget_live)
 
         self.refresh()
 
@@ -176,18 +205,39 @@ class SyncApp:
         state = "disabled" if on else "normal"
         for w in (self.refresh_btn, self.undo_btn, self.doctor_btn,
                   self.only_entry, self.filter_btn, self.clear_btn,
-                  self.trust_chk, self.update_chk):
+                  self.trust_chk, self.update_chk, self.newer_chk,
+                  self.orphan_chk, self.live_btn, self.forget_btn):
             w.configure(state=state)
+        # newer_chk qualifies update_chk, so re-releasing everything must not
+        # leave it live while the box it qualifies is unticked - it would read
+        # as a control that does nothing.
+        if not on and not self.update_var.get():
+            self.newer_chk.configure(state="disabled")
+            self.orphan_chk.configure(state="disabled")
 
     # ---------------------------------------------------------------- planning
-    def refresh(self, keep_live=False):
-        # An explicit Refresh always re-asks which account is live. A --live
-        # assertion is a statement about RIGHT NOW, not a setting: keeping it
-        # across a deliberate re-look would let a stale answer survive an
-        # account switch, which is the very failure --live exists to prevent.
-        # (Only the picker re-plans with keep_live=True, immediately after
-        # being told.)
-        if not keep_live:
+    def refresh(self, reset_live=False):
+        # The --live assertion survives a replan, and is cleared only on apply
+        # or when the user explicitly changes it.
+        #
+        # It used to be cleared on EVERY replan, on the reasoning that an
+        # assertion is a statement about right now and a stale one must not
+        # survive an account switch. Sound in principle; miserable in practice.
+        # Picking a destination re-plans, and so does ticking "Also refresh",
+        # so a single ordinary sitting - assert, choose destination, assert,
+        # tick the box, assert - asked the same question four times, each one
+        # phrased as though nothing had been said. A question re-asked that
+        # often stops being read, which is the opposite of what an assertion
+        # this consequential needs.
+        #
+        # Safe because the assertion is never load-bearing on its own: the
+        # executor re-derives the live account itself and revalidates the
+        # certification against the identity files before writing (RULING 5,
+        # _certified_live_account), so a stale answer refuses at apply rather
+        # than writing the wrong store. It is also cleared the moment an apply
+        # completes, shown in the window while it is in force, and changeable
+        # from the button beside it - visible state, not remembered state.
+        if reset_live:
             self.live_choice = ""
         # Snapshot the filter on the UI thread and carry it through. Reading
         # only_var again inside the worker or the callback let a quick A-then-B
@@ -202,14 +252,18 @@ class SyncApp:
         self.status.set("Planning...")
         self.detail.set("")
         self.show([])
-        threading.Thread(target=self._plan_worker,
-                         args=(gen, only, self.update_var.get()),
-                         daemon=True).start()
+        threading.Thread(
+            target=self._plan_worker,
+            args=(gen, only, self.update_var.get(), self.newer_var.get(),
+                  self.orphan_var.get()),
+            daemon=True).start()
 
-    def _plan_worker(self, gen, only, update):
+    def _plan_worker(self, gen, only, update, newer_only, allow_orphan):
         try:
             flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice,
-                                  only=only, update=update)
+                                  only=only, update=update,
+                                  newer_only=newer_only,
+                                  allow_orphan=allow_orphan)
             manifest = ccs.plan_sync(self.env, flags)
             self.root.after(0, self._plan_done, gen, only, manifest, None)
         except ccs.Refusal as exc:
@@ -290,6 +344,10 @@ class SyncApp:
                            ("deleted", "kept deleted (you deleted these there)"),
                            ("filtered", "filtered out"),
                            ("unreadable", "unreadable rows"),
+                           ("held_older", "held back - their copy is NEWER"),
+                           ("held_orphan", "held back - would HIDE a conversation"),
+                           ("swapping", "change WHICH conversation opens"),
+                           ("held_unknown", "held back - could not tell which is newer"),
                            ("resurrected", "!! RESURRECTED (deletion overridden)")):
             val = tally.get(key)
             count = len(val) if isinstance(val, (list, tuple, set)) else val
@@ -300,10 +358,52 @@ class SyncApp:
         if refreshes:
             lines += ["!! OVERWRITING {0} row(s) already in the destination"
                       .format(len(refreshes)),
-                      "   undo restores the exact bytes replaced; a row that account",
-                      "   changed since planning is refused, never overwritten.", ""]
-            lines += ["   !! " + (r.get("title") or r.get("session_id", ""))[:88]
-                      for r in refreshes]
+                      "   each replaces the WHOLE row with this account's copy, not",
+                      "   just its title and last-activity time.",
+                      "   undo restores the exact bytes replaced - while the operation",
+                      "   stays in the journal (the ten most recent are kept); a row",
+                      "   that account changed since planning is refused, never",
+                      "   overwritten.", ""]
+            # Name the direction per row, exactly as the CLI report does. A
+            # count alone ("2 of them would move that account backwards") tells
+            # a window user that something is wrong but not which rows, and the
+            # only way to find out was to leave for the terminal.
+            for r in refreshes:
+                title = (r.get("title") or r.get("session_id", ""))[:88]
+                if r.get("regresses"):
+                    mark = "   <- their copy is NEWER; this moves it BACKWARDS"
+                elif r.get("activity_unknown"):
+                    mark = "   <- which copy is newer could not be determined"
+                else:
+                    mark = ""
+                lines.append("   !! " + title + mark)
+                # Same rule as the CLI report: a pointer swap is a different
+                # act from a metadata refresh and must not read like one.
+                if r.get("swaps_conversation"):
+                    orph = r.get("displaced_orphan")
+                    fate = ("NOTHING else points at it - it becomes unreachable"
+                            if orph is True else
+                            "could not confirm anything else points at it"
+                            if orph == "unknown" else
+                            "still reachable from another account")
+                    lines.append("        ^ opens a DIFFERENT conversation after "
+                                 "this; the one it opens now: " + fate)
+            # All three of what the CLI prints, not just the first. Printing
+            # only `dest_dropped` hid a reset of permission state that account
+            # set itself, and - worse - rendered nothing at all when the field
+            # comparison returned "could not tell", turning "I could not look"
+            # into "there was nothing to report" in the one surface whose users
+            # are least likely to cross-check the terminal.
+            lost = sorted({k for r in refreshes for k in (r.get("dest_dropped") or [])})
+            reset = sorted({k for r in refreshes for k in (r.get("dest_reset") or [])})
+            unknown = sum(1 for r in refreshes if r.get("dest_dropped") is None)
+            if lost:
+                lines.append("   fields their row loses: " + ", ".join(lost))
+            if reset:
+                lines.append("   reset over their own setting: " + ", ".join(reset))
+            if unknown:
+                lines.append("   {0} row(s) could not be compared field by field -"
+                             " the whole row is still replaced.".format(unknown))
             lines.append("")
         lines += ["{0:<38}: {1}".format("to copy", len(adds)), ""]
         for r in adds:
@@ -317,6 +417,7 @@ class SyncApp:
         # yesterday and want it back" is the same need, and the CLI was the
         # only answer to it before.
         self._sync_undo_button()
+        self._sync_live_button()
         # A filter that hides candidates must say so on the status line, not only
         # in the tally: "nothing to copy" reads as "you are up to date", which is
         # a different and misleading statement when a filter caused it.
@@ -464,8 +565,10 @@ class SyncApp:
                        "account is signed in, and either record can be the stale one.\n\n"
                        "Tell it which store the DESKTOP APP is signed into right now. "
                        "The OTHER one is what gets written, so an answer that is wrong "
-                       "writes the store you are actually using.\n\nThis is not "
-                       "remembered - it is asked again every time.").pack(anchor="w")
+                       "writes the store you are actually using.\n\nThis answer holds "
+                       "for this window until you copy or change it - it is shown "
+                       "beside the Refresh button, and never saved to disk.").pack(
+                           anchor="w")
         for a, o, p in stores:
             rows = ccs._listing_row_count(p)
             count = ("{0} rows".format(rows) if rows
@@ -474,7 +577,7 @@ class SyncApp:
             def pick(path=p):
                 self.live_choice = path      # a full path matches exactly one store
                 win.destroy()
-                self.refresh(keep_live=True)
+                self.refresh()
             ttk.Button(win, command=pick,
                        text="Signed in as  {0}   org {1}…   ({2})".format(
                            self._account_label(a), o[:8], count)).pack(
@@ -722,17 +825,44 @@ class SyncApp:
             self.show([msg])
             messagebox.showwarning("Undo did not complete", msg)   # see _apply_done
             self._sync_undo_button()
+            self._sync_live_button()
             return
         self.status.set("Undone - the copied rows were removed")
         self.detail.set("The other account's sidebar is back to how it was. "
                         "Press Refresh to plan again.")
         self.show([])
         self._sync_undo_button()
+        self._sync_live_button()
 
     def forget_destination(self):
         self.dest_choice = ""
         save_pref("")
         self.refresh()
+
+    def _on_update_toggle(self):
+        """Enable the newer-only qualifier only while it can mean something."""
+        state = "normal" if self.update_var.get() else "disabled"
+        self.newer_chk.configure(state=state)
+        self.orphan_chk.configure(state=state)
+        self.refresh()
+
+    def forget_live(self):
+        """Drop the --live assertion and re-ask. The deliberate re-look the
+        old clear-on-every-replan behaviour was trying to provide, minus the
+        three unasked-for repetitions."""
+        self.refresh(reset_live=True)
+
+    def _sync_live_button(self):
+        """Show 'Change signed-in account' only while an assertion is held."""
+        # winfo_manager(), not winfo_ismapped(): the question is "is this packed",
+        # and ismapped answers "is it on screen right now", which is also False
+        # for a minimised or withdrawn window - so the button would be re-packed
+        # on every plan while iconified.
+        if self.live_choice:
+            if not self.live_btn.winfo_manager():
+                self.live_btn.pack(side="left", padx=(6, 0))
+        elif self.live_btn.winfo_manager():
+            self.live_btn.pack_forget()
 
     # ---------------------------------------------------------------- applying
     def on_apply(self):
@@ -740,20 +870,62 @@ class SyncApp:
             return
         n = len(self.manifest.get("rows") or [])
         dst = self.manifest.get("dest_email") or self.manifest["dest_account"][:8]
-        n_upd = sum(1 for r in (self.manifest.get("rows") or []) if r.get("is_update"))
+        rows = self.manifest.get("rows") or []
+        n_upd = sum(1 for r in rows if r.get("is_update"))
+        # Rows are per-account snapshots of one shared transcript, so the copy
+        # being overwritten is not automatically the older one. Saying "the
+        # newer copy" here asserted a comparison the tool never made; name the
+        # ones that actually go backwards instead.
+        n_back = sum(1 for r in rows if r.get("regresses"))
+        back_note = ""
+        if n_back:
+            back_note = ("\n\n{0} of them would move that account BACKWARDS: its "
+                         "copy was used more recently than this one.".format(n_back))
+        # Swaps are the ones worth stopping for: the entry opens a different
+        # conversation afterwards. Named in the confirmation, not just the pane.
+        n_swap = sum(1 for r in rows if r.get("swaps_conversation"))
+        n_hide = sum(1 for r in rows if r.get("displaced_orphan"))
+        if n_swap:
+            back_note += ("\n\n{0} of them will open a DIFFERENT CONVERSATION "
+                          "afterwards - the row points at a transcript, and these "
+                          "point at a different one in each account.".format(n_swap))
+        if n_hide:
+            back_note += ("\n{0} of those would leave the conversation they "
+                          "displace unreachable from every account.".format(n_hide))
         if n_upd and not messagebox.askokcancel(
                 "Overwrite existing rows?",
-                "{0} of these {1} row(s) ALREADY EXIST in {2} and will be "
-                "overwritten with the newer copy.\n\nUndo restores the exact bytes "
-                "replaced. A row that account has changed since this plan was made "
-                "is refused rather than overwritten.\n\nContinue?".format(
-                    n_upd, n, dst)):
+                "{0} of these {1} row(s) ALREADY EXIST in {2}. Each will have its "
+                "WHOLE row replaced by this account's copy - not just the title and "
+                "last-activity time.{3}\n\nUndo restores the exact bytes replaced, "
+                "for as long as the operation stays in the journal (the ten most "
+                "recent are kept). A row that account has changed since this plan "
+                "was made is refused rather than overwritten.\n\nContinue?".format(
+                    n_upd, n, dst, back_note)):
             return
+        # Split adds from refreshes. The old text said "This adds listing rows"
+        # unconditionally, so a pure-refresh run told the user it was adding
+        # rows immediately after they had confirmed overwriting some - the exact
+        # mental model RULING 8's visibility rules exist to build.
+        n_add = n - n_upd
+        if n_add and n_upd:
+            what = ("Add {0} row{1} and refresh {2} existing one{3} in {4}?".format(
+                n_add, "" if n_add == 1 else "s",
+                n_upd, "" if n_upd == 1 else "s", dst))
+            does = ("It adds listing rows to that account's sidebar and overwrites "
+                    "the {0} row{1} you just confirmed.".format(
+                        n_upd, "" if n_upd == 1 else "s"))
+        elif n_upd:
+            what = "Refresh {0} existing row{1} in {2}?".format(
+                n_upd, "" if n_upd == 1 else "s", dst)
+            does = ("It adds nothing - it overwrites rows already in that account's "
+                    "sidebar with this account's copy.")
+        else:
+            what = "Copy {0} session{1} into {2}?".format(
+                n, "" if n == 1 else "s", dst)
+            does = ("It adds listing rows to that account's sidebar. It never "
+                    "deletes anything.")
         if not messagebox.askokcancel(
-                "Copy sessions?",
-                "Copy {0} session{1} into {2}?\n\nThis adds listing rows to that "
-                "account's sidebar. It never deletes anything, and `ccs undo` "
-                "reverses it.".format(n, "" if n == 1 else "s", dst)):
+                "Copy sessions?", "{0}\n\n{1} Undo reverses it.".format(what, does)):
             return
         self.busy(True)
         self.apply_btn.configure(state="disabled")
@@ -794,15 +966,25 @@ class SyncApp:
             # is fixable in seconds - so leave Apply reachable after a Refresh.
             self.apply_btn.configure(state="disabled")
             return
-        written = sum(1 for r in (manifest.get("rows") or []) if r.get("written"))
+        done = [r for r in (manifest.get("rows") or []) if r.get("written")]
+        written = len(done)
+        n_upd = sum(1 for r in done if r.get("is_update"))
         self.live_choice = ""            # an assertion covers one run, not a session
-        self.status.set("Copied {0} session{1}".format(
-            written, "" if written == 1 else "s"))
+        # Same rule for the overwrite opt-in: it covers ONE run. Leaving the box
+        # ticked after an apply meant the next plan in the same window silently
+        # arrived with refreshes already enabled, which is not what "opt-in per
+        # run, never implied" promises - and the window is the one place a user
+        # is least likely to re-read what the checkbox does.
+        self.update_var.set(False)
+        self.status.set("Copied {0} session{1}{2}".format(
+            written - n_upd, "" if written - n_upd == 1 else "s",
+            ", refreshed {0}".format(n_upd) if n_upd else ""))
         self.detail.set("Sign into the other account (or restart the app) to see them. "
                         "Changed your mind? Undo is the button below - a GUI should not "
                         "send you to a terminal to reverse what it just did.")
         self.manifest = None
         self._sync_undo_button()
+        self._sync_live_button()
 
 
 # ------------------------------------------------------------------- shortcuts

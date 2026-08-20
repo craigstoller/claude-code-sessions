@@ -896,12 +896,21 @@ def test_recover_back_removes_written_rows_when_a_pending_row_is_blocked(two_acc
     assert ct.nonterminal_ops(env) == []
 
 
-def test_recover_back_says_so_when_it_removes_nothing(two_account_env, tmp_path):
+def test_recover_back_reverses_rows_the_journal_never_recorded(two_account_env,
+                                                               tmp_path):
     """A hard kill during a batched run can leave rows on disk that the
-    manifest never marked written, and 'back' only removes rows it can see it
-    wrote - so it removes nothing and, before this, printed a bare
-    'rolled_back'. It must name the forward-then-undo route that does clean
-    them up, or the rows are silently stranded in the OTHER account's store."""
+    manifest never marked written, because `written` is journalled AFTER
+    atomic_write returns.
+
+    This used to assert the opposite: that back removed nothing and merely
+    NAMED the forward-then-undo route that would clean them up. Peer review
+    (RULING 8 round two) rejected that as the wrong contract - `written` is an
+    intention recorded after the fact, while the file holding this op's exact
+    post-image is direct evidence it wrote it, so back can just reverse them.
+    It matters much more once --update exists: for an added row the old
+    behaviour stranded a stray row, but for a REFRESH it silently kept an
+    overwrite the user had explicitly asked to reverse, with the measured
+    pre-image sitting unused in the journal."""
     env, src, dst = two_account_env(tmp_path)
     _prepared(env, src, dst, n=2)
     m = ct.plan_sync(env, ct.SyncFlags())
@@ -918,10 +927,32 @@ def test_recover_back_says_so_when_it_removes_nothing(two_account_env, tmp_path)
 
     op = ct.nonterminal_ops(env)[0]
     assert ct.recover_op(env, op, "back") == "rolled_back"
-    assert all(os.path.exists(p) for p in landed)     # nothing deleted
+    # Reversed, not stranded, and not advertised as someone else's problem.
+    assert not any(os.path.exists(p) for p in landed)
     reason = ct.list_ops(env)[-1].manifest.get("abort_reason") or ""
-    assert "removed nothing" in reason
-    assert "--forward" in reason and "undo" in reason
+    assert "reversed nothing" not in reason
+
+
+def test_recover_back_says_so_when_there_was_nothing_to_reverse(two_account_env,
+                                                                tmp_path):
+    """The genuine nothing-to-do case still says so out loud rather than
+    printing a bare 'rolled_back': the rows this op wrote are gone from the
+    destination, so back had nothing to take back."""
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=2)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    ct.run_sync(env, m)
+    op = ct.list_ops(env)[-1]
+    for r in op.manifest["rows"]:
+        os.remove(r["dest_path"])         # that account deleted them itself
+        r["written"] = False
+    op.manifest["status"] = "writing"
+    ct.save_manifest(op)
+
+    op = ct.nonterminal_ops(env)[0]
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    reason = ct.list_ops(env)[-1].manifest.get("abort_reason") or ""
+    assert "reversed nothing" in reason
 
 
 def test_cmd_undo_dry_run_preview_for_sync_op(two_account_env, tmp_path, capsys):
