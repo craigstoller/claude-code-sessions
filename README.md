@@ -432,8 +432,11 @@ window into `journaled`/`completed`/`rolled_back`.
   `undo` restores them exactly. It turned out to matter more than "refresh a stale title": a
   row is a **pointer** to a transcript, and two accounts can point at different ones, so
   `--update` can restore access to a newer conversation — or, in the wrong direction, hide one.
-  Hence `--newer-only` (on by default in the window) and `--allow-orphan` (off). See
-  `docs/internals.md`, RULING 8.
+  Hence `--newer-only` (on by default in the window) and `--allow-orphan` (off). **0.9.10**
+  adds the number that makes that last decision judgeable: the plan says how much of the
+  conversation a refresh would displace also appears in the incoming one, so a hold reads as
+  "5% of its prose is in the incoming conversation" rather than only "would hide a
+  conversation". See `docs/internals.md`, RULING 8.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
