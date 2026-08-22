@@ -1253,3 +1253,49 @@ This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses
 touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation
 being reversed at the user's explicit request is a case where a surprise should mean stop and
 ask, not best-effort cleanup — the opposite of what a stuck, still-in-flight op needs.
+
+## Open question — is anchoring `sync` to the live account still earning its cost? (2026-08-21)
+
+**Not a ruling. A question raised by the user after `repoint` shipped, recorded because the
+answer is not obvious and the change it implies is large.**
+
+`sync` defines its source as the **live** account: `resolve_sync_endpoints` sets
+`source = live_account(env)`, and the destination is refused if it might be live
+(`_refuse_dest_possibly_live`). The rule this enforces is *never write the account you are
+currently using*.
+
+The user's observation: **the tool never needed to be signed in to READ a store.** All stores
+sit on one disk and are readable at any time. Liveness is not a data requirement — it is the
+anchor for a safety rule. And `repoint` is the existence proof that the rule is stronger than
+it strictly needs to be: it writes the LIVE account's store, deliberately, and its safety rests
+entirely on the running-app guard. With the app closed, every store is equally inert and the
+live/dormant distinction stops doing work.
+
+If that reasoning holds, a `sync --from X --to Y` gated on the same app-closed guard would be
+as safe as `repoint` already is, and would remove:
+
+- signing into the source account before every sync — the single largest piece of friction in
+  ordinary use, and the thing that made the 2026-08-21 incident possible in the first place
+  (opening a session under a different account is exactly what repointed its row);
+- most of **RULING 5** — the `--live` certification, the identity-disagreement refusal, the
+  GUI's account picker — all of which exist only to answer "which account is live?";
+- the account-ambiguity refusals that answer the same question a second time.
+
+**What the current design buys, and would be traded away.** Live-anchoring is defence in depth:
+it makes "overwrite the account you are actively using" structurally impossible even when the
+running-app guard is *wrong*. That is not hypothetical - the guard was wrong for four days when
+the Chrome helper's hash-bound exclusion lapsed (RULING 6/7), and it is a point-in-time process
+check with a documented residual window either way. Live-anchoring is the layer that holds when
+that one fails.
+
+**What would settle it.** How often is the guard actually wrong, and what is the blast radius
+when it is? A write into a dormant store under a running app corrupts a sidebar the user is not
+looking at; the same write into the live store lands under the app's feet. If the guard's
+failure rate is materially non-zero, the current design is right and the friction is the price.
+If the guard is reliable and the residual is only the microsecond check-to-write window, then
+the friction is buying very little and `repoint` has been demonstrating that for a release.
+
+**Not to be decided in passing.** `repoint` is one row, named explicitly, by a user who has just
+been told exactly what it will do. `sync` is up to hundreds of rows in one apply. The asymmetry
+in blast radius is a real argument for the asymmetry in rules, and any change here needs the
+review panel and a measurement of the guard, not a refactor.
