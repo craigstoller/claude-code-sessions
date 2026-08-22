@@ -353,6 +353,31 @@ class SyncApp:
             count = len(val) if isinstance(val, (list, tuple, set)) else val
             if count:
                 lines.append("{0:<38}: {1}".format(label, count))
+        # Rows held back as orphaning, with the measurement that makes the hold
+        # judgeable. Listed before the plan itself: they are the reason a plan
+        # can come back empty, and a user staring at "0 to copy" needs to see
+        # why and what ticking the box would actually cost.
+        detail = list(tally.get("held_orphan_detail") or [])
+        if detail:
+            # Unmeasured first, then lowest overlap first - "could not look" is
+            # the least reassuring answer, not the largest measured loss.
+            detail.sort(key=lambda d: (d.get("overlap") is not None,
+                                       d.get("overlap") if d.get("overlap") is not None else 0))
+            lines += ["!! NOT SENT - each would open a DIFFERENT conversation, and the",
+                      "   one it opens now was not confirmed reachable from any other",
+                      "   account. Tick \"allow hiding a conversation\" to send them.", ""]
+            for d in detail:
+                lines.append("   !! " + (d.get("title") or "")[:88])
+                # Confirmed-orphan and could-not-tell are different claims and
+                # must not share a line.
+                lines.append("        " + (
+                    "nothing else points at the conversation it opens now"
+                    if d.get("orphan") is True else
+                    "a store could not be read - whether anything else points at "
+                    "it is UNKNOWN"))
+                lines.append("        " + ccs._overlap_clause(d.get("overlap")))
+            lines.append("")
+
         refreshes = [r for r in rows if r.get("is_update")]
         adds = [r for r in rows if not r.get("is_update")]
         if refreshes:
@@ -388,6 +413,8 @@ class SyncApp:
                             "still reachable from another account")
                     lines.append("        ^ opens a DIFFERENT conversation after "
                                  "this; the one it opens now: " + fate)
+                    lines.append("          " +
+                                 ccs._overlap_clause(r.get("displaced_overlap")))
             # All three of what the CLI prints, not just the first. Printing
             # only `dest_dropped` hid a reset of permission state that account
             # set itself, and - worse - rendered nothing at all when the field
