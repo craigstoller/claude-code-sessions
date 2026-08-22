@@ -630,6 +630,44 @@ means once more than two accounts exist.
 - **`--only`**, the ordinary title filter, which is usually the right answer for "I just want
   this one session".
 
+**And every hold carries a measurement, because naming one is not enough.** Shipped without it,
+the orphan guard held back **7 of 7** candidate rows on a real three-account machine and wrote
+nothing — since once a session is worked from two accounts, *every* propagation is an orphaning
+swap by that definition. A guard that fires on the normal case is a wall, and it was reported as
+the tool being broken. `_displaced_overlap` compares the conversation a refresh would displace
+against the one it brings in, and the plan prints the answer per row. The same 7 rows then read
+5%, 35%, 72%, 87%, 97%, 99% and one unmeasurable — a decision, where seven identical warnings
+were not.
+
+Four properties of that number, each of which was got wrong first:
+
+- **Prose only, and measured rather than assumed.** Tool calls and results dominate a transcript
+  by count and are near-identical boilerplate across unrelated sessions. Counting every block
+  put two real pairs at 74% and 94% "already in the incoming conversation" where the prose those
+  pairs share is **5% and 36%** — numbers that would have talked a user into the overwrite the
+  prose says to avoid. Timestamps are excluded for the same reason: keyed on them, a
+  conversation "diverged" from its own continuation at message 8 of 738.
+- **It never claims nothing is lost.** The full-overlap line says *every prose turn appears in
+  the incoming conversation (text only, first 400 characters compared — images, attachments and
+  tool output were NOT)*. It compares truncated prose as an unordered set, so it cannot see
+  attachments, cannot distinguish a long turn that diverges after 400 characters, and cannot
+  tell a clean continuation from one interleaved into an unrelated conversation. The earlier
+  wording claimed preservation, and it sat on the line that tells the user how to override the
+  hold — every engine on the review panel raised it independently.
+- **Percentages floor.** `int(round(…))` printed 99.9% as 100% and gave it the full-overlap line.
+  Live on the reporting machine: the session the user cared most about read "nothing is lost"
+  and is 99%.
+- **Unmeasurable is never a number.** A missing, oversized, unreadable or ambiguous transcript,
+  or too few prose turns to support a percentage, all report NOT MEASURED. *Ambiguous* is real:
+  `find_transcripts` returns every project directory holding a session id, and a git worktree
+  put one session in two — it had been reporting 98% against whichever the directory walk
+  reached first.
+
+Known and deferred: the comparison is set membership, not sequence, so repeated boilerplate
+prose inflates it and an interleaved conversation can still read high; planning cost is bounded
+per row but not in total, and the window re-measures on every replan; and the several causes of
+NOT MEASURED print identically.
+
 Held back rather than refused outright: a refusal would block every other row in the run, and
 the point of naming them is that the user should not have to adjudicate a wall of titles.
 
