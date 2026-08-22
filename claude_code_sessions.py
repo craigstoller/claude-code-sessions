@@ -2321,6 +2321,19 @@ def cmd_doctor(env, ns):
         return rep["exit_code"]
     def say(line):
         print(line if ns.verbose else redact(env, line))
+
+    def say_ids(line):
+        """Like say(), but keeps session ids whole.
+
+        redact() shortens uuid-shaped ids to eight characters, which is right
+        for values that only identify a machine - and wrong for the one place
+        this report hands the user something to type back in. The orphan block
+        exists to feed `repoint --to`, which matches the transcript filename
+        exactly, so a shortened id makes that workflow impossible from the
+        default report. Home-directory redaction still applies; only the ids
+        survive.
+        """
+        print(line if ns.verbose else redact(env, line, keep_ids=True))
     say("[observed] store: {0} ({1})".format(rep["stores"]["status"],
                                              rep["stores"]["detail"]))
     for r in rep["stores"]["roots"]:
@@ -2348,15 +2361,16 @@ def cmd_doctor(env, ns):
         say("[hypothesis]   looking at: resuming a session under another account "
             "repoints its row, which can")
         say("[hypothesis]   leave the conversation you were just in reachable from no "
-            "sidebar. Newest first:")
-        # The FULL id, not a prefix. `repoint --to` matches the transcript
-        # filename exactly, and the README sends people here to find it - an
-        # 8-character prefix made the documented workflow impossible without
-        # re-running with --json. A session id is not a path; `list --full`
-        # already prints these.
+            "sidebar. Largest first,")
+        say("[hypothesis]   within the last 7 days; anything older comes after:")
+        # The FULL id, through say_ids. `repoint --to` matches the transcript
+        # filename exactly, and this block is where the README sends people to
+        # find it - so both the [:8] slice this used to do AND redact()'s
+        # uuid-shortening had to go. The first was fixed alone in 0.9.11, which
+        # left the workflow just as broken, one layer down.
         for d in ranked:
-            say("[observed]   {0}  {1:>6.1f} MB  last written {2} day(s) ago"
-                .format(d["session_id"], d["mb"], d["age_days"]))
+            say_ids("[observed]   {0}  {1:>6.1f} MB  last written {2} day(s) ago"
+                    .format(d["session_id"], d["mb"], d["age_days"]))
         say("[hypothesis]   to reach one again: repoint --only <title> --to <id above>")
         if len(rep["unlisted_transcripts"]) > len(ranked):
             say("[observed]   ... and {0} more (all of them in --json)"
