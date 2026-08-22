@@ -912,6 +912,237 @@ check("  and is reported as 'unknown', not as a confirmed orphan",
       row3["displaced_orphan"] == "unknown", str(row3["displaced_orphan"]))
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------- how much would actually be lost?
+# "This opens a different conversation and nothing else points at the old one"
+# is true of EVERY propagation once you work a session from two accounts, so on
+# its own it holds back the normal case and reads as the tool being broken.
+# Measured on a real machine: 7 rows held, 5 of which displaced a conversation
+# already 72-100% present in the incoming one. The number is what makes the
+# hold judgeable, so it is measured and printed.
+
+
+TURNS = 12          # prose turns in the displaced conversation
+
+
+def build_lineage(overlap):
+    """Two transcripts for one slot. `overlap` = how many of the older's TURNS
+    prose messages are repeated verbatim in the newer one.
+
+    Both transcripts also carry heavy tool traffic, which must NOT count: it is
+    near-identical boilerplate across unrelated sessions, and counting it put
+    two real pairs at 74%/94% shared when their prose was 5%/36% - numbers that
+    would have talked a user into an overwrite the prose says to avoid.
+    """
+    root, env, dest_row, src_row = build()
+    old_sid, new_sid = "%032d" % 21, "%032d" % 22
+    projects = os.path.join(env.home, ".claude", "projects", "proj")
+
+    def tool_noise(fh, tag):
+        for i in range(40):
+            fh.write(json.dumps({"type": "assistant", "timestamp": "%s%d" % (tag, i),
+                                 "message": {"content": [
+                                     {"type": "tool_use", "name": "Bash",
+                                      "input": {"command": "ls"}}]}}) + "\n")
+    with open(os.path.join(projects, old_sid + ".jsonl"), "w", encoding="utf-8") as fh:
+        for i in range(TURNS):
+            fh.write(json.dumps({"type": "user", "timestamp": "t%d" % i,
+                                 "message": {"content": "shared message %d" % i}}) + "\n")
+        tool_noise(fh, "oldtool")
+    with open(os.path.join(projects, new_sid + ".jsonl"), "w", encoding="utf-8") as fh:
+        for i in range(overlap):        # the same content, different timestamps
+            fh.write(json.dumps({"type": "user", "timestamp": "LATER%d" % i,
+                                 "message": {"content": "shared message %d" % i}}) + "\n")
+        for i in range(6):
+            fh.write(json.dumps({"type": "user", "timestamp": "new%d" % i,
+                                 "message": {"content": "brand new message %d" % i}}) + "\n")
+        tool_noise(fh, "newtool")
+    name = "local_lineage.json"
+    with open(os.path.join(os.path.dirname(src_row), name), "w") as fh:
+        json.dump({"cliSessionId": new_sid, "title": "Lineage",
+                   "cwd": projects, "lastActivityAt": 9000}, fh)
+    dst = os.path.join(os.path.dirname(dest_row), name)
+    with open(dst, "w") as fh:
+        json.dump({"cliSessionId": old_sid, "title": "Lineage",
+                   "cwd": projects, "lastActivityAt": 8000}, fh)
+    return root, env, dst
+
+
+for overlap, want_pct, phrase in ((TURNS, 100, "every prose turn"),
+                                  (TURNS // 2, 50, "a real part is only there"),
+                                  (0, 0, "largely its OWN conversation")):
+    root, env, dst = build_lineage(overlap)
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+    row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+    got = int(round((row.get("displaced_overlap") or 0) * 100))
+    check("overlap of %d/%d measures as %d%%" % (overlap, TURNS, want_pct),
+          got == want_pct, "got %s%%" % got)
+    check("  and reads as '%s'" % phrase[:28],
+          phrase in ccs._overlap_clause(row["displaced_overlap"]),
+          ccs._overlap_clause(row["displaced_overlap"]))
+    shutil.rmtree(root, ignore_errors=True)
+
+# timestamps must NOT count - a resume rewrites them, and keying on them
+# reported a conversation as diverging from its own continuation
+root, env, dst = build_lineage(TURNS)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+check("identical content with different timestamps is 100% overlap",
+      row["displaced_overlap"] == 1.0, str(row["displaced_overlap"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# the number reaches the user on the held-back path, which is where it decides
+root, env, dst = build_lineage(TURNS)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True))
+check("held back by default", m["tally"]["held_orphan"] == ["Lineage"])
+d = m["tally"]["held_orphan_detail"]
+check("  with the measurement carried alongside",
+      len(d) == 1 and d[0]["overlap"] == 1.0, str(d))
+check("  and no row bytes smuggled into the tally",
+      not any(k.endswith("_b64") for k in d[0]), str(sorted(d[0])))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  the report states the full-overlap case precisely",
+      any("every prose turn" in l for l in out)
+      and not any("nothing is lost" in l for l in out),
+      " | ".join(l.strip() for l in out if "prose turn" in l) or "(no line)")
+check("  and names the flag that would send it",
+      any("--allow-orphan" in l for l in out))
+shutil.rmtree(root, ignore_errors=True)
+
+# unmeasurable is reported as unmeasured, never as zero
+root, env, dst = build_lineage(TURNS)
+projects = os.path.join(env.home, ".claude", "projects", "proj")
+os.remove(os.path.join(projects, "%032d.jsonl" % 21))     # displaced one is gone
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+check("a missing displaced transcript is NOT MEASURED, not 0%",
+      row["displaced_overlap"] is None
+      and "NOT MEASURED" in ccs._overlap_clause(row["displaced_overlap"]),
+      str(row["displaced_overlap"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# ------------------------------------- what the overlap number may NOT claim
+# Every engine on the review panel raised the same objection: the full-overlap
+# line claimed "nothing is lost" from a prose-only, 400-char-truncated, unordered
+# comparison that never looks at images, attachments or tool output.
+check("the full-overlap line does not claim nothing is lost",
+      "nothing is lost" not in ccs._overlap_clause(1.0), ccs._overlap_clause(1.0))
+check("  it says what was actually compared",
+      "prose" in ccs._overlap_clause(1.0) and "400" in ccs._overlap_clause(1.0),
+      ccs._overlap_clause(1.0))
+check("  and names what was NOT",
+      all(w in ccs._overlap_clause(1.0) for w in ("images", "attachments", "tool output")))
+
+# percentages floor; int(round(...)) turned 99.9% into the full-overlap line
+for frac in (0.999, 0.9951, 0.995):
+    c = ccs._overlap_clause(frac)
+    check("%.4f does not render as full overlap" % frac,
+          "every prose turn" not in c, c[:60])
+check("  99.9% reads as 99%", "99%" in ccs._overlap_clause(0.999),
+      ccs._overlap_clause(0.999))
+check("a tiny non-zero overlap is not printed as 0%",
+      "under 1%" in ccs._overlap_clause(0.004), ccs._overlap_clause(0.004))
+check("exactly 1.0 is the only full-overlap case",
+      "every prose turn" in ccs._overlap_clause(1.0))
+
+# ------------------------------------- a malformed transcript must not crash
+# `(d.get("message") or {}).get(...)` raised AttributeError out of a function
+# whose caller catches only OSError, taking plan_sync down with it.
+root, env, dst = build_lineage(TURNS)
+projects = os.path.join(env.home, ".claude", "projects", "proj")
+bad = os.path.join(projects, "%032d.jsonl" % 21)
+with open(bad, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps({"type": "user", "message": "a string, not a dict"}) + "\n")
+    fh.write(json.dumps(["a list, not an object"]) + "\n")
+    fh.write("{not json at all\n")
+    fh.write(json.dumps({"type": "user", "message": {"content": "real turn"}}) + "\n")
+try:
+    fps = ccs._message_fingerprints(bad)
+    check("a malformed transcript parses instead of raising", fps == ccs._message_fingerprints(bad))
+    check("  keeping only the well-formed turns", len(fps) == 1, str(fps))
+except Exception as exc:
+    check("a malformed transcript parses instead of raising", False,
+          "%s: %s" % (type(exc).__name__, exc))
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+    row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+    check("  and planning survives it", row["displaced_overlap"] is None,
+          str(row["displaced_overlap"]))
+except Exception as exc:
+    check("  and planning survives it", False, "%s: %s" % (type(exc).__name__, exc))
+shutil.rmtree(root, ignore_errors=True)
+
+# ------------------------------------- an ambiguous session id is unmeasurable
+# find_transcripts returns EVERY project dir holding that id; taking [0] would
+# compare whichever the walk reached first.
+root, env, dst = build_lineage(TURNS)
+projects = os.path.join(env.home, ".claude", "projects")
+other = os.path.join(projects, "proj2")
+os.makedirs(other, exist_ok=True)
+shutil.copy(os.path.join(projects, "proj", "%032d.jsonl" % 21),
+            os.path.join(other, "%032d.jsonl" % 21))
+check("the same session id in two project dirs is ambiguous",
+      len(ccs.find_transcripts(env.projects_root, "%032d" % 21)) == 2)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+check("  so it is NOT MEASURED rather than measured against a guess",
+      row["displaced_overlap"] is None, str(row["displaced_overlap"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# ------------------------------------- cheap failures must not starve the cap
+root, env, dst = build_lineage(TURNS)
+os.remove(os.path.join(env.home, ".claude", "projects", "proj", "%032d.jsonl" % 21))
+saved = ccs.TRANSCRIPT_COMPARE_MAX_ROWS
+ccs.TRANSCRIPT_COMPARE_MAX_ROWS = 1
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True))
+    row = [r for r in m["rows"] if r["title"] == "Lineage"][0]
+    check("a measurement that produced no number does not spend the row budget",
+          row["displaced_overlap"] is None)
+finally:
+    ccs.TRANSCRIPT_COMPARE_MAX_ROWS = saved
+shutil.rmtree(root, ignore_errors=True)
+
+# ------------------------------------- 'unknown' is never reported as certain
+root, env, dst, old_sid, new_sid, todir = build_swap(third_holds_old=True)
+third = os.path.join(os.path.dirname(os.path.dirname(dst)), "3" * 32)
+orig_listdir = os.listdir
+
+
+def blind2(p):
+    if os.path.normcase(os.path.abspath(p)) == os.path.normcase(os.path.abspath(third)):
+        raise OSError(13, "permission denied")
+    return orig_listdir(p)
+
+
+ccs.os.listdir = blind2
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=todir))
+finally:
+    ccs.os.listdir = orig_listdir
+d = m["tally"]["held_orphan_detail"]
+check("an unreadable store yields an 'unknown' hold", len(d) == 1 and d[0]["orphan"] == "unknown",
+      str([(x["title"], x.get("orphan")) for x in d]))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  and the report says UNKNOWN, not 'nothing else points at it'",
+      any("UNKNOWN" in l for l in out)
+      and not any("nothing else points at the conversation" in l for l in out),
+      " | ".join(l.strip() for l in out if "UNKNOWN" in l or "nothing else" in l) or "(no line)")
+shutil.rmtree(root, ignore_errors=True)
+
+# a genuinely confirmed orphan still reads as certain
+root, env, dst, old_sid, new_sid, todir = build_swap()
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True))
+d = m["tally"]["held_orphan_detail"]
+check("a confirmed orphan is reported as certain", d and d[0]["orphan"] is True,
+      str([(x["title"], x.get("orphan")) for x in d]))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  with the definite wording",
+      any("nothing else points at the conversation" in l for l in out))
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

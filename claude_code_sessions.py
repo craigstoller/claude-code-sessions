@@ -3642,7 +3642,7 @@ def select_sync_rows(env, source, dest, flags):
              # refreshes that change WHICH conversation the row opens, and the
              # subset of those held back because the displaced conversation
              # would be left unreachable from every account
-             "swapping": [], "held_orphan": []}
+             "swapping": [], "held_orphan": [], "held_orphan_detail": []}
     have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
@@ -3819,6 +3819,128 @@ def _other_pointers(env, dest_path):
     return out
 
 
+# Bounds on the transcript comparison below. Transcripts reach tens of MB, so
+# this reads real data - but it only ever runs for rows that CHANGE which
+# conversation they open, which is a handful even on a machine with hundreds of
+# sessions (measured: 7 of 265). Both caps degrade to "unmeasured", never to a
+# wrong number.
+TRANSCRIPT_COMPARE_MAX_BYTES = 96 * 1024 * 1024
+TRANSCRIPT_COMPARE_MAX_ROWS = 40
+# Below this many prose turns in the displaced conversation, report "not
+# measured" rather than a percentage a handful of messages cannot support.
+OVERLAP_MIN_SAMPLE = 8
+
+
+def _message_fingerprints(path):
+    """Fingerprints of the PROSE turns in a transcript - what a person said and
+    what was said back - or None if it cannot be read or is too big to compare.
+
+    Two deliberate exclusions, both measured rather than assumed:
+
+    **Timestamps and ids.** Resuming a session rewrites them, so a comparison
+    that keys on them calls two copies of the same exchange different - it put
+    a conversation's overlap with its own continuation at "diverges at message
+    8 of 738" while the content of those messages was identical.
+
+    **Tool calls and their results.** They dominate a transcript by count and
+    are near-identical boilerplate across unrelated sessions, so counting them
+    inflates the answer to the only question this serves: how much of what
+    would be displaced is really gone? Measured on two real pairs - counting
+    every block put them at 74% and 94% "already in the incoming conversation",
+    while the prose those same pairs share is 5% and 36%. The first pair of
+    numbers invites a user to tick the box; the second correctly stops them.
+    Prose is a smaller sample and the right one.
+    """
+    try:
+        if os.path.getsize(path) > TRANSCRIPT_COMPARE_MAX_BYTES:
+            return None
+    except OSError:
+        return None
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                # Both shapes are checked, not assumed. A JSONL line can decode
+                # to a list or a bare string, and `message` can be a string in a
+                # malformed or hand-edited transcript - in which case
+                # `(d.get("message") or {}).get(...)` raised AttributeError
+                # straight out of a function whose caller catches only OSError,
+                # crashing plan_sync. Verified before the fix: a line whose
+                # message is a string raised `'str' object has no attribute
+                # 'get'`. A transcript we cannot parse must degrade to
+                # "unmeasured", which is what the comment on the caps promises.
+                if not isinstance(d, dict) or d.get("type") not in ("user", "assistant"):
+                    continue
+                msg = d.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                c = msg.get("content")
+                if isinstance(c, str):
+                    body = c
+                elif isinstance(c, list):
+                    body = " ".join(b.get("text") or "" for b in c
+                                    if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    continue
+                body = " ".join(body.split())
+                if body:
+                    out.append(hashlib.sha1(body[:400].encode("utf-8")).hexdigest()[:12])
+    except OSError:
+        return None
+    return out
+
+
+def _displaced_overlap(env, old_sid, new_sid):
+    """How much of the conversation a refresh DISPLACES also lives in the one it
+    brings in - a float 0.0-1.0, or None when it cannot be measured.
+
+    This is the number that makes an orphan warning actionable. "This row will
+    open a different conversation and nothing else points at the old one" is
+    true of every propagation in a multi-account workflow, because resuming a
+    session mints a new transcript id each time and each account records
+    whichever it last saw. Held back on that alone, the guard fires on the
+    normal case and reads as the tool being broken - measured on a real
+    machine, it held back all 7 candidate rows, of which 5 would have displaced
+    a conversation whose content was already 72-100% present in the incoming
+    one. The other 2 were 36% and 5%, and genuinely deserved the pause.
+
+    So: measure it, and let the number carry the decision. 1.0 means the
+    displaced conversation is wholly contained in its replacement and nothing is
+    reachable-only-there; a low number means it is substantially its own
+    conversation.
+    """
+    if not old_sid or not new_sid or old_sid == new_sid:
+        return None
+    old = find_transcripts(env.projects_root, old_sid)
+    new = find_transcripts(env.projects_root, new_sid)
+    if not old or not new:
+        return None                      # nothing on disk to compare
+    if len(old) > 1 or len(new) > 1:
+        # find_transcripts returns EVERY project directory holding that session
+        # id, and taking [0] would silently compare whichever the directory walk
+        # happened to reach first. A number derived from a file we only might
+        # have wanted is worse than no number - report it unmeasured.
+        return None
+    a = _message_fingerprints(old[0])
+    if not a or len(a) < OVERLAP_MIN_SAMPLE:
+        # Too few prose turns to say anything honest. A percentage off three
+        # messages reads as precise and is not; "not measured" is the truthful
+        # answer and the one the caller already knows how to print.
+        return None
+    b = _message_fingerprints(new[0])
+    if b is None:
+        return None
+    seen = set(b)
+    return sum(1 for h in a if h in seen) / float(len(a))
+
+
 def _refresh_field_loss(pre, post):
     """(dropped, reset) top-level keys the DESTINATION's row loses when a
     refresh replaces PRE with POST, or (None, None) if either side cannot be
@@ -3982,6 +4104,9 @@ def plan_sync(env, flags):
                      "swaps_conversation": swaps,
                      "displaced_session": pre_sid if swaps else None,
                      "displaced_orphan": None,
+                     # 0.0-1.0: how much of the displaced conversation is also
+                     # in the incoming one. None = not measured / not knowable.
+                     "displaced_overlap": None,
                      # carried per row so the report, --json and the window can
                      # each say which overwrites move a row backwards without
                      # re-deriving it
@@ -4012,9 +4137,33 @@ def plan_sync(env, flags):
     # until this pass existed the plan presented it identically to a title
     # update. Measured on a real machine: of 18 rows a --newer-only run would
     # have written, 6 swapped the conversation and 5 of those orphaned it.
-    if any(r["swaps_conversation"] for r in rows):
+    swap_rows = [r for r in rows if r["swaps_conversation"]]
+    if swap_rows:
         pointers = _other_pointers(env, dest.path)
         unreadable_store = None in pointers
+        # How much of each displaced conversation survives in its replacement.
+        # Bounded: past the row cap the number stops being worth the reads, and
+        # an unmeasured row simply says so rather than guessing.
+        measured = 0
+        for r in swap_rows:
+            if measured >= TRANSCRIPT_COMPARE_MAX_ROWS:
+                break
+            try:
+                incoming = _pointed_session(unb64(r["post_b64"]))
+            except (KeyError, ValueError):
+                incoming = None
+            r["displaced_overlap"] = _displaced_overlap(
+                env, r["displaced_session"], incoming)
+            # Only a row that actually produced a number spends the budget. It
+            # used to increment unconditionally, so a run of cheap failures - a
+            # missing transcript, an unresolvable id - could exhaust the cap and
+            # starve the rows further down that could have been measured. The
+            # cap exists to bound expensive reads, and a failure that never
+            # opened a file is not one. Residual: a file that IS read and then
+            # yields too few prose turns also goes uncounted; that is bounded by
+            # the number of swap rows, which is small by construction.
+            if r["displaced_overlap"] is not None:
+                measured += 1
         kept = []
         for r in rows:
             if not r["swaps_conversation"]:
@@ -4032,6 +4181,19 @@ def plan_sync(env, flags):
                 r["displaced_orphan"] = True
             if r["displaced_orphan"] and not flags.allow_orphan:
                 tally["held_orphan"].append(r["title"])
+                # Carried alongside rather than inside the title list, which
+                # other readers treat as plain titles. No row bytes here - only
+                # what a user needs to judge the hold.
+                tally["held_orphan_detail"].append(
+                    {"title": r["title"], "overlap": r["displaced_overlap"],
+                     # True = nothing else points at it; "unknown" = a store
+                     # could not be read, so reachability was never established.
+                     # Carried because the report used to state flatly that every
+                     # held row leaves its conversation reachable from no
+                     # account, which is a certainty the "unknown" rows do not
+                     # have and the code one line up is careful not to claim.
+                     "orphan": r["displaced_orphan"],
+                     "displaced_session": r["displaced_session"]})
                 continue
             kept.append(r)
         rows = kept
@@ -4885,6 +5047,48 @@ def undo_sync(env, op):
         release_lock(env)
 
 
+def _overlap_clause(frac):
+    """Plain words for how much of a displaced conversation is also in its
+    replacement. A user acts on this line without opening either conversation,
+    so it has to say what the number MEANS - and, at the top of the range, what
+    it does not mean.
+
+    **The full-overlap line never claims nothing is lost.** It used to. Every
+    engine on the review panel raised the same objection independently, and they
+    were right: this compares PROSE ONLY, truncated to the first 400 characters
+    of each turn, as an unordered set. Images, attachments, thinking blocks and
+    tool output are never looked at, a long turn that diverges after 400
+    characters fingerprints as identical, and set membership cannot tell a clean
+    continuation from a conversation interleaved into an unrelated one. So the
+    honest ceiling is "every prose turn appears somewhere in the incoming
+    conversation", which is worth knowing and is not a preservation guarantee.
+    The sentence sits on the line that then tells the user how to override the
+    hold, which is exactly where an overstatement does its damage.
+
+    **Percentages floor, never round.** `int(round(...))` turned 99.9% into
+    "100%" and printed the full-overlap line for a conversation with an
+    unmatched turn in it - possibly the decisive one. Only frac == 1.0 is full.
+    """
+    if frac is None:
+        return "how much of it is in the incoming one: NOT MEASURED"
+    if frac >= 1.0:
+        return ("every prose turn of it already appears in the incoming "
+                "conversation (text only, first 400 characters compared - images, "
+                "attachments and tool output were NOT)")
+    pct = int(frac * 100)               # floor: never round up to a false 100
+    if frac > 0 and pct == 0:
+        return ("under 1% of its prose is in the incoming conversation - it is "
+                "essentially its OWN conversation")
+    if pct >= 90:
+        return ("{0}% of its prose is already in the incoming conversation - a "
+                "little is only there".format(pct))
+    if pct >= 50:
+        return ("only {0}% of its prose is in the incoming conversation - a real "
+                "part is only there".format(pct))
+    return ("just {0}% of its prose is in the incoming conversation - it is "
+            "largely its OWN conversation".format(pct))
+
+
 def _public_manifest(m):
     """The manifest with refresh pre-images removed, for --json.
 
@@ -5123,13 +5327,44 @@ def _print_sync_report(say, manifest):
     # user unable to tell a correct hold-back from a wrong one, and the whole
     # point of the flag is that they no longer have to eyeball every row.
     for key, label in (("held_older", "not sent, their copy is newer"),
-                       ("held_unknown", "not sent, direction unknown"),
-                       ("held_orphan", "NOT SENT, would hide a conversation")):
+                       ("held_unknown", "not sent, direction unknown")):
         held = tally.get(key) or []
         for title in held[:15]:
             say("   {0}: {1}".format(label, title))
         if len(held) > 15:
             say("   ... and {0} more".format(len(held) - 15))
+
+    # Held-back swaps get the measurement, not just the name. Without it every
+    # line reads the same and the only way to judge one is to go and open both
+    # conversations - which is the position this whole feature exists to spare
+    # the user. Sorted so the ones that would really lose something come first.
+    detail = list(tally.get("held_orphan_detail") or [])
+    if detail:
+        say("")
+        say("!! NOT SENT - each of these would open a DIFFERENT conversation, and the "
+            "one it opens")
+        say("   now was not confirmed reachable from any other account. Pass "
+            "--allow-orphan (window:")
+        say("   \"allow hiding a conversation\") to send them.")
+        # Unmeasured first, then lowest overlap first. `None` sorts ahead of every
+        # number because "we could not look" is the least reassuring answer here,
+        # not because it is the largest loss - the same fail-closed posture the
+        # rest of this module runs on. (The earlier comment claimed this ordered
+        # by how much would be lost, which is not what the key does.)
+        detail.sort(key=lambda d: (d.get("overlap") is not None,
+                                   d.get("overlap") if d.get("overlap") is not None else 0))
+        for d in detail[:15]:
+            say("   !! {0}".format(d["title"]))
+            # Per row, because the two states are not the same claim.
+            say("        {0}".format(
+                "nothing else points at the conversation it opens now"
+                if d.get("orphan") is True else
+                "a store could not be read, so whether anything else points at "
+                "the conversation it opens now is UNKNOWN"))
+            say("        " + _overlap_clause(d.get("overlap")))
+        if len(detail) > 15:
+            say("   ... and {0} more".format(len(detail) - 15))
+        say("")
     if manifest.get("newer_only") and not manifest.get("update"):
         say("   (--newer-only had nothing to act on: it narrows --update, "
             "which was not given)")
@@ -5186,6 +5421,7 @@ def _print_sync_report(say, manifest):
                 say("      ^ opens a DIFFERENT conversation afterwards; the one it "
                     "opens now ({0}) {1}".format(
                         (r.get("displaced_session") or "?")[:8], fate))
+                say("        " + _overlap_clause(r.get("displaced_overlap")))
         if len(refreshes) > 15:
             say("   ... and {0} more".format(len(refreshes) - 15))
         # What a refresh actually replaces. It is not a field-level patch of
