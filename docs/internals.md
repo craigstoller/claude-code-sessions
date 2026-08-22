@@ -736,6 +736,49 @@ Each of these was a real defect. They are stated as rules because each one gener
   window session, is cleared on apply, and is changeable from a button beside Refresh —
   visible state rather than state re-demanded on every replan.
 
+##### When the app orphans a conversation, and nothing here can stop it (2026-08-21)
+
+The first incident where **no guard in this tool was applicable**, and the most instructive so
+far.
+
+A sidebar entry was resumed while the desktop was signed into a *different* account. That
+continued the older branch, and the app then wrote that transcript id into whichever store was
+active — including the account that had been holding the newer one. A 32 MB conversation was
+left on disk with no account's sidebar pointing at it. Reconstructed from mtimes: the row was
+written at 21:27:49, after every operation in the journal and two days after the last one that
+touched that store as a destination. **The mutation never went through this tool**, so
+`--newer-only`, the orphan hold and the running-app guard were all irrelevant — and by the time
+the tool next looked, the app's pointer genuinely *was* the newer one, so `--newer-only`
+correctly propagated it onward.
+
+Two consequences:
+
+- **`doctor` already knew, and buried it.** `unlisted_transcripts` has always been computed; it
+  printed one identical line per orphan — **155 of them inside a 569-line report**. The
+  information was there and unusable. It is now ranked newest-first with size and age, capped at
+  the top few, with the total named and the full list still in `--json`; the report dropped to
+  273 lines. Most unreferenced transcripts are ordinary — a CLI-started session never had a row,
+  and deleting a session leaves its transcript behind — so the ranking *is* the feature: a large
+  one from this afternoon was previously indistinguishable from a small one from last month.
+- **`repoint` puts a pointer back.** One row, one field (`cliSessionId`), journalled with a
+  pre-image so `undo` reverses it, under the same drift rule as everything else here: reversal
+  proceeds only while the row still holds exactly what the repoint wrote, because the app
+  rewrites these rows whenever it opens the session.
+
+**`repoint` defaults to the LIVE account's store, and that is a deliberate departure from
+`sync`.** Sync refuses to write the signed-in account, reasoning that the account you are using
+is the one you least want a background tool rearranging. Repoint exists to fix the sidebar you
+are looking at, so that refusal would rule out its only real use. What protects it instead is
+the running-app guard: the app must be closed, which is what makes "the live account's store" a
+safe target rather than a live one.
+
+**One judgement worth recording.** `--store` is *not* refused when several stores match, unlike
+every other selector here. An account owns one store per org, so naming it by email necessarily
+matches all of them — but only one can hold the row being repointed and the rest are the empty
+cross-pair scaffolding. The *row* settles it: every candidate store is searched, and the
+refusal fires only if the row itself is ambiguous. That is a question about the thing being
+changed rather than about directory naming, and it is the one a user can actually answer.
+
 ##### Accepted residuals
 
 - **Read-then-write.** `_sync_write_rows` reads, compares, then writes; `atomic_write` is an
