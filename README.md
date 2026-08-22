@@ -122,9 +122,9 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Seven commands. All mutating commands default to a dry run; add `--apply` to execute.
-(The seventh, `trust-signed-helper`, is the opt-in described above; it changes a setting,
-not your sessions.)
+Eight commands. All mutating commands default to a dry run; add `--apply` to execute.
+(`trust-signed-helper` is the opt-in described above; it changes a setting, not your
+sessions.)
 
 **`list`** — inventory sessions, optionally filtered by a search term:
 
@@ -133,11 +133,36 @@ claude-code-sessions list gate
 ```
 
 **`doctor`** — read-only health report (stale locks, unresolved operations, orphaned rows,
-encoding-scheme ambiguity):
+encoding-scheme ambiguity, and **conversations no account's sidebar points at**):
 
 ```
 claude-code-sessions doctor
 ```
+
+That last one needs a word, because most of what it finds is normal: a session started from
+the CLI never had a listing row, and deleting a session in the app leaves its transcript
+behind. What is *not* normal is a **recent, large** one — so they are ranked newest-first and
+only the top few are printed, with the total alongside (the full list is in `--json`).
+Resuming a session while signed into a different account repoints its row, which can leave the
+conversation you were in an hour ago reachable from no sidebar at all. That is what this
+ranking is for, and `repoint` is how you put it back.
+
+**`repoint`** — point one sidebar entry at a different conversation:
+
+```
+claude-code-sessions repoint --only "ACME-REVIEW" --to <cliSessionId> --apply
+```
+
+A listing row's filename is the *app's* session id, which survives being resumed, while the
+`cliSessionId` inside it names the transcript — and that changes on every new CLI run. So one
+sidebar entry accumulates several conversations over its life, and this chooses which one it
+opens. It changes that single field and nothing else; both conversations stay on disk.
+
+`--only` matches a title substring or a local id and must resolve to exactly one row. `--to`
+takes a `cliSessionId` — `doctor` lists the ones nothing currently points at. `--store` picks
+the account (id, org, email, or path substring); it defaults to the account that is signed in,
+which is the one difference from `sync`: this command exists to fix the sidebar you are looking
+at. The app must be closed either way, and `undo` puts the old pointer back.
 
 **`move`** — relocate a session to another project folder:
 

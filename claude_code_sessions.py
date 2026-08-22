@@ -1740,6 +1740,18 @@ def classify_op(env, op):
     m = op.manifest
     status = m["status"]
 
+    if m.get("op_type") == "repoint":
+        # One row, one field, one atomic write - there is no partial state to
+        # roll forward. A non-terminal repoint means the write never landed (the
+        # row still holds its original pointer), so nothing needs recovering and
+        # re-running is the fix. Returning no resolutions is the honest answer;
+        # falling through to the move shape below would invent source/dest keys
+        # this manifest does not have.
+        return {"status": m["status"], "source": m.get("store_label", "n/a"),
+                "dest": m.get("store_label", "n/a"), "resolutions": [],
+                "drifted_rows": [],
+                "note": "repoint: a single-row write that did not complete; the row "
+                        "still holds its original pointer - run repoint again"}
     if m.get("op_type") == "sync":
         return classify_sync_op(env, op)
 
@@ -1924,7 +1936,12 @@ def recover_op(env, op, direction):
         # A sync manifest carries no source_transcript/sidecar_inventory/
         # row["path"] for this validator to inspect - execute_sync_op does
         # its own containment check inline, per-row, instead.
-        if op.manifest.get("op_type") != "sync":
+        # Neither sync nor repoint carries the move-shaped keys this validates
+        # (source_transcript and friends). Running it on a repoint manifest
+        # raised a bare KeyError out of recover - and main() catches only
+        # Refusal/LayoutError, so the user got a traceback from the one command
+        # that exists to get them unstuck.
+        if op.manifest.get("op_type") not in ("sync", "repoint"):
             _validate_manifest_paths(env, op.manifest)
 
         c = classify_op(env, op)
@@ -2202,6 +2219,50 @@ def gather_doctor(env):
             for r in rows if r.cli_session_id and r.cli_session_id not in tids]
     listed = {r.cli_session_id for r in rows if r.cli_session_id}
     unlisted = sorted(tids - listed)
+    # A conversation on disk that no account's sidebar points at. MOST of these
+    # are ordinary and always will be: a CLI-created session never had a row, and
+    # a session deleted in the app leaves its transcript behind. On the machine
+    # this was written for, 155 of 497 transcripts were unlisted, and the check
+    # printed one identical line for each - 155 lines inside a 569-line report.
+    #
+    # That is why it did not help on 2026-08-21, when resuming a session under
+    # another account repointed its row and left a 32 MB conversation reachable
+    # from nothing. The information was in the report. Nobody could see it.
+    #
+    # So rank them. Recency and size are what separate "an old session I deleted"
+    # from "the conversation I was in this afternoon", and the ranked few go in
+    # the human report while the full list stays in --json for anything that
+    # wants to walk it.
+    sized = []
+    for _, p in transcripts:
+        sid = os.path.splitext(os.path.basename(p))[0]
+        if sid in listed:
+            continue
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        sized.append({"session_id": sid, "mb": round(st.st_size / 1e6, 1),
+                      "age_days": round((env.now() - st.st_mtime) / 86400.0, 1)})
+    # LARGEST first within the recent window, not newest first.
+    #
+    # Newest-first was the obvious ordering and it defeats itself: age is the
+    # primary key, so eight trivial transcripts from the last hour outrank a
+    # 32 MB one from yesterday and push it off the cap. The scenario is not
+    # hypothetical - investigating a lost conversation means starting CLI
+    # sessions, each of which mints a fresh unreferenced transcript, so looking
+    # for the thing you lost is exactly what buries it.
+    #
+    # Size within a recency window answers the real question ("is there a big
+    # conversation I can no longer reach?"), and anything older than the window
+    # is listed after, so a large orphan from last week still competes rather
+    # than being invisible.
+    recent = [d for d in sized if d["age_days"] <= 7]
+    older = [d for d in sized if d["age_days"] > 7]
+    recent.sort(key=lambda d: (-d["mb"], d["age_days"]))
+    older.sort(key=lambda d: (-d["mb"], d["age_days"]))
+    unlisted_ranked = (recent + older)[:8]
+    unlisted_recent = recent
     cwds = [r.cwd for r in rows if r.cwd]
     cur, leg = scheme_evidence(cwds, env.projects_root)
     # Recent-50 evidence: the SAME population plan_move itself consults to
@@ -2237,6 +2298,7 @@ def gather_doctor(env):
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
         "dead_rows": dead, "unlisted_transcripts": unlisted,
+        "unlisted_ranked": unlisted_ranked, "unlisted_recent": len(unlisted_recent),
         "encoding": {"current": cur, "legacy": leg},
         "encoding_recent": {"current": cur_recent, "legacy": leg_recent},
         "legacy_folders": legacy_folders, "nonterminal_ops": nt,
@@ -2274,10 +2336,31 @@ def cmd_doctor(env, ns):
             .format(d["local_id"], d["age_days"]))
         if d["age_days"] >= RETENTION_HINT_DAYS:
             say("[hypothesis]   age is consistent with the ~30-day retention default")
-    for sid in rep["unlisted_transcripts"]:
-        say("[observed] transcript {0} has no listing row".format(sid))
-        say("[hypothesis]   normal for CLI-created sessions; also what an interrupted "
-            "external move leaves behind")
+    ranked = rep.get("unlisted_ranked") or []
+    if ranked:
+        say("[observed] {0} transcript(s) have no listing row in any account; "
+            "{1} touched in the last 7 days"
+            .format(len(rep["unlisted_transcripts"]), rep.get("unlisted_recent", 0)))
+        say("[hypothesis]   most are normal - a CLI-created session never had a row, "
+            "and deleting a session in")
+        say("[hypothesis]   the app leaves its transcript behind. A RECENT, LARGE one "
+            "is the exception worth")
+        say("[hypothesis]   looking at: resuming a session under another account "
+            "repoints its row, which can")
+        say("[hypothesis]   leave the conversation you were just in reachable from no "
+            "sidebar. Newest first:")
+        # The FULL id, not a prefix. `repoint --to` matches the transcript
+        # filename exactly, and the README sends people here to find it - an
+        # 8-character prefix made the documented workflow impossible without
+        # re-running with --json. A session id is not a path; `list --full`
+        # already prints these.
+        for d in ranked:
+            say("[observed]   {0}  {1:>6.1f} MB  last written {2} day(s) ago"
+                .format(d["session_id"], d["mb"], d["age_days"]))
+        say("[hypothesis]   to reach one again: repoint --only <title> --to <id above>")
+        if len(rep["unlisted_transcripts"]) > len(ranked):
+            say("[observed]   ... and {0} more (all of them in --json)"
+                .format(len(rep["unlisted_transcripts"]) - len(ranked)))
     say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
         .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
     say("[observed] encoding evidence (all rows): current={0} legacy={1}"
@@ -2352,6 +2435,26 @@ def build_parser():
     grp.add_argument("--on", action="store_true", help="enable it")
     grp.add_argument("--off", action="store_true", help="disable it (the default)")
     common(sp)
+
+    rp = sub.add_parser("repoint",
+                        help="point one sidebar row at a different conversation")
+    rp.add_argument("--only", default="", metavar="SUBSTRING",
+                    help="substring of the row's title, or its local id - must match "
+                         "exactly one row")
+    rp.add_argument("--to", dest="to_session", default="", metavar="CLI_SESSION_ID",
+                    help="the cliSessionId the row should open instead. 'doctor' "
+                         "lists conversations no account currently points at")
+    rp.add_argument("--store", default="", metavar="SUBSTRING",
+                    help="which account's store to change (account id, org id, path, "
+                         "or email). Defaults to the account that is signed in - "
+                         "unlike sync, this command exists to fix the sidebar you are "
+                         "looking at, and the app must be closed either way")
+    rp.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into "
+                         "(RULING 5), when the identity files disagree")
+    rp.add_argument("--apply", action="store_true", help="actually write the row")
+    rp.add_argument("--json", action="store_true", help="print the plan as JSON")
+    rp.add_argument("--verbose", action="store_true", help="do not redact paths")
 
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
@@ -2461,7 +2564,7 @@ def cmd_undo(env, ns):
     # selecting one here would only ever produce that refusal instead of
     # reaching an older, still-undoable completed move/sync underneath it.
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
-                 and o.manifest.get("op_type", "move") in ("move", "sync")]
+                 and o.manifest.get("op_type", "move") in ("move", "sync", "repoint")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -2474,7 +2577,14 @@ def cmd_undo(env, ns):
     # only the users who happened to dry-run first.
     live_note = _live_override_note(prior.manifest)
     if not ns.apply:
-        if prior.manifest.get("op_type") == "sync":
+        if prior.manifest.get("op_type") == "repoint":
+            pm = prior.manifest
+            line = ("would undo {0} (repoint: {1!r} goes back to opening {2} instead "
+                    "of {3}); pass --apply to execute".format(
+                        pm["op_id"], pm.get("title", ""),
+                        (pm.get("from_session") or "nothing")[:8],
+                        (pm.get("to_session") or "")[:8]))
+        elif prior.manifest.get("op_type") == "sync":
             # A sync manifest has no session_id - the move-shaped preview
             # below would print "session None". Name what undo would
             # actually remove instead: how many rows landed, and where.
@@ -2492,7 +2602,9 @@ def cmd_undo(env, ns):
     if live_note:
         print(live_note if ns.verbose else redact(env, live_note))
     before_ids = {o.manifest["op_id"] for o in list_ops(env)}
-    if prior.manifest.get("op_type") == "sync":
+    if prior.manifest.get("op_type") == "repoint":
+        final = undo_repoint(env, prior)
+    elif prior.manifest.get("op_type") == "sync":
         final = undo_sync(env, prior)
     else:
         final = run_undo(env, prior)
@@ -2588,6 +2700,7 @@ def main(argv=None):
     env = default_env()
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
+                "repoint": cmd_repoint,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -5087,6 +5200,321 @@ def _overlap_clause(frac):
                 "part is only there".format(pct))
     return ("just {0}% of its prose is in the incoming conversation - it is "
             "largely its OWN conversation".format(pct))
+
+
+@dataclasses.dataclass
+class RepointFlags:
+    """Which row to repoint, and at what."""
+    only: str = ""          # substring of the row's title, or its local id
+    to_session: str = ""    # the cliSessionId the row should open instead
+    store: str = ""         # substring naming the store; default = the live one
+    live: str = ""          # RULING 5 assertion, as sync uses it
+
+
+def _email_of(env, account_uuid):
+    """Just the email for an account, or "". account_email returns
+    (email, provenance) and every caller that wants a label wants the first
+    half; unpacking it here keeps that mistake in one place."""
+    got = account_email(env, account_uuid)
+    if isinstance(got, tuple):
+        return got[0] or ""
+    return got or ""
+
+
+def _repoint_store(env, flags):
+    """(path, label) of the store whose row is being repointed.
+
+    Defaults to the LIVE account's store, and that is the whole difference
+    between this command and `sync`. Sync refuses to write the account the app
+    is signed into, because the account you are USING is the one whose state you
+    least want a background tool rearranging. Repoint exists precisely to fix
+    the sidebar you are looking at, so that refusal would rule out its only
+    real use. What protects it instead is the running-app guard: the app must be
+    closed, which is what makes "the live account's store" a safe target rather
+    than a live one. That is the same guard whose absence caused the loss this
+    command exists to undo - the app repointed a row itself, while running,
+    through no route this tool controls.
+    """
+    dirs = _account_dirs(env)
+    if flags.store:
+        want = flags.store.lower()
+        # Email included on purpose: an account id and an org id BOTH collide
+        # across stores on a real machine (three accounts x three org dirs here),
+        # so the fragments people reach for first are exactly the ones that come
+        # back ambiguous. The email is how a person names an account.
+        # account_email returns (email, provenance) - not a bare string. Taking
+        # it for one raised AttributeError on the first real invocation.
+        hits = [(a, o, p) for a, o, p in dirs
+                if want in a.lower() or want in o.lower()
+                or want in (_email_of(env, a) or "").lower()
+                or want in os.path.normcase(p).replace("\\", "/")]
+        if not hits:
+            raise Refusal("--store {0!r} matched no store on this machine:\n{1}"
+                          .format(flags.store, _candidate_listing(dirs)))
+        # Deliberately NOT refused here when several match. An account owns one
+        # store per org, and naming it by email necessarily matches all of them -
+        # but only one can hold the row being repointed, and the others are the
+        # empty cross-pair scaffolding described under "The account x org
+        # cross-pair". Let the ROW settle it: the caller searches every candidate
+        # and refuses only if the row itself is ambiguous. That is a question
+        # about the thing being changed rather than about directory naming, which
+        # is the one the user can actually answer.
+        return hits
+    # --live, wired the same way sync wires it. It was parsed, stored on the
+    # flags, named in the refusal below as the remedy - and never read, so the
+    # one state it exists for (the identity files disagreeing, where
+    # live_account returns None) sent the user to a flag that did nothing.
+    if flags.live:
+        live = _resolve_live_assertion(env, flags.live, dirs)
+    else:
+        live = live_account(env)
+    if not live or not live.path:
+        raise Refusal(
+            "cannot identify the signed-in account, so there is no default store to "
+            "repoint. Name one with --store <account id, email, or path substring>, "
+            "or assert the live account with --live (RULING 5).")
+    return [(live.account_uuid, getattr(live, "org_uuid", "") or "", live.path)]
+
+
+def plan_repoint(env, flags):
+    """Build a repoint manifest. Pure planning - writes nothing.
+
+    A repoint changes ONE field in ONE row: the `cliSessionId` that decides
+    which conversation a sidebar entry opens. Everything else in the row is
+    preserved byte-for-byte, because nothing else is wrong with it.
+    """
+    if not flags.to_session:
+        raise Refusal("--to is required: the cliSessionId the row should open")
+    if not flags.only:
+        raise Refusal("--only is required: a substring of the row's title, or its "
+                      "local id, naming exactly one row to repoint")
+    candidates = _repoint_store(env, flags)
+    want = flags.only.lower()
+    hits = []
+    for a, o, store in candidates:
+        label = "{0} ({1}{2})".format(_email_of(env, a) or a[:8], a[:8],
+                                      "/" + o[:8] if o else "")
+        try:
+            names = _listdir_or_refuse(store, "the store")
+        except Refusal:
+            continue                      # an empty or unreadable sibling store
+        for name in sorted(names):
+            if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            p = os.path.join(store, name)
+            try:
+                d = read_json(p)
+            except LayoutError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            title = d.get("title") or ""
+            local_id = name[len("local_"):-len(".json")]
+            if want in title.lower() or want in local_id.lower():
+                hits.append((store, label, name, p, d, title))
+    if not hits:
+        where = ", ".join(sorted({"{0}".format(a[:8]) for a, _o, _p in candidates}))
+        raise Refusal("no row matching --only {0!r} in any store for {1}"
+                      .format(flags.only, where))
+    if len(hits) > 1:
+        listing = "\n".join("   {0}   {1}   [{2}]".format(n, (t or "(untitled)")[:52], lb)
+                            for _s, lb, n, _p, _d, t in hits[:10])
+        raise Refusal("--only {0!r} matches {1} rows; name one exactly (a local id is "
+                      "unambiguous):\n{2}".format(flags.only, len(hits), listing))
+    store, label, name, path, data, title = hits[0]
+    current = data.get("cliSessionId")
+    if current == flags.to_session:
+        raise Refusal("that row already opens {0}; nothing to repoint"
+                      .format(flags.to_session))
+    # The target has to exist, or this trades a reachable conversation for a
+    # dangling pointer - a worse state than the one being fixed.
+    found = find_transcripts(env.projects_root, flags.to_session)
+    if not found:
+        raise Refusal(
+            "no transcript on disk for {0}, so repointing there would leave the row "
+            "opening nothing. Check the id - 'doctor' lists conversations that no "
+            "account points at.".format(flags.to_session))
+    if len(found) > 1:
+        raise Refusal("{0} exists in more than one project folder; refusing to guess "
+                      "which:\n{1}".format(flags.to_session,
+                                           "\n".join("   " + f for f in found)))
+    with open(path, "rb") as fh:
+        pre = fh.read()
+    post_data = dict(data)
+    post_data["cliSessionId"] = flags.to_session
+    post = json.dumps(post_data, separators=(",", ":")).encode("utf-8")
+    return {"op_type": "repoint", "store_path": store, "store_label": label,
+            "name": name, "row_path": path, "title": title or "(untitled)",
+            "from_session": current, "to_session": flags.to_session,
+            "transcript": found[0],
+            "transcript_mb": round(os.path.getsize(found[0]) / 1e6, 1),
+            "rows": [{"name": name, "dest_path": path, "title": title or "(untitled)",
+                      "pre_b64": b64(pre), "post_b64": b64(post),
+                      "is_update": True, "written": False}]}
+
+
+def execute_repoint_op(env, op):
+    """journaled -> writing -> completed. One row, one field, one write."""
+    m = op.manifest
+    # "writing" is resumable, not an error. A repoint that died between the two
+    # set_status calls would otherwise be neither finishable nor reversible:
+    # execute refused it, undo refuses anything not "completed", and nonterminal
+    # ops are never rotated away - a permanent entry in every doctor report
+    # pointing at a recovery route that could not help. Re-entry is safe because
+    # every decision below is made from the bytes on disk, not from what the
+    # journal expects to find.
+    if m.get("status") not in ("journaled", "writing"):
+        raise LayoutError("execute_repoint_op runs ops from 'journaled' or "
+                          "'writing'; this one is " + str(m.get("status")))
+    # The guard that was missing when this row was repointed by something else.
+    _guard_mutation(env, "repoint")
+    if not os.path.isdir(m["store_path"]):
+        raise LayoutError("store vanished: " + m["store_path"])
+    # Re-check the target HERE, not only at plan time. Between a dry run and
+    # --apply the transcript can be deleted, and writing then trades a reachable
+    # conversation for a row that opens nothing - the exact state this command
+    # exists to repair.
+    if not find_transcripts(env.projects_root, m["to_session"]):
+        raise Refusal(
+            "the transcript for {0} is no longer on disk, so this repoint would "
+            "leave the row opening nothing. Nothing was written."
+            .format(m["to_session"]))
+    set_status(op, "writing")
+    r = m["rows"][0]
+    real = ensure_contained(r["dest_path"], [m["store_path"]])
+    if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+        raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
+                          .format(r["dest_path"], m["store_path"]))
+    pre, post = _sync_pre_image(r), unb64(r["post_b64"])
+    try:
+        with open(r["dest_path"], "rb") as fh:
+            current = fh.read()
+    except OSError as exc:
+        raise Refusal("could not read the row to check it for changes since "
+                      "planning: {0}".format(exc))
+    if current == post:
+        r["written"] = True                      # already done
+    elif current != pre:
+        raise Refusal(
+            "that row changed since this repoint was planned, so writing would "
+            "discard whatever changed it. Re-run to plan against its current state.")
+    else:
+        try:
+            atomic_write(r["dest_path"], post)
+        except OSError as exc:
+            raise Refusal("could not write the row: {0}".format(exc))
+        r["written"] = True
+    save_manifest(op)
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_repoint(env, manifest):
+    """Lock, journal, execute, rotate - the same shape as run_sync."""
+    acquire_lock(env, "repoint")
+    try:
+        op = new_op(env, manifest)
+        # Hand the op_id back, exactly as run_sync does and for the same reason:
+        # new_op shallow-copies the manifest and sets op_id on ITS copy, so
+        # without this the caller cannot name the op it just ran - which is what
+        # `undo --id` and every report line need.
+        manifest["op_id"] = op.manifest["op_id"]
+        set_status(op, "journaled")
+        final = execute_repoint_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def undo_repoint(env, op):
+    """Put the original cliSessionId back, byte-for-byte from the pre-image.
+
+    Same evidence rule as undo_sync: only while the row still holds exactly what
+    this op wrote. If something has touched it since - the app, another repoint -
+    refuse rather than clobber it.
+    """
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "repoint":
+            raise Refusal("not a repoint op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        _guard_mutation(env, "repoint")
+        r = m["rows"][0]
+        if not r.get("written"):
+            raise Refusal("this repoint never wrote the row; nothing to undo")
+        real = ensure_contained(r["dest_path"], [m["store_path"]])
+        if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+            raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
+                              .format(r["dest_path"], m["store_path"]))
+        state = _sync_row_drift(r)
+        if state != "match":
+            raise Refusal(
+                "that row no longer holds what this repoint wrote ({0}); something "
+                "changed it since - most likely the app, which rewrites these rows "
+                "whenever it opens the session. Refusing to overwrite it."
+                .format(state))
+        atomic_write(r["dest_path"], _sync_pre_image(r))
+        set_status(op, "undone")
+        rotate_ops(env)
+        return "undone"
+    finally:
+        release_lock(env)
+
+
+def _print_repoint_report(say, m):
+    say("store   : {0}".format(m["store_label"]))
+    say("row     : {0}".format(m["name"]))
+    say("title   : {0}".format(m["title"]))
+    say("")
+    say("opens now : {0}".format(m["from_session"] or "(nothing)"))
+    say("will open : {0}   ({1} MB on disk)".format(m["to_session"], m["transcript_mb"]))
+    say("")
+    say("Only the row's cliSessionId changes. Both conversations stay on disk -")
+    say("this decides which one that sidebar entry opens.")
+
+
+def _public_repoint_manifest(m):
+    """The repoint manifest with both row images removed, for --json.
+
+    `pre_b64` and `post_b64` are the destination row VERBATIM - the same bytes
+    `_public_manifest` scrubs out of `sync --json`, and for the same reason:
+    a listing row carries `remoteMcpServersConfig` and permission state, and
+    printing it to stdout lets ordinary automation log another account's
+    connector configuration. This route had the identical exposure and no
+    scrub, which is worse than sync's was, because a repoint's post-image is a
+    copy of the row it is about to write rather than a stripped transform.
+    """
+    out = {k: v for k, v in m.items() if k != "rows"}
+    out["rows"] = [{k: v for k, v in r.items() if k not in ("pre_b64", "post_b64")}
+                   for r in m.get("rows", [])]
+    return out
+
+
+def cmd_repoint(env, ns):
+    flags = RepointFlags(only=ns.only, to_session=ns.to_session,
+                         store=ns.store, live=ns.live)
+    m = plan_repoint(env, flags)
+    # --apply runs BEFORE --json prints, the way cmd_sync does it. Printing and
+    # returning first meant `repoint --apply --json` reported a plan, exited 0,
+    # and wrote nothing - automation would read that as a completed repoint.
+    final = run_repoint(env, m) if ns.apply else None
+    if ns.json:
+        pub = _public_repoint_manifest(m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        return 0
+    _print_repoint_report(print, m)
+    if final is None:
+        print("\ndry run - pass --apply to repoint")
+        return 0
+    print("\nresult  : {0}".format(final))
+    print("Reopen the app and check the session - 'undo' puts the old pointer back.")
+    return 0
 
 
 def _public_manifest(m):
