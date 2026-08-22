@@ -462,6 +462,13 @@ window into `journaled`/`completed`/`rolled_back`.
   conversation a refresh would displace also appears in the incoming one, so a hold reads as
   "5% of its prose is in the incoming conversation" rather than only "would hide a
   conversation". See `docs/internals.md`, RULING 8.
+- **`repoint` and doctor's orphan ranking shipped in 0.9.11**, from the case none of the above
+  covers: the *app* repointed a row, while this tool was not running. Resuming a session under
+  another account continues that branch and stamps its id into whichever store is active, which
+  can leave the conversation you were in reachable from no sidebar. No guard here applies —
+  the mutation never came through this tool — so what shipped is detection (`doctor` ranks
+  conversations nothing points at) and repair (`repoint` puts a pointer back, journalled and
+  undoable).
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
