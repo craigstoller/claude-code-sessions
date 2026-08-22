@@ -32,7 +32,17 @@ def check(name, cond, extra=""):
 
 LIVE, DORM = "a" * 32, "b" * 32
 ORG_L, ORG_D = "1" * 32, "2" * 32
-OLD, NEW = "%032d" % 41, "%032d" % 42
+# UUID-SHAPED on purpose. These were 32 plain digits, which redact() does not
+# recognise as a session id - so the doctor block was tested against ids that
+# could not trigger the very redaction that broke the workflow in 0.9.11. A
+# fixture that does not look like production data verifies a path production
+# does not take.
+def _sid(n):
+    h = "%032x" % n
+    return "-".join((h[:8], h[8:12], h[12:16], h[16:20], h[20:]))
+
+
+OLD, NEW = _sid(0x41), _sid(0x42)
 
 
 def build(rows=(("KRIS-REVIEW session", OLD),)):
@@ -219,36 +229,44 @@ shutil.rmtree(root, ignore_errors=True)
 # thing you lost is what pushes it off the cap.
 root, env, row = build()
 projects = os.path.join(env.home, ".claude", "projects", "proj")
-big = os.path.join(projects, ("%032d" % 44) + ".jsonl")
+big = os.path.join(projects, (_sid(0x44)) + ".jsonl")
 with open(big, "w", encoding="utf-8") as fh:
     fh.write("x" * 30_000_000)                      # the 30 MB one, from "yesterday"
 os.utime(big, (0, os.path.getmtime(big) - 1 * 86400))
 for i in range(12):                                 # a dozen tiny ones from just now
-    tiny = os.path.join(projects, ("%032d" % (50 + i)) + ".jsonl")
+    tiny = os.path.join(projects, _sid(0x50 + i) + ".jsonl")
     with open(tiny, "w", encoding="utf-8") as fh:
         fh.write("{}\n")
 rep = ccs.gather_doctor(env)
 ranked = [d["session_id"] for d in rep["unlisted_ranked"]]
 check("a 30 MB orphan from yesterday survives 12 fresher trivial ones",
-      ("%032d" % 44) in ranked, "top: %s" % [r[-2:] for r in ranked])
-check("  and outranks them", ranked.index("%032d" % 44) == 0,
-      "position %d" % (ranked.index("%032d" % 44) if ("%032d" % 44) in ranked else -1))
-old_orphan = os.path.join(projects, ("%032d" % 43) + ".jsonl")
+      (_sid(0x44)) in ranked, "top: %s" % [r[-2:] for r in ranked])
+check("  and outranks them", ranked.index(_sid(0x44)) == 0,
+      "position %d" % (ranked.index(_sid(0x44)) if (_sid(0x44)) in ranked else -1))
+old_orphan = os.path.join(projects, (_sid(0x43)) + ".jsonl")
 with open(old_orphan, "w", encoding="utf-8") as fh:
     fh.write("x" * 5_000_000)
 os.utime(old_orphan, (0, os.path.getmtime(old_orphan) - 60 * 86400))
 rep = ccs.gather_doctor(env)
 ranked = [d["session_id"] for d in rep["unlisted_ranked"]]
 check("  a 60-day-old one ranks below everything recent",
-      ("%032d" % 43) not in ranked[:1], str(ranked[:1]))
+      (_sid(0x43)) not in ranked[:1], str(ranked[:1]))
 
 # the printed id must be usable by `repoint --to`, which matches the filename
 buf2 = _io.StringIO()
 with contextlib.redirect_stdout(buf2):
     ccs.cmd_doctor(env, NS())
 dtxt = buf2.getvalue()
-check("doctor prints FULL session ids, not 8-char prefixes",
-      ("%032d" % 44) in dtxt, "(full id absent)")
+# Not just present somewhere - present in the DEFAULT report. 0.9.11 printed
+# the full id and redact() shortened it, so --verbose worked and the report
+# people actually read did not.
+check("doctor prints FULL session ids in the default report",
+      _sid(0x44) in dtxt,
+      "full" if _sid(0x44) in dtxt else ("prefix only" if _sid(0x44)[:8] in dtxt
+                                          else "absent"))
+check("  and the ordering label matches the ordering",
+      "Largest first" in dtxt and "Newest first" not in dtxt,
+      "Largest first" if "Largest first" in dtxt else "wrong/missing label")
 check("  and names the command that uses them", "repoint --only" in dtxt)
 shutil.rmtree(root, ignore_errors=True)
 
