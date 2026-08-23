@@ -453,12 +453,15 @@ try:
 except ccs.Refusal as exc:
     check("all-empty candidates refuse by naming them", ORG_D in str(exc),
           str(exc)[:130])
-    # Org ids are the headline because they are what distinguishes these
-    # candidates. Paths are printed beside them and, since the 2026-08-23
-    # _repoint_store fix, work when pasted back too - they did not when this
-    # advice was written.
-    check("  naming ORG IDS, which are what tells the candidates apart",
-          "organization ids" in str(exc), str(exc)[:130])
+    # PATHS, not org ids. An org id matches one directory per account, so on a
+    # multi-account machine the org-id advice returned the same candidates and
+    # refused again - it looped. The org id is still printed beside each path,
+    # because it is the part that differs and so the part a person reads.
+    check("  naming PATHS, which match exactly one directory each",
+          "paths with --store" in str(exc), str(exc)[:130])
+    check("  while still printing the org id, which is what differs",
+          "org " + ORG_D in str(exc) or "org " + ORG_L in str(exc),
+          str(exc)[:130])
 shutil.rmtree(root, ignore_errors=True)
 
 # zero prose turns is ALLOWED - a policy choice must not masquerade as a

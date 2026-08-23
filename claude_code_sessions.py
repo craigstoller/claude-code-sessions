@@ -4913,14 +4913,18 @@ def _new_row_store(env, flags):
 
     So the guess is allowed to PLAN and not to WRITE. `heuristic` comes back
     True whenever row counts broke the tie, `plan_new_row` carries it into the
-    manifest, and `cmd_new_row` refuses `--apply` on it, naming the
-    ORGANIZATION ID that would settle it. A path works too, as of the
-    2026-08-23 fix to _repoint_store's matching - it did not when this was
-    written, which is why the org id was chosen - and a path is now the more
-    precise of the two, since an org id can still match the same org under
-    several accounts. The org id stays the suggestion because it is what
-    DISTINGUISHES the candidates being listed: they differ by org and share
-    everything else. An earlier draft relied on printing
+    manifest, and `cmd_new_row` refuses `--apply` on it, naming the STORE
+    PATH that would settle it.
+
+    It named the org id until 2026-08-23, and that advice LOOPED. Measured on
+    a real machine with three accounts across three orgs: an org id matches one
+    directory per account, so re-running with the one the refusal printed
+    produced the same three candidates, the same row-count tie-break, the same
+    guess and the same refusal - forever. The path was the right answer all
+    along and could not be given, because _repoint_store matched no Windows
+    path at all until that same day; the org id was chosen to work around a bug
+    and inherited its own. A full path matches exactly one directory, which is
+    what "settles it" has to mean. An earlier draft relied on printing
     the reasoning before the write instead - which is not a safeguard at all in
     a one-shot `--apply`, because there is no moment between the print and the
     write in which anyone can intervene, and no saved plan to approve. A dry run
@@ -4950,30 +4954,30 @@ def _new_row_store(env, flags):
                 if n.startswith("local_") and n.endswith(".json")]
         if rows:
             populated.append((a, o, p, len(rows)))
-    # Every refusal below narrows by ORGANIZATION ID, and prints the path
-    # beside it so either can be pasted back.
+    # Every refusal below tells the user to narrow by PATH, and prints the org
+    # id beside it because that is the part that differs and so the part a
+    # person reads to tell the candidates apart.
     #
-    # It used to say org id ONLY, and for a reason that no longer holds: until
-    # the 2026-08-23 fix, _repoint_store compared flags.store.lower() against
-    # os.path.normcase(p).replace(chr(92), "/"), so the candidate was
-    # forward-slashed and the argument was not, and a Windows path pasted from
-    # this very listing matched nothing. Advice that fails when followed is
-    # worse than no advice. _path_match_key now folds both sides, so the path
-    # is a real option - and the more precise one, since these candidates
-    # differ only by org. The org id remains the headline because it is the
-    # part that actually tells them apart.
+    # Not the org id, which is what this said until 2026-08-23 and which does
+    # not narrow: an org id matches one directory PER ACCOUNT, so on a machine
+    # with three accounts across three orgs, re-running with the org id from
+    # this listing returns the same three candidates and refuses again. The
+    # advice looped. It was chosen in the first place because _repoint_store
+    # matched no Windows path at all - a bug fixed that same day - so this is
+    # a workaround outliving the thing it worked around. A full path matches
+    # exactly one directory.
     listing = "\n".join("   org {0}   {1}".format(o, p) for _, o, p in hits)
     if not populated:
         raise Refusal(
             "--store {0!r} matched {1} directories and none of them holds any "
             "rows, so nothing distinguishes them. Re-run naming one of these "
-            "organization ids with --store:\n{2}"
+            "paths with --store - a full path matches exactly one:\n{2}"
             .format(flags.store, len(hits), listing))
     if len(populated) > 1:
         raise Refusal(
             "--store {0!r} matched {1} directories that each hold rows; refusing "
             "to guess which should get the new one. Re-run naming one of these "
-            "organization ids with --store:\n{2}".format(
+            "paths with --store - a full path matches exactly one:\n{2}".format(
                 flags.store, len(populated),
                 "\n".join("   org {0}   {1}  ({2} rows)".format(o, p, n)
                           for _, o, p, n in populated)))
@@ -5526,9 +5530,9 @@ def cmd_new_row(env, ns):
         raise Refusal(
             "which store should get this row was decided by counting rows, not "
             "by anything that identifies the account: {0}. That is fine for a "
-            "dry run and not fine for a write. Re-run with --store {1} if that "
+            "dry run and not fine for a write. Re-run with --store {1!r} if that "
             "is the one you mean. Nothing was written."
-            .format(m["store_why"], m["store_org"]))
+            .format(m["store_why"], m["store_path"]))
     final = run_new_row(env, m) if ns.apply else None
     if ns.json:
         pub = _public_new_row_manifest(m)
