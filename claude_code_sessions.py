@@ -2862,7 +2862,8 @@ def cmd_undo(env, ns):
     # selecting one here would only ever produce that refusal instead of
     # reaching an older, still-undoable completed move/sync underneath it.
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
-                 and o.manifest.get("op_type", "move") in ("move", "sync", "repoint")]
+                 and o.manifest.get("op_type", "move") in ("move", "sync",
+                                                           "repoint", "new-row")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -2890,6 +2891,12 @@ def cmd_undo(env, ns):
             dest = prior.manifest.get("dest_email") or prior.manifest.get("dest_account", "")
             line = ("would undo {0} (sync: {1} row(s) written to {2}); pass --apply "
                     "to execute".format(prior.manifest["op_id"], n_written, dest))
+        elif prior.manifest.get("op_type") == "new-row":
+            pm = prior.manifest
+            line = ("would undo {0} (new-row: removes the row {1!r}, which opens "
+                    "{2}); pass --apply to execute".format(
+                        pm["op_id"], pm.get("title", ""),
+                        (pm.get("to_session") or "")[:8]))
         else:
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
@@ -2904,6 +2911,8 @@ def cmd_undo(env, ns):
         final = undo_repoint(env, prior)
     elif prior.manifest.get("op_type") == "sync":
         final = undo_sync(env, prior)
+    elif prior.manifest.get("op_type") == "new-row":
+        final = undo_new_row(env, prior)
     else:
         final = run_undo(env, prior)
     print("result: " + final)

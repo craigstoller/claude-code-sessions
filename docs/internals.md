@@ -1689,8 +1689,8 @@ change here should know both arguments existed rather than rediscovering one of 
 `<ops_dir>/lock`, a fixed name, and `acquire_lock` creates it with `O_CREAT | O_EXCL` - the
 atomic "create only if absent" primitive. The `op_id` written inside is for diagnostics, so a
 refusal can name the holder; it plays no part in exclusion. Every mutating entry point competes
-for that same file: `run_move`, `undo_move`, `recover_op`, `run_sync`, `undo_sync`, `run_repoint`
-and `undo_repoint`. All seven release it in a `finally`.
+for that same file: `run_move`, `undo_move`, `recover_op`, `run_sync`, `undo_sync`, `run_repoint`,
+`undo_repoint`, `run_new_row` and `undo_new_row`. All nine release it in a `finally`.
 
 **What is inside the boundary for a sync.** `run_sync` acquires before `new_op`, and releases
 after `execute_sync_op` returns. So the running-app guard, the journal write, the apply-time

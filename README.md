@@ -143,7 +143,8 @@ claude-code-sessions list gate
 ```
 
 **`doctor`** — read-only health report (stale locks, unresolved operations, orphaned rows,
-encoding-scheme ambiguity, and **conversations no account's sidebar points at**):
+encoding-scheme ambiguity, a synthesized row that has since vanished, and **conversations no
+account's sidebar points at**):
 
 ```
 claude-code-sessions doctor
@@ -186,7 +187,7 @@ is on disk and unopenable — 170 such transcripts were measured on one machine.
 `doctor` lists them; this turns one back into a sidebar entry.
 
 The title comes from `--title`, or the transcript's own title if it has one, or a
-placeholder like `(untitled — 2026-06-14, 181 turns, Personal)` — deliberately not a
+placeholder like `(untitled - 2026-06-14, 181 turns, Personal)` — deliberately not a
 summary, because a machine-made title that reads like one is worse than an obvious
 placeholder.
 
