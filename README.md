@@ -126,6 +126,16 @@ Eight commands. All mutating commands default to a dry run; add `--apply` to exe
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
+`--version` prints the release **and the file it ran from** — worth knowing when a pipx
+install and a source checkout are both on `PATH`, which is exactly when a version number
+alone cannot tell you which copy answered:
+
+```
+$ ccs --version
+claude-code-sessions 0.9.14
+running from: C:\Users\craig\AppData\Local\pipx\...\claude_code_sessions.py
+```
+
 **`list`** — inventory sessions, optionally filtered by a search term:
 
 ```

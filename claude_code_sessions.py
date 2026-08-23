@@ -16,6 +16,14 @@ import dataclasses
 import os
 import sys
 
+# The single source of truth for the version. pyproject reads it from here
+# (setuptools dynamic attr), rather than the two declaring it separately - so
+# `--version` always reports the code that is actually running, which is the
+# only answer worth printing. A hardcoded duplicate in pyproject could disagree
+# with the module after a partial bump, and the disagreement would surface as a
+# user reporting a bug against a version they were not running.
+__version__ = "0.9.14"
+
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
 
@@ -2397,10 +2405,38 @@ def cmd_doctor(env, ns):
 import argparse
 
 
+class _PrintVersion(argparse.Action):
+    """`--version`, printed verbatim.
+
+    Exists only because argparse's built-in version action formats its text
+    through HelpFormatter, which re-wraps to the terminal width and will break
+    an absolute path mid-word. The whole value of printing the path is that it
+    can be pasted back; a wrapped one cannot.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        sys.stdout.write("claude-code-sessions {0}\n".format(__version__))
+        sys.stdout.write("running from: {0}\n".format(os.path.abspath(__file__)))
+        parser.exit()
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="claude-code-sessions",
         description="Inspect and relocate Claude Code sessions on disk. Unofficial; "
                     "fails closed. Close the Claude app before any mutation.")
+    # Prints the RUNNING module's __version__, plus where that module was loaded
+    # from. The path is the point: a pipx install and a source checkout can both
+    # be on PATH, and "which copy answered?" is the question a version number
+    # alone cannot settle. Exits during the argument scan, before the
+    # required-subcommand check, so `--version` works with no subcommand.
+    #
+    # NOT argparse's built-in `action="version"`: it runs the text through
+    # HelpFormatter, which re-wraps at the terminal width and broke this path
+    # across a line MID-WORD - producing exactly the uncopyable output 0.9.11
+    # and 0.9.12 were spent removing from `doctor`. A path you have to reassemble
+    # by hand is not an answer to "which copy is running".
+    p.add_argument("--version", action=_PrintVersion, nargs=0,
+                   help="print the version and the file this ran from")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):

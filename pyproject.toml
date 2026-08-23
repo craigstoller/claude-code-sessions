@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-code-sessions"
-version = "0.9.13"
+dynamic = ["version"]
 description = "Unofficial tool for Claude Code sessions on disk: make a session visible under your other Claude account on the same machine, or move one between project folders. Command line or GUI. Journaled, reversible, fails closed."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -45,3 +45,6 @@ ccs-gui = "claude_code_sessions_gui:main"
 
 [tool.setuptools]
 py-modules = ["claude_code_sessions", "claude_code_sessions_gui"]
+
+[tool.setuptools.dynamic]
+version = {attr = "claude_code_sessions.__version__"}
