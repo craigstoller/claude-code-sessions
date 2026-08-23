@@ -4692,12 +4692,15 @@ def _row_is_ours(r):
     Never raises - it is called from an error path, and a second exception
     thrown while composing the first one's message helps nobody.
     """
+    dest, name = r.get("dest_path"), r.get("name")
+    if not dest or not name:          # .get, not [] - "never raises" includes
+        return False                  # a manifest missing the keys entirely
     try:
-        d = read_json(r["dest_path"])
+        d = read_json(dest)
     except (LayoutError, OSError, ValueError):
         return False
     return (isinstance(d, dict)
-            and d.get("sessionId") == os.path.splitext(r["name"])[0])
+            and d.get("sessionId") == os.path.splitext(name)[0])
 
 
 def _new_row_preflight(env, m):
@@ -4780,8 +4783,13 @@ def _new_row_preflight(env, m):
             .format(m["store_label"], m["title"]))
 
 
-def execute_new_row_op(env, op):
+def execute_new_row_op(env, op):        # noqa: ARG001 - see the note on env
     """journaled -> writing -> completed. One row, created from nothing.
+
+    `env` is deliberately unused. Every guard that needs the environment runs in
+    _new_row_preflight before this is called, so an unused parameter here is the
+    structural evidence of that - not an oversight. It stays in the signature
+    because recover_op calls this the same way run_new_row does.
 
     Re-entrant from 'writing' for the same reason execute_repoint_op is: an op
     that died between the two set_status calls must still be finishable, and
@@ -4793,64 +4801,87 @@ def execute_new_row_op(env, op):
         raise LayoutError("execute_new_row_op runs ops from 'journaled' or "
                           "'writing'; this one is " + str(m.get("status")))
     r = m["rows"][0]
-    # THE WRITE ALREADY LANDED - finish the journal and stop.
+    # ONE read of the destination, and every branch below dispatches on its
+    # result. _sync_row_drift already opens the file, compares it to post_b64,
+    # and turns every way that can fail into a state - so re-reading the file
+    # here to compare it again would duplicate the work AND reintroduce the two
+    # holes an earlier draft had: a bare `open()` whose OSError escaped as an
+    # unredacted traceback (main() catches only Refusal and LayoutError), and an
+    # `os.path.exists` test that returns False when stat itself fails, so an
+    # unreadable-and-unstattable row fell through to atomic_write and got
+    # OVERWRITTEN - "couldn't look" becoming "nothing there" in the one function
+    # whose whole promise is that it never overwrites.
     #
-    # This is the crash `recover --forward` exists for: the row was written and
-    # the process died before the marker was saved. Re-validating a transcript
-    # whose facts have ALREADY been consumed and committed to the bytes on disk
-    # would make a transcript that has since aged out block recover - the one
-    # command whose job is to get the user unstuck, refusing to finish
-    # bookkeeping for a write that succeeded. The row matching post_b64 byte for
-    # byte is better evidence than any re-derivation could be.
-    #
-    # It also needs no mutation guard: it writes only the journal, so there is
-    # nothing in the account's store for a running app to race.
-    if _sync_row_drift(r) == "match":
+    # All five states are handled. `pristine` is unreachable for an add
+    # (_row_is_refresh is False when is_update is False and pre_b64 is None) but
+    # is grouped with `drifted` rather than left to fall off the end.
+    state = _sync_row_drift(r)
+    if state == "match":
+        # THE WRITE ALREADY LANDED - finish the journal and stop.
+        #
+        # This is the crash `recover --forward` exists for: the row was written
+        # and the process died before the marker was saved. Re-validating a
+        # transcript whose facts have ALREADY been consumed and committed to the
+        # bytes on disk would make a transcript that has since aged out block
+        # recover - the one command whose job is to get the user unstuck,
+        # refusing to finish bookkeeping for a write that succeeded. The row
+        # matching post_b64 byte for byte is better evidence than any
+        # re-derivation could be.
+        #
+        # It also needs no mutation guard: it writes only the journal, so there
+        # is nothing in the account's store for a running app to race.
         r["written"] = True
         save_manifest(op)
         set_status(op, "completed")
         return "completed"
+    if state == "unreadable":
+        raise Refusal(
+            "something is at {0!r} but it could not be read, so whether it is "
+            "the row this op wrote cannot be settled. Refusing rather than "
+            "overwrite a file nobody can see. Nothing was written - check that "
+            "file's permissions, or move it aside if it is not wanted, then "
+            "re-run.".format(r["name"]))
     # NO PREFLIGHT HERE. It runs in the two places that call this - run_new_row
     # before journalling, recover_op's forward arm before re-entering - and
     # calling it here as well would undo the very fix that moved it out: a
     # refusal raised at this point is raised AFTER new_op, which is what left a
     # non-terminal op behind for a command that changed nothing. One caller, one
     # preflight, always before the journal entry exists.
-    set_status(op, "writing")
+    #
+    # Everything that can still refuse happens BEFORE set_status, for the same
+    # reason: a containment failure or a corrupt post-image after the flip would
+    # leave a 'writing' op behind for a run that touched nothing, which is the
+    # pathology that refactor removed - reproduced one layer down.
     real = ensure_contained(r["dest_path"], [m["store_path"]])
     if os.path.dirname(real) != os.path.realpath(m["store_path"]):
         raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
                           .format(r["dest_path"], m["store_path"]))
-    post = unb64(r["post_b64"])
-    if os.path.exists(r["dest_path"]):
-        with open(r["dest_path"], "rb") as fh:
-            current = fh.read()
-        if current == post:
-            r["written"] = True              # already done; re-entry is safe
-        else:
-            # Two very different situations reach here, and telling the user the
-            # wrong one is worse than saying nothing. If this op had already
-            # written the row and the app has since rewritten it, "a different
-            # row already exists, nothing was written" is simply false - this op
-            # DID write it. Only an op that never wrote is looking at a genuine
-            # uuid4 collision. Never overwrite either way: this command adds.
-            if _row_is_ours(r):
-                raise Refusal(
-                    "this op wrote {0!r}, and something has changed it since - "
-                    "most likely the app, which rewrites these rows when it "
-                    "opens the session. It was NOT overwritten and nothing more "
-                    "was written; 'recover --back' closes this operation and "
-                    "leaves the row alone.".format(r["name"]))
+    if state != "absent":
+        # Something is there and it is not what this op wrote. Two very
+        # different situations, and telling the user the wrong one is worse than
+        # saying nothing: if this op already wrote the row and the app has since
+        # rewritten it, "a different row already exists, nothing was written" is
+        # false twice over. Only an op that never wrote is looking at a genuine
+        # uuid4 collision. Never overwrite either way: this command adds.
+        if _row_is_ours(r):
             raise Refusal(
-                "a different row already exists at {0!r}; refusing to overwrite "
-                "it. Nothing was written.".format(r["name"]))
-    else:
-        try:
-            atomic_write(r["dest_path"], post)
-        except OSError as exc:
-            raise Refusal("could not write the row: {0}".format(exc))
-        _maybe_crash("new-row-write-before-save")
-        r["written"] = True
+                "this op wrote {0!r}, and something has changed it since - "
+                "most likely the app, which rewrites these rows when it "
+                "opens the session. It was NOT overwritten and nothing more "
+                "was written; 'recover --back' closes this operation and "
+                "leaves the row alone.".format(r["name"]))
+        raise Refusal(
+            "a different row already exists at {0!r}; refusing to overwrite "
+            "it. Nothing was written.".format(r["name"]))
+    post = unb64(r["post_b64"])          # cannot raise: 'unreadable' covers it
+    set_status(op, "writing")
+    try:
+        atomic_write(r["dest_path"], post)
+    except OSError as exc:
+        raise Refusal("could not write the row: {0}. Nothing was written - "
+                      "check the store is writable, then re-run.".format(exc))
+    _maybe_crash("new-row-write-before-save")
+    r["written"] = True
     save_manifest(op)
     set_status(op, "completed")
     return "completed"
@@ -4914,11 +4945,13 @@ def undo_new_row(env, op):
                 "that row is already gone - something removed it since this op "
                 "created it. Nothing to undo, and nothing was changed.")
         if state != "match":
+            said = ("exists but could not be read" if state == "unreadable"
+                    else "no longer holds what this op wrote ({0})".format(state))
             raise Refusal(
-                "that row no longer holds what this op wrote ({0}); something "
+                "that row {0}; something "
                 "changed it since - most likely the app, which rewrites these "
                 "rows whenever it opens the session. Refusing to delete it."
-                .format(state))
+                .format(said))
         try:
             os.unlink(r["dest_path"])
         except OSError as exc:

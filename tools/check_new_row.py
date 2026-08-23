@@ -498,14 +498,20 @@ refusal("apply refuses when the transcript is no longer uniquely located",
         lambda: ccs.run_new_row(env, m), "more than one")
 shutil.rmtree(root, ignore_errors=True)
 
+# The transcript goes AFTER planning, so the refusal has to come from the
+# preflight rather than from plan time. Note the needle: _transcript_facts says
+# "no transcript on disk" and _new_row_preflight says "no LONGER on disk". An
+# earlier version of this test built a second plan inside the lambda, so
+# plan_new_row raised before run_new_row was ever entered - it asserted the
+# plan-time message under an apply-time label, and the preflight's own
+# not-found arm had no coverage at all.
 root, env, live, dorm = build([OPENER] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
-ccs.run_new_row(env, m)
 os.unlink(m["transcript"])
 refusal("apply refuses once the transcript is gone",
-        lambda: ccs.run_new_row(env, ccs.plan_new_row(
-            env, ccs.NewRowFlags(to_session=SID, store=DORM))),
-        "no transcript on disk")
+        lambda: ccs.run_new_row(env, m), "no longer on disk")
+check("  writing nothing", not os.path.exists(m["rows"][0]["dest_path"]))
+check("  and leaving no unresolved operation", not ccs.nonterminal_ops(env))
 shutil.rmtree(root, ignore_errors=True)
 
 # Same path, different bytes. Every fact in the post-image came out of this
