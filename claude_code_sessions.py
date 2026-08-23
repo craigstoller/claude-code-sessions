@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.9.15"
+__version__ = "0.9.16"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
@@ -3937,6 +3937,43 @@ def _pointed_session(blob):
     return sid if isinstance(sid, str) and sid else None
 
 
+# A store read that fails is treated as "cannot rule it out", which is correct
+# and, without a retry, brittle: a network drive blinking for a moment turns
+# into a hard stop on an operation that already passed planning. Three attempts
+# over roughly a second recovers a blip without making a genuine failure slow.
+# Module-level so a test can shorten them; deliberately small numbers rather
+# than a policy object, because the only caller is the one below.
+STORE_READ_ATTEMPTS = 3
+STORE_READ_BACKOFF = 0.25
+
+
+def _listdir_retrying(path):
+    """os.listdir, retried a bounded number of times on OSError.
+
+    Every OSError is retried, not a curated "transient" subset. Deciding which
+    errno means "will never work" is not portable - a Windows network drive can
+    surface a momentary outage as ENOENT, EACCES or a WinError with no stable
+    mapping - and the cost of being wrong in the retry direction is about a
+    second on a failure that was going to be reported anyway. The cost of being
+    wrong in the other direction is refusing an operation over a blink.
+
+    Still fails closed: after the last attempt the OSError propagates and the
+    caller records its "cannot rule it out" sentinel exactly as before. This
+    makes the guard less brittle, never less strict.
+    """
+    for attempt in range(STORE_READ_ATTEMPTS):
+        try:
+            return os.listdir(path)
+        except OSError:
+            if attempt + 1 >= STORE_READ_ATTEMPTS:
+                raise
+            # Linear, not exponential: the failure this exists for resolves in
+            # well under a second, and the total bound matters more than the
+            # shape. Worst case here is 0.25 + 0.50 = 0.75s per unreadable
+            # store before reporting it.
+            time.sleep(STORE_READ_BACKOFF * (attempt + 1))
+
+
 def _other_pointers(env, dest_path, doomed_rows=()):
     """{cliSessionId: [store labels]} for every row that will SURVIVE this plan.
 
@@ -3978,11 +4015,13 @@ def _other_pointers(env, dest_path, doomed_rows=()):
         is_dest = os.path.realpath(path) == real_dest
         label = "{0}/{1}".format(acct[:8], org[:8])
         try:
-            names = os.listdir(path)
+            names = _listdir_retrying(path)
         except OSError:
             # Fail CLOSED: a store we cannot read might hold the displaced
             # conversation, so we must not report it as orphaned. Recorded
             # under a sentinel the caller treats as "cannot rule it out".
+            # Reached only after STORE_READ_ATTEMPTS - a store that is still
+            # unreadable a second later is not blinking, it is unavailable.
             out.setdefault(None, []).append(label)
             continue
         for name in names:

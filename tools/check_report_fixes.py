@@ -486,6 +486,81 @@ except ccs.Refusal as exc:
           "already written 1 row(s) on an earlier run" in msg, msg[-150:])
 shutil.rmtree(root, ignore_errors=True)
 
+
+# ==========================================================================
+# F. a store that blinks is not a store that is gone
+# ==========================================================================
+print("\n--- F. bounded retry on an unreadable store ---")
+
+# Failing closed on an unreadable store is right. Failing closed WITHOUT a
+# retry turns a network drive blinking for a moment into a hard stop on an
+# operation that already passed planning - raised by both review engines.
+_backoff = ccs.STORE_READ_BACKOFF
+ccs.STORE_READ_BACKOFF = 0                       # keep the suite fast
+
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["third"], "local_other.json", OLD, "Third door", when=4000)
+third_dir = dirs["third"]
+real_listdir = os.listdir
+state = {"fails": 1}
+
+
+def blinking_listdir(p):
+    same = os.path.normcase(os.path.abspath(p)) == os.path.normcase(
+        os.path.abspath(third_dir))
+    if same and state["fails"] > 0:
+        state["fails"] -= 1
+        raise OSError(5, "the drive blinked")
+    return real_listdir(p)
+
+
+ccs.os.listdir = blinking_listdir
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True,
+                                         to=dirs["dorm"]))
+finally:
+    ccs.os.listdir = real_listdir
+r = [x for x in m["rows"] if x["title"] == "Shared slot"][0]
+check("one failed read is retried, not reported as unreadable",
+      r["displaced_orphan"] is False, str(r["displaced_orphan"]))
+check("  so the voucher in that store still counts", state["fails"] == 0)
+shutil.rmtree(root, ignore_errors=True)
+
+# a store that is genuinely gone still fails closed after the attempts
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["third"], "local_other.json", OLD, "Third door", when=4000)
+third_dir = dirs["third"]
+attempts = {"n": 0}
+
+
+def dead_listdir(p):
+    if os.path.normcase(os.path.abspath(p)) == os.path.normcase(
+            os.path.abspath(third_dir)):
+        attempts["n"] += 1
+        raise OSError(13, "permission denied")
+    return real_listdir(p)
+
+
+ccs.os.listdir = dead_listdir
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True,
+                                         to=dirs["dorm"]))
+finally:
+    ccs.os.listdir = real_listdir
+r = [x for x in m["rows"] if x["title"] == "Shared slot"][0]
+check("a permanently unreadable store still yields 'unknown'",
+      r["displaced_orphan"] == "unknown", str(r["displaced_orphan"]))
+check("  after exactly STORE_READ_ATTEMPTS tries, not more",
+      attempts["n"] == ccs.STORE_READ_ATTEMPTS,
+      "%d tries, expected %d" % (attempts["n"], ccs.STORE_READ_ATTEMPTS))
+shutil.rmtree(root, ignore_errors=True)
+
+ccs.STORE_READ_BACKOFF = _backoff
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

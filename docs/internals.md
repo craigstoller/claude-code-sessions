@@ -1621,9 +1621,21 @@ change here should know both arguments existed rather than rediscovering one of 
   the up-front check exists to avoid, with no route forward that does not involve re-planning.
   Real, and the resolution depends on the serialization question below rather than being
   independent of it.
-- **An unreadable sibling store aborts an op that already passed planning** (both). Failing closed
-  is right; failing closed *without a retry* turns a blinking network drive into a hard stop. A
-  bounded retry before refusing would keep the safety property and lose the brittleness.
+- **An unreadable sibling store aborted an op that already passed planning** (both). **FIXED
+  2026-08-22.** `_listdir_retrying` gives every store read `STORE_READ_ATTEMPTS` (3) tries with a
+  linear `STORE_READ_BACKOFF` (0.25s, so 0.75s total) before the OSError propagates and
+  `_other_pointers` records its "cannot rule it out" sentinel exactly as before. Less brittle,
+  never less strict: a store still unreadable a second later is not blinking, it is unavailable.
+
+  Every OSError is retried rather than a curated "transient" subset, deliberately. Deciding which
+  errno means "will never work" is not portable - a Windows network drive can surface a momentary
+  outage as ENOENT, EACCES or a WinError with no stable mapping - and being wrong in the retry
+  direction costs about a second on a failure that was going to be reported anyway, while being
+  wrong in the other direction refuses an operation over a blink.
+
+  Pinned in `tools/check_report_fixes.py` section F, which asserts both halves: a store that fails
+  once and then succeeds does NOT reach the sentinel, and a store that always fails still yields
+  `"unknown"` after exactly `STORE_READ_ATTEMPTS` tries and no more.
 - **The pointer scan is not a consistent snapshot** (Codex): `_other_pointers` walks several
   stores, and a concurrent change during the walk yields a mixed-time answer. **Narrower than
   filed** - see the correction above and the lock section below. Against another copy of this
