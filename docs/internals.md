@@ -1689,7 +1689,7 @@ change here should know both arguments existed rather than rediscovering one of 
 `<ops_dir>/lock`, a fixed name, and `acquire_lock` creates it with `O_CREAT | O_EXCL` - the
 atomic "create only if absent" primitive. The `op_id` written inside is for diagnostics, so a
 refusal can name the holder; it plays no part in exclusion. Every mutating entry point competes
-for that same file: `run_move`, `undo_move`, `recover_op`, `run_sync`, `undo_sync`, `run_repoint`,
+for that same file: `run_move`, `run_undo`, `recover_op`, `run_sync`, `undo_sync`, `run_repoint`,
 `undo_repoint`, `run_new_row` and `undo_new_row`. All nine release it in a `finally`.
 
 **What is inside the boundary for a sync.** `run_sync` acquires before `new_op`, and releases
@@ -1731,26 +1731,40 @@ account/org folder — the same enumeration `list`, `doctor`, and everything els
 does, and the whole reason a synthesized row is visible at all: nothing consults a registry
 that would need to know a given row was built by this tool rather than issued by the app.
 
-**The row template comes from a census, not a design meeting.** Measured 2026-08-22 across 987
-real rows on this machine: 52 distinct keys exist, and only 12 appear on every one of them, so
-there is no fixed row shape to copy. `NEW_ROW_DEFAULTS` follows a three-tier policy instead —
+**The row template comes from a census, not a design meeting.** Re-measured 2026-08-23 across
+988 real rows on this machine: 52 distinct keys exist, and only 12 appear on every one of them,
+so there is no fixed row shape to copy. `NEW_ROW_DEFAULTS` follows a three-tier policy instead —
 transcript-derived first, then a field at ≥95% presence *with a defensible zero value*, then
 omission. Clearing the threshold is necessary and not sufficient: `classifierSummaryEnabled`
-sits at 97.6% but is `True` on every row that carries it, which is behaviour asserted rather
-than a zero, so it is omitted regardless of the number. An earlier draft asserted
-`reportFindingsCard`, `chromeTabGroupId`, `lastSpawnRootDetected` and `remoteControlAutoEligible`
-on every synthesized row; measured presence across the census is 60.2%, 5.6%, 2.7% and **0.9%**.
-Writing a field that 99.1% of real rows do not carry is exactly the "plausible-looking default"
-the policy exists to forbid.
+sits at 97.6% (964 of 988) but is `True` on every row that carries it, which is behaviour
+asserted rather than a zero, so it is omitted regardless of the number. An earlier draft
+asserted `reportFindingsCard`, `chromeTabGroupId`, `lastSpawnRootDetected` and
+`remoteControlAutoEligible` on every synthesized row; measured presence on 2026-08-23 is 60.2%,
+14.6%, 6.9% and **2.3%**. Writing a field that 97.7% of real rows do not carry is exactly the
+"plausible-looking default" the policy exists to forbid.
+
+**Those percentages are a snapshot of a moving target — which is the argument for the policy,
+not a caveat on it.** The first three of those four were 60.2%, 5.6%, 2.7% and 0.9% when the
+census first ran on 2026-08-22. One day later they were 60.2%, 14.6%, 6.9% and 2.3%:
+`chromeTabGroupId` had nearly tripled, `lastSpawnRootDetected` had more than doubled, and
+`remoteControlAutoEligible` had more than doubled. Every row carrying either of the last two
+had been written in the preceding two days (oldest file mtime 2026-08-21 for both, measured on
+the same run), so the app is rolling these fields onto rows as it touches them rather than
+having shipped them retroactively. A field the app is mid-rollout on is exactly what a
+synthesized row must not assert: whatever value it would write is behaviour the app has not
+finished deciding, not a zero — and the percentage that justified writing it will be wrong by
+the time anyone reads this paragraph. So the question to ask of a candidate field is not "is it
+above 95%" but "is it stable"; re-run the census in the plan and compare against the numbers
+here before touching `NEW_ROW_DEFAULTS`.
 
 **`model` and `effort` are read from the transcript, never defaulted.** An earlier draft
 hardcoded `"model": "claude-opus-5"` as the account default; the same census says otherwise —
-`claude-fable-5` leads `claude-opus-5` 522 to 243 across the 987 rows. `_transcript_facts` keeps
+`claude-fable-5` leads `claude-opus-5` 522 to 244 across the 988 rows. `_transcript_facts` keeps
 the **last** `message.model` and top-level `effort` it sees, because what the session was
 running when it stopped is what a resumed row should carry — the opposite of `cwd`, which is
 first-wins because `originCwd` should name where the session began, not wherever it was when it
 stopped. A transcript with no assistant reply has no `model` to read and no zero value to fall
-back to (`model` sits at 100% of the 987 rows), so `_transcript_facts` refuses rather than
+back to (`model` sits at 100% of the 988 rows), so `_transcript_facts` refuses rather than
 invent one; if that ever costs someone a real conversation, the fix is a `--model` flag, not a
 silent default.
 
@@ -1762,9 +1776,14 @@ the command having failed.
 
 **`doctor`'s detection of a rejected row is bounded by journal retention, not by time.**
 `rotate_ops` keeps the ten most recent *terminal* ops across every operation type, and
-`_collides` — the check that shields an unresolved `sync` claim from that rotation — never
-shields a `new-row` op the same way. So the window `gather_doctor`'s `vanished_new_rows` check
-can see is however many other operations happen to run next, not a number of days. Measured
+`_collides` is what holds an op back from that rotation. It shields two things: an unresolved
+`sync`'s claim on a destination row, and any op carrying a `rollback_residue` — which today
+only a rolled-back `new-row` can, and which is pinned indefinitely so `doctor` can go on
+reporting the row that rollback could not remove (`gather_doctor`'s `rollback_residue` list;
+the alert clears when the row is actually gone, because it asks the store rather than the
+journal). A **completed** `new-row` op — the only kind `vanished_new_rows` reads — is never
+shielded. So the window that check can see is however many other operations happen to run
+next, not a number of days. Measured
 2026-08-23: after 15 sequential `new-row` runs, the first run's op had aged out of the journal,
 its vanished-row alert was gone, and `doctor` returned to exit 0 — with nothing about the row
 itself having changed to explain the alert clearing. In practice this covers the case the

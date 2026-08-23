@@ -2960,13 +2960,20 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is "move" or "sync" (or
-    # missing, which in practice never happens - every manifest sets
-    # op_type) is eligible as "the operation to undo". A completed *undo*
-    # op is itself terminal from cmd_undo's point of view - plan_undo
-    # always refuses an undo-of-undo ("to redo, run move again") - so
-    # selecting one here would only ever produce that refusal instead of
-    # reaching an older, still-undoable completed move/sync underneath it.
+    # delta: only a completed op whose op_type is one of the four this command
+    # can actually reverse - "move", "sync", "repoint", "new-row" (or missing,
+    # which in practice never happens - every manifest sets op_type) - is
+    # eligible as "the operation to undo". A completed *undo* op is itself
+    # terminal from cmd_undo's point of view - plan_undo always refuses an
+    # undo-of-undo ("to redo, run move again") - so selecting one here would
+    # only ever produce that refusal instead of reaching an older, still-
+    # undoable completed operation underneath it.
+    #
+    # THE GUI'S _find_undoable_sync MIRRORS THIS TUPLE, and its docstring says
+    # so. It read ("move", "sync") after this one grew, so with a completed
+    # repoint or new-row on top it reached past that op to an older sync and
+    # offered to undo THAT - the disagreement its docstring promises cannot
+    # happen. Anything added here has to be added there.
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
                  and o.manifest.get("op_type", "move") in ("move", "sync",
                                                            "repoint", "new-row")]
@@ -4716,16 +4723,26 @@ def _transcript_facts(env, session_id):
 # The static half of a synthesized row: every field that comes neither from the
 # transcript nor from the caller. One place, one comment per field.
 #
-# EVERY MEMBER EARNED ITS PLACE IN A CENSUS, not in a design meeting. Measured
-# 2026-08-22 across 987 real rows: 52 distinct keys exist and only 12 appear on
+# EVERY MEMBER EARNED ITS PLACE IN A CENSUS, not in a design meeting. Re-measured
+# 2026-08-23 across 988 real rows: 52 distinct keys exist and only 12 appear on
 # all of them, so there is no fixed row shape to copy. A field belongs here only
 # if it is effectively universal AND has a defensible zero value.
 #
 # What that ruled OUT is the point: an earlier draft asserted reportFindingsCard
-# (present on 60.2% of real rows), chromeTabGroupId (5.6%), lastSpawnRootDetected
-# (2.7%) and remoteControlAutoEligible (0.9%) on every synthesized row. Writing a
-# field that 99.1% of real rows do not carry is the "plausible-looking default"
-# this comment exists to forbid. Re-run the census in the plan before adding one.
+# (60.2% of real rows), chromeTabGroupId (14.6%), lastSpawnRootDetected (6.9%)
+# and remoteControlAutoEligible (2.3%) on every synthesized row. Writing a field
+# that 97.7% of real rows do not carry is the "plausible-looking default" this
+# comment exists to forbid.
+#
+# THOSE NUMBERS MOVE, AND THAT STRENGTHENS THE RULE RATHER THAN WEAKENING IT.
+# In the ONE DAY between the 2026-08-22 census and this re-run, chromeTabGroupId
+# went 5.6% -> 14.6%, lastSpawnRootDetected 2.7% -> 6.9% and
+# remoteControlAutoEligible 0.9% -> 2.3%; every row carrying either of the last
+# two was written in the preceding two days. The app is rolling these fields
+# onto rows as it touches them. A field mid-rollout is precisely what a
+# synthesized row must not assert - the value is behaviour the app has not
+# finished deciding, not a zero. Re-run the census in the plan before adding
+# one, and ask whether the number is STABLE, not merely whether it clears 95%.
 NEW_ROW_DEFAULTS = {
     "isArchived": False,              # 100% of rows; a recovered row is not archived
     "alwaysAllowedReasons": [],       # 100%; no permission history to inherit

@@ -99,9 +99,11 @@ read. See `docs/internals.md`, RULING 7.
 
 ## Before any move: close the Claude app.
 
-`move`, `undo`, `recover`, and every mutating `sync` route (`--apply`, `undo` of a completed
-sync, `recover --back` on a stuck one) all refuse while they can see the Claude desktop app
-running — whoever the identity files currently say is signed in. Closing the app first avoids
+`move`, `undo`, `recover`, `repoint --apply`, `new-row --apply`, and every mutating `sync`
+route (`--apply`, `undo` of a completed sync, `recover --back` on a stuck one) all refuse
+while they can see the Claude desktop app running — whoever the identity files currently say
+is signed in. That includes `undo` of a completed `repoint` or `new-row`, and `recover` on an
+interrupted one wherever it would write or delete a row rather than only close the record. Closing the app first avoids
 the refusal and guarantees nothing is actively appending to the sidebar rows you're about to
 touch. A running Claude Code CLI session does **not** count: it's recognised by its own
 install path and excluded from the check, so an open `claude` session never blocks any of this.
@@ -132,7 +134,7 @@ alone cannot tell you which copy answered:
 
 ```
 $ ccs --version
-claude-code-sessions 0.9.14
+claude-code-sessions 0.10.0
 running from: C:\Users\craig\AppData\Local\pipx\...\claude_code_sessions.py
 ```
 
@@ -193,10 +195,13 @@ placeholder.
 
 **Unofficial and unverified across app versions.** The app accepting a row it did not
 create was established by experiment, not documentation. The row is built from fields
-measured across 987 real rows plus values read out of the transcript itself, and it
+measured across 988 real rows plus values read out of the transcript itself, and it
 asserts nothing beyond those. If a future version rejects one, `doctor` reports it —
-but only while the creating operation is still in the journal, and that journal keeps
-just the last ten finished operations of any kind. In practice the alert covers the
+but only while the creating operation is still in the journal. That journal keeps the
+last ten finished operations, plus any it has to pin indefinitely: an unfinished
+`sync`'s claim on a destination row, and a rollback that left behind a row it could
+not remove. A **completed** `new-row` op is never pinned, so ten finished operations
+of any kind is exactly the window this alert has. In practice the alert covers the
 case it was built for, since an app version that rejects a row does so the first time
 it opens the sidebar. A row that disappears after a busy stretch of other operations
 will go unreported.
@@ -367,9 +372,11 @@ is always a preview will misread `sync --apply --json`.
   touching anything, copies to the destination, re-verifies the copy by hash, rewrites listing
   rows atomically, re-verifies both sides one last time, and only then deletes the source.
   Nothing is ever deleted while it is the only copy.
-- **`undo`** reverses the most recent completed move or sync by running the same journaled
-  protocol in reverse (for a sync, that means deleting exactly the rows the op wrote, and only
-  while they still match what was written).
+- **`undo`** reverses the most recent completed `move`, `sync`, `repoint` or `new-row` by
+  running the same journaled protocol in reverse — for a `sync`, deleting exactly the rows the
+  op wrote; for a `repoint`, restoring the pointer the row held before; for a `new-row`,
+  deleting the row it created. In every case only while what is on disk still matches what was
+  written.
 - **`recover`** classifies and resolves any operation a crash or interruption left in a
   non-terminal state — nothing is left stranded.
 - **`sync`** only ever writes rows into the store of the account you are *not* currently signed
