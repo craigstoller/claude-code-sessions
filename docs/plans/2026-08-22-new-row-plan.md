@@ -970,21 +970,18 @@ check("an email matching two org dirs picks the one holding rows",
 check("  and says so, because a heuristic the user cannot see is a trap",
       "rows" in m["store_why"], m["store_why"])
 check("  marking the choice as a guess", m["store_is_a_guess"] is True)
-# The guess may plan and may not write. Printing it and writing anyway leaves
-# no moment for anyone to intervene in a one-shot --apply.
-refusal("  and --apply REFUSES on a guessed store",
-        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
-                                         title="", live="", apply=True,
-                                         json=False)),
-        "decided by counting rows")
-check("  writing nothing", not any(n.startswith("local_") and "anything" not in n
-                                   for n in os.listdir(live)))
-# naming the store by path is not a guess, and does write
+# naming the store by path is not a guess
 m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=live))
 check("  while naming the store by path is not a guess",
       m2["store_is_a_guess"] is False)
-check("  and applies", ccs.run_new_row(env, m2) == "completed")
+check("  and planning wrote nothing either way",
+      sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
 shutil.rmtree(root, ignore_errors=True)
+
+# NOTE: that the guess may plan and may NOT write is asserted in Task 6, where
+# `cmd_new_row` exists to enforce it. Do not test it here - `cmd_new_row` and
+# `run_new_row` are introduced in Tasks 6 and 4, and calling them from this
+# task's suite would raise AttributeError rather than fail a check.
 
 # every candidate empty: name them rather than saying 'no way to tell'
 root, env, live, dorm = build([OPENER] + prose(8))
@@ -2075,6 +2072,35 @@ check("  including the store's reasoning",
       any(k == "print" and "chosen as" in v
           for k, v in order[:kinds.index("write")]),
       str([v for k, v in order[:kinds.index("write")]][:6]))
+shutil.rmtree(root, ignore_errors=True)
+
+# A guessed store may PLAN and may not WRITE. Task 3 asserts that planning
+# marks the guess; this is where the refusal itself lives, because cmd_new_row
+# is what enforces it and it does not exist before this task.
+print("\n--- a guessed store may plan, and may not write ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+os.makedirs(os.path.join(os.path.dirname(live), ORG_D))    # empty scaffolding
+with open(os.path.join(live, "local_anything.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 55, "title": "Something else",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("--apply refuses when row counts chose the store",
+        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
+                                         title="", live="", apply=True,
+                                         json=False)),
+        "decided by counting rows")
+check("  and writes nothing",
+      sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
+check("  while a dry run on the same guess is allowed",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
+                               title="", live="", apply=False, json=False)) == 0)
+# naming the store by path settles it, and then --apply proceeds
+check("naming the store by path lets --apply through",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=live, title="Recovered",
+                               live="", apply=True, json=False)) == 0)
+check("  and the row is on disk",
+      any(n != "local_anything.json" for n in os.listdir(live)),
+      str(os.listdir(live)))
 shutil.rmtree(root, ignore_errors=True)
 ```
 
