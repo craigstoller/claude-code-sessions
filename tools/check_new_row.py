@@ -945,6 +945,106 @@ check("the residue-bearing op survives rotation", len(survivor) == 1,
       "pruned - the only record that a row was left behind is gone")
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------------------------------ report and json
+print("\n--- the report, and --json ---")
+
+root, env, live, dorm = build(
+    [rec("user", "opening message long enough to count",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         custom="Their own title")] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+out = []
+ccs._print_new_row_report(out.append, m)
+joined = "\n".join(out)
+check("the report names the title", "Their own title" in joined)
+check("  AND where it came from", "custom title" in joined, joined[:120])
+check("  the conversation it will open", SID[:8] in joined)
+check("  which store, and why that one", m["store_why"] in joined, joined[:200])
+check("  and says the row is new rather than moved",
+      "creates a NEW" in joined or "new sidebar row" in joined, joined[:200])
+check("  without claiming nothing else points at the conversation",
+      "nothing pointing at it" not in joined, joined[:200])
+
+pub = ccs._public_new_row_manifest(m)
+blob = json.dumps(pub)
+check("--json carries no row image", "post_b64" not in blob)
+check("  nor a pre-image key", "pre_b64" not in blob)
+check("  while still naming the op and the target",
+      pub["op_type"] == "new-row" and pub["to_session"] == SID)
+shutil.rmtree(root, ignore_errors=True)
+
+# The store choice must be VISIBLE BEFORE the write, not after it. There is no
+# way to hand a saved dry run back to the CLI, so a separate dry run replans
+# and proves nothing about what the apply will pick - which makes "the user
+# sees the heuristic first" false unless --apply itself prints first.
+print("\n--- the report prints before the write ---")
+
+
+root, env, live, dorm = build([OPENER] + prose(8))
+order = []
+real_bp = builtins.print
+real_run = ccs.run_new_row
+
+
+def spy_print(*a, **k):
+    order.append(("print", " ".join(str(x) for x in a)))
+
+
+def spy_run(e, mm):
+    order.append(("write", mm["name"]))
+    return real_run(e, mm)
+
+
+builtins.print = spy_print
+ccs.run_new_row = spy_run
+try:
+    ccs.cmd_new_row(env, _Ns(to_session=SID, store="", title="Recovered",
+                             live="", apply=True, json=False))
+finally:
+    builtins.print = real_bp
+    ccs.run_new_row = real_run
+
+kinds = [k for k, _ in order]
+check("the write happens at all", "write" in kinds)
+check("  and the report was printed BEFORE it",
+      kinds.index("print") < kinds.index("write"), str(kinds[:4]))
+check("  including the store's reasoning",
+      any(k == "print" and "chosen as" in v
+          for k, v in order[:kinds.index("write")]),
+      str([v for k, v in order[:kinds.index("write")]][:6]))
+shutil.rmtree(root, ignore_errors=True)
+
+# A guessed store may PLAN and may not WRITE. Task 3 asserts that planning
+# marks the guess; this is where the refusal itself lives, because cmd_new_row
+# is what enforces it and it does not exist before this task.
+print("\n--- a guessed store may plan, and may not write ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+os.makedirs(os.path.join(os.path.dirname(live), ORG_D))    # empty scaffolding
+with open(os.path.join(live, "local_anything.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 55, "title": "Something else",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("--apply refuses when row counts chose the store",
+        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
+                                         title="", live="", apply=True,
+                                         json=False)),
+        "decided by counting rows")
+check("  and writes nothing",
+      sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
+check("  while a dry run on the same guess is allowed",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
+                               title="", live="", apply=False, json=False)) == 0)
+# The refusal must name something that WORKS when pasted back. Naming the org
+# id does; naming the path does not, because _repoint_store forward-slashes the
+# candidate but not the user's argument.
+check("naming the org id the refusal suggested lets --apply through",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=ORG_L, title="Recovered",
+                               live="", apply=True, json=False)) == 0)
+check("  and the row is on disk",
+      any(n != "local_anything.json" for n in os.listdir(live)),
+      str(os.listdir(live)))
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

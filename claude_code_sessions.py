@@ -2673,6 +2673,25 @@ def build_parser():
     rp.add_argument("--json", action="store_true", help="print the plan as JSON")
     rp.add_argument("--verbose", action="store_true", help="do not redact paths")
 
+    nr = sub.add_parser("new-row",
+                        help="create a sidebar row for a conversation that has none")
+    nr.add_argument("--to", dest="to_session", default="", metavar="CLI_SESSION_ID",
+                    help="the cliSessionId the new row should open. 'doctor' lists "
+                         "conversations no account currently points at")
+    nr.add_argument("--store", default="", metavar="SUBSTRING",
+                    help="which account's store to add the row to (account id, org "
+                         "id, path, or email). Defaults to the account the identity "
+                         "files agree is signed in, and refuses when they disagree")
+    nr.add_argument("--title", default="", metavar="TEXT",
+                    help="the row's title. Without this it is taken from the "
+                         "transcript's own title if it has one, otherwise a "
+                         "placeholder that does not impersonate a summary")
+    nr.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into "
+                         "(RULING 5), when the identity files disagree")
+    nr.add_argument("--apply", action="store_true", help="actually create the row")
+    nr.add_argument("--json", action="store_true", help="print the plan as JSON")
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -2921,7 +2940,7 @@ def main(argv=None):
     env = default_env()
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
-                "repoint": cmd_repoint,
+                "repoint": cmd_repoint, "new-row": cmd_new_row,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -5132,6 +5151,104 @@ def undo_new_row(env, op):
         return "undone"
     finally:
         release_lock(env)
+
+
+def _print_new_row_report(say, m):
+    say("store   : {0}".format(m["store_label"]))
+    # Printed because _new_row_store's choice among an account's org directories
+    # is a heuristic. A heuristic the user can see before --apply is a very
+    # different thing from one they cannot.
+    say("          chosen as {0}".format(m["store_why"]))
+    if m.get("store_is_a_guess"):
+        say("          ^ that is a GUESS from row counts, not an identification."
+            " --apply")
+        say("            will refuse until you name the store with --store.")
+    say("new row : local_{0}.json".format(m["name"]))
+    say("title   : {0}   ({1})".format(m["title"], m["title_provenance"]))
+    if m.get("title_collision"):
+        say("          another row in this account is already called {0!r}"
+            .format(m["title_collision"]))
+    say("")
+    say("will open : {0}   ({1} MB, {2})".format(
+        m["to_session"], m["transcript_mb"],
+        "{0} prose turns".format(m["turns"]) if m["turns"] is not None
+        else "too large to count turns"))
+    say("project   : {0}".format(m["cwd"]))
+    say("model     : {0}   (read from the transcript)".format(m["model"]))
+    say("")
+    say("This creates a NEW sidebar row. Nothing existing is changed, and the")
+    say("conversation itself is not touched. No row in THIS account opens it")
+    say("today; other accounts are not consulted, and may well have one.")
+
+
+def _public_new_row_manifest(m):
+    """The new-row manifest with the row image removed, for --json.
+
+    Same rule as `_public_repoint_manifest` and `_public_manifest`: a listing
+    row carries `remoteMcpServersConfig` and permission state, and printing it
+    to stdout lets ordinary automation log an account's connector configuration.
+    This command's post-image is synthesized rather than copied out of an
+    account, which makes it less sensitive and not differently governed - it
+    goes through the same filter rather than around it.
+    """
+    out = {k: v for k, v in m.items() if k != "rows"}
+    out["rows"] = [{k: v for k, v in r.items() if k not in ("pre_b64", "post_b64")}
+                   for r in m.get("rows", [])]
+    return out
+
+
+def cmd_new_row(env, ns):
+    flags = NewRowFlags(to_session=ns.to_session, store=ns.store,
+                        title=ns.title, live=ns.live)
+    m = plan_new_row(env, flags)
+    # The HUMAN report prints before the write, unlike cmd_sync and cmd_repoint,
+    # and the difference is deliberate. _new_row_store may have picked this
+    # account's store out of several by a heuristic, and the plan justifies that
+    # heuristic by saying the user sees it before anything happens. Printing
+    # afterwards made that false for `--apply` in one shot - which is how the
+    # command will usually be run, because there is no way to hand a saved dry
+    # run back to the CLI, so a separate dry run replans and proves nothing
+    # about what the apply will choose.
+    #
+    # --json keeps the other order (apply first, then print), exactly as
+    # cmd_sync and cmd_repoint do: printing first meant `--apply --json`
+    # reported a plan, exited 0, and wrote nothing, which automation reads as a
+    # completed operation.
+    if not ns.json:
+        _print_new_row_report(print, m)
+        if ns.apply:
+            print("")
+    # A guessed store may PLAN but never WRITE. Printing the guess and then
+    # writing anyway leaves no moment for anyone to intervene, so the dry run
+    # shows it and the apply refuses until the user settles it themselves.
+    if ns.apply and m.get("store_is_a_guess"):
+        raise Refusal(
+            "which store should get this row was decided by counting rows, not "
+            "by anything that identifies the account: {0}. That is fine for a "
+            "dry run and not fine for a write. Re-run with --store {1} if that "
+            "is the one you mean. Nothing was written."
+            .format(m["store_why"], m["store_org"]))
+    final = run_new_row(env, m) if ns.apply else None
+    if ns.json:
+        pub = _public_new_row_manifest(m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        return 0 if final in (None, "completed") else 1
+    if final is None:
+        print("\ndry run - pass --apply to create the row")
+        return 0
+    print("result  : {0}".format(final))
+    if final == "completed":
+        print("Reopen the app - the session should be in the sidebar. 'undo' "
+              "removes the row again.")
+        return 0
+    # cmd_move and cmd_sync both gate their exit code on the result; cmd_repoint
+    # returns 0 unconditionally, and that is the sibling not to copy. Today
+    # execute_new_row_op can only return "completed" or raise - but an
+    # unconditional success trailer plus exit 0 is a trap laid for whoever adds
+    # a second return value later.
+    return 1
 
 
 def _displaced_overlap(env, old_sid, new_sid):
