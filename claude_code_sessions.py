@@ -5133,10 +5133,18 @@ def execute_new_row_op(env, op):        # noqa: ARG001 - see the note on env
     # non-terminal op behind for a command that changed nothing. One caller, one
     # preflight, always before the journal entry exists.
     #
-    # Everything that can still refuse happens BEFORE set_status, for the same
-    # reason: a containment failure or a corrupt post-image after the flip would
+    # Every refusal that CAN happen before set_status does, for the same reason:
+    # a containment failure or a corrupt post-image raised after the flip would
     # leave a 'writing' op behind for a run that touched nothing, which is the
     # pathology that refactor removed - reproduced one layer down.
+    #
+    # EXACTLY ONE refusal necessarily survives past it, and the message below
+    # owns that rather than pretending otherwise: a write cannot be known to
+    # fail until it is tried. So the op really is journalled and open when
+    # atomic_write raises, re-running really does succeed while leaving it open,
+    # and only 'recover --back' closes it - which the message has to say,
+    # because 'doctor' will otherwise report an unresolved operation the user
+    # was told had changed nothing.
     real = ensure_contained(r["dest_path"], [m["store_path"]])
     if os.path.dirname(real) != os.path.realpath(m["store_path"]):
         raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
@@ -5163,8 +5171,15 @@ def execute_new_row_op(env, op):        # noqa: ARG001 - see the note on env
     try:
         atomic_write(r["dest_path"], post)
     except OSError as exc:
-        raise Refusal("could not write the row: {0}. Nothing was written - "
-                      "check the store is writable, then re-run.".format(exc))
+        raise Refusal(
+            "could not write the row: {0}. Nothing landed in the store - but "
+            "unlike every other refusal here, this one leaves the operation "
+            "journalled and open at 'writing', because a write cannot be known "
+            "to fail before it is tried. Check the store is writable and re-run "
+            "to create the row; then close this one with 'claude-code-sessions "
+            "recover --resolve {1} --back --apply', which has nothing to delete "
+            "and only closes the record. 'doctor' lists it until you do."
+            .format(exc, m.get("op_id")))
     _maybe_crash("new-row-write-before-save")
     r["written"] = True
     save_manifest(op)

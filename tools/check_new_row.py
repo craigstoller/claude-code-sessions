@@ -1361,6 +1361,76 @@ check("  the report still got out, with the unencodable characters replaced",
 shutil.rmtree(root, ignore_errors=True)
 
 
+# The one refusal that CANNOT happen before set_status, because a write cannot
+# be known to fail until it is tried. It said "Nothing was written - check the
+# store is writable, then re-run", and re-running does succeed - while the
+# 'writing' op it journalled stays open forever, doctor reports it, and only
+# 'recover --back' clears it. The structure is unavoidable; the message was not.
+print("\n--- the write refusal names the op it strands ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+real_write = ccs.atomic_write
+
+
+def fail_the_row_write(path, data):
+    """Fail ONLY the row write - the journal shares atomic_write, and failing
+    that instead would test a different (and much earlier) failure."""
+    if os.path.normcase(path) == os.path.normcase(m["rows"][0]["dest_path"]):
+        raise OSError("disk is full")
+    return real_write(path, data)
+
+
+ccs.atomic_write = fail_the_row_write
+try:
+    ccs.run_new_row(env, m)
+    check("a failed write refuses", False, "no refusal")
+    msg = ""
+except ccs.Refusal as exc:
+    msg = str(exc)
+    check("a failed write refuses", True)
+finally:
+    ccs.atomic_write = real_write
+
+check("  the message no longer claims nothing happened at all",
+      "Nothing was written - " not in msg, msg[:80])
+check("  it says the operation is journalled and still open",
+      "journalled" in msg and "'writing'" in msg, msg[:120])
+check("  and names recover --back, with the op id, as the way to close it",
+      "recover --resolve %s --back" % m["op_id"] in msg, msg[-140:])
+
+# The claim has to be TRUE, not merely reassuring: the op really is stranded,
+# and the command the message names really does close it.
+pending = ccs.nonterminal_ops(env)
+check("  the op really is left non-terminal", len(pending) == 1, str(len(pending)))
+check("    at exactly the status the message names",
+      pending[0].manifest["status"] == "writing", pending[0].manifest["status"])
+d = ccs.gather_doctor(env)
+check("    and doctor really does report it",
+      pending[0].manifest["op_id"] in d["nonterminal_ops"], str(d["nonterminal_ops"]))
+check("    so doctor's exit code is non-zero", d["exit_code"] != 0, str(d["exit_code"]))
+
+# Re-running succeeds - which is why the stale op is a real cost and not a
+# theoretical one: the user does what the refusal says and is left with two
+# things, one of which nothing told them about.
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+check("  re-running does succeed, leaving the stranded op behind",
+      ccs.run_new_row(env, m2) == "completed")
+check("    with the old op still open",
+      [o.manifest["op_id"] for o in ccs.nonterminal_ops(env)] == [m["op_id"]],
+      str([o.manifest["op_id"] for o in ccs.nonterminal_ops(env)]))
+
+# and the advice works when followed
+stuck = [o for o in ccs.nonterminal_ops(env) if o.manifest["op_id"] == m["op_id"]][0]
+check("  'recover --back' closes it, exactly as the message promises",
+      ccs.recover_op(env, stuck, "back") == "rolled_back")
+check("    leaving nothing unresolved", not ccs.nonterminal_ops(env),
+      str(ccs.nonterminal_ops(env)))
+check("    and the row created by the re-run untouched",
+      os.path.exists(m2["rows"][0]["dest_path"]))
+shutil.rmtree(root, ignore_errors=True)
+
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
