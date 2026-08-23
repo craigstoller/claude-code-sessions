@@ -16,8 +16,8 @@
 - **Refusals are `Refusal`, layout bugs are `LayoutError`.** A refusal names what happened, what was NOT done, and the way forward.
 - **Assert nothing you did not measure.** This is the rule the whole command turns on, and it is a *threshold policy*, not an absolute — stating it as "only universal fields" would be a rule this plan then breaks three times. The actual policy, applied in Task 1:
   1. **Derived from the transcript** — `cwd`, the timestamps, `completedTurns`, `model`, `effort`, `title`, `titleSource`. Preferred wherever the transcript can settle it.
-  2. **Present on ≥95% of real rows AND with a defensible zero value** — `isArchived: False`, `alwaysAllowedReasons: []`, `spawnSeed: {}`. "Zero value" is doing the work: these say *nothing happened*, which is true of a row that has never been opened.
-  3. **Everything else is omitted.** Including fields at 60% and below, and including any field whose plausible value would be a *claim* rather than a zero.
+  2. **Present on ≥95% of real rows AND with a defensible zero value** — `isArchived: False`, `alwaysAllowedReasons: []`, `sessionPermissionUpdates: []`, `spawnSeed: {}`, `chromePermissionMode: None`. "Zero value" is doing the work: these say *nothing happened*, which is true of a row that has never been opened.
+  3. **Everything else is omitted.** Including fields at 60% and below, **and any field whose plausible value would be a claim rather than a zero even when it clears 95%** — `classifierSummaryEnabled` is present on 97.6% of rows and is `True` on every one of them, and it is still omitted, because `True` is a behavioural setting rather than an absence. Absence is tolerated (24 rows have none), so omitting asserts strictly less at no cost.
 
   `permissionMode` is the one member of tier 2 with no zero value — it is on 100% of rows and every value is a claim — so it takes the most **restrictive** observed value rather than the most common. That is a documented compatibility choice, not a measurement, and it is called out as one in `NEW_ROW_DEFAULTS`. "Plausible default" remains the specific failure this command must not commit.
 - **No row images in `--json`.** `post_b64` never reaches stdout.
@@ -102,7 +102,7 @@ Measured 2026-08-22 over 987 rows: **52 distinct keys, and only 12 appear on eve
 | `sessionPermissionUpdates` | 99.7% | include (`[]`) |
 | `effort` | 99.4% | include, **derived from the transcript** |
 | `lastFocusedAt` | 100% of rows that have `completedTurns`; 95% overall | include |
-| `classifierSummaryEnabled` | 97.6%, and `True` on every row that has it | include (`True`) |
+| `classifierSummaryEnabled` | 97.6%, and `True` on every row that has it | **omit** — `True` is behaviour, not a zero |
 | `spawnSeed` | 95.7% | include (`{}`) |
 | `completedTurns` | 38.2%… of *sampled* rows; 100% of recent ones | include **only when measured** |
 | `titleSource` | 54.4% — `auto` 533, `user` 4 | include, **truthfully**: `user` only for `--title` |
@@ -137,6 +137,13 @@ ok = []
 def check(name, cond, extra=""):
     print("%s %s%s" % ("OK " if cond else "BAD", name, ("  " + extra) if extra else ""))
     ok.append(bool(cond))
+
+
+class _Ns(object):
+    """A stand-in for argparse's Namespace, for driving cmd_* directly."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 LIVE, DORM = "a" * 32, "b" * 32
@@ -241,6 +248,25 @@ check("  while model is LAST-wins", f["model"] == "claude-fable-5", str(f["model
 check("  and so is effort", f["effort"] == "xhigh", str(f["effort"]))
 shutil.rmtree(root, ignore_errors=True)
 
+# customTitle is LAST-wins too. A rename appends a new record rather than
+# editing the old one, so first-wins hands back a title the user already
+# replaced. Measured 2026-08-23: 47 of 507 transcripts here carry more than one
+# distinct customTitle - 9%, not a corner case.
+root, env, live, dorm = build([
+    rec("user", "the opening message, long enough to be a real one",
+        ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+        custom="Task manager performance audit"),
+    rec("assistant", "a reply long enough to count as a real message",
+        ts="2026-06-14T09:30:00.000Z", model="claude-fable-5"),
+    rec("user", "a later message after the conversation was renamed",
+        ts="2026-06-14T10:00:00.000Z",
+        custom="Task manager performance audit (fork)")])
+f = ccs._transcript_facts(env, SID)
+check("customTitle is LAST-wins - a rename is not undone",
+      f["custom_title"] == "Task manager performance audit (fork)",
+      str(f["custom_title"]))
+shutil.rmtree(root, ignore_errors=True)
+
 # An unmeasurable turn count must stay unmeasured. _message_fingerprints
 # returns None for a transcript over TRANSCRIPT_COMPARE_MAX_BYTES, and
 # len(None or []) would silently turn "too big to count" into "0 turns" -
@@ -327,6 +353,12 @@ def _transcript_facts(env, session_id):
                       "which:\n{1}".format(session_id,
                                            "\n".join("   " + f for f in found)))
     path = found[0]
+    # Stat BEFORE reading, and again after - see the comparison at the end.
+    try:
+        before = os.stat(path)
+    except OSError as exc:
+        raise Refusal("could not stat the transcript for {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
     cwd = custom = model = effort = None
     first_ms = last_ms = None
     try:
@@ -350,8 +382,14 @@ def _transcript_facts(env, session_id):
                 # should carry.
                 if cwd is None and isinstance(d.get("cwd"), str) and d["cwd"]:
                     cwd = d["cwd"]
-                if custom is None and isinstance(d.get("customTitle"), str) \
-                        and d["customTitle"].strip():
+                # LAST-wins, like model and effort. Renaming a conversation
+                # appends a new customTitle rather than editing the old record,
+                # so first-wins resurrects a title the user already replaced.
+                # Measured 2026-08-23: 47 of 507 transcripts on this machine
+                # carry more than one distinct customTitle - 9%, not a corner
+                # case - and the later one is the live one (one example goes
+                # "Task manager performance audit" -> "... (fork)").
+                if isinstance(d.get("customTitle"), str) and d["customTitle"].strip():
                     custom = d["customTitle"].strip()
                 # LAST of each - see the note on cwd above for why these two go
                 # the other way.
@@ -375,7 +413,16 @@ def _transcript_facts(env, session_id):
     if first_ms is None:
         missing.append("no usable timestamp")
     if not model:
-        missing.append("no model on any assistant record")
+        # A transcript with no assistant record - someone typed a prompt and
+        # closed the app before a reply. `model` is on 100% of the 987 rows
+        # measured and has no zero value, so there is nothing to omit and
+        # nothing to derive; the only alternative to refusing is inventing one.
+        # Refusing costs the user a conversation in which nothing was said back,
+        # which is the cheapest thing this rule could cost. Called out here
+        # because it is a deliberate trade, not an oversight - if it ever bites
+        # someone with a conversation worth keeping, the fix is a --model flag,
+        # not a silent default.
+        missing.append("no assistant reply, so nothing records which model it ran")
     if missing:
         raise Refusal(
             "the transcript for {0} parses but cannot populate a row ({1}), so a "
@@ -391,9 +438,27 @@ def _transcript_facts(env, session_id):
     except OSError as exc:
         raise Refusal("could not count the turns in {0}: {1}. Nothing was "
                       "written.".format(session_id, exc))
+    # Stat AFTER both reads and compare against the stat taken BEFORE them. The
+    # apply-time check re-stats this file and compares, so whatever is recorded
+    # here becomes the definition of "unchanged" - and a stat taken only at the
+    # end would happily record the state produced by an append that happened
+    # DURING the read, baptising a half-read file as the baseline. If the two
+    # stats disagree the file moved under us and there is nothing to record.
+    try:
+        after = os.stat(path)
+    except OSError as exc:
+        raise Refusal("could not stat the transcript for {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
+    if (after.st_size, int(after.st_mtime)) != (before.st_size,
+                                                int(before.st_mtime)):
+        raise Refusal(
+            "the transcript for {0} was being written while this read it, so the "
+            "facts gathered describe no single version of the file. Nothing was "
+            "written - re-run once the session is idle.".format(session_id))
     return {"path": path, "cwd": cwd, "created_ms": first_ms, "last_ms": last_ms,
             "turns": len(fps) if fps is not None else None,
-            "custom_title": custom, "model": model, "effort": effort}
+            "custom_title": custom, "model": model, "effort": effort,
+            "size": after.st_size, "mtime": int(after.st_mtime)}
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -434,7 +499,6 @@ EXPECTED = {
     "sessionPermissionUpdates": [],
     "spawnSeed": {},
     "chromePermissionMode": None,
-    "classifierSummaryEnabled": True,
     "permissionMode": "auto",
 }
 check("the row has exactly the expected fields, no more and no fewer",
@@ -445,11 +509,14 @@ for k in sorted(EXPECTED):
     if k in row:
         check("  %s" % k, row[k] == EXPECTED[k], "%r != %r" % (row.get(k), EXPECTED[k]))
 
-# The four fields an earlier draft asserted on every row. Measured 2026-08-22
-# across 987 real rows, they appear on 60.2%, 5.6%, 2.7% and 0.9% of them.
+# Fields the policy excludes. The first four an earlier draft asserted on every
+# row; measured across 987 real rows they appear on 60.2%, 5.6%, 2.7% and 0.9%.
+# classifierSummaryEnabled is the interesting one: it CLEARS the 95% bar at
+# 97.6% and is still omitted, because True is a behavioural setting rather than
+# an absence - a threshold alone would have let it through.
 for absent in ("reportFindingsCard", "chromeTabGroupId", "lastSpawnRootDetected",
-               "remoteControlAutoEligible"):
-    check("  %s is omitted - the census does not support it" % absent,
+               "remoteControlAutoEligible", "classifierSummaryEnabled"):
+    check("  %s is omitted - the policy does not support it" % absent,
           absent not in row)
 check("spawnedFrom is absent - the row claims no lineage it does not have",
       "spawnedFrom" not in row)
@@ -499,7 +566,6 @@ NEW_ROW_DEFAULTS = {
     "sessionPermissionUpdates": [],   # 99.7%; ditto
     "spawnSeed": {},                  # 95.7%; not spawned from anything
     "chromePermissionMode": None,     # 100%; None is the plurality - no Chrome state
-    "classifierSummaryEnabled": True, # 97.6%, and True on every row that has it
     # 100% of rows. Three values observed: auto (768), bypassPermissions (201),
     # acceptEdits (18). 'auto' is chosen because it is the most RESTRICTIVE of
     # the three, not because it is the most common - a synthesized row must
@@ -633,6 +699,18 @@ ROOT_FACTS = dict(FACTS, cwd="C:\\")
 check("a root cwd drops the component instead of dangling a comma",
       ccs._placeholder_title(ROOT_FACTS) == "(untitled - 2026-06-14, 181 turns)",
       ccs._placeholder_title(ROOT_FACTS))
+check("  a POSIX root likewise",
+      ccs._placeholder_title(dict(FACTS, cwd="/"))
+      == "(untitled - 2026-06-14, 181 turns)",
+      ccs._placeholder_title(dict(FACTS, cwd="/")))
+check("  and a non-C drive letter is not mistaken for a folder name",
+      ccs._placeholder_title(dict(FACTS, cwd="D:\\"))
+      == "(untitled - 2026-06-14, 181 turns)",
+      ccs._placeholder_title(dict(FACTS, cwd="D:\\")))
+check("  while a UNC share IS a real leaf and is kept",
+      ccs._placeholder_title(dict(FACTS, cwd="\\\\server\\share"))
+      == "(untitled - 2026-06-14, 181 turns, share)",
+      ccs._placeholder_title(dict(FACTS, cwd="\\\\server\\share")))
 
 # The cwd comes out of a transcript, not off this filesystem. os.path.basename
 # on a POSIX host finds no '/' in a Windows path and returns the whole thing,
@@ -702,7 +780,16 @@ def _placeholder_title(facts):
     # finds no `/`, returns the whole string, and the "placeholder" becomes an
     # absolute path. The test below pins a Windows cwd precisely so this stays
     # correct when the suite runs on macOS or Linux.
+    #
+    # A BARE DRIVE IS NOT A LEAF. `C:\` strips to `C:` and splits to `C:`, which
+    # is truthy - so a plain split appends "C:" to the title where the intent is
+    # to append nothing. ntpath.basename returned "" here and hid the case; the
+    # cross-platform split exposes it, so it has to be handled rather than
+    # inherited. Measured: C:\ -> 'C:', D:\ -> 'D:', / -> '', \\server\share ->
+    # 'share' (a real leaf, correctly kept).
     leaf = re.split(r"[\\/]", (facts.get("cwd") or "").rstrip("\\/"))[-1]
+    if re.match(r"^[A-Za-z]:$", leaf):
+        leaf = ""
     turns = facts.get("turns")
     parts = [day, "{0} turns".format(turns) if turns is not None
              else "turns not counted"]
@@ -786,10 +873,10 @@ is a claim, not a formatting detail."
 **Interfaces:**
 - Consumes: `_repoint_store(env, flags)` — reused for `--store` / `--live` resolution. **It returns a LIST of `(acct, org, path)` tuples, not one**, and its docstring says so deliberately: an account owns one store per org, so naming it by email matches all of them, and `plan_repoint` lets the *row* settle which. Also `_listdir_or_refuse`, `read_json`, `_email_of`, `_transcript_facts`, `_new_row_title`, `_unique_title`, `_synthesize_row`, `b64`.
 - Produces:
-  - `_new_row_store(env, flags) -> (acct, org, path, why)` — `why` is a human sentence naming how the store was chosen
+  - `_new_row_store(env, flags) -> (acct, org, path, why, heuristic)` — `why` is a human sentence naming how the store was chosen; `heuristic` is True when row counts broke a tie, and `--apply` refuses on it
   - `_row_already_opens(store, session_id) -> (name | None, titles set)` — **fails closed**
   - `NewRowFlags` dataclass: `to_session: str = ""`, `store: str = ""`, `title: str = ""`, `live: str = ""`
-  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
+  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `store_is_a_guess`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -859,6 +946,18 @@ refusal("a transcript with no cwd refuses distinctly from unreadable",
         "no cwd")
 shutil.rmtree(root, ignore_errors=True)
 
+# A conversation where nobody replied. Deliberately refused - model is on 100%
+# of real rows and has no zero value - and the message must name THAT, not
+# something vague, because it is the one refusal a user could reasonably
+# disagree with.
+root, env, live, dorm = build(
+    [rec("user", "typed a prompt and closed the app before any reply",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal")])
+refusal("a transcript with no assistant reply refuses, naming why",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "no assistant reply")
+shutil.rmtree(root, ignore_errors=True)
+
 # the cross-pair: one account, two org directories, only one of them real
 root, env, live, dorm = build([OPENER] + prose(8))
 os.makedirs(os.path.join(os.path.dirname(live), ORG_D))    # empty scaffolding
@@ -870,6 +969,21 @@ check("an email matching two org dirs picks the one holding rows",
       os.path.realpath(m["store_path"]) == os.path.realpath(live), m["store_path"])
 check("  and says so, because a heuristic the user cannot see is a trap",
       "rows" in m["store_why"], m["store_why"])
+check("  marking the choice as a guess", m["store_is_a_guess"] is True)
+# The guess may plan and may not write. Printing it and writing anyway leaves
+# no moment for anyone to intervene in a one-shot --apply.
+refusal("  and --apply REFUSES on a guessed store",
+        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
+                                         title="", live="", apply=True,
+                                         json=False)),
+        "decided by counting rows")
+check("  writing nothing", not any(n.startswith("local_") and "anything" not in n
+                                   for n in os.listdir(live)))
+# naming the store by path is not a guess, and does write
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=live))
+check("  while naming the store by path is not a guess",
+      m2["store_is_a_guess"] is False)
+check("  and applies", ccs.run_new_row(env, m2) == "completed")
 shutil.rmtree(root, ignore_errors=True)
 
 # every candidate empty: name them rather than saying 'no way to tell'
@@ -918,16 +1032,22 @@ def _new_row_store(env, flags):
 
     Know what that heuristic costs, because it is a guess and not a fact: a
     genuinely new or deliberately empty organization loses to an old populated
-    one, and this function would pick the wrong store confidently. Two things
-    contain that. It refuses whenever more than one candidate holds rows, and it
-    RETURNS ITS REASONING, which `_print_new_row_report` prints - so the dry run
-    shows which store was chosen and why before anything is written. A heuristic
-    the user can see is a very different thing from one they cannot.
+    one, and this function would pick the wrong store confidently.
+
+    So the guess is allowed to PLAN and not to WRITE. `heuristic` comes back
+    True whenever row counts broke the tie, `plan_new_row` carries it into the
+    manifest, and `cmd_new_row` refuses `--apply` on it, naming the exact
+    `--store <path>` that would settle it. An earlier draft relied on printing
+    the reasoning before the write instead - which is not a safeguard at all in
+    a one-shot `--apply`, because there is no moment between the print and the
+    write in which anyone can intervene, and no saved plan to approve. A dry run
+    that shows the guess and an apply that refuses to act on it are two
+    different promises; only the second one holds unattended.
     """
     hits = _repoint_store(env, flags)
     if len(hits) == 1:
         a, o, p = hits[0]
-        return a, o, p, "the only store matching what you named"
+        return a, o, p, "the only store matching what you named", False
     populated = []
     for a, o, p in hits:
         rows = [n for n in _listdir_or_refuse(p, "an account directory")
@@ -949,7 +1069,7 @@ def _new_row_store(env, flags):
                           for _, _, p, n in populated)))
     a, o, p, n = populated[0]
     return a, o, p, ("the only one of {0} matching directories that holds any "
-                     "rows ({1} of them)".format(len(hits), n))
+                     "rows ({1} of them)".format(len(hits), n)), True
 
 
 def _row_already_opens(store, session_id):
@@ -1006,7 +1126,7 @@ def plan_new_row(env, flags):
     if not flags.to_session:
         raise Refusal("--to is required: the cliSessionId the new row should open. "
                       "'doctor' lists conversations that no account points at.")
-    acct, org, store, why = _new_row_store(env, flags)
+    acct, org, store, why, heuristic = _new_row_store(env, flags)
     label = "{0} ({1}{2})".format(_email_of(env, acct) or acct[:8], acct[:8],
                                   "/" + org[:8] if org else "")
     facts = _transcript_facts(env, flags.to_session)
@@ -1040,16 +1160,18 @@ def plan_new_row(env, flags):
     name = "local_{0}.json".format(row_uuid)
     post = json.dumps(row, separators=(",", ":")).encode("utf-8")
     return {"op_type": "new-row", "store_path": store, "store_label": label,
-            "store_why": why, "name": row_uuid,
+            "store_why": why, "store_is_a_guess": heuristic, "name": row_uuid,
             "row_path": os.path.join(store, name),
             "title": title, "title_provenance": provenance,
             "title_collision": collision,
             "to_session": flags.to_session, "transcript": facts["path"],
-            # Size and mtime are the snapshot marker _new_row_preflight compares
-            # against: same path, different bytes is otherwise invisible, and
-            # every fact in the post-image was read out of this file.
-            "transcript_size": os.path.getsize(facts["path"]),
-            "transcript_mtime": int(os.stat(facts["path"]).st_mtime),
+            # The snapshot marker _new_row_preflight compares against - taken
+            # from `facts`, NOT re-stat'd here. Re-stat'ing would capture the
+            # file as it is now rather than as it was when its facts were read,
+            # so an append between the two would silently become the accepted
+            # baseline and the very drift this is meant to catch would validate.
+            "transcript_size": facts["size"],
+            "transcript_mtime": facts["mtime"],
             "transcript_mb": round(os.path.getsize(facts["path"]) / 1e6, 1),
             "turns": facts["turns"], "cwd": facts["cwd"], "model": facts["model"],
             "rows": [{"name": name, "dest_path": os.path.join(store, name),
@@ -1194,6 +1316,32 @@ check("  so doctor does not ask for a recover that has nothing to do",
       not ccs.gather_doctor(env)["nonterminal_ops"])
 shutil.rmtree(root, ignore_errors=True)
 
+# The generated title was suffixed past everything that existed at PLAN time.
+# A row created since can hold that suffix, and the preflight re-reads the
+# title set rather than discarding it.
+root, env, live, dorm = build(
+    [rec("user", "opening message long enough to count",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         custom="Shared name")] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+check("the generated title was taken from the transcript", m["title"] == "Shared name")
+with open(os.path.join(live, "local_racer.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 88, "title": "Shared name",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("a generated title claimed since planning refuses under the lock",
+        lambda: ccs.run_new_row(env, m), "chosen to be unique")
+shutil.rmtree(root, ignore_errors=True)
+
+# ...but an explicit --title duplicate was the user's own call and still writes.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Mine"))
+with open(os.path.join(live, "local_racer.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 88, "title": "Mine", "cwd": "proj",
+               "lastActivityAt": 1}, fh)
+check("an explicit --title duplicate is still written - the user asked for it",
+      ccs.run_new_row(env, m) == "completed")
+shutil.rmtree(root, ignore_errors=True)
+
 # undo refuses once the row has drifted - the app rewrites rows it opens
 root, env, live, dorm = build([OPENER] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
@@ -1227,6 +1375,26 @@ Expected: FAIL — `AttributeError: ... 'run_new_row'`
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
+def _row_is_ours(r):
+    """Whether the file at this row's dest_path is the one THIS op created.
+
+    The evidence is the uuid4 in the row's own `sessionId`: this op minted it at
+    plan time, so a file carrying it can only have come from here. That matters
+    on the drifted path, where "the app rewrote the row we wrote" and "an
+    unrelated file is sitting on our filename" are the same byte-level mismatch
+    and want opposite explanations.
+
+    Never raises - it is called from an error path, and a second exception
+    thrown while composing the first one's message helps nobody.
+    """
+    try:
+        d = read_json(r["dest_path"])
+    except (LayoutError, OSError, ValueError):
+        return False
+    return (isinstance(d, dict)
+            and d.get("sessionId") == os.path.splitext(r["name"])[0])
+
+
 def _new_row_preflight(env, m):
     """Every non-mutating re-check, run under the lock, before anything is
     journalled or written. Raises Refusal; returns nothing.
@@ -1284,12 +1452,23 @@ def _new_row_preflight(env, m):
             "Nothing was written - re-run to replan.".format(m["to_session"]))
     # Reachability, re-checked under the lock. plan_new_row's identical check is
     # for the dry run's benefit and closes no race at all.
-    hit, _ = _row_already_opens(m["store_path"], m["to_session"])
+    hit, titles = _row_already_opens(m["store_path"], m["to_session"])
     if hit and hit != m["rows"][0]["name"]:
         raise Refusal(
             "{0} now already opens {1} (row {2!r}) - something created it since "
             "this was planned. Nothing was written.".format(
                 m["store_label"], m["to_session"][:8], hit))
+    # The title set is re-read too, and not thrown away. _unique_title suffixed
+    # past everything that existed at PLAN time; a row created since can hold
+    # the suffix that was chosen, and writing it anyway would break the one
+    # uniqueness promise this command makes. Only generated titles are checked -
+    # an explicit --title duplicate was the user's own call.
+    if m.get("title_provenance") != "yours" and m["title"] in titles:
+        raise Refusal(
+            "another row in {0} is now called {1!r} - it appeared since this was "
+            "planned, and that title was chosen to be unique. Nothing was "
+            "written; re-run and a fresh suffix will be picked."
+            .format(m["store_label"], m["title"]))
 
 
 def execute_new_row_op(env, op):
@@ -1308,24 +1487,26 @@ def execute_new_row_op(env, op):
     # THE WRITE ALREADY LANDED - finish the journal and stop.
     #
     # This is the crash `recover --forward` exists for: the row was written and
-    # the process died before the marker was saved. Re-running the preflight
-    # here would re-validate a transcript whose facts have ALREADY been consumed
-    # and committed to the bytes on disk, so a transcript that has since aged
-    # out would make recover refuse - the one command whose job is to get the
-    # user unstuck, refusing to finish bookkeeping for a write that succeeded.
-    # The row matching post_b64 byte for byte is better evidence than any
-    # re-derivation could be.
+    # the process died before the marker was saved. Re-validating a transcript
+    # whose facts have ALREADY been consumed and committed to the bytes on disk
+    # would make a transcript that has since aged out block recover - the one
+    # command whose job is to get the user unstuck, refusing to finish
+    # bookkeeping for a write that succeeded. The row matching post_b64 byte for
+    # byte is better evidence than any re-derivation could be.
     #
-    # This arm also skips _guard_mutation, which lives inside the preflight, and
-    # that is correct rather than an oversight: it writes only the journal, so
-    # there is nothing in the account's store for a running app to race. The
-    # guard applies on the other branch, which is about to write a row.
+    # It also needs no mutation guard: it writes only the journal, so there is
+    # nothing in the account's store for a running app to race.
     if _sync_row_drift(r) == "match":
         r["written"] = True
         save_manifest(op)
         set_status(op, "completed")
         return "completed"
-    _new_row_preflight(env, m)
+    # NO PREFLIGHT HERE. It runs in the two places that call this - run_new_row
+    # before journalling, recover_op's forward arm before re-entering - and
+    # calling it here as well would undo the very fix that moved it out: a
+    # refusal raised at this point is raised AFTER new_op, which is what left a
+    # non-terminal op behind for a command that changed nothing. One caller, one
+    # preflight, always before the journal entry exists.
     set_status(op, "writing")
     real = ensure_contained(r["dest_path"], [m["store_path"]])
     if os.path.dirname(real) != os.path.realpath(m["store_path"]):
@@ -1338,8 +1519,19 @@ def execute_new_row_op(env, op):
         if current == post:
             r["written"] = True              # already done; re-entry is safe
         else:
-            # A fresh uuid4 filename that already exists means something is
-            # badly wrong. Never overwrite: this command adds, it does not edit.
+            # Two very different situations reach here, and telling the user the
+            # wrong one is worse than saying nothing. If this op had already
+            # written the row and the app has since rewritten it, "a different
+            # row already exists, nothing was written" is simply false - this op
+            # DID write it. Only an op that never wrote is looking at a genuine
+            # uuid4 collision. Never overwrite either way: this command adds.
+            if _row_is_ours(r):
+                raise Refusal(
+                    "this op wrote {0!r}, and something has changed it since - "
+                    "most likely the app, which rewrites these rows when it "
+                    "opens the session. It was NOT overwritten and nothing more "
+                    "was written; 'recover --back' closes this operation and "
+                    "leaves the row alone.".format(r["name"]))
             raise Refusal(
                 "a different row already exists at {0!r}; refusing to overwrite "
                 "it. Nothing was written.".format(r["name"]))
@@ -1363,7 +1555,9 @@ def run_new_row(env, manifest):
     "journalled and written", which is finished. Writing first would allow a row
     on disk that no op knows about, and nothing could find it to undo it.
     """
-    _guard_mutation(env, "create a row in")
+    # No _guard_mutation here - _new_row_preflight opens with it. Calling it in
+    # both places enumerated the running process list twice per apply for one
+    # answer, and process enumeration is the slowest thing this command does.
     acquire_lock(env, "new-row")
     try:
         # Preflight BEFORE new_op. Journalling first meant a safe refusal - the
@@ -1553,6 +1747,18 @@ check("a drifted row is NOT reported as 'was not written'",
       "was not written" not in note, note)
 check("  it is reported as written and since changed",
       "since changed" in note, note)
+# And forcing forward on it must say something TRUE. "a different row already
+# exists ... nothing was written" is false twice over: it is our row, and we
+# did write it.
+try:
+    ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward")
+    check("  forcing forward on a drifted row refuses", False, "it did not")
+except ccs.Refusal as exc:
+    check("  forcing forward on a drifted row refuses", True)
+    check("    without claiming nothing was written",
+          "Nothing was written" not in str(exc), str(exc)[:100])
+    check("    and names the app as the likely cause",
+          "the app" in str(exc), str(exc)[:100])
 shutil.rmtree(root, ignore_errors=True)
 
 root, env, m = crashed()
@@ -1695,6 +1901,12 @@ Then, in `recover_op`'s direction handling, add — immediately before the `sync
 ```python
         if m.get("op_type") == "new-row":
             if direction == "forward":
+                # The preflight moved out of execute_new_row_op, so this arm
+                # owns it - and only for a row that did NOT land. A landed row
+                # needs no re-validation (its facts are already committed) and
+                # no mutation guard (it writes only the journal).
+                if _sync_row_drift(m["rows"][0]) != "match":
+                    _new_row_preflight(env, m)
                 set_status(op, "journaled")
                 final = execute_new_row_op(env, op)
                 rotate_ops(env)
@@ -1830,11 +2042,6 @@ shutil.rmtree(root, ignore_errors=True)
 print("\n--- the report prints before the write ---")
 
 
-class _Ns(object):
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-
 root, env, live, dorm = build([OPENER] + prose(8))
 order = []
 import builtins                                  # noqa: E402
@@ -1885,6 +2092,10 @@ def _print_new_row_report(say, m):
     # is a heuristic. A heuristic the user can see before --apply is a very
     # different thing from one they cannot.
     say("          chosen as {0}".format(m["store_why"]))
+    if m.get("store_is_a_guess"):
+        say("          ^ that is a GUESS from row counts, not an identification."
+            " --apply")
+        say("            will refuse until you name the store with --store.")
     say("new row : local_{0}.json".format(m["name"]))
     say("title   : {0}   ({1})".format(m["title"], m["title_provenance"]))
     if m.get("title_collision"):
@@ -1940,6 +2151,16 @@ def cmd_new_row(env, ns):
         _print_new_row_report(print, m)
         if ns.apply:
             print("")
+    # A guessed store may PLAN but never WRITE. Printing the guess and then
+    # writing anyway leaves no moment for anyone to intervene, so the dry run
+    # shows it and the apply refuses until the user settles it themselves.
+    if ns.apply and m.get("store_is_a_guess"):
+        raise Refusal(
+            "which store should get this row was decided by counting rows, not "
+            "by anything that identifies the account: {0}. That is fine for a "
+            "dry run and not fine for a write. Re-run with --store {1!r} if that "
+            "is the one you mean. Nothing was written."
+            .format(m["store_why"], m["store_path"]))
     final = run_new_row(env, m) if ns.apply else None
     if ns.json:
         pub = _public_new_row_manifest(m)
@@ -2077,6 +2298,26 @@ d = ccs.gather_doctor(env)
 check("  a vanished row whose transcript ALSO went says so",
       d["vanished_new_rows"][0]["transcript_count"] == 0)
 shutil.rmtree(root, ignore_errors=True)
+
+# Taking doctor's OWN advice must clear doctor. Recreating mints a fresh uuid,
+# so the original path stays absent forever - reporting on that path alone
+# would leave a permanent alert whose suggested fix then refuses, because a row
+# already opens the session. The question is reachability, not one path.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])
+check("doctor reports the vanished row", len(ccs.gather_doctor(env)["vanished_new_rows"]) == 1)
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered again"))
+check("  recreating it mints a DIFFERENT filename",
+      m2["rows"][0]["name"] != m["rows"][0]["name"])
+ccs.run_new_row(env, m2)
+d = ccs.gather_doctor(env)
+check("  and the alert clears, because the account can open it again",
+      not d["vanished_new_rows"], str(d["vanished_new_rows"]))
+check("  taking doctor's exit code back to clean", d["exit_code"] == 0,
+      str(d["exit_code"]))
+shutil.rmtree(root, ignore_errors=True)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2106,6 +2347,21 @@ In `gather_doctor`, immediately **above** the `report = {` literal at `:2305`:
             continue
         _r = (_m.get("rows") or [{}])[0]
         if _r.get("written") and _sync_row_drift(_r) == "absent":
+            # ONE PATH BEING ABSENT IS NOT THE QUESTION. The question is whether
+            # the account can still open the conversation, and those come apart
+            # in two ordinary ways: the user takes doctor's own advice and
+            # re-runs `new-row`, which mints a FRESH uuid and leaves this path
+            # absent forever - so the alert would never clear, and the suggested
+            # command would then refuse because a row already opens it - or the
+            # user deletes the row deliberately. Either way, reporting a
+            # tombstone is wrong. Ask the store, not the journal.
+            try:
+                _still, _ = _row_already_opens(_m.get("store_path") or "",
+                                               _m.get("to_session") or "")
+            except (Refusal, LayoutError, OSError):
+                _still = None       # unreadable store: report it, do not hide it
+            if _still:
+                continue
             vanished_new.append({
                 "op_id": _m.get("op_id"), "title": _m.get("title"),
                 "to_session": _m.get("to_session"),
@@ -2289,13 +2545,38 @@ Recorded as **limits rather than fixed**, both with reasons in the self-review: 
 
 **Nothing rejected this round.** Every finding was verified against the code before being applied.
 
+**Round 3 (2026-08-23) — panel: Codex and Gemini reported; roster unavailable (DeepSeek and Kimi both INCOMPLETE, same transport failure, both aborted after one retry — one outage, not two independent voices).** Two blockers, both in round-2 fixes. Applied:
+
+- **Blocker `[Codex+Gemini]` — the round-2 path fix broke the root-directory case it inherited.** `re.split(r"[\\/]", "C:\\".rstrip("\\/"))[-1]` is `"C:"`, which is truthy, so a root cwd appended `C:` to the title and Task 2's own test would have failed on the first run. `ntpath.basename` had returned `""` and hidden it. Verified across six path shapes: `C:\`→`C:`, `D:\`→`D:`, `/`→`""`, `\\server\share`→`share`. Bare drive letters are now dropped explicitly, with all four cases tested — including the UNC share, which *is* a real leaf and is kept.
+- **Blocker `[Gemini]` — `_new_row_preflight` was called twice, reinstating the defect round 2 removed.** Moving it before `new_op` fixed nothing while `execute_new_row_op` still called it: a refusal there is raised *after* the journal entry exists, which is exactly what left non-terminal ops behind. It now has one caller per path — `run_new_row` before journalling, `recover_op`'s forward arm before re-entry, and only for a row that did not land.
+- **Major `[Codex]` — the transcript snapshot was captured after its own read**, so an append *during* fact-gathering became the accepted baseline and the "same path, different bytes" check validated stale facts. `_transcript_facts` now stats before and after and refuses if they disagree; the manifest records the stat from `facts`, never a fresh one.
+- **Major `[Gemini]` — `customTitle` was first-wins**, resurrecting titles users had already replaced. Confirmed against real data: **47 of 507 transcripts (9%) carry more than one distinct `customTitle`**, one going `"Task manager performance audit"` → `"... (fork)"`. Now last-wins, like `model` and `effort`; `cwd` stays first-wins and the comment says why.
+- **Major `[Codex]` — `classifierSummaryEnabled: True` violated the field policy** — it is behaviour, not a zero, and clears the 95% bar, so a threshold alone let it through. Omitted, and the policy now says explicitly that clearing the bar is necessary and not sufficient.
+- **Major `[Codex]` — the store guess printed and then wrote anyway.** In a one-shot `--apply` there is no moment between the print and the write for anyone to intervene, and no saved plan to approve, so "the user sees it first" was never a safeguard. `_new_row_store` now returns a `heuristic` flag; the guess may plan and may not write, and `--apply` refuses naming the `--store <path>` that settles it.
+- **Major `[Codex+Gemini]` — `doctor` could never clear its own alert.** It judged a row vanished from one path being absent, but taking doctor's advice mints a fresh uuid, so that path stays absent forever while the suggested command starts refusing (a row already opens it). A legitimate user deletion looked identical. It now asks the store whether the account can still open the conversation.
+- **Major `[Codex]` — generated-title uniqueness was computed unlocked and discarded.** The preflight took `hit, _ =` and threw the title set away, so a row created since planning could take the chosen suffix. Re-checked under the lock; an explicit `--title` duplicate still writes, because that was the user's own call.
+- **Major `[Gemini]` — `_guard_mutation` ran up to three times per apply**, each enumerating the process list. Down to one: the preflight owns it.
+- **Major `[Gemini]` — forcing `recover --forward` on a drifted row said "a different row already exists … Nothing was written",** which is false twice over — it is our row, and we did write it. `_row_is_ours` distinguishes a uuid4 collision from the app having rewritten our own row.
+- **Documented rather than changed `[Gemini]`:** a transcript with no assistant reply is refused, because `model` is on 100% of real rows and has no zero value. The refusal now names that specific case, and the comment records it as a deliberate trade whose fix, if it ever bites, is a `--model` flag rather than a silent default.
+
+**Nothing rejected.** Every finding verified before applying — the root-path one by running all six path shapes, the `customTitle` one against all 507 transcripts on disk.
+
+**Loop closed at the 3-round cap.** Rounds 1 and 2 each found real defects in the previous round's fixes, and round 3 did too — so the honest reading is that this plan is *better reviewed*, not *proven clean*. What remains open is recorded below.
+
 ## Self-review
 
 **Spec coverage.** Command surface → Task 6. Field derivation and the census → Task 1. Title derivation, provenance, collision → Task 2. Refusals → Task 3 (reachability incl. unreadable rows, missing/ambiguous transcript, unusable transcript, ambiguous store, zero turns allowed) and Task 4 (transcript gone, moved, or duplicated between plan and apply; another writer got there first). Journal/undo/lock → Tasks 3–4. `--json` filter → Task 6. `recover`/`classify_op` → Task 5. `doctor` detection → Task 7. Known limits in docs → Task 8. RULING 4 and RULING 5 come free via `_repoint_store` and `_guard_mutation`.
 
 **Checked against the code, not assumed.** `_repoint_store` returns a **list**, deliberately — hence `_new_row_store`. `gather_doctor`'s dict is `report` at `:2305`; `cmd_doctor` calls it `rep`. `classify_op`'s `repoint` branch is first, at `:1751`. `_sync_row_drift` returns **five** states — `match`, `pristine`, `absent`, `drifted`, `unreadable` — not four as an earlier draft said; Task 4's undo refuses every non-`match` one, and Task 5's `classify_op` note maps all five; `_row_is_refresh` returns False for a new-row row, so drift compares post bytes only. `_message_fingerprints` returns **None** above `TRANSCRIPT_COMPARE_MAX_BYTES` (96 MB) — hence `turns` is `None`, never `0`. `README.md:125` says `Eight commands.` `tools/` holds 12 suites, so this adds the 13th. `pyproject.toml` needs no edit.
 
-**Type consistency.** `_transcript_facts` returns the dict consumed by `_synthesize_row`, `_placeholder_title` and `_new_row_title` — keys `path`, `cwd`, `created_ms`, `last_ms`, `turns`, `custom_title`, `model`, `effort` throughout, with `turns` nullable. `_new_row_title` returns a **3-tuple**; `plan_new_row` passes the third element to `_synthesize_row` as `title_source` and derives `_unique_title`'s `generated` from the second. `_new_row_store` returns a **4-tuple**. `_row_already_opens` returns `(name|None, set)`. Manifest key `name` holds the bare uuid; `rows[0]["name"]` holds the full `local_<uuid>.json` filename.
+**Type consistency.** `_transcript_facts` returns the dict consumed by `_synthesize_row`, `_placeholder_title` and `_new_row_title` — keys `path`, `cwd`, `created_ms`, `last_ms`, `turns`, `custom_title`, `model`, `effort`, `size`, `mtime` throughout, with `turns` nullable. `_new_row_title` returns a **3-tuple**; `plan_new_row` passes the third element to `_synthesize_row` as `title_source` and derives `_unique_title`'s `generated` from the second. `_new_row_store` returns a **5-tuple** (`acct, org, path, why, heuristic`). `_row_already_opens` returns `(name|None, set)` and is called for both halves in the preflight. `_row_is_ours` returns a bool and never raises. Manifest key `name` holds the bare uuid; `rows[0]["name"]` holds the full `local_<uuid>.json` filename.
+
+**Still open, and deliberately so** — the three-round loop ended at its cap, not at proof:
+
+- **No test opens a real app version.** The command's central premise — that the app accepts a row it did not issue — rests on the 2026-08-22 prototype. `doctor` plus the README warning are the mitigation, not a solution.
+- **`doctor`'s detection is bounded by `rotate_ops` retention.** It covers the window a tombstoning version would act in and nothing after. A durable answer needs a standalone registry with its own retention and migration questions.
+- **Second-resolution mtime.** A rewrite that preserves both size and second-granularity mtime evades the snapshot check. Hashing would close it and costs a full re-read of files that reach 96 MB; the trade is recorded rather than taken.
+- **The store heuristic still exists**, it just cannot write any more. An account whose only store is legitimately empty needs `--store <path>`.
 
 **Two findings deliberately not acted on, with reasons:**
 - *"No test opens the real app to prove the row is accepted"* (Codex, critical). True, and it cannot be fixed by a test in this suite — the prototype on 2026-08-22 is the evidence, and Task 7 plus the README are the mitigation. Recorded as the command's headline limit rather than treated as a solved problem.
