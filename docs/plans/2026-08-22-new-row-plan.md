@@ -2066,12 +2066,16 @@ Then, in `recover_op`'s direction handling, add — immediately before the `sync
             return "rolled_back"
 ```
 
-Finally, in `cmd_recover`'s reporting, surface it — a residue nobody prints is a residue nobody acts on:
+Finally, in `cmd_recover`'s reporting, surface it — a residue nobody prints is a
+residue nobody acts on. Note the shape: `cmd_recover` has **no** `say()` helper
+(that is a local closure inside `cmd_doctor`), and it redacts by default, which
+matters here because the message carries a row filename:
 
 ```python
-    if op.manifest.get("rollback_residue"):
-        say("[observed] rollback left something behind: {0}"
-            .format(op.manifest["rollback_residue"]))
+    if matches[0].manifest.get("rollback_residue"):
+        line = "[observed] rollback left something behind: {0}".format(
+            matches[0].manifest["rollback_residue"])
+        print(line if ns.verbose else redact(env, line))
 ```
 
 - [ ] **Step 4: Run to verify it passes**
