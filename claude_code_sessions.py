@@ -2098,10 +2098,8 @@ def recover_op(env, op, direction):
                 # operation behind closing the desktop app - for an operation
                 # that touched no bytes. Same asymmetry the forward arm has, for
                 # the same reason.
-                _guard_mutation(env, "remove a row from", "the session store", because=(
-                            "The app rewrites these rows as it opens sessions, "
-                            "so one added or removed underneath it can be "
-                            "overwritten or lost"))
+                _guard_mutation(env, "remove a row from", NEW_ROW_STORE,
+                                because=NEW_ROW_GUARD_WHY)
                 try:
                     # Containment is re-established here, not inherited. This
                     # arm deletes a path out of a journal file, and a journal
@@ -3384,6 +3382,14 @@ def _guard_mutation(env, what, whose="another account's store",
 # into a proceed path would be exactly the fail-open this module never
 # allows.
 _CERT_ABSENT, _CERT_VALID, _CERT_VOID = "absent", "valid", "void"
+
+
+# What `new-row` and its undo/recover routes pass to _guard_mutation. Named
+# rather than repeated at the three call sites, so the three can never drift
+# into saying different things about the same guard.
+NEW_ROW_STORE = "the session store"
+NEW_ROW_GUARD_WHY = ("The app rewrites these rows as it opens sessions, so one "
+                     "added or removed underneath it can be overwritten or lost")
 
 
 def _certified_live_account(env, m):
@@ -5130,10 +5136,8 @@ def _new_row_preflight(env, m):
     had touched nothing at all. A refusal that manufactures cleanup work is a
     refusal that trains people to ignore the tool.
     """
-    _guard_mutation(env, "create a row in", "the session store", because=(
-                            "The app rewrites these rows as it opens sessions, "
-                            "so one added or removed underneath it can be "
-                            "overwritten or lost"))
+    _guard_mutation(env, "create a row in", NEW_ROW_STORE,
+                    because=NEW_ROW_GUARD_WHY)
     if not os.path.isdir(m["store_path"]):
         raise LayoutError("store vanished: " + m["store_path"])
     # The transcript must still be THE one this row was planned against - not
@@ -5378,10 +5382,8 @@ def undo_new_row(env, op):
                 "changed, and any row it wrote is still on disk - 'doctor' "
                 "lists conversations that no account points at."
                 .format(m.get("op_id"), bad))
-        _guard_mutation(env, "remove a row from", "the session store", because=(
-                            "The app rewrites these rows as it opens sessions, "
-                            "so one added or removed underneath it can be "
-                            "overwritten or lost"))
+        _guard_mutation(env, "remove a row from", NEW_ROW_STORE,
+                        because=NEW_ROW_GUARD_WHY)
         r = m["rows"][0]
         if not r.get("written"):
             raise Refusal("this op never wrote the row; nothing to undo")
