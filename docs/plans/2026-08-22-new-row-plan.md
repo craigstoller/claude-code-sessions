@@ -1093,8 +1093,16 @@ def _new_row_store(env, flags):
                      "rows ({1} of them)".format(len(hits), n)), True
 
 
-def _row_already_opens(store, session_id):
+def _row_already_opens(store, session_id, exclude_name=None):
     """(name of a row opening session_id or None, every title in the store).
+
+    `exclude_name` skips one filename entirely - the row THIS op wrote. Both
+    answers need it once an op can re-enter after a crash: the reachability
+    hit would be our own row, and so would the title. Excluding it in one
+    place beats two separate exemptions at the call sites, which is what an
+    earlier draft had - and it had the exemption on the reachability check
+    only, so `recover --forward` on a written-then-drifted row refused
+    against its own title with "it appeared since this was planned".
 
     FAILS CLOSED. An earlier draft skipped rows it could not parse, which meant
     an unreadable row pointing at this conversation went unseen and the command
@@ -1105,6 +1113,8 @@ def _row_already_opens(store, session_id):
     hit = None
     for name in sorted(_listdir_or_refuse(store, "the store")):
         if not (name.startswith("local_") and name.endswith(".json")):
+            continue
+        if exclude_name and name == exclude_name:
             continue
         try:
             # read_json already converts ValueError to LayoutError, so that arm
@@ -1311,7 +1321,7 @@ ccs.run_new_row(env, m)
 os.unlink(m["transcript"])
 refusal("apply refuses once the transcript is gone",
         lambda: ccs.run_new_row(env, ccs.plan_new_row(
-            env, ccs.NewRowFlags(to_session=SID, store=dorm))),
+            env, ccs.NewRowFlags(to_session=SID, store=DORM))),
         "no transcript on disk")
 shutil.rmtree(root, ignore_errors=True)
 
@@ -1362,6 +1372,36 @@ with open(os.path.join(live, "local_racer.json"), "w") as fh:
                "cwd": "proj", "lastActivityAt": 1}, fh)
 refusal("a generated title claimed since planning refuses under the lock",
         lambda: ccs.run_new_row(env, m), "chosen to be unique")
+shutil.rmtree(root, ignore_errors=True)
+
+# An op must never collide with ITSELF. After a crash the row can already be on
+# disk when the preflight runs again, and both of its checks - reachability and
+# title uniqueness - would otherwise fire against the very row this op wrote.
+# The reachability half was exempted from the start; the title half was not, so
+# `recover --forward` on a written-then-drifted row refused with "another row is
+# now called X - it appeared since this was planned" about its own row.
+root, env, live, dorm = build(
+    [rec("user", "opening message long enough to count",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         custom="Self collision")] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+ccs.run_new_row(env, m)
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 4242                      # as the app does on first focus
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+try:
+    ccs._new_row_preflight(env, m)
+    check("the preflight does not refuse against the op's own row", True)
+except ccs.Refusal as exc:
+    check("the preflight does not refuse against the op's own row", False,
+          str(exc)[:100])
+# and the exclusion is surgical - a DIFFERENT row with that title still counts
+with open(os.path.join(live, "local_other.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 77, "title": "Self collision",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("  while a different row taking the title still refuses",
+        lambda: ccs._new_row_preflight(env, m), "chosen to be unique")
 shutil.rmtree(root, ignore_errors=True)
 
 # ...but an explicit --title duplicate was the user's own call and still writes.
@@ -1484,8 +1524,12 @@ def _new_row_preflight(env, m):
             "Nothing was written - re-run to replan.".format(m["to_session"]))
     # Reachability, re-checked under the lock. plan_new_row's identical check is
     # for the dry run's benefit and closes no race at all.
-    hit, titles = _row_already_opens(m["store_path"], m["to_session"])
-    if hit and hit != m["rows"][0]["name"]:
+    # Excluding our own row here is what lets this run again after a crash:
+    # on re-entry the row may already be on disk, and without the exclusion
+    # both checks below would fire against it.
+    hit, titles = _row_already_opens(m["store_path"], m["to_session"],
+                                     exclude_name=m["rows"][0]["name"])
+    if hit:
         raise Refusal(
             "{0} now already opens {1} (row {2!r}) - something created it since "
             "this was planned. Nothing was written.".format(
