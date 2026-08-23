@@ -4670,6 +4670,252 @@ def plan_new_row(env, flags):
                       "is_update": False, "written": False}]}
 
 
+def _row_is_ours(r):
+    """Whether the file at this row's dest_path is the one THIS op created.
+
+    The evidence is the uuid4 in the row's own `sessionId`: this op minted it at
+    plan time, so a file carrying it can only have come from here. That matters
+    on the drifted path, where "the app rewrote the row we wrote" and "an
+    unrelated file is sitting on our filename" are the same byte-level mismatch
+    and want opposite explanations.
+
+    Never raises - it is called from an error path, and a second exception
+    thrown while composing the first one's message helps nobody.
+    """
+    try:
+        d = read_json(r["dest_path"])
+    except (LayoutError, OSError, ValueError):
+        return False
+    return (isinstance(d, dict)
+            and d.get("sessionId") == os.path.splitext(r["name"])[0])
+
+
+def _new_row_preflight(env, m):
+    """Every non-mutating re-check, run under the lock, before anything is
+    journalled or written. Raises Refusal; returns nothing.
+
+    THESE ARE THE REAL GUARDS, not the ones in plan_new_row. Planning runs
+    unlocked, so between a dry run and --apply another writer can create a row
+    for this conversation, the transcript can age out, move, or be duplicated.
+
+    It is a separate function, and it runs BEFORE `new_op`, for a reason that
+    only shows up on the failure path: journalling first meant a perfectly safe
+    refusal - transcript gone, duplicate row appeared - left a non-terminal op
+    behind, and `doctor` then told the user to run `recover` over a command that
+    had touched nothing at all. A refusal that manufactures cleanup work is a
+    refusal that trains people to ignore the tool.
+    """
+    _guard_mutation(env, "create a row in")
+    if not os.path.isdir(m["store_path"]):
+        raise LayoutError("store vanished: " + m["store_path"])
+    # The transcript must still be THE one this row was planned against - not
+    # merely some transcript with that id, and not the same path with different
+    # contents. Every fact in the post-image was read out of that file, so a
+    # transcript that grew or was rewritten between plan and apply leaves the
+    # row asserting timestamps and a turn count that no longer describe it.
+    found = find_transcripts(env.projects_root, m["to_session"])
+    if not found:
+        raise Refusal(
+            "the transcript for {0} is no longer on disk, so this row would open "
+            "nothing. Nothing was written.".format(m["to_session"]))
+    if len(found) > 1:
+        raise Refusal(
+            "{0} now exists in more than one project folder, so the row planned "
+            "against a single transcript no longer names one. Nothing was "
+            "written:\n{1}".format(m["to_session"], "\n".join("   " + f
+                                                             for f in found)))
+    if os.path.realpath(found[0]) != os.path.realpath(m["transcript"]):
+        raise Refusal(
+            "the transcript for {0} has moved since this was planned ({1} -> "
+            "{2}); the row's recorded facts came from the old path. Nothing was "
+            "written - re-run to replan.".format(m["to_session"], m["transcript"],
+                                                 found[0]))
+    # Same path, different bytes. Size and mtime rather than a hash: these
+    # transcripts run to 96 MB, re-reading one to prove it is unchanged costs
+    # more than the fact is worth, and an append - the way transcripts actually
+    # change - moves both.
+    try:
+        st = os.stat(found[0])
+    except OSError as exc:
+        raise Refusal("could not stat the transcript for {0}: {1}. Nothing was "
+                      "written.".format(m["to_session"], exc))
+    if (st.st_size != m.get("transcript_size")
+            or int(st.st_mtime) != m.get("transcript_mtime")):
+        raise Refusal(
+            "the transcript for {0} has changed since this was planned, so the "
+            "row's recorded timestamps and turn count no longer describe it. "
+            "Nothing was written - re-run to replan.".format(m["to_session"]))
+    # Reachability, re-checked under the lock. plan_new_row's identical check is
+    # for the dry run's benefit and closes no race at all.
+    hit, titles = _row_already_opens(m["store_path"], m["to_session"])
+    if hit and hit != m["rows"][0]["name"]:
+        raise Refusal(
+            "{0} now already opens {1} (row {2!r}) - something created it since "
+            "this was planned. Nothing was written.".format(
+                m["store_label"], m["to_session"][:8], hit))
+    # The title set is re-read too, and not thrown away. _unique_title suffixed
+    # past everything that existed at PLAN time; a row created since can hold
+    # the suffix that was chosen, and writing it anyway would break the one
+    # uniqueness promise this command makes. Only generated titles are checked -
+    # an explicit --title duplicate was the user's own call.
+    if m.get("title_provenance") != "yours" and m["title"] in titles:
+        raise Refusal(
+            "another row in {0} is now called {1!r} - it appeared since this was "
+            "planned, and that title was chosen to be unique. Nothing was "
+            "written; re-run and a fresh suffix will be picked."
+            .format(m["store_label"], m["title"]))
+
+
+def execute_new_row_op(env, op):
+    """journaled -> writing -> completed. One row, created from nothing.
+
+    Re-entrant from 'writing' for the same reason execute_repoint_op is: an op
+    that died between the two set_status calls must still be finishable, and
+    every decision here is made from the bytes on disk rather than from what the
+    journal expects to find.
+    """
+    m = op.manifest
+    if m.get("status") not in ("journaled", "writing"):
+        raise LayoutError("execute_new_row_op runs ops from 'journaled' or "
+                          "'writing'; this one is " + str(m.get("status")))
+    r = m["rows"][0]
+    # THE WRITE ALREADY LANDED - finish the journal and stop.
+    #
+    # This is the crash `recover --forward` exists for: the row was written and
+    # the process died before the marker was saved. Re-validating a transcript
+    # whose facts have ALREADY been consumed and committed to the bytes on disk
+    # would make a transcript that has since aged out block recover - the one
+    # command whose job is to get the user unstuck, refusing to finish
+    # bookkeeping for a write that succeeded. The row matching post_b64 byte for
+    # byte is better evidence than any re-derivation could be.
+    #
+    # It also needs no mutation guard: it writes only the journal, so there is
+    # nothing in the account's store for a running app to race.
+    if _sync_row_drift(r) == "match":
+        r["written"] = True
+        save_manifest(op)
+        set_status(op, "completed")
+        return "completed"
+    # NO PREFLIGHT HERE. It runs in the two places that call this - run_new_row
+    # before journalling, recover_op's forward arm before re-entering - and
+    # calling it here as well would undo the very fix that moved it out: a
+    # refusal raised at this point is raised AFTER new_op, which is what left a
+    # non-terminal op behind for a command that changed nothing. One caller, one
+    # preflight, always before the journal entry exists.
+    set_status(op, "writing")
+    real = ensure_contained(r["dest_path"], [m["store_path"]])
+    if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+        raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
+                          .format(r["dest_path"], m["store_path"]))
+    post = unb64(r["post_b64"])
+    if os.path.exists(r["dest_path"]):
+        with open(r["dest_path"], "rb") as fh:
+            current = fh.read()
+        if current == post:
+            r["written"] = True              # already done; re-entry is safe
+        else:
+            # Two very different situations reach here, and telling the user the
+            # wrong one is worse than saying nothing. If this op had already
+            # written the row and the app has since rewritten it, "a different
+            # row already exists, nothing was written" is simply false - this op
+            # DID write it. Only an op that never wrote is looking at a genuine
+            # uuid4 collision. Never overwrite either way: this command adds.
+            if _row_is_ours(r):
+                raise Refusal(
+                    "this op wrote {0!r}, and something has changed it since - "
+                    "most likely the app, which rewrites these rows when it "
+                    "opens the session. It was NOT overwritten and nothing more "
+                    "was written; 'recover --back' closes this operation and "
+                    "leaves the row alone.".format(r["name"]))
+            raise Refusal(
+                "a different row already exists at {0!r}; refusing to overwrite "
+                "it. Nothing was written.".format(r["name"]))
+    else:
+        try:
+            atomic_write(r["dest_path"], post)
+        except OSError as exc:
+            raise Refusal("could not write the row: {0}".format(exc))
+        _maybe_crash("new-row-write-before-save")
+        r["written"] = True
+    save_manifest(op)
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_new_row(env, manifest):
+    """Lock, journal, execute, rotate - the same shape as run_repoint.
+
+    Journal BEFORE the write: the only crash-visible states are then
+    "journalled, not written" - which recover completes or closes - and
+    "journalled and written", which is finished. Writing first would allow a row
+    on disk that no op knows about, and nothing could find it to undo it.
+    """
+    # No _guard_mutation here - _new_row_preflight opens with it. Calling it in
+    # both places enumerated the running process list twice per apply for one
+    # answer, and process enumeration is the slowest thing this command does.
+    acquire_lock(env, "new-row")
+    try:
+        # Preflight BEFORE new_op. Journalling first meant a safe refusal - the
+        # transcript aged out, another writer got there first - left a
+        # non-terminal op behind, and doctor then told the user to run 'recover'
+        # over a command that had touched nothing.
+        _new_row_preflight(env, manifest)
+        op = new_op(env, manifest)
+        manifest["op_id"] = op.manifest["op_id"]
+        set_status(op, "journaled")
+        final = execute_new_row_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def undo_new_row(env, op):
+    """Delete the row this op created - but only while it still holds exactly
+    what was written.
+
+    The same evidence rule `undo_sync` applies to rows a sync ADDED. If the
+    account has since opened the session the app rewrites the row, and deleting
+    it would discard that account's own state.
+    """
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "new-row":
+            raise Refusal("not a new-row op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        _guard_mutation(env, "remove a row from")
+        r = m["rows"][0]
+        if not r.get("written"):
+            raise Refusal("this op never wrote the row; nothing to undo")
+        real = ensure_contained(r["dest_path"], [m["store_path"]])
+        if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+            raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
+                              .format(r["dest_path"], m["store_path"]))
+        state = _sync_row_drift(r)
+        if state == "absent":
+            raise Refusal(
+                "that row is already gone - something removed it since this op "
+                "created it. Nothing to undo, and nothing was changed.")
+        if state != "match":
+            raise Refusal(
+                "that row no longer holds what this op wrote ({0}); something "
+                "changed it since - most likely the app, which rewrites these "
+                "rows whenever it opens the session. Refusing to delete it."
+                .format(state))
+        try:
+            os.unlink(r["dest_path"])
+        except OSError as exc:
+            raise Refusal("could not remove the row: {0}".format(exc))
+        set_status(op, "undone")
+        rotate_ops(env)
+        return "undone"
+    finally:
+        release_lock(env)
+
+
 def _displaced_overlap(env, old_sid, new_sid):
     """How much of the conversation a refresh DISPLACES also lives in the one it
     brings in - a float 0.0-1.0, or None when it cannot be measured.

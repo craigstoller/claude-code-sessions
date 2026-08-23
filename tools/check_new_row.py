@@ -453,6 +453,144 @@ check("a transcript with zero prose turns is allowed", m["turns"] == 0)
 check("  and its placeholder says so", "0 turns" in m["title"], m["title"])
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------------------------------ apply and undo
+print("\n--- apply, and undo by deletion ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+check("apply completes", ccs.run_new_row(env, m) == "completed")
+path = m["rows"][0]["dest_path"]
+check("  the row exists on disk", os.path.exists(path))
+written = json.load(open(path, encoding="utf-8"))
+check("  opening the right conversation", written["cliSessionId"] == SID)
+check("  under the title the plan showed", written["title"] == "Recovered")
+check("  and the manifest carries an op_id for undo --id", bool(m.get("op_id")))
+check("  the lock was released", not os.path.exists(ccs._lock_path(env)))
+
+op = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("undo deletes the row", ccs.undo_new_row(env, op) == "undone")
+check("  the file is gone", not os.path.exists(path))
+check("  and the transcript is untouched", os.path.exists(m["transcript"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# The TOCTOU the lock exists to close: plan runs unlocked, so another writer
+# can create a row for this conversation between plan and apply.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+with open(os.path.join(live, "local_sneaked.json"), "w") as fh:
+    json.dump({"cliSessionId": SID, "title": "Got there first", "cwd": "proj",
+               "lastActivityAt": 1}, fh)
+refusal("apply re-checks reachability under the lock and refuses",
+        lambda: ccs.run_new_row(env, m), "already opens")
+check("  writing nothing", not os.path.exists(m["rows"][0]["dest_path"]))
+check("  and releasing the lock", not os.path.exists(ccs._lock_path(env)))
+shutil.rmtree(root, ignore_errors=True)
+
+# The transcript must still be the SAME single transcript, not merely some
+# transcript: a duplicate appearing in another project folder between plan and
+# apply would make the planned row's facts describe a file it no longer names.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+other = os.path.join(env.projects_root, "other")
+os.makedirs(other)
+shutil.copy(m["transcript"], os.path.join(other, SID + ".jsonl"))
+refusal("apply refuses when the transcript is no longer uniquely located",
+        lambda: ccs.run_new_row(env, m), "more than one")
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["transcript"])
+refusal("apply refuses once the transcript is gone",
+        lambda: ccs.run_new_row(env, ccs.plan_new_row(
+            env, ccs.NewRowFlags(to_session=SID, store=DORM))),
+        "no transcript on disk")
+shutil.rmtree(root, ignore_errors=True)
+
+# Same path, different bytes. Every fact in the post-image came out of this
+# file, so an append between plan and apply leaves the row's timestamps and
+# turn count describing a version that no longer exists. A path-only check
+# cannot see this.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+with open(m["transcript"], "a", encoding="utf-8") as fh:
+    fh.write(rec("user", "a message appended after the plan was built",
+                 ts="2026-06-14T11:00:00.000Z") + "\n")
+os.utime(m["transcript"], (m["transcript_mtime"] + 60,
+                           m["transcript_mtime"] + 60))
+refusal("apply refuses when the transcript changed at the SAME path",
+        lambda: ccs.run_new_row(env, m), "has changed since this was planned")
+check("  writing nothing", not os.path.exists(m["rows"][0]["dest_path"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# A safe refusal must not manufacture cleanup work. Journalling before the
+# preflight left a non-terminal op behind, so doctor told the user to run
+# 'recover' over a command that had touched nothing at all.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+with open(os.path.join(live, "local_sneaked2.json"), "w") as fh:
+    json.dump({"cliSessionId": SID, "title": "Got there first", "cwd": "proj",
+               "lastActivityAt": 1}, fh)
+refusal("a pre-write refusal still refuses",
+        lambda: ccs.run_new_row(env, m), "already opens")
+check("  and leaves NO unresolved operation behind",
+      not ccs.nonterminal_ops(env), str([o.manifest.get("op_id")
+                                         for o in ccs.nonterminal_ops(env)]))
+check("  so doctor does not ask for a recover that has nothing to do",
+      not ccs.gather_doctor(env)["nonterminal_ops"])
+shutil.rmtree(root, ignore_errors=True)
+
+# The generated title was suffixed past everything that existed at PLAN time.
+# A row created since can hold that suffix, and the preflight re-reads the
+# title set rather than discarding it.
+root, env, live, dorm = build(
+    [rec("user", "opening message long enough to count",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         custom="Shared name")] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+check("the generated title was taken from the transcript", m["title"] == "Shared name")
+with open(os.path.join(live, "local_racer.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 88, "title": "Shared name",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("a generated title claimed since planning refuses under the lock",
+        lambda: ccs.run_new_row(env, m), "chosen to be unique")
+shutil.rmtree(root, ignore_errors=True)
+
+# ...but an explicit --title duplicate was the user's own call and still writes.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Mine"))
+with open(os.path.join(live, "local_racer.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 88, "title": "Mine", "cwd": "proj",
+               "lastActivityAt": 1}, fh)
+check("an explicit --title duplicate is still written - the user asked for it",
+      ccs.run_new_row(env, m) == "completed")
+shutil.rmtree(root, ignore_errors=True)
+
+# undo refuses once the row has drifted - the app rewrites rows it opens
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+path = m["rows"][0]["dest_path"]
+d = json.load(open(path, encoding="utf-8"))
+d["lastFocusedAt"] = 999                      # as the app does on first focus
+with open(path, "w") as fh:
+    json.dump(d, fh)
+op = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+refusal("undo refuses a row the app has touched",
+        lambda: ccs.undo_new_row(env, op), "no longer holds")
+check("  and leaves it in place", os.path.exists(path))
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])
+op = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+refusal("undo reports an already-absent row distinctly from drift",
+        lambda: ccs.undo_new_row(env, op), "already gone")
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
