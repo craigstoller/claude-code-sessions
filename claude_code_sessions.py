@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.9.16"
+__version__ = "0.9.17"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
@@ -4776,19 +4776,35 @@ def _sync_recheck_reachability(env, m, rows):
         # otherwise would send them looking for an untouched destination that
         # does not exist - and would mislead anyone reading this to decide
         # whether a rollback is needed.
+        # Name the way out, and name it accurately for the state the op is in.
+        # A refusal that says only "re-run" is fine for a fresh op and is not
+        # the whole story for a resumed one, where rows have already landed and
+        # an open op is sitting in the journal for doctor to flag. Both routes
+        # verified to work from exactly this state: `--back` reverses what
+        # landed and closes the op, and a re-plan succeeds and correctly HOLDS
+        # this row back under the orphan tally rather than writing it.
         done = sum(1 for x in rows if x.get("written"))
-        landed = ("Nothing has been written." if not done else
-                  "This op had already written {0} row(s) on an earlier run; "
-                  "nothing further has been written now, and those rows are "
-                  "untouched.".format(done))
+        if not done:
+            landed = ("Nothing has been written. Re-run to re-plan against the "
+                      "store as it is now - the new plan will name this "
+                      "conversation and hold the row back, so you can decide "
+                      "with the evidence in front of you.")
+        else:
+            landed = (
+                "This op had already written {0} row(s) on an earlier run; "
+                "nothing further has been written now, and those rows are "
+                "untouched. Two ways on, and the op stays open until you take "
+                "one: 'recover --id {1} --back --apply' reverses the {0} row(s) "
+                "and closes it, or re-run sync to re-plan - the new plan holds "
+                "this row back and names the conversation, and 'recover --id "
+                "{1} --back --apply' still closes the stalled op afterwards."
+                .format(done, m.get("op_id", "<op>")))
         raise Refusal(
             "reachability changed since this sync was planned: refreshing row "
             "{0!r} (session {1}) would stop it opening conversation {2}, and "
             "{3}. When this was planned another row still opened it, so this "
             "is NOT one of the conversations the plan offered to hide - it "
-            "became hideable afterwards. {4} Re-run to re-plan against the "
-            "store as it is now; the new plan will name this conversation and "
-            "you can decide about it with the evidence in front of you."
+            "became hideable afterwards. {4}"
             .format(r["name"], r["session_id"],
                     (r["displaced_session"] or "?")[:8], why, landed))
 

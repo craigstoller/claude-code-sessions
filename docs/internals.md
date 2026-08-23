@@ -1616,11 +1616,31 @@ change here should know both arguments existed rather than rediscovering one of 
 
 ### Raised, not fixed
 
-- **A stalled op can deadlock** (Gemini, and Codex's medium): rows written, then a voucher
-  vanishes, and the re-check refuses the remainder - leaving exactly the partially-applied state
-  the up-front check exists to avoid, with no route forward that does not involve re-planning.
-  Real, and the resolution depends on the serialization question below rather than being
-  independent of it.
+- **"A stalled op can deadlock"** (Gemini high, Codex medium): rows written, then a voucher
+  vanishes, and the re-check refuses the remainder - "permanently stuck in the exact
+  partially-applied state the up-front check was designed to avoid". **Reproduced 2026-08-22 and
+  it is not stuck.** Three routes were open the whole time, and section G of
+  `tools/check_report_fixes.py` is the executable form of that investigation:
+
+  | Route | Result |
+  |---|---|
+  | `recover --forward` | refused - correct, it would orphan a conversation nobody reviewed |
+  | `recover --back` | **succeeds**, reverses what landed and closes the op |
+  | re-plan and apply | **succeeds**, and correctly HOLDS the swap back under `held_orphan` |
+
+  The third is the one that settles it: the fresh plan runs the orphan guard against the store as
+  it now is, so the row that would orphan is held rather than written, and the guard needs no
+  special case for "a previous op stalled here".
+
+  **What WAS wrong is narrower: the refusal named no exit.** It said "re-run to re-plan", which
+  works, while saying nothing about the open op still sitting in the journal for `doctor` to flag,
+  and nothing about `--back`. Fixed - the message now branches on whether rows have already
+  landed, and the resumed form names the op id and both routes verbatim.
+
+  Worth recording as a pattern rather than a one-off: this is the second 0.9.15 finding that
+  shrank on investigation, after the serialization boundary that already existed. Both were
+  reasoned from a review document rather than from the code, which is the documented limit of
+  reviewing a summary - and the reason the repo-aware roster route exists at all.
 - **An unreadable sibling store aborted an op that already passed planning** (both). **FIXED
   2026-08-22.** `_listdir_retrying` gives every store read `STORE_READ_ATTEMPTS` (3) tries with a
   linear `STORE_READ_BACKOFF` (0.25s, so 0.75s total) before the OSError propagates and

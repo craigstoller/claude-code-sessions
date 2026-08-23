@@ -392,6 +392,8 @@ except ccs.Refusal as exc:
     # became hideable after the plan was read. Re-planning is the only route
     # that puts the decision in front of the user with the evidence.
     check("  pointing at a re-plan, not at the flag", "Re-run to re-plan" in msg)
+    check("  and saying what the re-plan will do with it",
+          "hold the row back" in msg, msg[-120:])
     check("  and NOT offering --allow-orphan for an orphan nobody reviewed",
           "--allow-orphan" not in msg, msg[-90:])
 dest = os.path.join(dirs["dorm"], "local_one.json")
@@ -484,6 +486,13 @@ except ccs.Refusal as exc:
           "Nothing has been written" not in msg, msg[:90])
     check("  it names how many rows an earlier run landed",
           "already written 1 row(s) on an earlier run" in msg, msg[-150:])
+    # A refusal that names no exit is how a recoverable state gets reported as
+    # a deadlock. Both routes below were verified to work from exactly this
+    # state before the wording was written.
+    check("  and names --back as a route out, with the op id",
+          "--back --apply" in msg and "recover --id" in msg, msg[-170:])
+    check("  and re-running sync as the other route",
+          "re-run sync to re-plan" in msg, msg[-170:])
 shutil.rmtree(root, ignore_errors=True)
 
 
@@ -560,6 +569,91 @@ check("  after exactly STORE_READ_ATTEMPTS tries, not more",
 shutil.rmtree(root, ignore_errors=True)
 
 ccs.STORE_READ_BACKOFF = _backoff
+
+
+# ==========================================================================
+# G. the "stalled op deadlock" - reproduced, and shown not to be one
+# ==========================================================================
+print("\n--- G. a stalled op whose voucher vanished has ways out ---")
+
+# Filed after the 0.9.15 panel as a high-severity deadlock: rows written, the
+# process dies, a voucher disappears, and the apply-time re-check then refuses
+# the remainder - "permanently stuck in the exact partially-applied state the
+# up-front check was designed to avoid". Reproduced here, and it is not stuck.
+# Every assertion below is the executable form of that investigation, so the
+# claim cannot drift back into the record unchallenged.
+PLAIN = "%032d" % 41
+
+
+def stalled():
+    """Crash mid-op with one row landed, then lose the swap row's voucher."""
+    root, env, dirs, projects = build({OLD: shared,
+                                       NEW: shared + prose(4, "n"),
+                                       PLAIN: prose(6, "p")})
+    row(dirs["live"], "local_add.json", PLAIN, "Plain add")
+    row(dirs["live"], "local_swap.json", NEW, "Swap slot")
+    row(dirs["dorm"], "local_swap.json", OLD, "Swap slot", when=4000)
+    row(dirs["dorm"], "local_voucher.json", OLD, "Voucher", when=4000)
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=dirs["dorm"]))
+    real = ccs.atomic_write
+
+    def die_on_swap(path, data):
+        if "swap" in os.path.basename(path):
+            raise KeyboardInterrupt("simulated kill mid-op")
+        return real(path, data)
+
+    ccs.atomic_write = die_on_swap
+    try:
+        ccs.run_sync(env, m)
+    except BaseException:                      # noqa: BLE001 - the simulated kill
+        pass
+    finally:
+        ccs.atomic_write = real
+    os.remove(os.path.join(dirs["dorm"], "local_voucher.json"))
+    return root, env, dirs
+
+
+root, env, dirs = stalled()
+pending = ccs.nonterminal_ops(env)
+check("the op is left non-terminal after the kill", len(pending) == 1)
+c = ccs.classify_op(env, pending[0])
+check("  at status 'writing', with rows written and pending",
+      c["status"] == "writing", c["status"])
+check("  and recover offers BOTH directions",
+      sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# forward is refused - it would orphan a conversation nobody reviewed
+root, env, dirs = stalled()
+try:
+    ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward")
+    check("recover --forward refuses - that part of the report was right",
+          False, "it completed")
+except ccs.Refusal as exc:
+    check("recover --forward refuses - that part of the report was right",
+          "reachability changed" in str(exc), str(exc)[:70])
+shutil.rmtree(root, ignore_errors=True)
+
+# ...but back is a real way out, and it closes the op
+root, env, dirs = stalled()
+res = ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+check("recover --back succeeds - so it is NOT a deadlock",
+      res == "rolled_back", str(res))
+check("  and the op is closed afterwards", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# ...and so is simply re-planning, which holds the row back rather than
+# writing it - the orphan guard doing exactly its job on the fresh plan
+root, env, dirs = stalled()
+m2 = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=dirs["dorm"]))
+check("a fresh plan still works while the stalled op sits there",
+      isinstance(m2.get("rows"), list))
+check("  and it HOLDS the swap back rather than writing it",
+      "Swap slot" in (m2["tally"].get("held_orphan") or []),
+      str(m2["tally"].get("held_orphan")))
+check("  so applying that plan writes no swap row",
+      not any(r["title"] == "Swap slot" for r in m2["rows"]))
+shutil.rmtree(root, ignore_errors=True)
 
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
