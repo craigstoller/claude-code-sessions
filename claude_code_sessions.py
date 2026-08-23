@@ -1794,30 +1794,62 @@ def classify_op(env, op):
         #
         # There is a partial state, and the row on disk says which: a write can
         # land and the marker fail to save, exactly as it can for new-row.
-        r = (m.get("rows") or [{}])[0]
+        bad = _repoint_shape_error(m)
+        if bad:
+            return {"status": m["status"], "source": m.get("store_label", "n/a"),
+                    "dest": m.get("store_label", "n/a"), "resolutions": [],
+                    "drifted_rows": [],
+                    "note": "repoint: this operation's record is damaged ({0}), "
+                            "so neither direction can be run from it".format(bad)}
+        r = m["rows"][0]
         state = _sync_row_drift(r)
-        landed = _repoint_landed(m, r)
-        if state == "match":
-            said = "was written"
-            res = ["forward", "back"]
-        elif landed is False:
-            # THE POINTER IS THE EVIDENCE, not the bytes. A repoint changes one
-            # field, and the app rewrites the others (lastActivityAt and
-            # friends) whenever it opens the session - so a row this op never
-            # touched still reads as "drifted" days later. Asking where the row
-            # points answers the only question that matters here.
-            said = ("was not written - the row still opens what it opened "
-                    "before")
-            res = ["forward", "back"]
+        # unreadable is decided BEFORE the pointer is consulted. _sync_row_drift
+        # fails closed and reaching past it to a pointer we could not verify
+        # would offer `forward` on an image that cannot even be decoded.
+        if state == "unreadable":
+            said = "exists but could not be read"
+            res = ["back"]
         elif state == "absent":
             said = "is gone from the store"
             res = ["back"]
-        elif state == "unreadable":
-            said = "exists but could not be read"
-            res = ["back"]
+        elif state == "match":
+            # A later completed op writing the same bytes looks identical from
+            # here. Say which it is, because the two have opposite advice: back
+            # reverses OUR write, or declines to reverse SOMEBODY ELSE'S.
+            _claim = _repoint_claimed_later(env, m, r)
+            if _claim:
+                said = ("holds exactly what this operation would write - but "
+                        "operation {0} wrote that row after this one, so these "
+                        "may be its bytes rather than this operation's"
+                        .format(_claim))
+                res = ["forward", "back"]
+            else:
+                said = "holds exactly what this operation would write"
+                res = ["forward", "back"]
+        elif state == "pristine":
+            said = "was not written - the row is exactly as it was before"
+            res = ["forward", "back"]
         else:
-            said = ("was written, and something has changed the row since - "
-                    "most likely the app")
+            # Drifted. THE POINTER IS THE EVIDENCE, not the bytes: a repoint
+            # changes one field and the app rewrites the others whenever it
+            # opens the session, so a row this op never touched reads as
+            # drifted within a day.
+            #
+            # `forward` is NOT offered here even when the pointer says the write
+            # never landed. execute_repoint_op compares BYTES and refuses a row
+            # that changed since planning - so offering it would advertise a
+            # resolution that always refuses, and send the user back to the
+            # re-run loop this branch exists to break.
+            landed = _repoint_landed(m, r)
+            if landed is False:
+                said = ("was not written - the row still opens what it opened "
+                        "before, so there is nothing to undo")
+            elif landed is True:
+                said = ("was written, and something has changed the row since - "
+                        "most likely the app")
+            else:
+                said = ("has changed since this ran, and this operation cannot "
+                        "tell where it now points")
             res = ["back"]
         return {"status": m["status"], "source": m.get("store_label", "n/a"),
                 "dest": m.get("store_label", "n/a"), "resolutions": res,
@@ -1826,6 +1858,9 @@ def classify_op(env, op):
                     said,
                     "back closes this operation and leaves the row alone"
                     if res == ["back"] else
+                    "forward completes it, back closes it without touching the "
+                    "row - reversing it would undo that later operation"
+                    if _repoint_claimed_later(env, m, r) else
                     "forward completes it, back puts the row back as it was")}
     if m.get("op_type") == "new-row":
         # Unlike repoint, there IS a partial state worth resolving: the row may
@@ -2158,6 +2193,12 @@ def recover_op(env, op, direction):
             rotate_ops(env)
             return "rolled_back"
         if m.get("op_type") == "repoint":
+            bad = _repoint_shape_error(m)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed."
+                    .format(m.get("op_id"), bad))
             r = m["rows"][0]
             state = _sync_row_drift(r)
             if direction == "forward":
@@ -2180,7 +2221,18 @@ def recover_op(env, op, direction):
             # journal. What it does depends on whether our write is still in
             # effect, which the POINTER answers and the bytes do not.
             residue = None
-            if state == "match":
+            claimant = _repoint_claimed_later(env, m, r) if state == "match" else None
+            if claimant:
+                # Byte-identical is not proof WE wrote it. A later repoint of
+                # the same row at the same target writes the same bytes, and
+                # restoring our pre-image would silently reverse that completed
+                # operation - whose own undo then refuses, because the row no
+                # longer holds what it wrote. Close the record; touch nothing.
+                residue = ("left {0!r} alone - operation {1} wrote that row after "
+                           "this one and is still recorded as completed, so "
+                           "putting it back would silently reverse it"
+                           .format(r.get("name"), claimant))
+            elif state == "match":
                 _guard_mutation(env, "repoint")
                 try:
                     real = ensure_contained(r["dest_path"], [m["store_path"]])
@@ -2190,14 +2242,19 @@ def recover_op(env, op, direction):
                 except (OSError, LayoutError, ValueError, KeyError) as exc:
                     residue = ("could not put {0!r} back: {1}"
                                .format(r.get("name"), exc))
-            elif _repoint_landed(m, r) is False:
+            elif state == "pristine" or _repoint_landed(m, r) is False:
                 pass          # never took effect; nothing to undo, just close
             else:
+                landed = _repoint_landed(m, r)
                 why = ("it exists but could not be read" if state == "unreadable"
                        else "it is gone from the store" if state == "absent"
                        else "it still opens what this op pointed it at, and no "
                             "longer holds the bytes this op wrote, so putting "
-                            "it back would discard whatever changed it")
+                            "it back would discard whatever changed it"
+                       if landed is True
+                       else "it changed since this ran and this operation "
+                            "cannot tell where it now points, so putting it "
+                            "back could discard something it never wrote")
                 residue = "left {0!r} alone - {1}".format(r.get("name"), why)
             if residue:
                 m["rollback_residue"] = residue
@@ -6461,6 +6518,76 @@ def run_sync(env, manifest):
         return final
     finally:
         release_lock(env)
+
+
+def _repoint_shape_error(m):
+    """A sentence naming what is wrong with this repoint manifest, or None.
+
+    Repoint sits in recover_op's allowlist that skips _validate_manifest_paths,
+    and until now brought nothing in its place - so a damaged record raised
+    KeyError, IndexError or TypeError straight out of recover, which main() does
+    not catch. Worse, cmd_recover's bare listing classifies EVERY pending op, so
+    one damaged repoint took the whole diagnostic down with it.
+
+    NEVER RAISES. classify_op calls it, and classify_op must never raise.
+
+    dest_path is required to be a str specifically: read_json(17) reaches
+    open(17), which treats an int as a FILE DESCRIPTOR - it would open and close
+    an unrelated fd rather than fail.
+    """
+    rows = m.get("rows")
+    if not isinstance(rows, list) or len(rows) != 1:
+        return "its 'rows' is not a one-element list"
+    r = rows[0]
+    if not isinstance(r, dict):
+        return "its row is not an object"
+    for k in ("name", "dest_path", "pre_b64", "post_b64"):
+        if not isinstance(r.get(k), str) or not r[k]:
+            return "its row has no usable {0!r}".format(k)
+    if not isinstance(m.get("store_path"), str) or not m["store_path"]:
+        return "it has no usable 'store_path'"
+    return None
+
+
+def _repoint_claimed_later(env, m, r):
+    """The op_id of a LATER operation that wrote this same row, or None.
+
+    plan_repoint builds its post-image as a deterministic function of the row,
+    so a second repoint of the same row at the same target produces
+    byte-identical bytes. That makes "the row matches our post-image" mean
+    either "we wrote it" or "somebody else wrote exactly the same thing" - and
+    restoring our pre-image in the second case silently reverses a COMPLETED
+    operation, whose own undo then refuses because the row no longer holds what
+    it wrote. The work becomes unreachable through the tool.
+
+    This is not hypothetical: it is what the tool's own pre-fix advice produced.
+    A stalled repoint told the user to run repoint again; the re-run completed;
+    clearing the stale record with --back would then undo the re-run. One real
+    journal held exactly that - two stuck ops and one completed op on one row.
+
+    _sync_paths_claimed_elsewhere does this for sync and filters op_type
+    != "sync"; this is the repoint-shaped equivalent. Ids are timestamp-prefixed
+    and sort chronologically, which is what "later" means here.
+
+    Never raises - every caller is on a path that must terminate.
+    """
+    try:
+        mine = m.get("op_id") or ""
+        dest = os.path.normcase(os.path.abspath(r["dest_path"]))
+        for o in list_ops(env):
+            om = o.manifest
+            oid = om.get("op_id") or ""
+            if oid <= mine or om.get("status") not in TERMINAL:
+                continue
+            for orow in om.get("rows") or []:
+                p = orow.get("dest_path")
+                if not isinstance(p, str) or not orow.get("written"):
+                    continue
+                if os.path.normcase(os.path.abspath(p)) == dest:
+                    return oid
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def _repoint_landed(m, r):

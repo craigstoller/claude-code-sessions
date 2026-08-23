@@ -467,7 +467,9 @@ root, env, row, m, op = torn(landed=True)
 c = ccs.classify_op(env, op)
 check("a landed-but-unmarked repoint offers both directions",
       sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
-check("  and says the row WAS written", "was written" in c["note"], c["note"][:70])
+check("  and says the row holds what this op would write",
+      "holds exactly what this operation would write" in c["note"],
+      c["note"][:70])
 env.process_lister = lambda: [DESKTOP]
 try:
     _r = ccs.recover_op(env, op, "forward")
@@ -520,8 +522,12 @@ check("a row the app touched reads as drifted",
 check("  but the pointer says the write never landed",
       ccs._repoint_landed(m, m["rows"][0]) is False)
 c = ccs.classify_op(env, op)
-check("  so classify_op still offers both directions",
-      sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
+# Only `back`. execute_repoint_op compares BYTES and refuses a row that changed
+# since planning, so offering `forward` here would advertise a resolution that
+# always refuses and send the user back into the re-run loop this branch exists
+# to break. The pointer settles what happened; it does not make forward safe.
+check("  so classify_op offers only back",
+      c["resolutions"] == ["back"], str(c["resolutions"]))
 check("  and says the row still opens what it opened before",
       "still opens what it opened before" in c["note"], c["note"][:80])
 before = open(row, "rb").read()
@@ -584,6 +590,158 @@ for bad in ({}, {"dest_path": row + ".missing"}, {"dest_path": 17}):
     except BaseException as exc:                    # noqa: BLE001
         check("_repoint_landed survives %r" % (sorted(bad) or "an empty row"),
               False, type(exc).__name__)
+shutil.rmtree(root, ignore_errors=True)
+
+
+# --- back must not reverse a LATER completed repoint of the same row ---------
+# plan_repoint builds its post-image as a function of the row, so a second
+# repoint of the same row at the same target writes byte-identical bytes. "The
+# row matches our post-image" therefore means EITHER we wrote it OR somebody
+# else wrote the same thing - and restoring our pre-image in the second case
+# silently reverses a completed operation whose own undo then refuses.
+#
+# This is the sequence the tool's own pre-fix advice produced: a stalled repoint
+# said "run repoint again", the re-run completed, and clearing the stale record
+# would undo the re-run. One real journal held exactly it - two stuck ops and
+# one completed op on a single row.
+print("\n--- back does not reverse a later completed repoint ---")
+
+root, env, row = build()
+m1 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+op1 = ccs.new_op(env, m1)
+ccs.set_status(op1, "journaled")                  # stalls, never writes
+m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+check("the re-run completes", ccs.run_repoint(env, m2) == "completed")
+check("  and the row opens the new conversation", sid_of(row) == NEW, sid_of(row))
+
+# new_op does not stamp op_id onto the caller's dict - only run_* does - so the
+# stalled op's id has to come from the Op, not from the manifest passed in.
+op1_id = op1.manifest["op_id"]
+stuck = [o for o in ccs.nonterminal_ops(env) if o.manifest["op_id"] == op1_id][0]
+check("the stuck op's row matches its post-image byte for byte",
+      ccs._sync_row_drift(stuck.manifest["rows"][0]) == "match")
+check("  and the later completed op IS identified",
+      ccs._repoint_claimed_later(env, stuck.manifest,
+                                 stuck.manifest["rows"][0]) == m2["op_id"],
+      str(ccs._repoint_claimed_later(env, stuck.manifest,
+                                     stuck.manifest["rows"][0])))
+c = ccs.classify_op(env, stuck)
+check("  and the note SAYS so rather than promising a clean reversal",
+      "wrote that row after this one" in c["note"], c["note"][:110])
+before = open(row, "rb").read()
+check("back closes the stuck op", ccs.recover_op(env, stuck, "back") == "rolled_back")
+check("  WITHOUT reverting the completed op's work", sid_of(row) == NEW, sid_of(row))
+check("  leaving the row byte-identical", open(row, "rb").read() == before)
+res = [o.manifest.get("rollback_residue") for o in ccs.list_ops(env)
+       if o.manifest.get("rollback_residue")]
+check("  and recording WHY it declined", len(res) == 1 and m2["op_id"] in res[0],
+      str(res)[:100])
+later = [o for o in ccs.list_ops(env) if o.manifest["op_id"] == m2["op_id"]][0]
+check("  the completed op is untouched and still undoable",
+      later.manifest["status"] == "completed")
+check("  which it then does", ccs.undo_repoint(env, later) == "undone")
+check("  restoring the original pointer", sid_of(row) == OLD, sid_of(row))
+shutil.rmtree(root, ignore_errors=True)
+
+# ...and with no later claimant, back still reverses normally.
+root, env, row = build()
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+op = ccs.new_op(env, m)
+ccs.set_status(op, "journaled")
+ccs.atomic_write(m["rows"][0]["dest_path"], ccs.unb64(m["rows"][0]["post_b64"]))
+check("with no later op, back still restores the pre-image",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  putting the original pointer back", sid_of(row) == OLD, sid_of(row))
+shutil.rmtree(root, ignore_errors=True)
+
+# --- a damaged record must not traceback out of recover ---------------------
+print("\n--- a damaged repoint record ---")
+
+for label, wreck in (("no rows key", lambda mm: mm.pop("rows")),
+                     ("rows empty", lambda mm: mm.__setitem__("rows", [])),
+                     ("rows not a list", lambda mm: mm.__setitem__("rows", {})),
+                     ("rows a string", lambda mm: mm.__setitem__("rows", "nope")),
+                     ("dest_path None",
+                      lambda mm: mm["rows"][0].__setitem__("dest_path", None)),
+                     ("dest_path an int",
+                      lambda mm: mm["rows"][0].__setitem__("dest_path", 17)),
+                     ("store_path None",
+                      lambda mm: mm.__setitem__("store_path", None)),
+                     ("post_b64 missing",
+                      lambda mm: mm["rows"][0].pop("post_b64"))):
+    root, env, row = build()
+    m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    op = ccs.new_op(env, m)
+    ccs.set_status(op, "journaled")
+    wreck(op.manifest)
+    ccs.save_manifest(op)
+    o = ccs.nonterminal_ops(env)[0]
+    try:
+        c = ccs.classify_op(env, o)
+        check("classify_op survives %s" % label, "damaged" in c["note"], c["note"][:60])
+        check("  offering nothing it cannot run", c["resolutions"] == [])
+    except BaseException as exc:                   # noqa: BLE001 - that is the bug
+        check("classify_op survives %s" % label, False, type(exc).__name__)
+        check("  offering nothing it cannot run", False, "raised")
+    for d in ("forward", "back"):
+        try:
+            ccs.recover_op(env, o, d)
+            check("  recover --%s refuses %s" % (d, label), False, "no refusal")
+        except ccs.Refusal as exc:
+            check("  recover --%s refuses %s" % (d, label),
+                  "is damaged" in str(exc), str(exc)[:60])
+        except BaseException as exc:               # noqa: BLE001
+            check("  recover --%s refuses %s" % (d, label), False,
+                  "ESCAPED " + type(exc).__name__)
+    shutil.rmtree(root, ignore_errors=True)
+
+# one damaged op must not take the whole listing down with it
+root, env, row = build()
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+bad_op = ccs.new_op(env, m)
+ccs.set_status(bad_op, "journaled")
+bad_op.manifest.pop("rows")
+ccs.save_manifest(bad_op)
+m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+good = ccs.new_op(env, m2)
+ccs.set_status(good, "journaled")
+try:
+    notes = [ccs.classify_op(env, o)["note"] for o in ccs.nonterminal_ops(env)]
+    check("a damaged op does not take the recover listing down", len(notes) == 2,
+          str(len(notes)))
+except BaseException as exc:                       # noqa: BLE001
+    check("a damaged op does not take the recover listing down", False,
+          "ESCAPED " + type(exc).__name__)
+shutil.rmtree(root, ignore_errors=True)
+
+# --- from_session None: the pointer cannot say "not landed", pristine can ----
+print("\n--- a row that opened nothing before ---")
+
+root, env, row = build()
+d = json.load(open(row, encoding="utf-8"))
+del d["cliSessionId"]
+with open(row, "w") as fh:
+    json.dump(d, fh)
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+check("planning against a row that opens nothing works",
+      (m.get("from_session") or None) is None, str(m.get("from_session")))
+op = ccs.new_op(env, m)
+ccs.set_status(op, "journaled")                    # never writes
+check("  the untouched row reads as pristine",
+      ccs._sync_row_drift(m["rows"][0]) == "pristine")
+check("  and the pointer cannot settle it",
+      ccs._repoint_landed(m, m["rows"][0]) is None)
+c = ccs.classify_op(env, ccs.nonterminal_ops(env)[0])
+check("  so pristine carries the answer instead",
+      "was not written" in c["note"], c["note"][:80])
+check("  and forward is still offered", "forward" in c["resolutions"],
+      str(c["resolutions"]))
+before = open(row, "rb").read()
+check("  back closes it", ccs.recover_op(env, ccs.nonterminal_ops(env)[0],
+                                         "back") == "rolled_back")
+check("  touching nothing", open(row, "rb").read() == before)
+check("  with no residue", not [o for o in ccs.list_ops(env)
+                                if o.manifest.get("rollback_residue")])
 shutil.rmtree(root, ignore_errors=True)
 
 print()
