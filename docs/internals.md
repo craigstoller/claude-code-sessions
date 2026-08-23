@@ -1499,12 +1499,17 @@ run. Three findings changed the code; several more are recorded here unfixed.**
   the ones re-checked. When one of them has lost its voucher the refusal points at a re-plan
   rather than at the flag, because the flag is the wrong answer to "an orphan nobody reviewed".
 
-  Residual, stated rather than papered over: this narrows the window from "between planning and
-  applying" - minutes to overnight, and where the app does its repointing - to "between the check
-  and the writes". It does not close it and it is not a lock: a change landing after the check is
-  not seen, so it catches edits *completed before* it, not concurrent ones. Closing that needs an
-  apply-time serialization boundary spanning the guard, the check, every write and the journal
-  update. Both engines said so; it is a bigger change than this and is not pretended otherwise.
+  Residual: this narrows the window from "between planning and applying" - minutes to overnight,
+  and where the app does its repointing - to "between the check and the writes".
+
+  **Correction, 2026-08-22.** The first version of this entry said closing the remaining window
+  needed "an apply-time serialization boundary spanning the guard, the check, every write and the
+  journal update", because both review engines named exactly that as the highest-impact fix. That
+  boundary already existed - see the section below. Both engines were reasoning from a review
+  document that never mentioned locking, so they assumed the lock was per-op; the omission was
+  mine, and the gap was recorded on their inference rather than on the code. Against another copy
+  of THIS tool the window is not merely narrow, it is closed. What remains open is the desktop
+  app and hand edits, which no cooperative lock can bind.
 - **`doomed` is computed before orphaning swaps are removed from the plan (Codex, DeepSeek).**
   Two swaps that are each other's only remaining door are both marked doomed, both classified
   orphaning, and both held - so both survive and either could have vouched. Deterministic
@@ -1620,8 +1625,52 @@ change here should know both arguments existed rather than rediscovering one of 
   is right; failing closed *without a retry* turns a blinking network drive into a hard stop. A
   bounded retry before refusing would keep the safety property and lose the brittleness.
 - **The pointer scan is not a consistent snapshot** (Codex): `_other_pointers` walks several
-  stores, and a concurrent change during the walk yields a mixed-time answer. Same root as the
-  serialization gap.
+  stores, and a concurrent change during the walk yields a mixed-time answer. **Narrower than
+  filed** - see the correction above and the lock section below. Against another copy of this
+  tool the walk is already serialized, so the only writer that can produce a mixed-time answer is
+  the desktop app or a hand edit, which is RULING 4's territory rather than a scan-atomicity
+  problem.
 - **Untested paths** (Codex): a crash between a row write and its `written` marker; drift that
   changes a row's swap classification between plan and apply; a voucher *repointed* rather than
   deleted; two applies interleaved between check and write.
+
+## The operation lock — the serialization boundary, and exactly what it binds
+
+*(the code is `_lock_path`, `acquire_lock`, `release_lock`; pinned by
+`tools/check_serialization.py`)*
+
+**One lock file per journal directory, not one per operation.** `_lock_path(env)` is
+`<ops_dir>/lock`, a fixed name, and `acquire_lock` creates it with `O_CREAT | O_EXCL` - the
+atomic "create only if absent" primitive. The `op_id` written inside is for diagnostics, so a
+refusal can name the holder; it plays no part in exclusion. Every mutating entry point competes
+for that same file: `run_move`, `undo_move`, `recover_op`, `run_sync`, `undo_sync`, `run_repoint`
+and `undo_repoint`. All seven release it in a `finally`.
+
+**What is inside the boundary for a sync.** `run_sync` acquires before `new_op`, and releases
+after `execute_sync_op` returns. So the running-app guard, the journal write, the apply-time
+reachability re-check and every row write happen while it is held. `tools/check_serialization.py`
+asserts the strong form rather than the shape: it wraps `atomic_write` and records whether the
+lock file existed at the moment of each row write. Every write, every time.
+
+**What it binds, and what it cannot.**
+
+- **Another copy of this tool: bound.** A second `--apply` refuses immediately, naming the pid
+  and op holding it. This is the case a review panel named as the open gap in 0.9.15 and it was
+  already closed - see the correction above.
+- **The desktop app: NOT bound, and cannot be.** The app knows nothing about this file and would
+  not honour it if it did. RULING 4's running-app guard is the control there, and it is a
+  point-in-time process check with a documented residual window - a different mechanism for a
+  different adversary, not a weaker version of this one.
+- **A hand edit: not bound.** Same reason.
+
+Naming that distinction matters more than it looks. "Is the apply serialized?" has two different
+answers depending on who is asking, and answering it with one word is how a closed gap gets
+recorded as an open one.
+
+**A stale lock is recoverable, not fatal.** `lock_is_stale` probes the recorded pid; `recover`
+clears a lock whose holder is gone. The refusal text points there, so a machine that lost power
+mid-sync does not need the file deleted by hand.
+
+**Not documented before 2026-08-22, and not tested at all.** That is how a real guarantee ended
+up written down as a missing one. The test file exists to make the property checkable rather than
+inferable from a call-site reading.
