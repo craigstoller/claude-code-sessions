@@ -89,6 +89,28 @@ OPENER = rec("user", "the opening message, long enough to be a real one",
 # ------------------------------------------------------------ transcript facts
 print("\n--- transcript facts ---")
 
+# _iso_ms pinned against INDEPENDENTLY computed epoch integers, not against
+# itself. Every check below this point compares _transcript_facts's output to
+# ccs._iso_ms(same literal string) - which pins the RELATIONSHIP between the
+# two call sites, not the VALUE either one produces. If _iso_ms lost its
+# `base.replace(tzinfo=datetime.timezone.utc)` and started reading timestamps
+# as local time, both sides of every comparison below would shift by the same
+# wrong amount and this suite would still print ALL PASS. Hardcoded integers
+# are the point: a test that computes its expectation with the function under
+# test cannot detect a timezone regression in that function.
+check("_iso_ms is exact against an independently computed epoch",
+      ccs._iso_ms("2026-06-14T09:00:00.000Z") == 1781427600000,
+      str(ccs._iso_ms("2026-06-14T09:00:00.000Z")))
+check("  a second independently computed epoch",
+      ccs._iso_ms("2026-06-14T10:08:00.000Z") == 1781431680000,
+      str(ccs._iso_ms("2026-06-14T10:08:00.000Z")))
+check("  and the fractional-milliseconds branch",
+      ccs._iso_ms("2026-06-14T09:00:00.123Z") == 1781427600123,
+      str(ccs._iso_ms("2026-06-14T09:00:00.123Z")))
+check("_iso_ms returns None for something unparseable, per its documented contract",
+      ccs._iso_ms("not a timestamp") is None,
+      repr(ccs._iso_ms("not a timestamp")))
+
 root, env, live, dorm = build([OPENER] + prose(8))
 f = ccs._transcript_facts(env, SID)
 check("cwd comes from the transcript",

@@ -4372,7 +4372,16 @@ def _synthesize_row(session_id, title, title_source, facts, row_uuid):
     sorting a recovered row to the bottom of the sidebar, where a user concludes
     the command failed.
     """
-    row = dict(NEW_ROW_DEFAULTS)
+    # dict(NEW_ROW_DEFAULTS) alone is only a SHALLOW copy: alwaysAllowedReasons,
+    # sessionPermissionUpdates and spawnSeed would still be the exact same
+    # list/dict objects NEW_ROW_DEFAULTS holds, shared across every row built in
+    # this process. Nothing mutates them today, but the day some caller does
+    # `row["alwaysAllowedReasons"].append(...)` instead of reassigning, that
+    # append leaks into every OTHER synthesized row - and into
+    # NEW_ROW_DEFAULTS itself, permanently, for the life of the process. Each
+    # row gets its own list/dict so mutating one can never touch another.
+    row = {k: (list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v)
+           for k, v in NEW_ROW_DEFAULTS.items()}
     row.update({
         "sessionId": "local_" + row_uuid,
         "cliSessionId": session_id,
