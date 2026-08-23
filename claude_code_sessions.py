@@ -2222,16 +2222,25 @@ def recover_op(env, op, direction):
             # effect, which the POINTER answers and the bytes do not.
             residue = None
             claimant = _repoint_claimed_later(env, m, r) if state == "match" else None
+            declined = None
             if claimant:
                 # Byte-identical is not proof WE wrote it. A later repoint of
                 # the same row at the same target writes the same bytes, and
                 # restoring our pre-image would silently reverse that completed
                 # operation - whose own undo then refuses, because the row no
                 # longer holds what it wrote. Close the record; touch nothing.
-                residue = ("left {0!r} alone - operation {1} wrote that row after "
-                           "this one and is still recorded as completed, so "
-                           "putting it back would silently reverse it"
-                           .format(r.get("name"), claimant))
+                #
+                # NOT residue. Residue means "we left something we wrote that
+                # nothing else tracks", and doctor reports it because nothing
+                # else would. Here the row belongs to an operation that IS
+                # tracked and IS recorded as completed, and leaving it is the
+                # correct outcome rather than an anomaly - so this is written
+                # under its own key. Filing it as residue made doctor exit 1
+                # permanently and told the user to delete a row they wanted.
+                declined = ("left {0!r} alone - operation {1} wrote that row "
+                            "after this one and is still recorded as completed, "
+                            "so putting it back would silently reverse it"
+                            .format(r.get("name"), claimant))
             elif state == "match":
                 _guard_mutation(env, "repoint")
                 try:
@@ -2258,6 +2267,9 @@ def recover_op(env, op, direction):
                 residue = "left {0!r} alone - {1}".format(r.get("name"), why)
             if residue:
                 m["rollback_residue"] = residue
+            if declined:
+                m["rollback_declined"] = declined
+            if residue or declined:
                 save_manifest(op)
             set_status(op, "rolled_back")
             rotate_ops(env)
@@ -3249,6 +3261,13 @@ def cmd_recover(env, ns):
     if matches[0].manifest.get("rollback_residue"):
         line = "[observed] rollback left something behind: {0}".format(
             matches[0].manifest["rollback_residue"])
+        print(line if ns.verbose else redact(env, line))
+    if matches[0].manifest.get("rollback_declined"):
+        # Printed for the record, and deliberately NOT reported by doctor: the
+        # row belongs to an operation that is tracked and completed, so leaving
+        # it is the correct outcome rather than something needing attention.
+        line = "[observed] rollback deliberately changed nothing: {0}".format(
+            matches[0].manifest["rollback_declined"])
         print(line if ns.verbose else redact(env, line))
     return 0
 

@@ -632,10 +632,21 @@ before = open(row, "rb").read()
 check("back closes the stuck op", ccs.recover_op(env, stuck, "back") == "rolled_back")
 check("  WITHOUT reverting the completed op's work", sid_of(row) == NEW, sid_of(row))
 check("  leaving the row byte-identical", open(row, "rb").read() == before)
-res = [o.manifest.get("rollback_residue") for o in ccs.list_ops(env)
-       if o.manifest.get("rollback_residue")]
-check("  and recording WHY it declined", len(res) == 1 and m2["op_id"] in res[0],
-      str(res)[:100])
+# DECLINED, not residue - and the distinction is what keeps doctor honest.
+# Residue means "we left something we wrote that nothing else tracks", which is
+# why doctor reports it and why _collides pins the op. Here the row belongs to
+# an operation that IS tracked and IS completed, so leaving it is correct rather
+# than an anomaly. Filing it as residue made doctor exit 1 permanently and told
+# the user to delete a row they wanted.
+dec = [o.manifest.get("rollback_declined") for o in ccs.list_ops(env)
+       if o.manifest.get("rollback_declined")]
+check("  and recording WHY it declined", len(dec) == 1 and m2["op_id"] in dec[0],
+      str(dec)[:100])
+check("  as DECLINED rather than residue, so doctor stays quiet",
+      not [o for o in ccs.list_ops(env) if o.manifest.get("rollback_residue")])
+check("  and doctor's exit code is unaffected by it",
+      ccs.gather_doctor(env)["exit_code"] == 0,
+      str(ccs.gather_doctor(env)["exit_code"]))
 later = [o for o in ccs.list_ops(env) if o.manifest["op_id"] == m2["op_id"]][0]
 check("  the completed op is untouched and still undoable",
       later.manifest["status"] == "completed")
