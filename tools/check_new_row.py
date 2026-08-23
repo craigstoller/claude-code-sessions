@@ -222,7 +222,9 @@ for k in sorted(EXPECTED):
         check("  %s" % k, row[k] == EXPECTED[k], "%r != %r" % (row.get(k), EXPECTED[k]))
 
 # Fields the policy excludes. The first four an earlier draft asserted on every
-# row; measured across 987 real rows they appear on 60.2%, 5.6%, 2.7% and 0.9%.
+# row; measured across 988 real rows on 2026-08-23 they appear on 60.2%, 14.6%,
+# 6.9% and 2.3% - three of the four having risen sharply in a single day, which
+# is why docs/internals.md now says the test is whether a number is STABLE.
 # classifierSummaryEnabled is the interesting one: it CLEARS the 95% bar at
 # 97.6% and is still omitted, because True is a behavioural setting rather than
 # an absence - a threshold alone would have let it through.

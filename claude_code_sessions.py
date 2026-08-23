@@ -4679,9 +4679,10 @@ def _transcript_facts(env, session_id):
         missing.append("no usable timestamp")
     if not model:
         # A transcript with no assistant record - someone typed a prompt and
-        # closed the app before a reply. `model` is on 100% of the 987 rows
-        # measured and has no zero value, so there is nothing to omit and
-        # nothing to derive; the only alternative to refusing is inventing one.
+        # closed the app before a reply. `model` is on 100% of the 988 rows
+        # measured (2026-08-23) and has no zero value, so there is nothing to
+        # omit and nothing to derive; the only alternative to refusing is
+        # inventing one.
         # Refusing costs the user a conversation in which nothing was said back,
         # which is the cheapest thing this rule could cost. Called out here
         # because it is a deliberate trade, not an oversight - if it ever bites
@@ -4755,10 +4756,12 @@ NEW_ROW_DEFAULTS = {
     "sessionPermissionUpdates": [],   # 99.7%; ditto
     "spawnSeed": {},                  # 95.7%; not spawned from anything
     "chromePermissionMode": None,     # 100%; None is the plurality - no Chrome state
-    # 100% of rows. Three values observed: auto (768), bypassPermissions (201),
-    # acceptEdits (18). 'auto' is chosen because it is the most RESTRICTIVE of
-    # the three, not because it is the most common - a synthesized row must
-    # never hand a resumed session more permission than it had.
+    # 100% of rows. Three values observed on 2026-08-23: auto (768),
+    # bypassPermissions (202), acceptEdits (18) - they sum to the census total,
+    # so a stale row count shows up here as arithmetic that no longer adds up.
+    # 'auto' is chosen because it is the most RESTRICTIVE of the three, not
+    # because it is the most common - a synthesized row must never hand a
+    # resumed session more permission than it had.
     "permissionMode": "auto",
 }
 
