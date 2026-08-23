@@ -1555,10 +1555,17 @@ pipx install --force "claude-code-sessions==<new version>"
 Verified 2026-08-22: this installed 0.9.14 immediately, in the same minute `pipx upgrade`
 insisted 0.9.13 was current.
 
+**pipx also caches, independently of both.** Measured on 0.9.15, 2026-08-22 21:50: BOTH PyPI
+surfaces were serving it - JSON API and simple index - and `pipx upgrade` still reported
+"already at latest version 0.9.14". So the pin is not merely a workaround for a stale JSON API;
+it is the reliable route regardless of which layer is behind. Reach for it first and skip the
+diagnosis unless it fails.
+
 **Check which surface is actually stale before waiting.** Earlier releases were handled by
 retrying a few minutes later, on the assumption that everything was lagging together. That is
 sometimes true and was not true here - and when only the JSON API is behind, waiting costs time
-for nothing. Two commands settle it:
+for nothing. Two commands settle it - and note they say nothing about pipx's own cache, which
+is why the pin comes first:
 
 ```
 curl -s https://pypi.org/pypi/claude-code-sessions/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])"
