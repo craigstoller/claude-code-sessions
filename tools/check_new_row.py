@@ -1045,6 +1045,63 @@ check("  and the row is on disk",
       str(os.listdir(live)))
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------------------------------ doctor detection
+print("\n--- doctor notices a synthesized row that vanished ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+d = ccs.gather_doctor(env)
+check("a row that is still there is not reported",
+      not d.get("vanished_new_rows"), str(d.get("vanished_new_rows")))
+os.unlink(m["rows"][0]["dest_path"])           # as a tombstoning app would
+d = ccs.gather_doctor(env)
+check("a vanished synthesized row IS reported", len(d["vanished_new_rows"]) == 1)
+v = d["vanished_new_rows"][0]
+check("  naming the op that created it", v["op_id"] == m["op_id"])
+check("  and the conversation it opened", v["to_session"] == SID)
+check("  having actually counted the transcripts rather than assuming",
+      v["transcript_count"] == 1, str(v["transcript_count"]))
+check("  and doctor's exit code reflects the anomaly", d["exit_code"] != 0,
+      str(d["exit_code"]))
+
+# Two project folders: the recreate advice would refuse, so doctor must not
+# give it. bool() on the find_transcripts list could not tell these apart.
+other = os.path.join(env.projects_root, "other")
+os.makedirs(other)
+shutil.copy(m["transcript"], os.path.join(other, SID + ".jsonl"))
+d = ccs.gather_doctor(env)
+check("  an ambiguous transcript is counted, not just called present",
+      d["vanished_new_rows"][0]["transcript_count"] == 2,
+      str(d["vanished_new_rows"][0]["transcript_count"]))
+shutil.rmtree(other, ignore_errors=True)
+
+os.unlink(m["transcript"])
+d = ccs.gather_doctor(env)
+check("  a vanished row whose transcript ALSO went says so",
+      d["vanished_new_rows"][0]["transcript_count"] == 0)
+shutil.rmtree(root, ignore_errors=True)
+
+# Taking doctor's OWN advice must clear doctor. Recreating mints a fresh uuid,
+# so the original path stays absent forever - reporting on that path alone
+# would leave a permanent alert whose suggested fix then refuses, because a row
+# already opens the session. The question is reachability, not one path.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])
+check("doctor reports the vanished row", len(ccs.gather_doctor(env)["vanished_new_rows"]) == 1)
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered again"))
+check("  recreating it mints a DIFFERENT filename",
+      m2["rows"][0]["name"] != m["rows"][0]["name"])
+ccs.run_new_row(env, m2)
+d = ccs.gather_doctor(env)
+check("  and the alert clears, because the account can open it again",
+      not d["vanished_new_rows"], str(d["vanished_new_rows"]))
+check("  taking doctor's exit code back to clean", d["exit_code"] == 0,
+      str(d["exit_code"]))
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

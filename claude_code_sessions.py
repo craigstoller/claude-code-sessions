@@ -2469,6 +2469,50 @@ def gather_doctor(env):
         unknown_layout = ["encoding-scheme evidence is tied/undecidable (recent 50: "
                           "current={0} legacy={1})".format(cur_recent, leg_recent)]
     nt = [o.manifest["op_id"] for o in nonterminal_ops(env)]
+    # A synthesized row that is no longer on disk. The app tolerating a row it
+    # never issued rests on one experiment (2026-08-22); if a future version
+    # tombstones one, the row is gone, undo's byte-identity test finds nothing
+    # to match, and nothing else would ever tell the user.
+    #
+    # BOUNDED BY JOURNAL RETENTION: rotate_ops ages ops out, so this sees only
+    # rows whose creating op is still in the journal. That covers the window a
+    # tombstoning app version would act in, and nothing after it. A durable
+    # answer needs a standalone registry of synthesized rows - noted in the
+    # README's known limits rather than silently implied here.
+    vanished_new = []
+    for _op in list_ops(env):
+        _m = _op.manifest
+        if _m.get("op_type") != "new-row" or _m.get("status") != "completed":
+            continue
+        _r = (_m.get("rows") or [{}])[0]
+        if _r.get("written") and _sync_row_drift(_r) == "absent":
+            # ONE PATH BEING ABSENT IS NOT THE QUESTION. The question is whether
+            # the account can still open the conversation, and those come apart
+            # in two ordinary ways: the user takes doctor's own advice and
+            # re-runs `new-row`, which mints a FRESH uuid and leaves this path
+            # absent forever - so the alert would never clear, and the suggested
+            # command would then refuse because a row already opens it - or the
+            # user deletes the row deliberately. Either way, reporting a
+            # tombstone is wrong. Ask the store, not the journal.
+            try:
+                _still, _ = _row_already_opens(_m.get("store_path") or "",
+                                               _m.get("to_session") or "")
+            except (Refusal, LayoutError, OSError):
+                _still = None       # unreadable store: report it, do not hide it
+            if _still:
+                continue
+            vanished_new.append({
+                "op_id": _m.get("op_id"), "title": _m.get("title"),
+                "to_session": _m.get("to_session"),
+                "store_label": _m.get("store_label"),
+                # Checked, not assumed - and counted, not merely tested for
+                # truthiness. The diagnostic below offers `new-row --to <id>`,
+                # which refuses when the id resolves to more than one project
+                # folder; bool() here would send the user at a command that
+                # refuses. Only exactly one hit means the advice will work.
+                "transcript_count": len(find_transcripts(
+                    env.projects_root, _m.get("to_session") or "")),
+            })
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
@@ -2479,10 +2523,11 @@ def gather_doctor(env):
         "legacy_folders": legacy_folders, "nonterminal_ops": nt,
         "stale_lock": lock_is_stale(env),
         "unknown_layout": unknown_layout,
+        "vanished_new_rows": vanished_new,
     }
     if disc.status == "error" or row_errors or unknown_layout:
         report["exit_code"] = 2
-    elif blank or dead or nt or report["stale_lock"] or legacy_folders:
+    elif blank or dead or nt or report["stale_lock"] or legacy_folders or vanished_new:
         report["exit_code"] = 1
     else:
         report["exit_code"] = 0
@@ -2550,6 +2595,23 @@ def cmd_doctor(env, ns):
         if len(rep["unlisted_transcripts"]) > len(ranked):
             say("[observed]   ... and {0} more (all of them in --json)"
                 .format(len(rep["unlisted_transcripts"]) - len(ranked)))
+    for v in rep.get("vanished_new_rows") or []:
+        say_ids("[observed] a row this tool created is no longer on disk: {0!r} "
+                "(op {1}, {2})".format(v["title"], v["op_id"], v["store_label"]))
+        if v["transcript_count"] == 1:
+            say("[hypothesis]   the app removed a row it did not issue - the one "
+                "documented risk of 'new-row'. The conversation ({0}) is still "
+                "on disk; 'new-row --to {0}' makes another."
+                .format(v["to_session"]))
+        elif v["transcript_count"] == 0:
+            say("[observed]     the conversation ({0}) is gone from disk too, so "
+                "this is retention catching up rather than the app rejecting a "
+                "row. Nothing to recreate.".format(v["to_session"]))
+        else:
+            say("[observed]     the conversation ({0}) is now in {1} project "
+                "folders, so 'new-row' would refuse to guess between them. "
+                "Resolve that first.".format(v["to_session"],
+                                             v["transcript_count"]))
     say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
         .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
     say("[observed] encoding evidence (all rows): current={0} legacy={1}"
