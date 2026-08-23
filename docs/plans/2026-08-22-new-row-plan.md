@@ -44,7 +44,7 @@ for t in tools/check_*.py; do python "$t" >/dev/null 2>&1 && echo "PASS $t" || e
 - Consumes: `find_transcripts(projects_root, sid)`, `_message_fingerprints(path)`, `Refusal`
 - Produces:
   - `_iso_ms(ts) -> int | None`
-  - `_transcript_facts(env, session_id) -> dict` with keys `path` (str), `cwd` (str), `created_ms` (int), `last_ms` (int), `turns` (int **or None**), `custom_title` (str|None), `model` (str|None), `effort` (str|None). Raises `Refusal`.
+  - `_transcript_facts(env, session_id) -> dict` with keys `path` (str), `cwd` (str), `created_ms` (int), `last_ms` (int), `turns` (int **or None**), `custom_title` (str|None), `model` (str|None), `effort` (str|None), plus the snapshot pair `size` (int) and `mtime` (int) that Task 3 journals and Task 4's preflight re-checks. Raises `Refusal`.
   - `NEW_ROW_DEFAULTS -> dict` — the static half of the template.
   - `_synthesize_row(session_id, title, title_source, facts, row_uuid) -> dict`
 
