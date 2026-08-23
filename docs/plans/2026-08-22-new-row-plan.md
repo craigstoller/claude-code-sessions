@@ -121,6 +121,7 @@ Create `tools/check_new_row.py`:
 
 ```python
 """ccs new-row - creating a sidebar row for a conversation that has none."""
+import builtins
 import json
 import os
 import shutil
@@ -1964,6 +1965,107 @@ left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0
 check("  and RECORDING that it left something behind",
       bool(left.manifest.get("rollback_residue")),
       str(left.manifest.get("rollback_residue")))
+# ...and PRINTING it. A residue nobody prints is a residue nobody acts on, and
+# the storing half is what an assertion on the manifest would already cover.
+out = []
+real_bp2 = builtins.print
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    ccs.cmd_recover(env, _Ns(op_id=m["op_id"], forward=False, back=False,
+                             apply=False, verbose=True))
+finally:
+    builtins.print = real_bp2
+check("  and cmd_recover PRINTS the residue",
+      any("left something behind" in line for line in out), str(out)[:120])
+shutil.rmtree(root, ignore_errors=True)
+
+# The headline safety property of this arm - containment before unlink - and
+# the two other residue paths. All three were unprotected: the commit message
+# led with containment and nothing exercised it.
+root, env, m = crashed()
+op = ccs.nonterminal_ops(env)[0]
+outside = os.path.join(os.path.dirname(os.path.dirname(m["store_path"])),
+                       "escaped.json")
+with open(outside, "w") as fh:
+    fh.write("{}")
+op.manifest["rows"][0]["dest_path"] = outside          # as a corrupt journal would
+ccs.save_manifest(op)
+check("back closes even when the row path escapes the store",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  WITHOUT deleting the outside file", os.path.exists(outside))
+left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("  recording that it could not remove it",
+      "could not remove" in (left.manifest.get("rollback_residue") or ""),
+      str(left.manifest.get("rollback_residue"))[:90])
+shutil.rmtree(root, ignore_errors=True)
+
+# An unlink that fails for an ordinary OS reason still terminates, still records
+root, env, m = crashed()
+real_unlink = os.unlink
+
+
+def refuse_unlink(path, *a, **k):
+    if os.path.abspath(path) == os.path.abspath(m["rows"][0]["dest_path"]):
+        raise OSError(13, "Permission denied")
+    return real_unlink(path, *a, **k)
+
+
+os.unlink = refuse_unlink
+try:
+    res = ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+finally:
+    os.unlink = real_unlink
+check("back terminates when the unlink itself fails", res == "rolled_back")
+left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("  recording the failure rather than reporting a clean rollback",
+      "could not remove" in (left.manifest.get("rollback_residue") or ""),
+      str(left.manifest.get("rollback_residue"))[:90])
+shutil.rmtree(root, ignore_errors=True)
+
+# A damaged journal must not traceback out of the one command that unsticks you.
+root, env, m = crashed()
+op = ccs.nonterminal_ops(env)[0]
+op.manifest["rows"] = []
+ccs.save_manifest(op)
+c = ccs.classify_op(env, ccs.nonterminal_ops(env)[0])
+check("classify_op survives a damaged record instead of raising",
+      "damaged" in c["note"], c["note"][:80])
+check("  and offers no direction it cannot run", c["resolutions"] == [])
+for d in ("forward", "back"):
+    refusal("  recover --%s refuses it as a Refusal, not a traceback" % d,
+            lambda d=d: ccs.recover_op(env, ccs.nonterminal_ops(env)[0], d),
+            "is damaged")
+shutil.rmtree(root, ignore_errors=True)
+
+# 'back' on a row there is nothing to delete is journal-only, so a running app
+# must not block it - the same asymmetry the forward arm has. Otherwise the ONLY
+# exit from a stuck operation sits behind closing the desktop app, for an
+# operation that touched no bytes.
+root, env, m = crashed()
+os.unlink(m["rows"][0]["dest_path"])           # nothing left to remove
+env.process_lister = lambda: [DESKTOP]
+check("back on an absent row closes the op even with the app running",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  leaving nothing pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# The residue must survive rotation - it is destroyed in the same call that
+# writes it unless _collides holds the op back.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 1234
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+for _ in range(12):                            # push it out of the newest ten
+    ccs.rotate_ops(env)
+    other = ccs.new_op(env, {"op_type": "new-row", "status": "rolled_back",
+                             "store_path": m["store_path"], "rows": []})
+    ccs.set_status(other, "rolled_back")
+ccs.rotate_ops(env)
+survivor = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]]
+check("the residue-bearing op survives rotation", len(survivor) == 1,
+      "pruned - the only record that a row was left behind is gone")
 shutil.rmtree(root, ignore_errors=True)
 ```
 
@@ -1974,7 +2076,43 @@ Expected: FAIL — `classify_op` falls through to the move branch and raises, or
 
 - [ ] **Step 3: Write minimal implementation**
 
-In `classify_op` (`claude_code_sessions.py:1743`), add this branch between the existing `repoint` branch (:1751) and the `sync` branch (:1763):
+First, add this helper immediately above `classify_op`. Widening `recover_op`'s
+allowlist removes the only shape validation on that path, and the comment above
+that allowlist records exactly what happens without one:
+
+```python
+def _new_row_shape_error(m):
+    """A sentence naming what is wrong with this new-row manifest, or None.
+
+    `recover_op` runs `_validate_manifest_paths` on every op type outside its
+    allowlist, and the comment above that allowlist records why: without it a
+    damaged manifest raised a bare KeyError out of recover, and main() catches
+    only Refusal and LayoutError - so the user got a traceback from the one
+    command whose job is to get them unstuck. Adding 'new-row' to that allowlist
+    would have re-opened the hole, because the move-shaped validator cannot read
+    a new-row manifest. This is the replacement, shaped for this op type.
+
+    NEVER RAISES. classify_op calls it too, and classify_op's contract is that
+    it never raises - cmd_recover classifies every pending op to print its
+    listing, so one damaged manifest would otherwise take down the whole
+    diagnostic rather than one line of it.
+    """
+    rows = m.get("rows")
+    if not isinstance(rows, list) or len(rows) != 1:
+        return "its 'rows' is not a one-element list"
+    r = rows[0]
+    if not isinstance(r, dict):
+        return "its row is not an object"
+    for k in ("name", "dest_path", "post_b64"):
+        if not isinstance(r.get(k), str) or not r[k]:
+            return "its row has no usable {0!r}".format(k)
+    if not isinstance(m.get("store_path"), str) or not m["store_path"]:
+        return "it has no usable 'store_path'"
+    return None
+```
+
+Then, in `classify_op` (`claude_code_sessions.py:1743`), add this branch between
+the existing `repoint` branch (:1751) and the `sync` branch (:1763):
 
 ```python
     if m.get("op_type") == "new-row":
@@ -1982,7 +2120,17 @@ In `classify_op` (`claude_code_sessions.py:1743`), add this branch between the e
         # or may not have landed before the crash. Both directions are real -
         # forward finishes the write, back removes what landed - so offer them
         # rather than returning the empty list repoint returns.
-        r = (m.get("rows") or [{}])[0]
+        bad = _new_row_shape_error(m)
+        if bad:
+            # Damaged record. Say so and offer NOTHING: every resolution below
+            # dereferences the row, so advertising them would invite exactly the
+            # traceback the shape check exists to prevent.
+            return {"status": m["status"], "source": m.get("store_label", "n/a"),
+                    "dest": m.get("store_label", "n/a"), "resolutions": [],
+                    "drifted_rows": [],
+                    "note": "new-row: this operation's record is damaged ({0}), "
+                            "so neither direction can be run from it".format(bad)}
+        r = m["rows"][0]
         # Map the ACTUAL state, all five of them. `== "match"` collapsed four
         # states into "was not written", so a row the app had already reopened
         # and rewritten - the plan's own stated risk - was reported as never
@@ -1999,9 +2147,17 @@ In `classify_op` (`claude_code_sessions.py:1743`), add this branch between the e
         return {"status": m["status"], "source": m.get("store_label", "n/a"),
                 "dest": m.get("store_label", "n/a"),
                 "resolutions": ["forward", "back"], "drifted_rows": [],
-                "note": "new-row: the row {0}; forward finishes creating it, "
-                        "back removes it only if it still matches what this op "
-                        "wrote".format(said)}
+                # The guidance is state-aware too. An earlier draft made `said`
+                # accurate and then told every reader "forward finishes creating
+                # it" - false in the two states the five-way map exists to
+                # detect, because a landed-and-changed row is precisely what
+                # forward now refuses.
+                "note": "new-row: the row {0}; {1}".format(
+                    said,
+                    "back closes this operation and leaves the row alone"
+                    if state in ("drifted", "pristine", "unreadable") else
+                    "forward finishes creating it, back removes it only if it "
+                    "still matches what this op wrote")}
 ```
 
 In `recover_op`, widen the allowlist so a new-row manifest is not handed to the move-shaped validator:
@@ -2009,6 +2165,18 @@ In `recover_op`, widen the allowlist so a new-row manifest is not handed to the 
 ```python
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row"):
             _validate_manifest_paths(env, op.manifest)
+        elif op.manifest.get("op_type") == "new-row":
+            # The allowlist above skips the move-shaped validator, so this op
+            # type brings its own. Without it the branch below dereferences
+            # m["rows"][0]["name"] and m["store_path"] straight out of a file a
+            # user can edit, and a bare KeyError escapes main().
+            bad = _new_row_shape_error(op.manifest)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed. Any row it created "
+                    "is still on disk - 'doctor' lists conversations that no "
+                    "account points at.".format(op.manifest.get("op_id"), bad))
 ```
 
 Then, in `recover_op`'s direction handling, add — immediately before the `sync` branch:
@@ -2020,19 +2188,29 @@ Then, in `recover_op`'s direction handling, add — immediately before the `sync
                 # owns it - and only for a row that did NOT land. A landed row
                 # needs no re-validation (its facts are already committed) and
                 # no mutation guard (it writes only the journal).
-                if _sync_row_drift(m["rows"][0]) != "match":
+                state = _sync_row_drift(m["rows"][0])
+                if state not in ("match", "absent"):
+                    # The row DID land and is not what we wrote. Refuse HERE,
+                    # accurately, rather than letting the preflight speak: every
+                    # one of its refusals ends "Nothing was written", which is
+                    # false about a row sitting on disk, and it sends the user to
+                    # "re-run to replan" - which plan_new_row then refuses,
+                    # because that row already opens the session. Two refusals,
+                    # neither of them true, on exactly the path a user reaches
+                    # weeks later when the transcript has aged out too.
+                    raise Refusal(
+                        "there is already a row at {0!r} and it is not what this "
+                        "operation wrote ({1}); forward cannot finish a row that "
+                        "is already there and already different, and nothing was "
+                        "changed. Most likely the app rewrote it when it reopened "
+                        "the session. 'recover --back' closes this operation and "
+                        "leaves the row alone.".format(m["rows"][0]["name"], state))
+                if state != "match":
                     _new_row_preflight(env, m)
                 set_status(op, "journaled")
                 final = execute_new_row_op(env, op)
                 rotate_ops(env)
                 return final
-            # The running-app guard, which this arm did not have. `recover_op`
-            # never calls _guard_mutation for any op type, and every other
-            # deleting path in this module does - so after a crash, reopening
-            # the app and then recovering backward would delete a row out from
-            # under a running app that is reading and rewriting that store. The
-            # exact race the whole command otherwise refuses to run into.
-            _guard_mutation(env, "remove a row from")
             r = m["rows"][0]
             # 'back' must always terminate - it is the only exit from a stuck
             # op - so a row it cannot safely remove is SKIPPED rather than
@@ -2044,6 +2222,16 @@ Then, in `recover_op`'s direction handling, add — immediately before the `sync
             residue = None
             state = _sync_row_drift(r)
             if state == "match":
+                # The running-app guard (RULING 4) belongs HERE, not at the top
+                # of the arm. Until this task recover_op called it for no op type
+                # at all, so recovering backward could delete a row out from
+                # under a running app rewriting that store. But only this branch
+                # deletes anything: on every other state 'back' is a journal-only
+                # close, and guarding that would put the ONLY exit from a stuck
+                # operation behind closing the desktop app - for an operation
+                # that touched no bytes. Same asymmetry the forward arm has, for
+                # the same reason.
+                _guard_mutation(env, "remove a row from")
                 try:
                     # Containment is re-established here, not inherited. This
                     # arm deletes a path out of a journal file, and a journal
@@ -2056,14 +2244,36 @@ Then, in `recover_op`'s direction handling, add — immediately before the `sync
                 except (OSError, LayoutError) as exc:
                     residue = "could not remove {0!r}: {1}".format(r["name"], exc)
             elif state != "absent":
-                residue = ("left {0!r} in place - it no longer holds what this op "
-                           "wrote ({1})".format(r["name"], state))
+                # "couldn't read it" and "it changed" are different facts about a
+                # file left on disk. undo_new_row and classify_op both bother to
+                # tell them apart; this was the one place in the new code that
+                # collapsed them, which is the module's posture inverted.
+                why = ("it exists but could not be read" if state == "unreadable"
+                       else "it no longer holds what this op wrote ({0})"
+                            .format(state))
+                residue = "left {0!r} in place - {1}".format(r["name"], why)
             if residue:
                 m["rollback_residue"] = residue
                 save_manifest(op)
             set_status(op, "rolled_back")
             rotate_ops(env)
             return "rolled_back"
+```
+
+Then stop `rotate_ops` from destroying the residue in the same call that writes
+it. `rotate_ops` prunes `terminal[:-10]` by creation time, and its `_collides`
+guard holds back only `sync` ops — so a stale operation recovered after ten
+newer ones has its manifest deleted immediately, on exactly the "came back to a
+stuck op weeks later" path `recover` exists for. Add this as the **first** test
+inside `_collides`, above the `if not live` line:
+
+```python
+        # A rolled-back op that left something on disk is the only durable
+        # record that it did. Pruning it destroys the residue in the same call
+        # that wrote it, and nothing afterwards looks for that row: doctor's
+        # vanished-row check reads only 'completed' ops, deliberately. Hold it.
+        if om.get("rollback_residue"):
+            return True
 ```
 
 Finally, in `cmd_recover`'s reporting, surface it — a residue nobody prints is a
@@ -2163,7 +2373,6 @@ print("\n--- the report prints before the write ---")
 
 root, env, live, dorm = build([OPENER] + prose(8))
 order = []
-import builtins                                  # noqa: E402
 real_bp = builtins.print
 real_run = ccs.run_new_row
 
