@@ -1505,3 +1505,48 @@ run. Three findings changed the code; several more are recorded here unfixed.**
 - **Error paths around `_displaced_sizes` are untested (DeepSeek).** A missing transcript, an
   unreadable one, or a non-string `text` block should degrade to `(None, None)`; nothing pins
   that today, so a change letting an exception escape would take `plan_sync` down with it.
+
+## Publishing — the PyPI index lag, and the pin that routes around it
+
+*(observed across 8 releases to 2026-08-22; PyPI behaviour, not this tool's)*
+
+**`pipx upgrade` can report "already at latest version" minutes after a successful upload.** Hit
+on 6 of the 8 releases so far, which makes it the normal case rather than an incident. It is
+index propagation, not a failed publish - `twine upload` has already returned success and the
+files are on the server.
+
+**The two surfaces disagree, and they disagree in a direction that is useful.** Measured for
+0.9.14 at 2026-08-22 21:28, minutes after upload:
+
+| Surface | Consumer | Had the new version? |
+|---|---|---|
+| `https://pypi.org/simple/claude-code-sessions/` | what pip *resolves* from | **yes** |
+| `https://pypi.org/pypi/claude-code-sessions/json` | what pipx checks for "is there a newer one?" | no - still the previous release |
+
+So `pipx upgrade` was asking a stale oracle about a package that was already installable.
+
+**The workaround is to pin the version, which goes through the fresh surface:**
+
+```
+pipx install --force "claude-code-sessions==<new version>"
+```
+
+Verified 2026-08-22: this installed 0.9.14 immediately, in the same minute `pipx upgrade`
+insisted 0.9.13 was current.
+
+**Check which surface is actually stale before waiting.** Earlier releases were handled by
+retrying a few minutes later, on the assumption that everything was lagging together. That is
+sometimes true and was not true here - and when only the JSON API is behind, waiting costs time
+for nothing. Two commands settle it:
+
+```
+curl -s https://pypi.org/pypi/claude-code-sessions/json | python -c "import json,sys; print(json.load(sys.stdin)['info']['version'])"
+curl -s https://pypi.org/simple/claude-code-sessions/ | grep -o "claude_code_sessions-[0-9.]*" | sort -u | tail -3
+```
+
+If the simple index has it, pin and install. If neither does, the upload has genuinely not
+landed yet and waiting is the only option.
+
+**Not a reason to re-upload.** A second `twine upload` of the same version is rejected as a
+duplicate, and a bumped version to "force" propagation burns a release number on an index
+delay.
