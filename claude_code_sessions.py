@@ -2560,6 +2560,7 @@ def gather_doctor(env):
                 _still = None       # unreadable store: report it, do not hide it
             if _still:
                 continue
+            _found = find_transcripts(env.projects_root, _m.get("to_session") or "")
             vanished_new.append({
                 "op_id": _m.get("op_id"), "title": _m.get("title"),
                 "to_session": _m.get("to_session"),
@@ -2569,8 +2570,11 @@ def gather_doctor(env):
                 # which refuses when the id resolves to more than one project
                 # folder; bool() here would send the user at a command that
                 # refuses. Only exactly one hit means the advice will work.
-                "transcript_count": len(find_transcripts(
-                    env.projects_root, _m.get("to_session") or "")),
+                "transcript_count": len(_found),
+                # And the PATHS. When there are several, "resolve that first"
+                # is not advice - WHICH folders hold the duplicates is the whole
+                # of the answer, and this loop is the only place that knows.
+                "transcript_paths": _found,
             })
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
@@ -2652,27 +2656,49 @@ def cmd_doctor(env, ns):
         for d in ranked:
             say_ids("[observed]   {0}  {1:>6.1f} MB  last written {2} day(s) ago"
                     .format(d["session_id"], d["mb"], d["age_days"]))
-        say("[hypothesis]   to reach one again: repoint --only <title> --to <id above>")
+        # `new-row` FIRST, `repoint` as the alternative. Until this branch,
+        # repointing an existing row was the only way to reach an unlisted
+        # conversation, and it costs whatever that row used to open - the exact
+        # trade that produced the 2026-08-21 loss this block exists to report.
+        # A purely additive command now exists; README:186 says of this very
+        # block that "doctor lists them; this turns one back into a sidebar
+        # entry", and doctor was the one place that never said so.
+        say("[hypothesis]   to reach one again: new-row --to <id above> adds a "
+            "sidebar row for it and changes nothing that already exists")
+        say("[hypothesis]   or repoint --only <title> --to <id above>, when you "
+            "would rather an EXISTING row opened it than have another one")
         if len(rep["unlisted_transcripts"]) > len(ranked):
             say("[observed]   ... and {0} more (all of them in --json)"
                 .format(len(rep["unlisted_transcripts"]) - len(ranked)))
     for v in rep.get("vanished_new_rows") or []:
         say_ids("[observed] a row this tool created is no longer on disk: {0!r} "
                 "(op {1}, {2})".format(v["title"], v["op_id"], v["store_label"]))
+        # say_ids, not say. redact() shortens a uuid-shaped id to eight
+        # characters, and these lines hand the user a command to type back -
+        # `new-row --to 174eb7c1…` is not a command. Same reason the ranked
+        # orphan block above uses say_ids; this branch was written with say and
+        # never noticed, because every test id here is 32 digits with no hyphens
+        # and the uuid pattern does not match one.
         if v["transcript_count"] == 1:
-            say("[hypothesis]   the app removed a row it did not issue - the one "
-                "documented risk of 'new-row'. The conversation ({0}) is still "
-                "on disk; 'new-row --to {0}' makes another."
-                .format(v["to_session"]))
+            say_ids("[hypothesis]   the app removed a row it did not issue - the "
+                    "one documented risk of 'new-row'. The conversation ({0}) is "
+                    "still on disk; 'new-row --to {0}' makes another."
+                    .format(v["to_session"]))
         elif v["transcript_count"] == 0:
-            say("[observed]     the conversation ({0}) is gone from disk too, so "
-                "this is retention catching up rather than the app rejecting a "
-                "row. Nothing to recreate.".format(v["to_session"]))
+            say_ids("[observed]     the conversation ({0}) is gone from disk too, "
+                    "so this is retention catching up rather than the app "
+                    "rejecting a row. Nothing to recreate.".format(v["to_session"]))
         else:
-            say("[observed]     the conversation ({0}) is now in {1} project "
-                "folders, so 'new-row' would refuse to guess between them. "
-                "Resolve that first.".format(v["to_session"],
-                                             v["transcript_count"]))
+            # "Resolve that first" named a problem and no way out of it. The
+            # duplicates are the answer, so print them.
+            say_ids("[observed]     the conversation ({0}) is now in {1} project "
+                    "folders, so 'new-row' would refuse to guess between them:"
+                    .format(v["to_session"], v["transcript_count"]))
+            for _p in v.get("transcript_paths") or []:
+                say_ids("[observed]       " + _p)
+            say_ids("[hypothesis]     remove or rename the copies you do not "
+                    "want - whichever one is left is the one 'new-row --to {0}' "
+                    "will open.".format(v["to_session"]))
     for res in rep.get("rollback_residue") or []:
         say_ids("[observed] a rolled-back operation left a row in the store: {0} "
                 "(op {1}, {2})".format(res["detail"], res["op_id"],
@@ -4557,9 +4583,15 @@ def _transcript_facts(env, session_id):
             "open. Check the id - 'doctor' lists conversations that no account "
             "points at.".format(session_id))
     if len(found) > 1:
-        raise Refusal("{0} exists in more than one project folder; refusing to guess "
-                      "which:\n{1}".format(session_id,
-                                           "\n".join("   " + f for f in found)))
+        # The paths alone are evidence, not a way forward - this plan's rule is
+        # that a refusal names one, and listing the duplicates and stopping left
+        # the user holding the evidence with no instruction.
+        raise Refusal(
+            "{0} exists in more than one project folder, so a row built for it "
+            "would name a file this tool cannot identify; refusing to guess "
+            "which. Nothing was written. Remove or rename the copies you do not "
+            "want - whichever one is left is what the row will open:\n{1}"
+            .format(session_id, "\n".join("   " + f for f in found)))
     path = found[0]
     # Stat BEFORE reading, and again after - see the comparison at the end.
     try:

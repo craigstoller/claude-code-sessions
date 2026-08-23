@@ -1522,6 +1522,106 @@ check("  and doctor STILL reports the residue - what the hold is for",
 shutil.rmtree(root, ignore_errors=True)
 
 
+# doctor recommended `repoint` for the condition this feature exists to fix.
+# Repointing an existing row costs whatever that row used to open - the exact
+# trade that produced the loss the block reports - while `new-row` is purely
+# additive. new-row's own refusals point users at `doctor`, and README:186 says
+# of this block "doctor lists them; this turns one back into a sidebar entry".
+# doctor never said so.
+print("\n--- doctor recommends new-row for an unlisted transcript ---")
+
+# A UUID-SHAPED id, not the 32-digit ones the rest of this suite uses. That is
+# the point of this fixture: redact() only shortens ids matching the uuid
+# pattern, so every existing check here is blind to a truncated id - and these
+# lines hand the user a command to paste back.
+UUID_SID = "174eb7c1-879f-4f0e-abff-8fdc7210f3d9"
+
+
+def doctor_output(env, verbose=False):
+    lines = []
+    real = builtins.print
+    builtins.print = lambda *a, **k: lines.append(" ".join(str(x) for x in a))
+    try:
+        rc = ccs.cmd_doctor(env, _Ns(json=False, verbose=verbose))
+    finally:
+        builtins.print = real
+    return rc, lines
+
+
+root, env, live, dorm = build([OPENER] + prose(8), sid=UUID_SID)
+rc, lines = doctor_output(env)
+advice = [l for l in lines if "to reach one again" in l or "repoint --only" in l]
+check("doctor still reports the unlisted transcript",
+      any("no listing row in any account" in l for l in lines), str(lines)[:90])
+check("  and offers new-row FIRST", advice and "new-row --to" in advice[0],
+      str(advice))
+check("  keeping repoint as the alternative",
+      any("repoint --only" in l for l in advice), str(advice))
+check("  and saying what repoint costs that new-row does not",
+      any("EXISTING row" in l for l in advice), str(advice))
+shutil.rmtree(root, ignore_errors=True)
+
+# The vanished-row branch hands over a command too, and printed it through
+# say() - which truncates a uuid-shaped id to eight characters, so the command
+# could not be pasted back. The ranked-orphan block above uses say_ids for
+# exactly this reason; this branch was written with say and nothing caught it.
+print("\n--- and the vanished-row advice survives redaction ---")
+
+root, env, live, dorm = build([OPENER] + prose(8), sid=UUID_SID)
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=UUID_SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])
+rc, lines = doctor_output(env)
+hint = [l for l in lines if "makes another" in l]
+check("the vanished-row advice is printed", len(hint) == 1, str(lines)[-160:])
+check("  with the WHOLE session id, so the command can be pasted back",
+      hint and UUID_SID in hint[0], str(hint))
+check("  and it is the new-row command", hint and "new-row --to" in hint[0],
+      str(hint))
+
+# The ambiguous branch said "Resolve that first" and stopped. Which folders hold
+# the duplicates is the entire answer, and only gather_doctor knows it.
+other = os.path.join(env.projects_root, "other")
+os.makedirs(other)
+shutil.copy(m["transcript"], os.path.join(other, UUID_SID + ".jsonl"))
+d = ccs.gather_doctor(env)
+check("the report carries the duplicate PATHS, not just a count",
+      len(d["vanished_new_rows"][0].get("transcript_paths") or []) == 2,
+      str(d["vanished_new_rows"][0].get("transcript_paths")))
+rc, lines = doctor_output(env)
+check("  and doctor prints both of them",
+      sum(1 for l in lines if l.strip().endswith(UUID_SID + ".jsonl")) == 2,
+      str([l for l in lines if UUID_SID in l])[:150])
+check("  telling the user how to resolve it, not just that they must",
+      any("remove or rename" in l.lower() for l in lines),
+      str([l for l in lines if "folders" in l or "rename" in l])[:150])
+check("  and no longer just saying 'Resolve that first'",
+      not any("Resolve that first" in l for l in lines))
+shutil.rmtree(root, ignore_errors=True)
+
+# The same condition reached through the command itself. Its refusal listed the
+# duplicate paths and stopped - evidence with no instruction, against this
+# plan's own rule that every refusal names a way forward.
+print("\n--- and so does the refusal the command raises ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+other = os.path.join(env.projects_root, "other")
+os.makedirs(other)
+shutil.copy(os.path.join(env.projects_root, "proj", SID + ".jsonl"),
+            os.path.join(other, SID + ".jsonl"))
+try:
+    ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+    check("a duplicated transcript still refuses", False, "no refusal")
+    msg = ""
+except ccs.Refusal as exc:
+    msg = str(exc)
+    check("a duplicated transcript still refuses", True)
+check("  still naming both paths", msg.count(SID + ".jsonl") == 2, msg[-90:])
+check("  and now saying what to do about them",
+      "Remove or rename" in msg, msg[:140])
+shutil.rmtree(root, ignore_errors=True)
+
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
