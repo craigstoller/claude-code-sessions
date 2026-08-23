@@ -1697,6 +1697,84 @@ except ccs.Refusal as exc:
 shutil.rmtree(root, ignore_errors=True)
 
 
+# The window is a thin shell over this library, and two of its own filters had
+# drifted away from the CLI they promise to mirror. Neither was touched by this
+# branch; both became wrong because the CLI moved underneath them.
+print("\n--- the GUI agrees with the CLI again ---")
+
+import claude_code_sessions_gui as gui  # noqa: E402
+
+# doctor_lines never looked at vanished_new_rows, so the window said "Nothing is
+# blocking a sync" over a report `ccs doctor` exits 1 on. Checked against REAL
+# reports from real fixtures, so the two sides cannot drift again without this
+# failing.
+root, env, live, dorm = build([OPENER] + prose(8))
+rep = ccs.gather_doctor(env)
+check("a clean store: the CLI exits 0", rep["exit_code"] == 0, str(rep["exit_code"]))
+check("  and the window says nothing is blocking",
+      gui.SyncApp.doctor_lines(rep)[0].startswith("Nothing is blocking"),
+      gui.SyncApp.doctor_lines(rep)[0])
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])              # as a tombstoning app would
+rep = ccs.gather_doctor(env)
+check("a vanished synthesized row: the CLI exits 1", rep["exit_code"] == 1,
+      str(rep["exit_code"]))
+check("  and the window no longer says nothing is blocking",
+      gui.SyncApp.doctor_lines(rep)[0] == "NEEDS ATTENTION",
+      gui.SyncApp.doctor_lines(rep)[0])
+check("  naming what it is",
+      any("no longer on disk" in l for l in gui.SyncApp.doctor_lines(rep)),
+      str(gui.SyncApp.doctor_lines(rep))[:120])
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, m = rolled_back_with_residue()
+rep = ccs.gather_doctor(env)
+check("a rollback that left a row: the CLI exits 1", rep["exit_code"] == 1,
+      str(rep["exit_code"]))
+check("  and the window agrees",
+      gui.SyncApp.doctor_lines(rep)[0] == "NEEDS ATTENTION",
+      gui.SyncApp.doctor_lines(rep)[0])
+check("  naming what it is",
+      any("could not be removed" in l for l in gui.SyncApp.doctor_lines(rep)),
+      str(gui.SyncApp.doctor_lines(rep))[:120])
+shutil.rmtree(root, ignore_errors=True)
+
+# _find_undoable_sync filtered ("move", "sync") under a docstring promising it
+# mirrors `ccs undo` "so the button and the CLI can never disagree". cmd_undo
+# now handles four types: with a completed new-row as the most recent op, the
+# window skipped past it to an older sync and offered to undo THAT, while
+# `ccs undo` would have reversed the new-row.
+root, env, live, dorm = build([OPENER] + prose(8))
+with open(os.path.join(env.projects_root, "proj", ("%032d" % 74) + ".jsonl"), "w",
+          encoding="utf-8") as fh:
+    fh.write("\n".join([OPENER] + prose(8)) + "\n")
+app = type("E", (), {"env": env})()
+
+ccs.run_new_row(env, ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID,
+                                                           title="First")))
+sm = ccs.plan_sync(env, ccs.SyncFlags())
+check("a sync copies that row to the dormant account",
+      ccs.run_sync(env, sm) == "completed")
+check("  and the window offers to undo it, since it is the most recent",
+      (gui.SyncApp._find_undoable_sync(app) or (None,))[0] == sm["op_id"],
+      str(gui.SyncApp._find_undoable_sync(app)))
+
+nm = ccs.plan_new_row(env, ccs.NewRowFlags(to_session="%032d" % 74, title="Newer"))
+check("a new-row then becomes the most recent completed op",
+      ccs.run_new_row(env, nm) == "completed")
+cli_pick = [o for o in ccs.list_ops(env)
+            if o.manifest.get("status") == "completed"
+            and o.manifest.get("op_type", "move") in ("move", "sync", "repoint",
+                                                      "new-row")][-1]
+check("  which is the one `ccs undo` selects",
+      cli_pick.manifest["op_id"] == nm["op_id"], cli_pick.manifest["op_id"])
+check("  so the window must offer NOTHING rather than the older sync",
+      gui.SyncApp._find_undoable_sync(app) is None,
+      str(gui.SyncApp._find_undoable_sync(app)))
+shutil.rmtree(root, ignore_errors=True)
+
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

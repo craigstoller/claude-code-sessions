@@ -709,6 +709,26 @@ class SyncApp:
         if rep.get("unknown_layout"):
             blocking.append("{0} unrecognised item(s) in the store layout. The tool "
                             "fails closed on these.".format(len(rep["unknown_layout"])))
+        # Both of these make `ccs doctor` exit 1, and this window reported
+        # "Nothing is blocking a sync" over the top of them. They go in the
+        # blocking list rather than the inventory below because neither is
+        # routine and neither is numerous - which is the line the ordering rule
+        # in this docstring actually draws. Aged-out transcripts and legacy
+        # folders are ordinary facts about a machine's history; a row this tool
+        # created disappearing is the one documented risk of `new-row`, and a
+        # rollback that could not remove what it wrote is an operation that did
+        # not finish cleanly.
+        n = len(rep.get("vanished_new_rows") or [])
+        if n:
+            blocking.append("{0} row(s) this tool created are no longer on disk - "
+                            "the app may have rejected one it did not issue. Run "
+                            "`ccs doctor`: it names the conversation each opened "
+                            "and whether it can be recreated.".format(n))
+        n = len(rep.get("rollback_residue") or [])
+        if n:
+            blocking.append("{0} rolled-back operation(s) left a row in the store "
+                            "that could not be removed. `ccs doctor` names the row "
+                            "and the operation.".format(n))
 
         st = rep.get("stores") or {}
         notes.append("store: {0}".format(st.get("status", "?")))
@@ -771,17 +791,24 @@ class SyncApp:
     def _find_undoable_sync(self):
         """(op_id, rows, dest) for the most recent completed op IF it is a sync.
 
-        Deliberately only the MOST RECENT completed move/sync, mirroring what
-        `ccs undo` would pick - so the button and the CLI can never disagree
-        about which operation "the last one" is. If that op is a move (done
-        from the CLI), no undo is offered here: this window does not do moves,
-        and quietly reaching past it to an older sync would undo something
-        other than what the user last did.
+        Deliberately only the MOST RECENT completed op `ccs undo` would pick -
+        so the button and the CLI can never disagree about which operation "the
+        last one" is. If that op is anything this window does not do (a move,
+        a repoint, a new-row - all CLI-only), no undo is offered here, because
+        quietly reaching past it to an older sync would undo something other
+        than what the user last did.
+
+        THE FILTER HAS TO MATCH `cmd_undo`'s CANDIDATE TUPLE, or this docstring
+        is a lie. It read ("move", "sync") while cmd_undo grew "repoint" and
+        then "new-row": with a completed new-row as the most recent operation,
+        this skipped straight past it to an older sync and offered to undo THAT,
+        while `ccs undo` would have reversed the new-row.
         """
         try:
             ops = [o for o in ccs.list_ops(self.env)
                    if o.manifest.get("status") == "completed"
-                   and o.manifest.get("op_type", "move") in ("move", "sync")]
+                   and o.manifest.get("op_type", "move") in ("move", "sync",
+                                                             "repoint", "new-row")]
         except Exception:
             return None
         if not ops or ops[-1].manifest.get("op_type") != "sync":
