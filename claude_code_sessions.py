@@ -4552,8 +4552,16 @@ def _new_row_store(env, flags):
                      "rows ({1} of them)".format(len(hits), n)), True
 
 
-def _row_already_opens(store, session_id):
+def _row_already_opens(store, session_id, exclude_name=None):
     """(name of a row opening session_id or None, every title in the store).
+
+    `exclude_name` skips one filename entirely - the row THIS op wrote. Both
+    answers need it once an op can re-enter after a crash: the reachability
+    hit would be our own row, and so would the title. Excluding it in one
+    place beats two separate exemptions at the call sites, which is what an
+    earlier draft had - and it had the exemption on the reachability check
+    only, so `recover --forward` on a written-then-drifted row refused
+    against its own title with "it appeared since this was planned".
 
     FAILS CLOSED. An earlier draft skipped rows it could not parse, which meant
     an unreadable row pointing at this conversation went unseen and the command
@@ -4564,6 +4572,8 @@ def _row_already_opens(store, session_id):
     hit = None
     for name in sorted(_listdir_or_refuse(store, "the store")):
         if not (name.startswith("local_") and name.endswith(".json")):
+            continue
+        if exclude_name and name == exclude_name:
             continue
         try:
             # read_json already converts ValueError to LayoutError, so that arm
@@ -4747,8 +4757,12 @@ def _new_row_preflight(env, m):
             "Nothing was written - re-run to replan.".format(m["to_session"]))
     # Reachability, re-checked under the lock. plan_new_row's identical check is
     # for the dry run's benefit and closes no race at all.
-    hit, titles = _row_already_opens(m["store_path"], m["to_session"])
-    if hit and hit != m["rows"][0]["name"]:
+    # Excluding our own row here is what lets this run again after a crash:
+    # on re-entry the row may already be on disk, and without the exclusion
+    # both checks below would fire against it.
+    hit, titles = _row_already_opens(m["store_path"], m["to_session"],
+                                     exclude_name=m["rows"][0]["name"])
+    if hit:
         raise Refusal(
             "{0} now already opens {1} (row {2!r}) - something created it since "
             "this was planned. Nothing was written.".format(

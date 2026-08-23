@@ -557,6 +557,36 @@ refusal("a generated title claimed since planning refuses under the lock",
         lambda: ccs.run_new_row(env, m), "chosen to be unique")
 shutil.rmtree(root, ignore_errors=True)
 
+# An op must never collide with ITSELF. After a crash the row can already be on
+# disk when the preflight runs again, and both of its checks - reachability and
+# title uniqueness - would otherwise fire against the very row this op wrote.
+# The reachability half was exempted from the start; the title half was not, so
+# `recover --forward` on a written-then-drifted row refused with "another row is
+# now called X - it appeared since this was planned" about its own row.
+root, env, live, dorm = build(
+    [rec("user", "opening message long enough to count",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         custom="Self collision")] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+ccs.run_new_row(env, m)
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 4242                      # as the app does on first focus
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+try:
+    ccs._new_row_preflight(env, m)
+    check("the preflight does not refuse against the op's own row", True)
+except ccs.Refusal as exc:
+    check("the preflight does not refuse against the op's own row", False,
+          str(exc)[:100])
+# and the exclusion is surgical - a DIFFERENT row with that title still counts
+with open(os.path.join(live, "local_other.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 77, "title": "Self collision",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+refusal("  while a different row taking the title still refuses",
+        lambda: ccs._new_row_preflight(env, m), "chosen to be unique")
+shutil.rmtree(root, ignore_errors=True)
+
 # ...but an explicit --title duplicate was the user's own call and still writes.
 root, env, live, dorm = build([OPENER] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Mine"))
