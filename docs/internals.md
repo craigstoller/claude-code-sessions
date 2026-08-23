@@ -1299,3 +1299,60 @@ the friction is buying very little and `repoint` has been demonstrating that for
 been told exactly what it will do. `sync` is up to hundreds of rows in one apply. The asymmetry
 in blast radius is a real argument for the asymmetry in rules, and any change here needs the
 review panel and a measurement of the guard, not a refactor.
+
+## Open question — the swap report answers a question about the LINEAGE, not about the ROW (2026-08-22)
+
+**Not a ruling. Three symptoms of one gap, all hit in a single afternoon of real use on
+2026-08-22, recorded because the fix is not obviously a small one.**
+
+When `sync --update` swaps which conversation a row opens, the report says two things about it:
+whether the displaced conversation is **orphaned**, and what **fraction of its prose** already
+appears in the incoming one. Both are properties of the CONVERSATION. Neither is a property of
+the ROW the user is about to change. That turns out to matter, in three different ways.
+
+### 1. "Still reachable" is measured across ALL accounts, including ones out of scope
+
+`plan_sync` sets `displaced_orphan = False` the moment ANY store holds a pointer to the
+displaced conversation (`if sid in pointers`). On a three-account machine, a user working two of
+them sees "still reachable from another account" for a row whose *only* remaining door is the
+third account - the one they are not signed into and may not open for weeks.
+
+Measured: a 436-turn record of an active legal matter, reachable from exactly one row on one
+account. The plan reported it safe to overwrite, correctly by its own definition, because a
+different account held it. The user's actual question - "can *I* still get to it from the
+accounts I use?" - was answered NO by the same data.
+
+### 2. The report never says the row got SHORTER
+
+A swap that takes a row from a 436-turn conversation to a 336-turn one is not flagged at all, as
+long as the 436-turn one is reachable somewhere. Two of four swaps in one real plan were
+regressions of this kind (-256 turns and -100 turns); the report's only comment on them was the
+overlap percentage, which the user has to convert into a length judgement themselves.
+
+The same blind spot exists in `repoint`, which prints `opens now` / `will open` and the incoming
+file's size on disk, but never compares their content. One of fourteen repoints applied that
+day moved a row from a 181-turn conversation to a 174-turn one - a deliberate and defensible
+choice (the shorter branch had the ending where the work shipped) but presented as if it were
+purely a gain.
+
+### 3. Interruption markers count as prose, inflating apparent risk
+
+`_message_fingerprints` already excludes timestamps and tool blocks, for good measured reasons.
+It does NOT exclude `[Request interrupted by user]`, `No response requested`, "I accidentally
+closed the app", or the other plumbing the app writes into a transcript. Three rows in one plan
+reported 95%, 98% and 98% overlap - implying a handful of real turns at risk - and on inspection
+every single non-overlapping turn was one of those markers. The number made safe overwrites look
+dangerous, which is the opposite of the error it was built to prevent, and it pushes users
+toward the habit this report exists to discourage: accepting the warning without reading it.
+
+**What a fix would have to decide.** Symptom 3 is a filter and is nearly free. Symptoms 1 and 2
+are not: reporting "this ROW loses N turns" means comparing content on every swap row rather
+than only where an orphan is suspected, and scoping reachability to "the accounts in play"
+means the plan needs to know which accounts those ARE - which sync currently does not, since it
+knows only a source and a destination. A `--scope` argument, or treating the source/destination
+pair as the scope, both change what the orphan check means; neither is obviously right.
+
+**Why it is recorded rather than fixed.** All three were found in one session by a user reading
+plans carefully and pushing back when a claim did not match what he was looking at. That is
+evidence about the report's wording as much as its arithmetic, and the wording is what stops a
+careless reader from losing something. Worth the panel.
