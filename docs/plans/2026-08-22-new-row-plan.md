@@ -876,7 +876,7 @@ is a claim, not a formatting detail."
   - `_new_row_store(env, flags) -> (acct, org, path, why, heuristic)` — `why` is a human sentence naming how the store was chosen; `heuristic` is True when row counts broke a tie, and `--apply` refuses on it
   - `_row_already_opens(store, session_id) -> (name | None, titles set)` — **fails closed**
   - `NewRowFlags` dataclass: `to_session: str = ""`, `store: str = ""`, `title: str = ""`, `live: str = ""`
-  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `store_is_a_guess`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
+  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `store_is_a_guess`, `store_org`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -964,15 +964,24 @@ os.makedirs(os.path.join(os.path.dirname(live), ORG_D))    # empty scaffolding
 with open(os.path.join(live, "local_anything.json"), "w") as fh:
     json.dump({"cliSessionId": "%032d" % 55, "title": "Something else",
                "cwd": "proj", "lastActivityAt": 1}, fh)
-m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store="live@example.com"))
-check("an email matching two org dirs picks the one holding rows",
+# The ACCOUNT id matches both of that account's org dirs - which is exactly
+# the tie _new_row_store exists to break. Deliberately not the account's
+# email: _repoint_store matches email through account_email, whose docstring
+# says it resolves a DORMANT account, so the LIVE account's own email (which
+# lives in ~/.claude.json and only live_account reads) matches nothing. That
+# is a real gap in shipped `repoint`, filed separately - do not paper over it
+# by teaching this test to use whichever identifier happens to work.
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=LIVE))
+check("an account id matching two org dirs picks the one holding rows",
       os.path.realpath(m["store_path"]) == os.path.realpath(live), m["store_path"])
 check("  and says so, because a heuristic the user cannot see is a trap",
       "rows" in m["store_why"], m["store_why"])
 check("  marking the choice as a guess", m["store_is_a_guess"] is True)
-# naming the store by path is not a guess
-m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=live))
-check("  while naming the store by path is not a guess",
+check("  and naming the org that would settle it", m["store_org"] == ORG_L,
+      str(m.get("store_org")))
+# the ORG id narrows to one directory, so no tie and no guess
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=ORG_L))
+check("  while naming the org id is not a guess",
       m2["store_is_a_guess"] is False)
 check("  and planning wrote nothing either way",
       sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
@@ -987,11 +996,13 @@ shutil.rmtree(root, ignore_errors=True)
 root, env, live, dorm = build([OPENER] + prose(8))
 os.makedirs(os.path.join(os.path.dirname(live), ORG_D))
 try:
-    ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store="live@example.com"))
+    ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=LIVE))
     check("all-empty candidates refuse by naming them", False, "no refusal")
 except ccs.Refusal as exc:
-    check("all-empty candidates refuse by naming them", ORG_D[:8] in str(exc)
-          or ORG_D in str(exc), str(exc)[:120])
+    check("all-empty candidates refuse by naming them", ORG_D in str(exc),
+          str(exc)[:130])
+    check("  naming ORG IDS, not paths - a Windows path pasted back would not "
+          "match", "organization ids" in str(exc), str(exc)[:130])
 shutil.rmtree(root, ignore_errors=True)
 
 # zero prose turns is ALLOWED - a policy choice must not masquerade as a
@@ -1051,19 +1062,28 @@ def _new_row_store(env, flags):
                 if n.startswith("local_") and n.endswith(".json")]
         if rows:
             populated.append((a, o, p, len(rows)))
-    listing = "\n".join("   " + p for _, _, p in hits)
+    # Every refusal below tells the user to narrow by ORGANIZATION ID, never
+    # "name it by path". Measured 2026-08-23 against shipped code: _repoint_store
+    # compares `flags.store.lower()` against `os.path.normcase(p).replace("\\","/")`,
+    # so the candidate path is lower-cased AND forward-slashed while the user's
+    # argument is only lower-cased - a Windows path pasted from this very listing
+    # matches nothing. Advice that fails when followed is worse than no advice,
+    # and the org id is the thing that actually distinguishes these directories.
+    listing = "\n".join("   org {0}   {1}".format(o, p) for _, o, p in hits)
     if not populated:
         raise Refusal(
             "--store {0!r} matched {1} directories and none of them holds any "
-            "rows, so nothing distinguishes them. Name one by path:\n{2}"
+            "rows, so nothing distinguishes them. Re-run naming one of these "
+            "organization ids with --store:\n{2}"
             .format(flags.store, len(hits), listing))
     if len(populated) > 1:
         raise Refusal(
             "--store {0!r} matched {1} directories that each hold rows; refusing "
-            "to guess which should get the new one:\n{2}".format(
+            "to guess which should get the new one. Re-run naming one of these "
+            "organization ids with --store:\n{2}".format(
                 flags.store, len(populated),
-                "\n".join("   {0}  ({1} rows)".format(p, n)
-                          for _, _, p, n in populated)))
+                "\n".join("   org {0}   {1}  ({2} rows)".format(o, p, n)
+                          for _, o, p, n in populated)))
     a, o, p, n = populated[0]
     return a, o, p, ("the only one of {0} matching directories that holds any "
                      "rows ({1} of them)".format(len(hits), n)), True
@@ -1157,7 +1177,8 @@ def plan_new_row(env, flags):
     name = "local_{0}.json".format(row_uuid)
     post = json.dumps(row, separators=(",", ":")).encode("utf-8")
     return {"op_type": "new-row", "store_path": store, "store_label": label,
-            "store_why": why, "store_is_a_guess": heuristic, "name": row_uuid,
+            "store_why": why, "store_is_a_guess": heuristic,
+            "store_org": org, "name": row_uuid,
             "row_path": os.path.join(store, name),
             "title": title, "title_provenance": provenance,
             "title_collision": collision,
@@ -2085,18 +2106,20 @@ with open(os.path.join(live, "local_anything.json"), "w") as fh:
     json.dump({"cliSessionId": "%032d" % 55, "title": "Something else",
                "cwd": "proj", "lastActivityAt": 1}, fh)
 refusal("--apply refuses when row counts chose the store",
-        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
+        lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
                                          title="", live="", apply=True,
                                          json=False)),
         "decided by counting rows")
 check("  and writes nothing",
       sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
 check("  while a dry run on the same guess is allowed",
-      ccs.cmd_new_row(env, _Ns(to_session=SID, store="live@example.com",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
                                title="", live="", apply=False, json=False)) == 0)
-# naming the store by path settles it, and then --apply proceeds
-check("naming the store by path lets --apply through",
-      ccs.cmd_new_row(env, _Ns(to_session=SID, store=live, title="Recovered",
+# The refusal must name something that WORKS when pasted back. Naming the org
+# id does; naming the path does not, because _repoint_store forward-slashes the
+# candidate but not the user's argument.
+check("naming the org id the refusal suggested lets --apply through",
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=ORG_L, title="Recovered",
                                live="", apply=True, json=False)) == 0)
 check("  and the row is on disk",
       any(n != "local_anything.json" for n in os.listdir(live)),
@@ -2184,9 +2207,9 @@ def cmd_new_row(env, ns):
         raise Refusal(
             "which store should get this row was decided by counting rows, not "
             "by anything that identifies the account: {0}. That is fine for a "
-            "dry run and not fine for a write. Re-run with --store {1!r} if that "
+            "dry run and not fine for a write. Re-run with --store {1} if that "
             "is the one you mean. Nothing was written."
-            .format(m["store_why"], m["store_path"]))
+            .format(m["store_why"], m["store_org"]))
     final = run_new_row(env, m) if ns.apply else None
     if ns.json:
         pub = _public_new_row_manifest(m)
