@@ -5581,14 +5581,76 @@ class RepointFlags:
     live: str = ""          # RULING 5 assertion, as sync uses it
 
 
-def _email_of(env, account_uuid):
+# "the caller did not look", which is NOT "the caller looked and there is no
+# live account". live_account legitimately returns None (the identity files
+# disagree), and a plain None default would send every such call back to look
+# again - the one case where re-looking is guaranteed to find nothing.
+_LIVE_UNRESOLVED = object()
+
+
+def _email_of(env, account_uuid, live=_LIVE_UNRESOLVED):
     """Just the email for an account, or "". account_email returns
     (email, provenance) and every caller that wants a label wants the first
-    half; unpacking it here keeps that mistake in one place."""
+    half; unpacking it here keeps that mistake in one place.
+
+    It also covers account_email's one deliberate blind spot. That function
+    answers for a DORMANT account - the per-account sandbox config, then the
+    memo - and neither source knows the account the app is signed INTO, whose
+    email lives only in ~/.claude.json's oauthAccount, which only live_account
+    reads. So the live account was the single account whose own email named
+    nothing: `repoint --store <the email you are signed in as>` refused while
+    that account sat in the listing the refusal printed, and the plan labelled
+    the store you are looking at with eight hex characters. Invisible on a
+    machine that already holds an email memo for every account, which is how it
+    shipped.
+
+    Asked HERE rather than inside account_email so that function's dormant-only
+    contract stays exactly as documented - callers label its second half
+    'sandbox' or 'memo:<date>' and a freshly observed email is neither. This
+    returns a bare string, so there is no provenance to misreport.
+
+    live_account is a safe source for the pairing: it takes the uuid and the
+    email from one oauthAccount record and this checks that uuid against the
+    one asked for, the same standard dormant_account_email holds its sandbox
+    configs to. It also returns None outright when the two identity files
+    disagree (RULING 4), so a stale oauthAccount cannot answer here for an
+    account it no longer names.
+
+    LIVE may be passed by a caller that has already resolved it - live_account
+    re-reads both identity files and re-walks the store tree on every call
+    (11 ms of a 300 ms `repoint` plan, measured 2026-08-23 over nine store
+    dirs), and its answer is the same for every account in one command.
+    Omitting it is always correct, only slower.
+    """
+    if live is _LIVE_UNRESOLVED:
+        live = live_account(env)
+    if live and live.account_uuid == account_uuid and live.email:
+        return live.email
     got = account_email(env, account_uuid)
     if isinstance(got, tuple):
         return got[0] or ""
     return got or ""
+
+
+def _path_match_key(path):
+    """A path flattened for substring matching: lower case, forward slashes.
+
+    The point is that BOTH sides go through it. os.path.normcase looks like the
+    right primitive and is not: on Windows it lower-cases AND rewrites "/" as
+    "\\", so normalizing only the candidate left a `want` that had merely been
+    .lower()ed still carrying the backslashes every Windows path has - including
+    the ones this tool prints in its own "which store did you mean" listing.
+    Pasting one of those back was refused. On POSIX normcase is the identity
+    function, so there the candidate kept its case while `want` was lowered, and
+    any upper-case component failed the same way.
+
+    Lower-casing both sides is more lenient than a case-sensitive filesystem
+    strictly requires. That is deliberate: this is a substring match on a
+    fragment a person typed, the other branches beside it are already
+    case-insensitive, and matching several stores is a normal outcome here
+    rather than an error - the caller lets the ROW settle which one it meant.
+    """
+    return path.lower().replace("\\", "/")
 
 
 def _repoint_store(env, flags):
@@ -5607,7 +5669,19 @@ def _repoint_store(env, flags):
     """
     dirs = _account_dirs(env)
     if flags.store:
+        # Once, not once per candidate: the same answer for every dir below.
+        # Only in this branch - the --live path resolves its own, and asking
+        # here would be work thrown away.
+        live = live_account(env)
         want = flags.store.lower()
+        # The path gets its OWN normalized form, and is the only branch that
+        # uses it. Kept separate from `want` so the substring semantics of the
+        # other three branches are untouched: neither a uuid nor an email can
+        # contain a path separator, so folding one in would be a no-op for them
+        # in practice - but a no-op by assumption rather than by construction,
+        # and this is exactly the kind of shared-string reasoning that produced
+        # the mismatch _path_match_key documents.
+        want_path = _path_match_key(flags.store)
         # Email included on purpose: an account id and an org id BOTH collide
         # across stores on a real machine (three accounts x three org dirs here),
         # so the fragments people reach for first are exactly the ones that come
@@ -5616,8 +5690,8 @@ def _repoint_store(env, flags):
         # it for one raised AttributeError on the first real invocation.
         hits = [(a, o, p) for a, o, p in dirs
                 if want in a.lower() or want in o.lower()
-                or want in (_email_of(env, a) or "").lower()
-                or want in os.path.normcase(p).replace("\\", "/")]
+                or want in (_email_of(env, a, live) or "").lower()
+                or want_path in _path_match_key(p)]
         if not hits:
             raise Refusal("--store {0!r} matched no store on this machine:\n{1}"
                           .format(flags.store, _candidate_listing(dirs)))

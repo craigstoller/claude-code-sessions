@@ -779,6 +779,37 @@ cross-pair scaffolding. The *row* settles it: every candidate store is searched,
 refusal fires only if the row itself is ambiguous. That is a question about the thing being
 changed rather than about directory naming, and it is the one a user can actually answer.
 
+**Two gaps in that matching, both shipped, both fixed 2026-08-23.** Found while building
+`new-row`, which reuses `_repoint_store`; neither was caused by that work. The help text and
+the README had advertised both inputs all along, so this was documented behaviour that did not
+run.
+
+- *The live account's own email matched nothing.* `account_email` answers for a **dormant**
+  account — the per-account sandbox config, then the memo — and the signed-in account's email
+  is in neither: it lives in `~/.claude.json`'s `oauthAccount`, which only `live_account`
+  reads. So the one account `repoint` *defaults* to was the one account whose own email named
+  no store, and the plan labelled the store you are looking at with eight hex characters.
+  `_email_of` now asks `live_account` first. Deliberately *there* rather than inside
+  `account_email`: that function's second return value is labelled `'sandbox'` or
+  `'memo:<date>'` and a freshly observed email is neither, so widening it would have forced
+  either a new provenance value on every caller or a mislabelled one. `_email_of` returns a
+  bare string, so there is no provenance to misreport. It was invisible on a machine that
+  already holds an email memo for every account, which is how it survived.
+
+- *A path with this platform's own separators matched nothing.* `os.path.normcase` on Windows
+  lower-cases **and** rewrites `/` as `\`; the candidate was then flipped back to `/`, while
+  the string the user typed was only `.lower()`ed — so the backslashes in a path copied out of
+  this tool's own "which store did you mean" listing survived and could never match. On POSIX
+  `normcase` is the identity function, so there an upper-case component failed the same way.
+  `_path_match_key` now normalizes both sides identically. It lower-cases on every platform,
+  which is more lenient than a case-sensitive filesystem strictly requires — deliberate, since
+  this is a substring match on a fragment a person typed and matching several stores is
+  already the normal outcome here.
+
+`tools/check_repoint.py` exercised no `--store` matching whatsoever before this, which is how
+both reached a release. It now covers the live account's email, a dormant account's email, an
+account id, an org id, and a native-separator path.
+
 ##### Accepted residuals
 
 - **Read-then-write.** `_sync_write_rows` reads, compares, then writes; `atomic_write` is an

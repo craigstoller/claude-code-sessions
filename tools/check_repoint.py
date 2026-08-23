@@ -32,6 +32,7 @@ def check(name, cond, extra=""):
 
 LIVE, DORM = "a" * 32, "b" * 32
 ORG_L, ORG_D = "1" * 32, "2" * 32
+ORG_L2 = "3" * 32                       # a SECOND org under the live account
 # UUID-SHAPED on purpose. These were 32 plain digits, which redact() does not
 # recognise as a session id - so the doctor block was tested against ids that
 # could not trigger the very redaction that broke the workflow in 0.9.11. A
@@ -45,14 +46,20 @@ def _sid(n):
 OLD, NEW = _sid(0x41), _sid(0x42)
 
 
-def build(rows=(("ACME-REVIEW session", OLD),)):
-    """A live store holding rows, plus two transcripts to point between."""
+def build(rows=(("ACME-REVIEW session", OLD),), live_orgs=(ORG_L,)):
+    """A live store holding rows, plus two transcripts to point between.
+
+    LIVE_ORGS may name more than one org under the live account. That is the
+    shape --store has to tell apart and the shape a real machine has - one
+    account, one store per org - so the store-matching block below builds it.
+    Rows always land in the first.
+    """
     root = tempfile.mkdtemp(prefix="rp-")
     home = os.path.join(root, "home")
     store = os.path.join(root, "Claude", "claude-code-sessions")
-    live_dir = os.path.join(store, LIVE, ORG_L)
+    live_dir = os.path.join(store, LIVE, live_orgs[0])
     dorm_dir = os.path.join(store, DORM, ORG_D)
-    for d in (live_dir, dorm_dir, home):
+    for d in [os.path.join(store, LIVE, o) for o in live_orgs] + [dorm_dir, home]:
         os.makedirs(d)
     projects = os.path.join(home, ".claude", "projects", "proj")
     os.makedirs(projects)
@@ -66,7 +73,8 @@ def build(rows=(("ACME-REVIEW session", OLD),)):
             json.dump({"appSessionId": "slot%d" % i, "cliSessionId": sid,
                        "title": title, "cwd": projects, "lastActivityAt": 1000}, fh)
     with open(os.path.join(home, ".claude.json"), "w") as fh:
-        json.dump({"oauthAccount": {"accountUuid": LIVE, "organizationUuid": ORG_L,
+        json.dump({"oauthAccount": {"accountUuid": LIVE,
+                                    "organizationUuid": live_orgs[0],
                                     "emailAddress": "live@example.com"}}, fh)
     with open(os.path.join(root, "Claude", "config.json"), "w") as fh:
         json.dump({"lastKnownAccountUuid": LIVE}, fh)
@@ -352,6 +360,76 @@ except ccs.Refusal as exc:
 m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW, live=LIVE))
 check("  and --live resolves it instead of being ignored",
       m["store_path"].endswith(os.path.join(LIVE, ORG_L)), m["store_path"][-40:])
+shutil.rmtree(root, ignore_errors=True)
+
+# ------------------------------------------------------- --store matching
+# Two shipped gaps, neither covered: this file exercised no --store matching at
+# all, so both branches below had never been run by a passing test. Found
+# 2026-08-23 while building `new-row`, whose own store picker hands out the
+# same advice this one does.
+root, env, _row = build(live_orgs=(ORG_L, ORG_L2))
+ccs.remember_account_email(env, DORM, "dorm@example.com")
+
+
+def picks(want):
+    """The (account, org) prefixes --store WANT selects, sorted.
+
+    A Refusal comes back as ["(matched nothing)"] rather than propagating: not
+    matching IS the failure under test, and letting it raise would end the run
+    at the first gap instead of reporting both.
+    """
+    try:
+        hits = ccs._repoint_store(env, ccs.RepointFlags(store=want))
+    except ccs.Refusal:
+        return ["(matched nothing)"]
+    return sorted((a[:8], o[:8]) for a, o, _p in hits)
+
+
+BOTH_LIVE = sorted((LIVE[:8], o[:8]) for o in (ORG_L, ORG_L2))
+ONLY_DORM = [(DORM[:8], ORG_D[:8])]
+
+# GAP 1. account_email answers for a DORMANT account - the sandbox config, then
+# the memo - and the signed-in account's email is in neither: it lives in
+# ~/.claude.json's oauthAccount, which only live_account reads. So the one
+# account this command DEFAULTS to, and the one a person is likeliest to name,
+# was the single account whose own email matched nothing. Invisible on a
+# machine that already holds a memo for every account, which is why it shipped.
+check("--store matches the live account's own email",
+      picks("live@example.com") == BOTH_LIVE, str(picks("live@example.com")))
+check("  without dragging the other account in",
+      ONLY_DORM[0] not in picks("live@example.com"))
+check("  a dormant account's email still matches it",
+      picks("dorm@example.com") == ONLY_DORM, str(picks("dorm@example.com")))
+check("  an account uuid matches every org under it",
+      picks(LIVE) == BOTH_LIVE, str(picks(LIVE)))
+check("  an org uuid matches just the one store",
+      picks(ORG_L2) == [(LIVE[:8], ORG_L2[:8])], str(picks(ORG_L2)))
+
+# GAP 2. os.path.normcase lower-cases AND turns "/" into "\" on Windows, and
+# the candidate then had its separators flipped back to "/" - while `want` was
+# only .lower()ed, so the backslashes in a path copied out of this tool's own
+# listing survived and could never match. A user pasting what we printed got
+# "matched no store on this machine".
+native = os.path.join(env.store_candidates[0], LIVE, ORG_L)
+check("--store matches a path spelled with this platform's own separators",
+      picks(native) == [(LIVE[:8], ORG_L[:8])], native)
+check("  and the same path spelled with forward slashes",
+      picks(native.replace(os.sep, "/")) == [(LIVE[:8], ORG_L[:8])])
+check("  a path naming the account alone matches both its orgs",
+      picks(os.path.join(env.store_candidates[0], LIVE)) == BOTH_LIVE)
+
+try:
+    ccs._repoint_store(env, ccs.RepointFlags(store="no-such-store"))
+    check("--store still refuses what it cannot find", False, "it matched something")
+except ccs.Refusal as exc:
+    check("--store still refuses what it cannot find",
+          "matched no store" in str(exc), str(exc)[:60])
+
+# The same lookup labels the plan, so gap 1 also printed eight hex characters
+# for the store the user is looking at.
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+check("the plan names the live store by email rather than a hex prefix",
+      m["store_label"].startswith("live@example.com"), m["store_label"])
 shutil.rmtree(root, ignore_errors=True)
 
 print()
