@@ -357,6 +357,135 @@ check("  at every site where it renders the overlap clause",
 check("  and it does not say 'another account' either",
       "reachable from another account" not in src)
 
+# ==========================================================================
+# E. reachability is re-checked at APPLY time, not trusted from the plan
+# ==========================================================================
+print("\n--- E. the voucher that vanishes between plan and apply ---")
+
+# plan_sync decides displaced_orphan from the store as it stood when the plan
+# was built. The app repoints rows while this tool is not running, so a
+# conversation that had a second door when planned can lose it before Apply.
+# Until 0.9.15 the write went ahead on the stale answer and orphaned it without
+# ever asking for --allow-orphan.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=dirs["dorm"]))
+r = [x for x in m["rows"] if x["title"] == "Shared slot"][0]
+check("planned as safe - a second door exists", r["displaced_orphan"] is False)
+check("  and the plan records the orphan consent it was built under",
+      m.get("allow_orphan") is False, str(m.get("allow_orphan")))
+
+# the door closes after planning, exactly as the app does it
+os.remove(os.path.join(dirs["dorm"], "local_two.json"))
+try:
+    ccs.run_sync(env, m)
+    check("apply REFUSES once the only other door is gone", False, "it wrote")
+except ccs.Refusal as exc:
+    msg = str(exc)
+    check("apply REFUSES once the only other door is gone", True)
+    check("  naming reachability, not drift", "reachability changed" in msg, msg[:70])
+    check("  and stating nothing was written", "Nothing has been written" in msg)
+    # It must NOT offer --allow-orphan here. That flag means "hide the
+    # conversations this plan named", and this one is not among them - it
+    # became hideable after the plan was read. Re-planning is the only route
+    # that puts the decision in front of the user with the evidence.
+    check("  pointing at a re-plan, not at the flag", "Re-run to re-plan" in msg)
+    check("  and NOT offering --allow-orphan for an orphan nobody reviewed",
+          "--allow-orphan" not in msg, msg[-90:])
+dest = os.path.join(dirs["dorm"], "local_one.json")
+still = json.load(open(dest, encoding="utf-8"))["cliSessionId"]
+check("  the destination row is untouched - it still opens the old conversation",
+      still == OLD, "opens %s, expected %s" % (still[:8], OLD[:8]))
+shutil.rmtree(root, ignore_errors=True)
+
+# --allow-orphan is consent to the orphans the PLAN NAMED, not a blanket
+# licence. Both reviewers rejected the first version, which returned early on
+# the flag and would have let a brand-new orphan through unseen. A row planned
+# as SAFE, whose voucher then vanishes, is not something the user was ever
+# shown - so it refuses even with the flag set.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+check("a plan built with --allow-orphan records it", m.get("allow_orphan") is True)
+check("  and this row was planned SAFE, so consent never covered it",
+      [x for x in m["rows"] if x["title"] == "Shared slot"][0]["displaced_orphan"]
+      is False)
+os.remove(os.path.join(dirs["dorm"], "local_two.json"))
+try:
+    ccs.run_sync(env, m)
+    check("  --allow-orphan does NOT wave through a newly-created orphan",
+          False, "it wrote")
+except ccs.Refusal as exc:
+    check("  --allow-orphan does NOT wave through a newly-created orphan", True)
+    check("    and says why - it was not one the plan offered to hide",
+          "NOT one of the conversations the plan offered to hide" in str(exc),
+          str(exc)[:80])
+shutil.rmtree(root, ignore_errors=True)
+
+# a swap that was ALWAYS orphaning is not re-litigated either
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_solo.json", NEW, "Only slot")
+row(dirs["dorm"], "local_solo.json", OLD, "Only slot", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+try:
+    ccs.run_sync(env, m)
+    check("an always-orphaning swap still applies under --allow-orphan", True)
+except ccs.Refusal as exc:
+    check("an always-orphaning swap still applies under --allow-orphan",
+          False, str(exc)[:70])
+shutil.rmtree(root, ignore_errors=True)
+
+# A manifest written before 0.9.15 has no allow_orphan key at all. `.get()`
+# returns None there, which is falsy, so the check RUNS - the fail-safe
+# direction. Bracket access would raise KeyError on exactly the recovery path
+# this feature is meant to protect, so the accessor is pinned here.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=dirs["dorm"]))
+del m["allow_orphan"]                       # a pre-0.9.15 manifest
+os.remove(os.path.join(dirs["dorm"], "local_two.json"))
+try:
+    ccs.run_sync(env, m)
+    check("a legacy manifest with no allow_orphan key still gets the check",
+          False, "it wrote")
+except KeyError as exc:
+    check("a legacy manifest with no allow_orphan key still gets the check",
+          False, "KeyError: %s" % exc)
+except ccs.Refusal:
+    check("a legacy manifest with no allow_orphan key still gets the check", True)
+shutil.rmtree(root, ignore_errors=True)
+
+# On a RESUME the op has already written rows, so "Nothing has been written"
+# would be false - and would send the user looking for an untouched
+# destination that does not exist.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, to=dirs["dorm"]))
+m["rows"].append({"name": "local_done.json", "written": True, "is_update": False,
+                  "swaps_conversation": False, "session_id": "x" * 32,
+                  "dest_path": os.path.join(dirs["dorm"], "local_done.json"),
+                  "post_b64": ccs.b64(b"{}"), "pre_b64": None,
+                  "displaced_orphan": None, "displaced_session": None})
+os.remove(os.path.join(dirs["dorm"], "local_two.json"))
+try:
+    ccs.run_sync(env, m)
+    check("a resumed op does not claim nothing was written", False, "it wrote")
+except ccs.Refusal as exc:
+    msg = str(exc)
+    check("a resumed op does not claim nothing was written",
+          "Nothing has been written" not in msg, msg[:90])
+    check("  it names how many rows an earlier run landed",
+          "already written 1 row(s) on an earlier run" in msg, msg[-150:])
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

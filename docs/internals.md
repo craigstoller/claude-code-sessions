@@ -1479,11 +1479,32 @@ run. Three findings changed the code; several more are recorded here unfixed.**
 
 ### Raised, not fixed — recorded so they are known rather than rediscovered
 
-- **Reachability is plan-time, never revalidated at apply time (Codex).** If a vouching row is
-  repointed or deleted between plan and apply, a swap approved as safe can orphan its
-  conversation with no `--allow-orphan`. Pre-existing, but 0.9.13 makes vouchers load-bearing in
-  a way they were not before, so the exposure is larger now. The fix is a re-scan under the
-  mutation lock immediately before writing.
+- **Reachability was plan-time, never revalidated at apply time (Codex). FIXED in 0.9.15.**
+  `_sync_recheck_reachability` re-runs the orphan question under the lock `execute_sync_op`
+  already holds, once per invocation, before that invocation writes anything - and refuses with
+  a message naming reachability rather than drift, stating that nothing was written, and
+  offering `--allow-orphan` as the deliberate route. A resumed op gets it too, since
+  `recover --forward` sets the status back to `journaled` and re-enters through the same door;
+  rows already written are skipped, and the refusal says how many an earlier run landed rather
+  than claiming nothing was written.
+
+  **`--allow-orphan` is consent to the orphans the plan NAMED, not a blanket licence.** The first
+  version returned early on the flag, and both review engines rejected that independently: at
+  plan time the flag means "hide these conversations, the ones the report just listed", so
+  honouring it at apply time for a conversation that became hideable *afterwards* lets through
+  an orphan the user never saw - and makes the plan phase decorative. No separate approval list
+  is needed, because the manifest already records it per row: a row survives planning with
+  `displaced_orphan` True or `"unknown"` only when the flag was passed, so that field IS the
+  record of what was shown and accepted. Rows planned `False` rested on a voucher, and those are
+  the ones re-checked. When one of them has lost its voucher the refusal points at a re-plan
+  rather than at the flag, because the flag is the wrong answer to "an orphan nobody reviewed".
+
+  Residual, stated rather than papered over: this narrows the window from "between planning and
+  applying" - minutes to overnight, and where the app does its repointing - to "between the check
+  and the writes". It does not close it and it is not a lock: a change landing after the check is
+  not seen, so it catches edits *completed before* it, not concurrent ones. Closing that needs an
+  apply-time serialization boundary spanning the guard, the check, every write and the journal
+  update. Both engines said so; it is a bigger change than this and is not pretended otherwise.
 - **`doomed` is computed before orphaning swaps are removed from the plan (Codex, DeepSeek).**
   Two swaps that are each other's only remaining door are both marked doomed, both classified
   orphaning, and both held - so both survive and either could have vouched. Deterministic
@@ -1550,3 +1571,50 @@ landed yet and waiting is the only option.
 **Not a reason to re-upload.** A second `twine upload` of the same version is rejected as a
 duplicate, and a bumped version to "force" propagation burns a release number on an index
 delay.
+
+## The 0.9.15 review panel — the consent question both engines asked
+
+**Codex and Gemini (agy) reviewed 0.9.15 before it shipped. The roster was not run.** One finding
+changed the semantics; the rest are recorded here.
+
+### Changed before shipping
+
+- **`--allow-orphan` was being treated as blanket consent at apply time.** Both engines raised it
+  independently and framed it the same way: at plan time the flag approves the specific orphans
+  the report named, so honouring it later for a conversation that became orphanable *after* the
+  user read the plan approves something they never saw. Fixed as described above - only rows the
+  plan actually recorded as orphaning are exempt, and a newly-orphaning row refuses even with the
+  flag set, pointing at a re-plan rather than at the flag.
+- **The refusal claimed "Nothing has been written" on a resumed op** (Codex), where an earlier
+  invocation had already landed rows. It now names how many, so nobody goes looking for an
+  untouched destination that does not exist.
+- **The residual was overstated.** The docstring said the check covers "another copy of this tool,
+  or a hand edit, in the same seconds". Codex: it covers edits *completed before* the check, not
+  concurrent ones. Corrected in place.
+
+### The one place the engines disagreed
+
+Gemini's headline fix was to move the check **inside** the row loop, re-verifying immediately
+before each write, to shrink the race window. Codex looked at the same trade and concluded the
+opposite: per-row "merely narrows the race while increasing partial-application risk; it does not
+establish correctness". Kept the up-front check on Codex's reasoning - a fresh op that refuses
+before writing anything preserves the reviewed plan, whereas a mid-loop refusal leaves a
+partially-applied plan nobody reviewed. Recorded because the disagreement is real and a future
+change here should know both arguments existed rather than rediscovering one of them.
+
+### Raised, not fixed
+
+- **A stalled op can deadlock** (Gemini, and Codex's medium): rows written, then a voucher
+  vanishes, and the re-check refuses the remainder - leaving exactly the partially-applied state
+  the up-front check exists to avoid, with no route forward that does not involve re-planning.
+  Real, and the resolution depends on the serialization question below rather than being
+  independent of it.
+- **An unreadable sibling store aborts an op that already passed planning** (both). Failing closed
+  is right; failing closed *without a retry* turns a blinking network drive into a hard stop. A
+  bounded retry before refusing would keep the safety property and lose the brittleness.
+- **The pointer scan is not a consistent snapshot** (Codex): `_other_pointers` walks several
+  stores, and a concurrent change during the walk yields a mixed-time answer. Same root as the
+  serialization gap.
+- **Untested paths** (Codex): a crash between a row write and its `written` marker; drift that
+  changes a row's swap classification between plan and apply; a voucher *repointed* rather than
+  deleted; two applies interleaved between check and write.

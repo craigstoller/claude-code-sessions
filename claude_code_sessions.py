@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.9.14"
+__version__ = "0.9.15"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
@@ -4527,7 +4527,15 @@ def plan_sync(env, flags):
            "dest_email": dest.email, "dest_email_source": dest.email_source,
            "dest_path": dest.path,
            "verbatim": bool(flags.verbatim), "update": bool(flags.update),
-           "newer_only": bool(flags.newer_only), "rows": rows, "tally": tally}
+           "newer_only": bool(flags.newer_only),
+           # Recorded because it changes what this op is PERMITTED to do, and
+           # because the apply step needs it: reachability is re-checked before
+           # writing, and a run the user consented to orphan on must not be
+           # stopped by that check. Inferring it from the rows is not sound - a
+           # plan with --allow-orphan that happens to orphan nothing looks
+           # identical to one without it.
+           "allow_orphan": bool(flags.allow_orphan),
+           "rows": rows, "tally": tally}
     if source.resolved_from == "user":
         out["live_override"] = _live_override_record(env, source)
     return out
@@ -4598,6 +4606,11 @@ def execute_sync_op(env, op):
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
 
+    # BEFORE set_status: a refusal here has written nothing, so the op should
+    # stay at 'journaled' rather than being marked 'writing' - a status that
+    # tells recover a partial write may have happened when none did.
+    _sync_recheck_reachability(env, m, m["rows"])
+
     set_status(op, "writing")
     rows = m["rows"]
     # What one save_manifest costs, estimated once rather than measured per
@@ -4637,6 +4650,108 @@ def execute_sync_op(env, op):
     # doubles the cost the budget just saved.
     set_status(op, "completed")
     return "completed"
+
+
+def _sync_recheck_reachability(env, m, rows):
+    """Re-verify, at APPLY time, that every swap approved as safe still is.
+
+    `plan_sync` decides `displaced_orphan` from the store as it stood when the
+    plan was built. That answer is only as fresh as the plan, and the gap
+    between planning and applying is exactly where the app repoints rows - the
+    behaviour that started this whole line of work. A conversation that had a
+    second door when the plan was made can have lost it by the time Apply is
+    pressed, and until this function existed the write went ahead on the stale
+    answer, orphaning it without ever asking for --allow-orphan.
+
+    0.9.13 raised the stakes: reachability became per-row, so a single
+    surviving row can now be what makes a swap safe, where before it took a
+    whole account. A single row is a much easier thing to lose.
+
+    Runs ONCE per invocation, before that invocation writes anything, under the
+    lock execute_sync_op already holds:
+
+    - Before, not during: the moment the loop writes its first row the store no
+      longer matches the plan, and a mid-loop recount would measure this op's
+      own progress rather than anything the user needs to know about.
+    - Once, not per row: `_other_pointers` is a full read of every store, and
+      the plan spent its budget answering this same question at the same
+      granularity. Per row would be a different, more expensive guarantee.
+    - A RESUMED op gets the check too, and should: `recover --forward` sets the
+      status back to 'journaled' and re-enters execute_sync_op, so an op that
+      stalled overnight re-verifies against the store as it is now rather than
+      as it was when the plan was built. Rows already `written` are skipped -
+      they are done, and this op is what made them so.
+
+    **What this does NOT do.** It narrows the window from "between planning and
+    applying" - which is minutes to overnight, and is where the app does its
+    repointing - to "between this check and the writes", which is milliseconds.
+    It does not close it, and it is not a lock: a change that lands after the
+    check is not seen, so this catches edits COMPLETED BEFORE it, not
+    concurrent ones. A reviewer put that plainly and was right to: a second
+    copy of this tool could pass the same check, remove the last voucher, and
+    let this op orphan the conversation anyway. Closing that needs an apply-time
+    serialization boundary spanning the guard, the check, every write and the
+    journal update - a bigger change than this, and recorded as such in
+    internals.md rather than implied to be handled here.
+
+    Also unhandled by design: a destination row that changed from a non-swap
+    into a swap since planning is not re-classified here. The write loop's own
+    drift check covers it - `current != pre` refuses that row outright - so the
+    row never gets written, but it is the drift refusal doing the work, not
+    this function.
+    """
+    # NOT `if m["allow_orphan"]: return`. That was the first version, and both
+    # reviewers rejected it independently: at plan time --allow-orphan means
+    # "hide THESE conversations, the ones the report just named", and treating
+    # it at apply time as a blanket licence lets a NEW orphan through - one the
+    # user never saw, created by a change after they read the plan. The plan
+    # phase would be doing no work at all in that case.
+    #
+    # The manifest already records what was consented to, per row, and does not
+    # need a separate list: a row survives planning with `displaced_orphan` True
+    # or "unknown" ONLY when --allow-orphan was passed (plan_sync drops it
+    # otherwise), so that field IS the record of what the user was shown and
+    # accepted. Rows planned as False are the ones whose safety rested on a
+    # voucher, and they are exactly the ones worth re-checking.
+    at_risk = [r for r in rows
+               if r.get("swaps_conversation")
+               and r.get("displaced_orphan") is False
+               and not r.get("written")
+               and r.get("displaced_session")]
+    if not at_risk:
+        return
+    pointers = _other_pointers(env, m["dest_path"],
+                               {r["name"] for r in rows if r.get("is_update")})
+    unreadable = None in pointers
+    for r in at_risk:
+        if r["displaced_session"] in pointers:
+            continue
+        # Fail closed on an unreadable sibling, exactly as the planner does:
+        # "we could not look" is never "nothing there". Named separately so the
+        # user is not sent hunting for a vanished row that may never have gone.
+        why = ("a store could not be read, so whether anything still opens it "
+               "cannot be confirmed" if unreadable else
+               "nothing else points at it any more")
+        # "Nothing has been written" is only true of a FRESH op. On a resume,
+        # an earlier invocation already landed rows, and telling the user
+        # otherwise would send them looking for an untouched destination that
+        # does not exist - and would mislead anyone reading this to decide
+        # whether a rollback is needed.
+        done = sum(1 for x in rows if x.get("written"))
+        landed = ("Nothing has been written." if not done else
+                  "This op had already written {0} row(s) on an earlier run; "
+                  "nothing further has been written now, and those rows are "
+                  "untouched.".format(done))
+        raise Refusal(
+            "reachability changed since this sync was planned: refreshing row "
+            "{0!r} (session {1}) would stop it opening conversation {2}, and "
+            "{3}. When this was planned another row still opened it, so this "
+            "is NOT one of the conversations the plan offered to hide - it "
+            "became hideable afterwards. {4} Re-run to re-plan against the "
+            "store as it is now; the new plan will name this conversation and "
+            "you can decide about it with the evidence in front of you."
+            .format(r["name"], r["session_id"],
+                    (r["displaced_session"] or "?")[:8], why, landed))
 
 
 def _sync_write_rows(op, m, rows, per_save, budget):
