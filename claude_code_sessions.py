@@ -4164,6 +4164,238 @@ def _message_fingerprints(path):
     return out
 
 
+import datetime
+
+
+def _iso_ms(ts):
+    """An ISO-8601 transcript timestamp as epoch milliseconds, or None.
+
+    Transcripts write `2026-06-14T09:00:00.000Z`. Parsed with the same
+    tolerance the rest of this module applies to the app's format: a value it
+    cannot read is None, never a guess, and the caller decides what that means.
+    """
+    if not isinstance(ts, str) or len(ts) < 19:
+        return None
+    try:
+        base = datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    frac = 0
+    if len(ts) > 20 and ts[19] == ".":
+        digits = ""
+        for ch in ts[20:]:
+            if not ch.isdigit():
+                break
+            digits += ch
+        frac = int((digits + "000")[:3]) if digits else 0
+    # Stamping UTC explicitly is what makes .timestamp() exact. A naive
+    # datetime would be read as local time, so createdAt would be wrong by the
+    # machine's offset (8 hours here) and wrong by a DIFFERENT amount on a
+    # machine in another zone. Transcripts have always written Z; a value
+    # carrying some other offset is parsed as UTC anyway, which is a known and
+    # accepted approximation rather than a silent one.
+    base = base.replace(tzinfo=datetime.timezone.utc)
+    return int(base.timestamp()) * 1000 + frac
+
+
+def _transcript_facts(env, session_id):
+    """Everything a synthesized row needs, read from the transcript itself.
+
+    Refuses rather than guessing. A row built on values that could not be read
+    is a guess wearing the app's clothes, and the whole point of the template is
+    that it asserts nothing it cannot support.
+
+    Sequential order, NOT minimum and maximum. An earlier draft of the spec said
+    to take the earliest timestamp "so a malformed tail cannot move the start",
+    which is exactly backwards: scanning the file for a minimum is what lets a
+    corrupted, back-dated record at the tail pull the start earlier. The first
+    record's timestamp is what resists that - and it is right for the ordinary
+    case because transcripts are append-only, which is the real justification.
+    """
+    found = find_transcripts(env.projects_root, session_id)
+    if not found:
+        raise Refusal(
+            "no transcript on disk for {0}, so there is nothing for a new row to "
+            "open. Check the id - 'doctor' lists conversations that no account "
+            "points at.".format(session_id))
+    if len(found) > 1:
+        raise Refusal("{0} exists in more than one project folder; refusing to guess "
+                      "which:\n{1}".format(session_id,
+                                           "\n".join("   " + f for f in found)))
+    path = found[0]
+    # Stat BEFORE reading, and again after - see the comparison at the end.
+    try:
+        before = os.stat(path)
+    except OSError as exc:
+        raise Refusal("could not stat the transcript for {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
+    cwd = custom = model = effort = None
+    first_ms = last_ms = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                # cwd is FIRST-wins while model and effort below are LAST-wins,
+                # and the asymmetry is deliberate. cwd populates `originCwd` as
+                # well as `cwd`, and a session that changed directories mid-way
+                # still originated in the first one - which is also what the app
+                # sorts and groups by. model and effort are the opposite: what
+                # the session was running when it stopped is what a resumed row
+                # should carry.
+                if cwd is None and isinstance(d.get("cwd"), str) and d["cwd"]:
+                    cwd = d["cwd"]
+                # LAST-wins, like model and effort. Renaming a conversation
+                # appends a new customTitle rather than editing the old record,
+                # so first-wins resurrects a title the user already replaced.
+                # Measured 2026-08-23: 47 of 507 transcripts on this machine
+                # carry more than one distinct customTitle - 9%, not a corner
+                # case - and the later one is the live one (one example goes
+                # "Task manager performance audit" -> "... (fork)").
+                if isinstance(d.get("customTitle"), str) and d["customTitle"].strip():
+                    custom = d["customTitle"].strip()
+                # LAST of each - see the note on cwd above for why these two go
+                # the other way.
+                if isinstance(d.get("effort"), str) and d["effort"]:
+                    effort = d["effort"]
+                msg = d.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("model"), str) \
+                        and msg["model"] and not msg["model"].startswith("<"):
+                    model = msg["model"]          # skip the "<synthetic>" marker
+                ms = _iso_ms(d.get("timestamp"))
+                if ms is not None:
+                    if first_ms is None:
+                        first_ms = ms
+                    last_ms = ms
+    except OSError as exc:
+        raise Refusal("could not read the transcript for {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
+    missing = []
+    if not cwd:
+        missing.append("no cwd")
+    if first_ms is None:
+        missing.append("no usable timestamp")
+    if not model:
+        # A transcript with no assistant record - someone typed a prompt and
+        # closed the app before a reply. `model` is on 100% of the 987 rows
+        # measured and has no zero value, so there is nothing to omit and
+        # nothing to derive; the only alternative to refusing is inventing one.
+        # Refusing costs the user a conversation in which nothing was said back,
+        # which is the cheapest thing this rule could cost. Called out here
+        # because it is a deliberate trade, not an oversight - if it ever bites
+        # someone with a conversation worth keeping, the fix is a --model flag,
+        # not a silent default.
+        missing.append("no assistant reply, so nothing records which model it ran")
+    if missing:
+        raise Refusal(
+            "the transcript for {0} parses but cannot populate a row ({1}), so a "
+            "row built from it would assert values this tool never read. Nothing "
+            "was written.".format(session_id, " and ".join(missing)))
+    # _message_fingerprints does its own I/O and returns None for a transcript
+    # over TRANSCRIPT_COMPARE_MAX_BYTES. `len(fps or [])` would turn "too big to
+    # count" into "0 turns" - a false assertion, and precisely on the large
+    # conversations most worth recovering. Unmeasured stays unmeasured, and
+    # _synthesize_row omits the field rather than writing a number.
+    try:
+        fps = _message_fingerprints(path)
+    except OSError as exc:
+        raise Refusal("could not count the turns in {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
+    # Stat AFTER both reads and compare against the stat taken BEFORE them. The
+    # apply-time check re-stats this file and compares, so whatever is recorded
+    # here becomes the definition of "unchanged" - and a stat taken only at the
+    # end would happily record the state produced by an append that happened
+    # DURING the read, baptising a half-read file as the baseline. If the two
+    # stats disagree the file moved under us and there is nothing to record.
+    try:
+        after = os.stat(path)
+    except OSError as exc:
+        raise Refusal("could not stat the transcript for {0}: {1}. Nothing was "
+                      "written.".format(session_id, exc))
+    if (after.st_size, int(after.st_mtime)) != (before.st_size,
+                                                int(before.st_mtime)):
+        raise Refusal(
+            "the transcript for {0} was being written while this read it, so the "
+            "facts gathered describe no single version of the file. Nothing was "
+            "written - re-run once the session is idle.".format(session_id))
+    return {"path": path, "cwd": cwd, "created_ms": first_ms, "last_ms": last_ms,
+            "turns": len(fps) if fps is not None else None,
+            "custom_title": custom, "model": model, "effort": effort,
+            "size": after.st_size, "mtime": int(after.st_mtime)}
+
+
+# The static half of a synthesized row: every field that comes neither from the
+# transcript nor from the caller. One place, one comment per field.
+#
+# EVERY MEMBER EARNED ITS PLACE IN A CENSUS, not in a design meeting. Measured
+# 2026-08-22 across 987 real rows: 52 distinct keys exist and only 12 appear on
+# all of them, so there is no fixed row shape to copy. A field belongs here only
+# if it is effectively universal AND has a defensible zero value.
+#
+# What that ruled OUT is the point: an earlier draft asserted reportFindingsCard
+# (present on 60.2% of real rows), chromeTabGroupId (5.6%), lastSpawnRootDetected
+# (2.7%) and remoteControlAutoEligible (0.9%) on every synthesized row. Writing a
+# field that 99.1% of real rows do not carry is the "plausible-looking default"
+# this comment exists to forbid. Re-run the census in the plan before adding one.
+NEW_ROW_DEFAULTS = {
+    "isArchived": False,              # 100% of rows; a recovered row is not archived
+    "alwaysAllowedReasons": [],       # 100%; no permission history to inherit
+    "sessionPermissionUpdates": [],   # 99.7%; ditto
+    "spawnSeed": {},                  # 95.7%; not spawned from anything
+    "chromePermissionMode": None,     # 100%; None is the plurality - no Chrome state
+    # 100% of rows. Three values observed: auto (768), bypassPermissions (201),
+    # acceptEdits (18). 'auto' is chosen because it is the most RESTRICTIVE of
+    # the three, not because it is the most common - a synthesized row must
+    # never hand a resumed session more permission than it had.
+    "permissionMode": "auto",
+}
+
+
+def _synthesize_row(session_id, title, title_source, facts, row_uuid):
+    """A complete listing row, built from a template plus transcript facts.
+
+    NEVER cloned from a sibling row. The 2026-08-22 prototype cloned one and had
+    to strip a `spawnedFrom` asserting descent from a task that never happened;
+    cloning also inherits permission modes, MCP configuration, Chrome tab state
+    and worktree paths, none of which a new row has any business asserting.
+
+    `lastFocusedAt` is seeded with the transcript's last activity rather than
+    omitted. Measured on the prototype: the app REWRITES this field when the row
+    is first focused, so seeding is transient - and omitting it risks the app
+    sorting a recovered row to the bottom of the sidebar, where a user concludes
+    the command failed.
+    """
+    row = dict(NEW_ROW_DEFAULTS)
+    row.update({
+        "sessionId": "local_" + row_uuid,
+        "cliSessionId": session_id,
+        "title": title,
+        "titleSource": title_source,
+        "cwd": facts["cwd"],
+        "originCwd": facts["cwd"],
+        "createdAt": facts["created_ms"],
+        "lastActivityAt": facts["last_ms"],
+        "lastFocusedAt": facts["last_ms"],
+        "model": facts["model"],
+    })
+    # Both omitted rather than defaulted when the transcript could not settle
+    # them. effort is absent from 0.6% of real rows, so its absence is a shape
+    # the app already tolerates; completedTurns is absent whenever the
+    # transcript was too big to count.
+    if facts.get("effort"):
+        row["effort"] = facts["effort"]
+    if facts.get("turns") is not None:
+        row["completedTurns"] = facts["turns"]
+    return row
+
+
 def _displaced_overlap(env, old_sid, new_sid):
     """How much of the conversation a refresh DISPLACES also lives in the one it
     brings in - a float 0.0-1.0, or None when it cannot be measured.
