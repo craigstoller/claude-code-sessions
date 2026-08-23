@@ -321,6 +321,138 @@ check("a generated duplicate is suffixed past every taken variant",
 check("  and an untaken generated title is untouched",
       ccs._unique_title("Fresh", existing, generated=True) == "Fresh")
 
+# ------------------------------------------------------------ planning
+print("\n--- plan_new_row ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="A title"))
+check("the plan names the new-row op type", m["op_type"] == "new-row")
+check("  targeting the signed-in store by default",
+      os.path.realpath(m["store_path"]) == os.path.realpath(live), m["store_path"])
+check("  and says HOW that store was chosen", bool(m.get("store_why")),
+      str(m.get("store_why")))
+check("  with exactly one row", len(m["rows"]) == 1)
+check("  which is an ADD, not an update", m["rows"][0]["is_update"] is False)
+check("  and carries no pre-image, because nothing existed",
+      m["rows"][0]["pre_b64"] is None)
+check("  the row filename matches the synthesized sessionId",
+      json.loads(ccs.unb64(m["rows"][0]["post_b64"]).decode("utf-8"))["sessionId"]
+      == "local_" + m["name"], m["name"])
+check("  and nothing was written", not os.listdir(live))
+shutil.rmtree(root, ignore_errors=True)
+
+print("\n--- refusals ---")
+
+
+def refusal(label, fn, needle):
+    try:
+        fn()
+        check(label, False, "no refusal")
+    except ccs.Refusal as exc:
+        check(label, needle in str(exc), str(exc)[:90])
+
+
+root, env, live, dorm = build([OPENER] + prose(8))
+refusal("--to naming no transcript refuses",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session="%032d" % 99)),
+        "no transcript on disk")
+refusal("an empty --to refuses",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session="")),
+        "--to is required")
+with open(os.path.join(live, "local_existing.json"), "w") as fh:
+    json.dump({"cliSessionId": SID, "title": "Already here", "cwd": "proj",
+               "lastActivityAt": 1}, fh)
+refusal("a conversation this account already reaches refuses",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "already opens")
+shutil.rmtree(root, ignore_errors=True)
+
+# An UNREADABLE row must fail closed. Skipping it means a row that already
+# opens this conversation goes unseen and the command creates a duplicate -
+# a fail-open in a module whose whole posture is fail-closed.
+root, env, live, dorm = build([OPENER] + prose(8))
+with open(os.path.join(live, "local_broken.json"), "w") as fh:
+    fh.write("{not json at all")
+refusal("an unreadable row in the store refuses rather than being skipped",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "could not be read")
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, live, dorm = build([rec("user", "no cwd anywhere in this file at all")])
+refusal("a transcript with no cwd refuses distinctly from unreadable",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "no cwd")
+shutil.rmtree(root, ignore_errors=True)
+
+# A conversation where nobody replied. Deliberately refused - model is on 100%
+# of real rows and has no zero value - and the message must name THAT, not
+# something vague, because it is the one refusal a user could reasonably
+# disagree with.
+root, env, live, dorm = build(
+    [rec("user", "typed a prompt and closed the app before any reply",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal")])
+refusal("a transcript with no assistant reply refuses, naming why",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "no assistant reply")
+shutil.rmtree(root, ignore_errors=True)
+
+# the cross-pair: one account, two org directories, only one of them real
+root, env, live, dorm = build([OPENER] + prose(8))
+os.makedirs(os.path.join(os.path.dirname(live), ORG_D))    # empty scaffolding
+with open(os.path.join(live, "local_anything.json"), "w") as fh:
+    json.dump({"cliSessionId": "%032d" % 55, "title": "Something else",
+               "cwd": "proj", "lastActivityAt": 1}, fh)
+# The ACCOUNT id matches both of that account's org dirs - which is exactly
+# the tie _new_row_store exists to break. Deliberately not the account's
+# email: _repoint_store matches email through account_email, whose docstring
+# says it resolves a DORMANT account, so the LIVE account's own email (which
+# lives in ~/.claude.json and only live_account reads) matches nothing. That
+# is a real gap in shipped `repoint`, filed separately - do not paper over it
+# by teaching this test to use whichever identifier happens to work.
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=LIVE))
+check("an account id matching two org dirs picks the one holding rows",
+      os.path.realpath(m["store_path"]) == os.path.realpath(live), m["store_path"])
+check("  and says so, because a heuristic the user cannot see is a trap",
+      "rows" in m["store_why"], m["store_why"])
+check("  marking the choice as a guess", m["store_is_a_guess"] is True)
+check("  and naming the org that would settle it", m["store_org"] == ORG_L,
+      str(m.get("store_org")))
+# the ORG id narrows to one directory, so no tie and no guess
+m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=ORG_L))
+check("  while naming the org id is not a guess",
+      m2["store_is_a_guess"] is False)
+check("  and planning wrote nothing either way",
+      sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
+shutil.rmtree(root, ignore_errors=True)
+
+# NOTE: that the guess may plan and may NOT write is asserted in Task 6, where
+# `cmd_new_row` exists to enforce it. Do not test it here - `cmd_new_row` and
+# `run_new_row` are introduced in Tasks 6 and 4, and calling them from this
+# task's suite would raise AttributeError rather than fail a check.
+
+# every candidate empty: name them rather than saying 'no way to tell'
+root, env, live, dorm = build([OPENER] + prose(8))
+os.makedirs(os.path.join(os.path.dirname(live), ORG_D))
+try:
+    ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=LIVE))
+    check("all-empty candidates refuse by naming them", False, "no refusal")
+except ccs.Refusal as exc:
+    check("all-empty candidates refuse by naming them", ORG_D in str(exc),
+          str(exc)[:130])
+    check("  naming ORG IDS, not paths - a Windows path pasted back would not "
+          "match", "organization ids" in str(exc), str(exc)[:130])
+shutil.rmtree(root, ignore_errors=True)
+
+# zero prose turns is ALLOWED - a policy choice must not masquerade as a
+# technical constraint. completedTurns takes 0 and the placeholder renders it.
+root, env, live, dorm = build(
+    [rec("system", None, ts="2026-06-14T09:00:00.000Z",
+         cwd=r"C:\Users\craig\Projects\Personal", model="claude-fable-5")])
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
+check("a transcript with zero prose turns is allowed", m["turns"] == 0)
+check("  and its placeholder says so", "0 turns" in m["title"], m["title"])
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

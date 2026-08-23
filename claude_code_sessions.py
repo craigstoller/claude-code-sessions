@@ -4483,6 +4483,180 @@ def _unique_title(title, existing, generated):
     return "{0} ({1})".format(title, n)
 
 
+import uuid
+
+
+def _new_row_store(env, flags):
+    """(acct, org, path, why) - exactly one store, and how it was chosen.
+
+    `_repoint_store` returns a LIST, and refusing whenever it returns more than
+    one would refuse the ordinary case: an account owns one directory per org, so
+    naming it by email matches all of them. `plan_repoint` resolves that by
+    letting the ROW settle which store is meant - a luxury this command does not
+    have, because the row is what it is about to create.
+
+    So let the CONTENT settle it: the cross-pair directories are empty
+    scaffolding, and the account's real store is the one with rows in it.
+
+    Know what that heuristic costs, because it is a guess and not a fact: a
+    genuinely new or deliberately empty organization loses to an old populated
+    one, and this function would pick the wrong store confidently.
+
+    So the guess is allowed to PLAN and not to WRITE. `heuristic` comes back
+    True whenever row counts broke the tie, `plan_new_row` carries it into the
+    manifest, and `cmd_new_row` refuses `--apply` on it, naming the exact
+    `--store <path>` that would settle it. An earlier draft relied on printing
+    the reasoning before the write instead - which is not a safeguard at all in
+    a one-shot `--apply`, because there is no moment between the print and the
+    write in which anyone can intervene, and no saved plan to approve. A dry run
+    that shows the guess and an apply that refuses to act on it are two
+    different promises; only the second one holds unattended.
+    """
+    hits = _repoint_store(env, flags)
+    if len(hits) == 1:
+        a, o, p = hits[0]
+        return a, o, p, "the only store matching what you named", False
+    populated = []
+    for a, o, p in hits:
+        rows = [n for n in _listdir_or_refuse(p, "an account directory")
+                if n.startswith("local_") and n.endswith(".json")]
+        if rows:
+            populated.append((a, o, p, len(rows)))
+    # Every refusal below tells the user to narrow by ORGANIZATION ID, never
+    # "name it by path". Measured 2026-08-23 against shipped code: _repoint_store
+    # compares `flags.store.lower()` against `os.path.normcase(p).replace("\\","/")`,
+    # so the candidate path is lower-cased AND forward-slashed while the user's
+    # argument is only lower-cased - a Windows path pasted from this very listing
+    # matches nothing. Advice that fails when followed is worse than no advice,
+    # and the org id is the thing that actually distinguishes these directories.
+    listing = "\n".join("   org {0}   {1}".format(o, p) for _, o, p in hits)
+    if not populated:
+        raise Refusal(
+            "--store {0!r} matched {1} directories and none of them holds any "
+            "rows, so nothing distinguishes them. Re-run naming one of these "
+            "organization ids with --store:\n{2}"
+            .format(flags.store, len(hits), listing))
+    if len(populated) > 1:
+        raise Refusal(
+            "--store {0!r} matched {1} directories that each hold rows; refusing "
+            "to guess which should get the new one. Re-run naming one of these "
+            "organization ids with --store:\n{2}".format(
+                flags.store, len(populated),
+                "\n".join("   org {0}   {1}  ({2} rows)".format(o, p, n)
+                          for _, o, p, n in populated)))
+    a, o, p, n = populated[0]
+    return a, o, p, ("the only one of {0} matching directories that holds any "
+                     "rows ({1} of them)".format(len(hits), n)), True
+
+
+def _row_already_opens(store, session_id):
+    """(name of a row opening session_id or None, every title in the store).
+
+    FAILS CLOSED. An earlier draft skipped rows it could not parse, which meant
+    an unreadable row pointing at this conversation went unseen and the command
+    created a second door to it - a fail-open in a module whose entire posture is
+    that "couldn't look" is never "nothing there".
+    """
+    titles = set()
+    hit = None
+    for name in sorted(_listdir_or_refuse(store, "the store")):
+        if not (name.startswith("local_") and name.endswith(".json")):
+            continue
+        try:
+            # read_json already converts ValueError to LayoutError, so that arm
+            # is unreachable today. It stays as defence against a future
+            # read_json that stops converting - this is a fail-closed path, and
+            # the cost of an unreachable except clause is a comment.
+            d = read_json(os.path.join(store, name))
+        except (LayoutError, OSError, ValueError) as exc:
+            raise Refusal(
+                "the row {0!r} in this store could not be read ({1}), so this "
+                "command cannot tell whether it already opens {2}. Refusing "
+                "rather than risk a second row for the same conversation. "
+                "Nothing was written.".format(name, exc, session_id[:8]))
+        if not isinstance(d, dict):
+            raise Refusal("the row {0!r} is not a JSON object; refusing to add "
+                          "a row beside it. Nothing was written.".format(name))
+        if d.get("cliSessionId") == session_id:
+            hit = name
+        if isinstance(d.get("title"), str):
+            titles.add(d["title"])
+    return hit, titles
+
+
+@dataclasses.dataclass
+class NewRowFlags:
+    """Which conversation to surface, in which account, under what name."""
+    to_session: str = ""    # the cliSessionId the new row should open
+    store: str = ""         # substring naming the store; default = the live one
+    title: str = ""         # explicit title; otherwise derived
+    live: str = ""          # RULING 5 assertion, as sync and repoint use it
+
+
+def plan_new_row(env, flags):
+    """Build a new-row manifest. Pure planning - writes nothing.
+
+    Creates a row where none existed, which is the one thing `repoint`, `sync`
+    and `move` all need to already have been done for them. Measured 2026-08-22:
+    170 transcripts on one machine were reachable from no row in any account.
+    """
+    if not flags.to_session:
+        raise Refusal("--to is required: the cliSessionId the new row should open. "
+                      "'doctor' lists conversations that no account points at.")
+    acct, org, store, why, heuristic = _new_row_store(env, flags)
+    label = "{0} ({1}{2})".format(_email_of(env, acct) or acct[:8], acct[:8],
+                                  "/" + org[:8] if org else "")
+    facts = _transcript_facts(env, flags.to_session)
+
+    # Within ONE account. Several accounts each holding a row for the same
+    # conversation is the normal and desirable state; two rows in one sidebar
+    # opening the same conversation is the clutter this tool spent a day
+    # removing. This is re-checked under the lock in execute_new_row_op - the
+    # check here is for the dry run's benefit, and is not the guard.
+    hit, existing_titles = _row_already_opens(store, flags.to_session)
+    if hit:
+        raise Refusal(
+            "{0} already opens {1} in this account (row {2!r}), so a new row "
+            "would be a second door to the same conversation. Nothing was "
+            "written. If that row is the problem - it opens the right "
+            "conversation under the wrong title, say - edit it rather than "
+            "adding another.".format(label, flags.to_session[:8], hit))
+
+    title, provenance, title_source = _new_row_title(flags.title, facts)
+    collision = title if title in existing_titles else None
+    title = _unique_title(title, existing_titles, generated=provenance != "yours")
+
+    # The uuid is minted HERE so that everything this manifest reports - the
+    # filename, the sessionId inside the row - is internally consistent, and so
+    # `--apply --json` reports the id it actually wrote. It is NOT a promise
+    # that a later, separate `--apply` run reuses it: there is no way to hand a
+    # saved manifest back to the CLI, so a second invocation replans and mints
+    # a new one. That is fine; nothing keys on the value.
+    row_uuid = str(uuid.uuid4())
+    row = _synthesize_row(flags.to_session, title, title_source, facts, row_uuid)
+    name = "local_{0}.json".format(row_uuid)
+    post = json.dumps(row, separators=(",", ":")).encode("utf-8")
+    return {"op_type": "new-row", "store_path": store, "store_label": label,
+            "store_why": why, "store_is_a_guess": heuristic,
+            "store_org": org, "name": row_uuid,
+            "row_path": os.path.join(store, name),
+            "title": title, "title_provenance": provenance,
+            "title_collision": collision,
+            "to_session": flags.to_session, "transcript": facts["path"],
+            # The snapshot marker _new_row_preflight compares against - taken
+            # from `facts`, NOT re-stat'd here. Re-stat'ing would capture the
+            # file as it is now rather than as it was when its facts were read,
+            # so an append between the two would silently become the accepted
+            # baseline and the very drift this is meant to catch would validate.
+            "transcript_size": facts["size"],
+            "transcript_mtime": facts["mtime"],
+            "transcript_mb": round(os.path.getsize(facts["path"]) / 1e6, 1),
+            "turns": facts["turns"], "cwd": facts["cwd"], "model": facts["model"],
+            "rows": [{"name": name, "dest_path": os.path.join(store, name),
+                      "title": title, "pre_b64": None, "post_b64": b64(post),
+                      "is_update": False, "written": False}]}
+
+
 def _displaced_overlap(env, old_sid, new_sid):
     """How much of the conversation a refresh DISPLACES also lives in the one it
     brings in - a float 0.0-1.0, or None when it cannot be measured.
