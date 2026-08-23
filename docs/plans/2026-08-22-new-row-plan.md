@@ -1966,13 +1966,32 @@ check("  and RECORDING that it left something behind",
       bool(left.manifest.get("rollback_residue")),
       str(left.manifest.get("rollback_residue")))
 # ...and PRINTING it. A residue nobody prints is a residue nobody acts on, and
-# the storing half is what an assertion on the manifest would already cover.
+# the storing half is what the assertion above already covers.
+#
+# DEVIATION FROM THE BRIEF: the brief's version of this check called
+# ccs.recover_op(..., "back") directly (as above) and THEN called cmd_recover
+# with the same op_id, expecting it to print the residue on that second call.
+# It cannot: "rolled_back" is a TERMINAL status (ccs.TERMINAL), and
+# cmd_recover's --id lookup filters through nonterminal_ops(env) - the same
+# filter the bare listing form uses - so the instant recover_op resolves the
+# op, cmd_recover can no longer see it by id at all. It raises "no unresolved
+# op with id ..." before ever reaching the print. Probed directly: reusing the
+# brief's exact call sequence raises that Refusal every time, on this build
+# and presumably any. The only point cmd_recover ever HOLDS this manifest
+# nonterminal is during its own call to recover_op - so proving cmd_recover
+# prints the residue means letting cmd_recover perform the resolution itself
+# (back=True, apply=True) rather than resolving it beforehand.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 4343
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
 out = []
 real_bp2 = builtins.print
 builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
 try:
-    ccs.cmd_recover(env, _Ns(op_id=m["op_id"], forward=False, back=False,
-                             apply=False, verbose=True))
+    ccs.cmd_recover(env, _Ns(op_id=m["op_id"], forward=False, back=True,
+                             apply=True, verbose=True))
 finally:
     builtins.print = real_bp2
 check("  and cmd_recover PRINTS the residue",
@@ -1986,8 +2005,20 @@ root, env, m = crashed()
 op = ccs.nonterminal_ops(env)[0]
 outside = os.path.join(os.path.dirname(os.path.dirname(m["store_path"])),
                        "escaped.json")
-with open(outside, "w") as fh:
-    fh.write("{}")
+# DEVIATION FROM THE BRIEF: the brief wrote literal b"{}" at `outside`. That
+# never matches post_b64 (a full session row), so _sync_row_drift classifies
+# the redirected dest_path as "drifted", not "match" - and the containment
+# check this test exists to exercise sits ONLY inside the "match" branch (the
+# same branch that guards and unlinks; see Finding 4's asymmetry: back never
+# touches a row that isn't a byte-exact match for what it wrote). Probed
+# directly: with b"{}" the residue comes back "left ... in place - it no
+# longer holds what this op wrote (drifted)", never reaching ensure_contained
+# at all, so "could not remove" never appears - failing the very check this
+# block is for. Writing the REAL post_b64 bytes at the escaped path is what
+# makes the row "match" so recover_op actually attempts the delete, hits
+# ensure_contained, and records the containment failure.
+with open(outside, "wb") as fh:
+    fh.write(ccs.unb64(op.manifest["rows"][0]["post_b64"]))
 op.manifest["rows"][0]["dest_path"] = outside          # as a corrupt journal would
 ccs.save_manifest(op)
 check("back closes even when the row path escapes the store",
