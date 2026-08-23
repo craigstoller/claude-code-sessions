@@ -2484,8 +2484,7 @@ shutil.rmtree(root, ignore_errors=True)
 # promise is false in the worst way: undo silently selects an older unrelated
 # operation and reverses THAT, or refuses when none exists. undo_new_row was
 # fully built and tested in Task 4 and reachable from nothing.
-print("
---- undo actually reaches a new-row op ---")
+print("\n--- undo actually reaches a new-row op ---")
 
 root, env, live, dorm = build([OPENER] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Undo me"))
@@ -2495,7 +2494,7 @@ out = []
 real_bp3 = builtins.print
 builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
 try:
-    rc = ccs.cmd_undo(env, _Ns(op_id="", apply=False, verbose=True))
+    rc = ccs.cmd_undo(env, _Ns(op_id="", apply=False, verbose=True, show=False))
 finally:
     builtins.print = real_bp3
 check("undo's dry run SEES the new-row op", rc == 0 and any(
@@ -2507,7 +2506,7 @@ check("  describing it as a new-row, not as 'session None'",
 out = []
 builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
 try:
-    ccs.cmd_undo(env, _Ns(op_id="", apply=True, verbose=True))
+    ccs.cmd_undo(env, _Ns(op_id="", apply=True, verbose=True, show=False))
 finally:
     builtins.print = real_bp3
 check("  and --apply removes the row", not os.path.exists(path), str(out)[:110])
