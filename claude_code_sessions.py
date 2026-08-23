@@ -488,6 +488,12 @@ def rotate_ops(env):
 
     def _collides(op):
         om = op.manifest
+        # A rolled-back op that left something on disk is the only durable
+        # record that it did. Pruning it destroys the residue in the same call
+        # that wrote it, and nothing afterwards looks for that row: doctor's
+        # vanished-row check reads only 'completed' ops, deliberately. Hold it.
+        if om.get("rollback_residue"):
+            return True
         if not live or om.get("op_type") != "sync":
             return False
         if om.get("status") in ("undone", "rolled_back"):
@@ -1740,6 +1746,36 @@ def is_prefix_of(journaled_hash, journaled_size, path):
     return h.hexdigest() == journaled_hash
 
 
+def _new_row_shape_error(m):
+    """A sentence naming what is wrong with this new-row manifest, or None.
+
+    `recover_op` runs `_validate_manifest_paths` on every op type outside its
+    allowlist, and the comment above that allowlist records why: without it a
+    damaged manifest raised a bare KeyError out of recover, and main() catches
+    only Refusal and LayoutError - so the user got a traceback from the one
+    command whose job is to get them unstuck. Adding 'new-row' to that allowlist
+    would have re-opened the hole, because the move-shaped validator cannot read
+    a new-row manifest. This is the replacement, shaped for this op type.
+
+    NEVER RAISES. classify_op calls it too, and classify_op's contract is that
+    it never raises - cmd_recover classifies every pending op to print its
+    listing, so one damaged manifest would otherwise take down the whole
+    diagnostic rather than one line of it.
+    """
+    rows = m.get("rows")
+    if not isinstance(rows, list) or len(rows) != 1:
+        return "its 'rows' is not a one-element list"
+    r = rows[0]
+    if not isinstance(r, dict):
+        return "its row is not an object"
+    for k in ("name", "dest_path", "post_b64"):
+        if not isinstance(r.get(k), str) or not r[k]:
+            return "its row has no usable {0!r}".format(k)
+    if not isinstance(m.get("store_path"), str) or not m["store_path"]:
+        return "it has no usable 'store_path'"
+    return None
+
+
 def classify_op(env, op):
     """Classify a non-terminal op's source/destination/row state and the
     safe recovery resolutions. Rules per spec Recovery classification, plus
@@ -1765,7 +1801,17 @@ def classify_op(env, op):
         # or may not have landed before the crash. Both directions are real -
         # forward finishes the write, back removes what landed - so offer them
         # rather than returning the empty list repoint returns.
-        r = (m.get("rows") or [{}])[0]
+        bad = _new_row_shape_error(m)
+        if bad:
+            # Damaged record. Say so and offer NOTHING: every resolution below
+            # dereferences the row, so advertising them would invite exactly the
+            # traceback the shape check exists to prevent.
+            return {"status": m["status"], "source": m.get("store_label", "n/a"),
+                    "dest": m.get("store_label", "n/a"), "resolutions": [],
+                    "drifted_rows": [],
+                    "note": "new-row: this operation's record is damaged ({0}), "
+                            "so neither direction can be run from it".format(bad)}
+        r = m["rows"][0]
         # Map the ACTUAL state, all five of them. `== "match"` collapsed four
         # states into "was not written", so a row the app had already reopened
         # and rewritten - the plan's own stated risk - was reported as never
@@ -1782,9 +1828,17 @@ def classify_op(env, op):
         return {"status": m["status"], "source": m.get("store_label", "n/a"),
                 "dest": m.get("store_label", "n/a"),
                 "resolutions": ["forward", "back"], "drifted_rows": [],
-                "note": "new-row: the row {0}; forward finishes creating it, "
-                        "back removes it only if it still matches what this op "
-                        "wrote".format(said)}
+                # The guidance is state-aware too. An earlier draft made `said`
+                # accurate and then told every reader "forward finishes creating
+                # it" - false in the two states the five-way map exists to
+                # detect, because a landed-and-changed row is precisely what
+                # forward now refuses.
+                "note": "new-row: the row {0}; {1}".format(
+                    said,
+                    "back closes this operation and leaves the row alone"
+                    if state in ("drifted", "pristine", "unreadable") else
+                    "forward finishes creating it, back removes it only if it "
+                    "still matches what this op wrote")}
     if m.get("op_type") == "sync":
         return classify_sync_op(env, op)
 
@@ -1976,6 +2030,18 @@ def recover_op(env, op, direction):
         # that exists to get them unstuck.
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row"):
             _validate_manifest_paths(env, op.manifest)
+        elif op.manifest.get("op_type") == "new-row":
+            # The allowlist above skips the move-shaped validator, so this op
+            # type brings its own. Without it the branch below dereferences
+            # m["rows"][0]["name"] and m["store_path"] straight out of a file a
+            # user can edit, and a bare KeyError escapes main().
+            bad = _new_row_shape_error(op.manifest)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed. Any row it created "
+                    "is still on disk - 'doctor' lists conversations that no "
+                    "account points at.".format(op.manifest.get("op_id"), bad))
 
         c = classify_op(env, op)
         if direction not in c["resolutions"]:
@@ -1989,19 +2055,29 @@ def recover_op(env, op, direction):
                 # owns it - and only for a row that did NOT land. A landed row
                 # needs no re-validation (its facts are already committed) and
                 # no mutation guard (it writes only the journal).
-                if _sync_row_drift(m["rows"][0]) != "match":
+                state = _sync_row_drift(m["rows"][0])
+                if state not in ("match", "absent"):
+                    # The row DID land and is not what we wrote. Refuse HERE,
+                    # accurately, rather than letting the preflight speak: every
+                    # one of its refusals ends "Nothing was written", which is
+                    # false about a row sitting on disk, and it sends the user to
+                    # "re-run to replan" - which plan_new_row then refuses,
+                    # because that row already opens the session. Two refusals,
+                    # neither of them true, on exactly the path a user reaches
+                    # weeks later when the transcript has aged out too.
+                    raise Refusal(
+                        "there is already a row at {0!r} and it is not what this "
+                        "operation wrote ({1}); forward cannot finish a row that "
+                        "is already there and already different, and nothing was "
+                        "changed. Most likely the app rewrote it when it reopened "
+                        "the session. 'recover --back' closes this operation and "
+                        "leaves the row alone.".format(m["rows"][0]["name"], state))
+                if state != "match":
                     _new_row_preflight(env, m)
                 set_status(op, "journaled")
                 final = execute_new_row_op(env, op)
                 rotate_ops(env)
                 return final
-            # The running-app guard, which this arm did not have. `recover_op`
-            # never calls _guard_mutation for any op type, and every other
-            # deleting path in this module does - so after a crash, reopening
-            # the app and then recovering backward would delete a row out from
-            # under a running app that is reading and rewriting that store. The
-            # exact race the whole command otherwise refuses to run into.
-            _guard_mutation(env, "remove a row from")
             r = m["rows"][0]
             # 'back' must always terminate - it is the only exit from a stuck
             # op - so a row it cannot safely remove is SKIPPED rather than
@@ -2013,6 +2089,16 @@ def recover_op(env, op, direction):
             residue = None
             state = _sync_row_drift(r)
             if state == "match":
+                # The running-app guard (RULING 4) belongs HERE, not at the top
+                # of the arm. Until this task recover_op called it for no op type
+                # at all, so recovering backward could delete a row out from
+                # under a running app rewriting that store. But only this branch
+                # deletes anything: on every other state 'back' is a journal-only
+                # close, and guarding that would put the ONLY exit from a stuck
+                # operation behind closing the desktop app - for an operation
+                # that touched no bytes. Same asymmetry the forward arm has, for
+                # the same reason.
+                _guard_mutation(env, "remove a row from")
                 try:
                     # Containment is re-established here, not inherited. This
                     # arm deletes a path out of a journal file, and a journal
@@ -2025,8 +2111,14 @@ def recover_op(env, op, direction):
                 except (OSError, LayoutError) as exc:
                     residue = "could not remove {0!r}: {1}".format(r["name"], exc)
             elif state != "absent":
-                residue = ("left {0!r} in place - it no longer holds what this op "
-                           "wrote ({1})".format(r["name"], state))
+                # "couldn't read it" and "it changed" are different facts about a
+                # file left on disk. undo_new_row and classify_op both bother to
+                # tell them apart; this was the one place in the new code that
+                # collapsed them, which is the module's posture inverted.
+                why = ("it exists but could not be read" if state == "unreadable"
+                       else "it no longer holds what this op wrote ({0})"
+                            .format(state))
+                residue = "left {0!r} in place - {1}".format(r["name"], why)
             if residue:
                 m["rollback_residue"] = residue
                 save_manifest(op)

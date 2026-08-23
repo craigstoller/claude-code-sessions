@@ -1,4 +1,5 @@
 """ccs new-row - creating a sidebar row for a conversation that has none."""
+import builtins
 import json
 import os
 import shutil
@@ -808,6 +809,140 @@ left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0
 check("  and RECORDING that it left something behind",
       bool(left.manifest.get("rollback_residue")),
       str(left.manifest.get("rollback_residue")))
+shutil.rmtree(root, ignore_errors=True)
+
+# ...and PRINTING it. A residue nobody prints is a residue nobody acts on, and
+# the storing half is what the assertion above already covers.
+#
+# DEVIATION FROM THE BRIEF: the brief's version of this check called
+# ccs.recover_op(..., "back") directly (as above) and THEN called cmd_recover
+# with the same op_id, expecting it to print the residue on that second call.
+# It cannot: "rolled_back" is a TERMINAL status (ccs.TERMINAL), and
+# cmd_recover's --id lookup filters through nonterminal_ops(env) - the same
+# filter the bare listing form uses - so the instant recover_op resolves the
+# op, cmd_recover can no longer see it by id at all. It raises "no unresolved
+# op with id ..." before ever reaching the print. Probed directly: reusing the
+# brief's exact call sequence raises that Refusal every time, on this build
+# and presumably any. The only point cmd_recover ever HOLDS this manifest
+# nonterminal is during its own call to recover_op - so proving cmd_recover
+# prints the residue means letting cmd_recover perform the resolution itself
+# (back=True, apply=True) rather than resolving it beforehand.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 4343
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+out = []
+real_bp2 = builtins.print
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    ccs.cmd_recover(env, _Ns(op_id=m["op_id"], forward=False, back=True,
+                             apply=True, verbose=True))
+finally:
+    builtins.print = real_bp2
+check("  and cmd_recover PRINTS the residue",
+      any("left something behind" in line for line in out), str(out)[:120])
+shutil.rmtree(root, ignore_errors=True)
+
+# The headline safety property of this arm - containment before unlink - and
+# the two other residue paths. All three were unprotected: the commit message
+# led with containment and nothing exercised it.
+root, env, m = crashed()
+op = ccs.nonterminal_ops(env)[0]
+outside = os.path.join(os.path.dirname(os.path.dirname(m["store_path"])),
+                       "escaped.json")
+# DEVIATION FROM THE BRIEF: the brief wrote literal b"{}" at `outside`. That
+# never matches post_b64 (a full session row), so _sync_row_drift classifies
+# the redirected dest_path as "drifted", not "match" - and the containment
+# check this test exists to exercise sits ONLY inside the "match" branch (the
+# same branch that guards and unlinks; see Finding 4's asymmetry: back never
+# touches a row that isn't a byte-exact match for what it wrote). Probed
+# directly: with b"{}" the residue comes back "left ... in place - it no
+# longer holds what this op wrote (drifted)", never reaching ensure_contained
+# at all, so "could not remove" never appears - failing the very check this
+# block is for. Writing the REAL post_b64 bytes at the escaped path is what
+# makes the row "match" so recover_op actually attempts the delete, hits
+# ensure_contained, and records the containment failure.
+with open(outside, "wb") as fh:
+    fh.write(ccs.unb64(op.manifest["rows"][0]["post_b64"]))
+op.manifest["rows"][0]["dest_path"] = outside          # as a corrupt journal would
+ccs.save_manifest(op)
+check("back closes even when the row path escapes the store",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  WITHOUT deleting the outside file", os.path.exists(outside))
+left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("  recording that it could not remove it",
+      "could not remove" in (left.manifest.get("rollback_residue") or ""),
+      str(left.manifest.get("rollback_residue"))[:90])
+shutil.rmtree(root, ignore_errors=True)
+
+# An unlink that fails for an ordinary OS reason still terminates, still records
+root, env, m = crashed()
+real_unlink = os.unlink
+
+
+def refuse_unlink(path, *a, **k):
+    if os.path.abspath(path) == os.path.abspath(m["rows"][0]["dest_path"]):
+        raise OSError(13, "Permission denied")
+    return real_unlink(path, *a, **k)
+
+
+os.unlink = refuse_unlink
+try:
+    res = ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+finally:
+    os.unlink = real_unlink
+check("back terminates when the unlink itself fails", res == "rolled_back")
+left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("  recording the failure rather than reporting a clean rollback",
+      "could not remove" in (left.manifest.get("rollback_residue") or ""),
+      str(left.manifest.get("rollback_residue"))[:90])
+shutil.rmtree(root, ignore_errors=True)
+
+# A damaged journal must not traceback out of the one command that unsticks you.
+root, env, m = crashed()
+op = ccs.nonterminal_ops(env)[0]
+op.manifest["rows"] = []
+ccs.save_manifest(op)
+c = ccs.classify_op(env, ccs.nonterminal_ops(env)[0])
+check("classify_op survives a damaged record instead of raising",
+      "damaged" in c["note"], c["note"][:80])
+check("  and offers no direction it cannot run", c["resolutions"] == [])
+for d in ("forward", "back"):
+    refusal("  recover --%s refuses it as a Refusal, not a traceback" % d,
+            lambda d=d: ccs.recover_op(env, ccs.nonterminal_ops(env)[0], d),
+            "is damaged")
+shutil.rmtree(root, ignore_errors=True)
+
+# 'back' on a row there is nothing to delete is journal-only, so a running app
+# must not block it - the same asymmetry the forward arm has. Otherwise the ONLY
+# exit from a stuck operation sits behind closing the desktop app, for an
+# operation that touched no bytes.
+root, env, m = crashed()
+os.unlink(m["rows"][0]["dest_path"])           # nothing left to remove
+env.process_lister = lambda: [DESKTOP]
+check("back on an absent row closes the op even with the app running",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  leaving nothing pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# The residue must survive rotation - it is destroyed in the same call that
+# writes it unless _collides holds the op back.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 1234
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+for _ in range(12):                            # push it out of the newest ten
+    ccs.rotate_ops(env)
+    other = ccs.new_op(env, {"op_type": "new-row", "status": "rolled_back",
+                             "store_path": m["store_path"], "rows": []})
+    ccs.set_status(other, "rolled_back")
+ccs.rotate_ops(env)
+survivor = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]]
+check("the residue-bearing op survives rotation", len(survivor) == 1,
+      "pruned - the only record that a row was left behind is gone")
 shutil.rmtree(root, ignore_errors=True)
 
 print()
