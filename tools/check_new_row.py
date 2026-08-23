@@ -999,7 +999,7 @@ builtins.print = spy_print
 ccs.run_new_row = spy_run
 try:
     ccs.cmd_new_row(env, _Ns(to_session=SID, store="", title="Recovered",
-                             live="", apply=True, json=False))
+                             live="", apply=True, json=False, verbose=False))
 finally:
     builtins.print = real_bp
     ccs.run_new_row = real_run
@@ -1027,19 +1027,20 @@ with open(os.path.join(live, "local_anything.json"), "w") as fh:
 refusal("--apply refuses when row counts chose the store",
         lambda: ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
                                          title="", live="", apply=True,
-                                         json=False)),
+                                         json=False, verbose=False)),
         "decided by counting rows")
 check("  and writes nothing",
       sorted(os.listdir(live)) == ["local_anything.json"], str(os.listdir(live)))
 check("  while a dry run on the same guess is allowed",
-      ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE,
-                               title="", live="", apply=False, json=False)) == 0)
+      ccs.cmd_new_row(env, _Ns(to_session=SID, store=LIVE, title="", live="",
+                               apply=False, json=False, verbose=False)) == 0)
 # The refusal must name something that WORKS when pasted back. Naming the org
 # id does; naming the path does not, because _repoint_store forward-slashes the
 # candidate but not the user's argument.
 check("naming the org id the refusal suggested lets --apply through",
       ccs.cmd_new_row(env, _Ns(to_session=SID, store=ORG_L, title="Recovered",
-                               live="", apply=True, json=False)) == 0)
+                               live="", apply=True, json=False,
+                               verbose=False)) == 0)
 check("  and the row is on disk",
       any(n != "local_anything.json" for n in os.listdir(live)),
       str(os.listdir(live)))
@@ -1263,6 +1264,101 @@ for label, mutate in (
     # the lock must not survive the refusal - undo_new_row releases in a finally
     check("  and the lock is released", not os.path.exists(ccs._lock_path(env)))
     shutil.rmtree(root, ignore_errors=True)
+
+
+# README:470 promises plain-text output replaces the home directory with `~` and
+# that --verbose shows paths in full; README:527 tells users not to paste --json
+# into an issue BECAUSE that one is unredacted, which reads as a guarantee about
+# the plain text. This command printed the plan through a bare `print`, so the
+# user's project directory went out whole - and `new-row --verbose` exited 2,
+# because the flag did not exist.
+print("\n--- the report redacts, and --verbose turns that off ---")
+
+import io  # noqa: E402 - needed only by the encoding check below
+
+check("the parser accepts --verbose for new-row",
+      ccs.build_parser().parse_args(["new-row", "--to", "x", "--verbose"]).verbose
+      is True)
+check("  and defaults it off",
+      ccs.build_parser().parse_args(["new-row", "--to", "x"]).verbose is False)
+
+
+def new_row_output(env, **kw):
+    """Drive cmd_new_row and return (rc, printed lines)."""
+    lines = []
+    real = builtins.print
+    builtins.print = lambda *a, **k: lines.append(" ".join(str(x) for x in a))
+    try:
+        rc = ccs.cmd_new_row(env, _Ns(to_session=SID, store="", title="Recovered",
+                                      live="", **kw))
+    finally:
+        builtins.print = real
+    return rc, lines
+
+
+def retranscribe(env, cwd, sid=SID):
+    """Rewrite the fixture transcript so its cwd is one this test chose."""
+    opener = rec("user", "the opening message, long enough to be a real one",
+                 ts="2026-06-14T09:00:00.000Z", cwd=cwd)
+    with open(os.path.join(env.projects_root, "proj", sid + ".jsonl"), "w",
+              encoding="utf-8") as fh:
+        fh.write("\n".join([opener] + prose(8)) + "\n")
+
+
+root, env, live, dorm = build([OPENER] + prose(8))
+under_home = os.path.join(env.home, "Projects", "Personal")
+retranscribe(env, under_home)
+
+rc, lines = new_row_output(env, apply=False, json=False, verbose=False)
+check("the default report does not print the home directory",
+      rc == 0 and not any(env.home in l for l in lines),
+      str([l for l in lines if env.home in l])[:90])
+check("  it prints the project line redacted to ~",
+      any(l.startswith("project") and "~" in l for l in lines),
+      str([l for l in lines if l.startswith("project")]))
+
+rc, lines = new_row_output(env, apply=False, json=False, verbose=True)
+check("--verbose prints the project directory in full",
+      rc == 0 and any(under_home in l for l in lines),
+      str([l for l in lines if l.startswith("project")]))
+shutil.rmtree(root, ignore_errors=True)
+
+# A cwd outside the console codepage. Piped stdout on Windows is cp1252 here, so
+# print() raised UnicodeEncodeError - and because the report prints BEFORE the
+# write, the command aborted having done nothing at all. A bare traceback for a
+# directory name, from a command whose whole job is to add one row.
+print("\n--- an unprintable cwd degrades the report, it does not abort ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+odd = os.path.join(env.home, "Projects", "\u65e5\u672c\u8a9e")   # not in cp1252
+retranscribe(env, odd)
+
+buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+real_stdout, err, rc = sys.stdout, None, None
+sys.stdout = buf
+try:
+    rc = ccs.cmd_new_row(env, _Ns(to_session=SID, store="", title="Recovered",
+                                  live="", apply=True, json=False, verbose=True))
+except BaseException as exc:                       # noqa: BLE001 - that is the bug
+    err = exc
+finally:
+    sys.stdout = real_stdout
+    try:
+        buf.flush()
+        printed = buf.buffer.getvalue().decode("cp1252", "replace")
+    except BaseException:                          # noqa: BLE001
+        printed = ""
+
+check("a cwd outside the console codepage does not raise",
+      err is None, "" if err is None else "%s: %s" % (type(err).__name__,
+                                                      str(err)[:60]))
+check("  the command still completes", rc == 0, str(rc))
+check("  and the row is actually on disk - the report printed BEFORE the write, "
+      "so a raising report meant nothing was created",
+      any(n.startswith("local_") for n in os.listdir(live)), str(os.listdir(live)))
+check("  the report still got out, with the unencodable characters replaced",
+      "project" in printed and "Reopen the app" in printed, repr(printed[:70]))
+shutil.rmtree(root, ignore_errors=True)
 
 
 print()

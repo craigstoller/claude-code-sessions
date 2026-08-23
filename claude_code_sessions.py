@@ -2770,6 +2770,13 @@ def build_parser():
                          "(RULING 5), when the identity files disagree")
     nr.add_argument("--apply", action="store_true", help="actually create the row")
     nr.add_argument("--json", action="store_true", help="print the plan as JSON")
+    # Not optional decoration. README's redaction section promises that
+    # plain-text output replaces the home directory with `~` and that --verbose
+    # shows paths in full, and it tells users not to paste --json into an issue
+    # BECAUSE that one is unredacted - which reads as a guarantee that the plain
+    # text is safe. This command printed the user's project directory in the
+    # clear and had no --verbose to offer, so `new-row --verbose` exited 2.
+    nr.add_argument("--verbose", action="store_true", help="do not redact paths")
 
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
@@ -5306,6 +5313,33 @@ def cmd_new_row(env, ns):
     flags = NewRowFlags(to_session=ns.to_session, store=ns.store,
                         title=ns.title, live=ns.live)
     m = plan_new_row(env, flags)
+
+    def say(line):
+        """The report line, redacted by default and never a traceback.
+
+        The same `print(line if ns.verbose else redact(env, line))` form
+        cmd_recover, cmd_doctor and cmd_repoint use - this command was printing
+        the plan through a bare `print`, so the project directory went out in
+        full while the README promised otherwise.
+
+        The try/except is the second half, and it is not decoration either.
+        Piped stdout on Windows is the console codepage (cp1252 on the machine
+        this was measured on), so a cwd holding a character outside it made
+        print() raise UnicodeEncodeError - a bare traceback, out of a report
+        that prints BEFORE the write, so the command aborted having done
+        nothing at all. Replacement characters are a worse report than the real
+        one and a far better one than a stack trace over a command that then
+        refused to run. It is here rather than in _print_new_row_report because
+        the report is only half the output; the result trailer goes through the
+        same wrapper.
+        """
+        text = line if ns.verbose else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
     # The HUMAN report prints before the write, unlike cmd_sync and cmd_repoint,
     # and the difference is deliberate. _new_row_store may have picked this
     # account's store out of several by a heuristic, and the plan justifies that
@@ -5320,9 +5354,9 @@ def cmd_new_row(env, ns):
     # reported a plan, exited 0, and wrote nothing, which automation reads as a
     # completed operation.
     if not ns.json:
-        _print_new_row_report(print, m)
+        _print_new_row_report(say, m)
         if ns.apply:
-            print("")
+            say("")
     # A guessed store may PLAN but never WRITE. Printing the guess and then
     # writing anyway leaves no moment for anyone to intervene, so the dry run
     # shows it and the apply refuses until the user settles it themselves.
@@ -5341,12 +5375,12 @@ def cmd_new_row(env, ns):
         print(json.dumps(pub, indent=1))
         return 0 if final in (None, "completed") else 1
     if final is None:
-        print("\ndry run - pass --apply to create the row")
+        say("\ndry run - pass --apply to create the row")
         return 0
-    print("result  : {0}".format(final))
+    say("result  : {0}".format(final))
     if final == "completed":
-        print("Reopen the app - the session should be in the sidebar. 'undo' "
-              "removes the row again.")
+        say("Reopen the app - the session should be in the sidebar. 'undo' "
+            "removes the row again.")
         return 0
     # cmd_move and cmd_sync both gate their exit code on the result; cmd_repoint
     # returns 0 unconditionally, and that is the sibling not to copy. Today
