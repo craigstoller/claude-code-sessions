@@ -1356,3 +1356,53 @@ pair as the scope, both change what the orphan check means; neither is obviously
 plans carefully and pushing back when a claim did not match what he was looking at. That is
 evidence about the report's wording as much as its arithmetic, and the wording is what stops a
 careless reader from losing something. Worth the panel.
+
+## Known defect — the orphan check is blind to the destination's OWN other rows (2026-08-22)
+
+**Not an open question. A defect with a known fix, found in live use the same evening the two
+questions above were recorded.**
+
+`_other_pointers(env, dest_path)` builds its reachability set from *"every store EXCEPT
+dest_path"*:
+
+```
+    real_dest = os.path.realpath(dest_path)
+    for acct, org, path in _account_dirs(env):
+        if os.path.realpath(path) == real_dest:
+            continue
+```
+
+`plan_sync` then asks `if sid in pointers` to decide `displaced_orphan`. So when a swap displaces
+a conversation that is still held by **another row in the destination account itself**, the plan
+reports it as about to become unreachable. It is not.
+
+**How it was hit.** A conversation lived on exactly one account. To make a sync of its row safe,
+a redundant `(fork)` row in that SAME account was repointed at it first - deliberately, as the
+cheapest way to keep a second door open. The sync then still demanded `--allow-orphan`, because
+the door it had just been given was inside the store the check skips. Verified on disk: the
+conversation was held by two rows in the destination, and the plan called it orphaned.
+
+**Why the exclusion exists, and why it is the wrong shape.** The question the check serves is
+"this row is about to stop pointing at the conversation - does anything else still point at
+it?", so the row being changed must not vote for itself. Excluding the whole destination STORE
+is one way to guarantee that, and it is too coarse.
+
+**The fix is narrower AND wider than either.** Exclude **every row this plan will overwrite** -
+by `(store, row id)`, not by store:
+
+- Narrower than today: other rows in the destination account, untouched by this plan, SHOULD
+  count. That is the false positive above.
+- Wider than "just this row": a conversation held only by some OTHER row that this same plan
+  also overwrites is genuinely about to become unreachable, and a per-row exclusion alone would
+  call it safe. Today's store-wide exclusion happens to get that case right, and any fix must
+  keep getting it right.
+
+**Severity.** It fails in the safe direction - false alarms, never false reassurance - which is
+why it survived to 0.9.12. But a false alarm is not free: it is indistinguishable from a real
+one at the point of decision, and the only way past it is to tick `--allow-orphan` / "allow
+hiding a conversation". Training the user to tick that box is the specific harm, because that
+box is the last thing standing between a real orphaning and an unrecoverable one.
+
+**Note for whoever fixes this.** `unreadable_store` (the `None` sentinel that makes an
+unreadable sibling count as "cannot rule it out") must survive the change - the fail-closed
+posture is separate from, and more important than, this fix.
