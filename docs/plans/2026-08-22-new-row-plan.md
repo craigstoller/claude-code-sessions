@@ -32,6 +32,18 @@ for t in tools/check_*.py; do python "$t" >/dev/null 2>&1 && echo "PASS $t" || e
 
   There are **12** suites today; adding `check_new_row.py` makes **13**. Every task below expects thirteen `PASS` lines.
 
+- **AND the pytest suite, which the line above does not cover.** `tests/` holds
+  **326 tests** across 17 files — `test_journal.py`, `test_recover.py`,
+  `test_sync.py`, `test_containment.py` and others that exercise exactly the
+  machinery this plan edits. Run it for every task, not only at the end:
+
+```bash
+python -m pytest tests/ -q
+```
+
+  A green `tools/` loop is not evidence the tool still works. Both suites, every
+  task.
+
 ---
 
 ### Task 1: The field census, transcript facts, and the row template
@@ -2647,7 +2659,21 @@ behaviour it does not have.
 
 **Why:** the app tolerating a row it never issued rests on one experiment. If a future version tombstones one, the row is gone, `undo`'s byte-identity test finds nothing to match, and the user learns by noticing an absent sidebar entry.
 
-**Stated limit — this detection is bounded by journal retention.** `rotate_ops` bounds the ops journal, so once a completed `new-row` op rotates out, its row becomes invisible to this check. That makes the detector good for the days after a row is created — when a tombstoning app version would act — and silent thereafter. A durable answer would need a separate append-only registry of synthesized rows, which is a design change beyond this plan; it is recorded as a known limit in Task 8 rather than pretended away here.
+**Stated limit — this detection is bounded by journal retention, and the bound is
+much tighter than "a while".** `rotate_ops` keeps only the last **10 terminal
+ops across all op types combined**, and `_collides` shields only `sync` ops and
+ones carrying `rollback_residue` — never `new-row`. Measured 2026-08-23: after
+15 sequential `new-row` runs, the first op's vanished-row alert — live and
+correctly reported the moment its row was deleted — is gone, and `doctor`'s exit
+code returns to 0.
+
+So the real window is "the next ten completed operations of any kind", which an
+active user can burn through in minutes. Do not describe it as days. It still
+covers the case it was built for — an app version that rejects a row does so the
+first time it opens, not ten operations later — but a row removed after a busy
+stretch goes unreported, and the user is told nothing. A durable answer needs a
+separate append-only registry of synthesized rows, which is a design change
+beyond this plan. Recorded here and in Task 8 rather than pretended away.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2687,6 +2713,49 @@ os.unlink(m["transcript"])
 d = ccs.gather_doctor(env)
 check("  a vanished row whose transcript ALSO went says so",
       d["vanished_new_rows"][0]["transcript_count"] == 0)
+shutil.rmtree(root, ignore_errors=True)
+
+# doctor must SURVIVE the conditions it exists to report. _row_already_opens
+# fails closed and raises on a row it cannot parse - correct for a command that
+# is about to write, wrong for a diagnostic, which has to produce a report
+# precisely when the store is in a bad way. The try/except around that call had
+# no test: delete it and every suite still passed, while a store holding one
+# malformed row aborted the whole report.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])           # the row vanishes...
+with open(os.path.join(live, "local_broken.json"), "w") as fh:
+    fh.write("{not json at all")               # ...and the store is unreadable
+try:
+    d = ccs.gather_doctor(env)
+    check("doctor still produces a report when a store row is unparseable", True)
+    check("  and still reports the vanished row",
+          len(d.get("vanished_new_rows") or []) == 1,
+          str(d.get("vanished_new_rows")))
+    check("  with a non-zero exit code", d["exit_code"] != 0, str(d["exit_code"]))
+except BaseException as exc:                   # noqa: BLE001 - that is the bug
+    check("doctor still produces a report when a store row is unparseable",
+          False, "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+    check("  and still reports the vanished row", False, "no report")
+    check("  with a non-zero exit code", False, "no report")
+shutil.rmtree(root, ignore_errors=True)
+
+# The same, one layer out: the store directory itself is gone.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+shutil.rmtree(m["store_path"], ignore_errors=True)
+try:
+    d = ccs.gather_doctor(env)
+    check("doctor survives the whole store directory vanishing", True)
+    check("  reporting the row as vanished",
+          len(d.get("vanished_new_rows") or []) == 1,
+          str(d.get("vanished_new_rows")))
+except BaseException as exc:                   # noqa: BLE001
+    check("doctor survives the whole store directory vanishing", False,
+          "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+    check("  reporting the row as vanished", False, "no report")
 shutil.rmtree(root, ignore_errors=True)
 
 # Taking doctor's OWN advice must clear doctor. Recreating mints a fresh uuid,
@@ -2857,8 +2926,11 @@ placeholder.
 create was established by experiment, not documentation. The row is built from fields
 measured across 987 real rows plus values read out of the transcript itself, and it
 asserts nothing beyond those. If a future version rejects one, `doctor` reports it —
-but only while the creating operation is still in the journal, which `recover`'s
-rotation bounds. A row removed long after it was made will go unreported.
+but only while the creating operation is still in the journal, and that journal keeps
+just the last ten finished operations of any kind. In practice the alert covers the
+case it was built for, since an app version that rejects a row does so the first time
+it opens the sidebar. A row that disappears after a busy stretch of other operations
+will go unreported.
 ```
 
 - [ ] **Step 2: Add an internals section**
