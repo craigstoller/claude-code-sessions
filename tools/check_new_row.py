@@ -1082,6 +1082,49 @@ check("  a vanished row whose transcript ALSO went says so",
       d["vanished_new_rows"][0]["transcript_count"] == 0)
 shutil.rmtree(root, ignore_errors=True)
 
+# doctor must SURVIVE the conditions it exists to report. _row_already_opens
+# fails closed and raises on a row it cannot parse - correct for a command that
+# is about to write, wrong for a diagnostic, which has to produce a report
+# precisely when the store is in a bad way. The try/except around that call had
+# no test: delete it and every suite still passed, while a store holding one
+# malformed row aborted the whole report.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+os.unlink(m["rows"][0]["dest_path"])           # the row vanishes...
+with open(os.path.join(live, "local_broken.json"), "w") as fh:
+    fh.write("{not json at all")               # ...and the store is unreadable
+try:
+    d = ccs.gather_doctor(env)
+    check("doctor still produces a report when a store row is unparseable", True)
+    check("  and still reports the vanished row",
+          len(d.get("vanished_new_rows") or []) == 1,
+          str(d.get("vanished_new_rows")))
+    check("  with a non-zero exit code", d["exit_code"] != 0, str(d["exit_code"]))
+except BaseException as exc:                   # noqa: BLE001 - that is the bug
+    check("doctor still produces a report when a store row is unparseable",
+          False, "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+    check("  and still reports the vanished row", False, "no report")
+    check("  with a non-zero exit code", False, "no report")
+shutil.rmtree(root, ignore_errors=True)
+
+# The same, one layer out: the store directory itself is gone.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+ccs.run_new_row(env, m)
+shutil.rmtree(m["store_path"], ignore_errors=True)
+try:
+    d = ccs.gather_doctor(env)
+    check("doctor survives the whole store directory vanishing", True)
+    check("  reporting the row as vanished",
+          len(d.get("vanished_new_rows") or []) == 1,
+          str(d.get("vanished_new_rows")))
+except BaseException as exc:                   # noqa: BLE001
+    check("doctor survives the whole store directory vanishing", False,
+          "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+    check("  reporting the row as vanished", False, "no report")
+shutil.rmtree(root, ignore_errors=True)
+
 # Taking doctor's OWN advice must clear doctor. Recreating mints a fresh uuid,
 # so the original path stays absent forever - reporting on that path alone
 # would leave a permanent alert whose suggested fix then refuses, because a row
