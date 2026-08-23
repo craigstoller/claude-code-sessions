@@ -2098,7 +2098,10 @@ def recover_op(env, op, direction):
                 # operation behind closing the desktop app - for an operation
                 # that touched no bytes. Same asymmetry the forward arm has, for
                 # the same reason.
-                _guard_mutation(env, "remove a row from")
+                _guard_mutation(env, "remove a row from", "the session store", because=(
+                            "The app rewrites these rows as it opens sessions, "
+                            "so one added or removed underneath it can be "
+                            "overwritten or lost"))
                 try:
                     # Containment is re-established here, not inherited. This
                     # arm deletes a path out of a journal file, and a journal
@@ -3311,10 +3314,20 @@ def _require_verified_platform(env, what):
         "is needed - it is read-only and mutates nothing.".format(what))
 
 
-def _guard_mutation(env, what):
-    """Refuse to WHAT another account's store while the Claude desktop app
-    is running. Applies to every mutation route, whatever named the live
-    account.
+def _guard_mutation(env, what, whose="another account's store",
+                    because=("No identity-file evidence can make 'the destination "
+                             "is dormant' certain enough to mutate under a running "
+                             "app")):
+    """Refuse to WHAT WHOSE store while the Claude desktop app is running.
+    Applies to every mutation route, whatever named the live account.
+
+    `whose` and `because` are parameters because this guard now covers routes
+    with different targets. `sync` writes into the account you are NOT signed
+    into, and both defaults are written for it. `new-row` defaults to the
+    account you ARE signed into, so telling that user it refuses to touch
+    "another account's store" describes something they did not ask for, and
+    "the destination is dormant" is not the claim being made about it. The
+    guard is identical either way; only what it is guarding is named.
 
     RULING 4 (2026-08-02). The E4 verification measured ~/.claude.json's
     oauthAccount STALE across a real desktop account switch while
@@ -3347,15 +3360,14 @@ def _guard_mutation(env, what):
         # failed is reading the process list. Say what is really true.
         raise Refusal(
             "the running-process list could not be read, so whether the Claude "
-            "desktop app is running cannot be confirmed; refusing to {0} another "
-            "account's store while that is unavailable - re-run once the process "
-            "list can be read.{1}".format(what, extra))
+            "desktop app is running cannot be confirmed; refusing to {0} {1} "
+            "while that is unavailable - re-run once the process "
+            "list can be read.{2}".format(what, whose, extra))
     raise Refusal(
-        "the Claude desktop app appears to be running ({0}); refusing to {1} "
-        "another account's store while it is. No identity-file evidence can make "
-        "'the destination is dormant' certain enough to mutate under a running "
-        "app - close the desktop app and re-run.{2}{3}".format(
-            running[0], what, extra, helper_hash_note(running, env)))
+        "the Claude desktop app appears to be running ({0}); refusing to {1} {2} "
+        "while it is. {3} - close the desktop app and re-run.{4}{5}".format(
+            running[0], what, whose, because, extra,
+            helper_hash_note(running, env)))
 
 
 # _certified_live_account's three states (RULING 5). Tri-state on purpose:
@@ -4885,10 +4897,23 @@ def _new_row_store(env, flags):
     that shows the guess and an apply that refuses to act on it are two
     different promises; only the second one holds unattended.
     """
-    hits = _repoint_store(env, flags)
+    hits = _repoint_store(env, flags, what="add a row to")
     if len(hits) == 1:
         a, o, p = hits[0]
-        return a, o, p, "the only store matching what you named", False
+        # This string exists to JUSTIFY the choice to the user before --apply,
+        # printed by _print_new_row_report as "chosen as ...", so it has to be
+        # true on every path that reaches it. On the default path the user named
+        # nothing at all and _repoint_store returned the live account's single
+        # store; "the only store matching what you named" claimed a match
+        # against an argument that was never given.
+        if flags.store:
+            why = "the only store matching what you named"
+        elif flags.live:
+            why = "the store of the account you asserted with --live"
+        else:
+            why = ("the store of the account the identity files agree is signed "
+                   "in - nothing was named, so this is the default")
+        return a, o, p, why, False
     populated = []
     for a, o, p in hits:
         rows = [n for n in _listdir_or_refuse(p, "an account directory")
@@ -5088,7 +5113,10 @@ def _new_row_preflight(env, m):
     had touched nothing at all. A refusal that manufactures cleanup work is a
     refusal that trains people to ignore the tool.
     """
-    _guard_mutation(env, "create a row in")
+    _guard_mutation(env, "create a row in", "the session store", because=(
+                            "The app rewrites these rows as it opens sessions, "
+                            "so one added or removed underneath it can be "
+                            "overwritten or lost"))
     if not os.path.isdir(m["store_path"]):
         raise LayoutError("store vanished: " + m["store_path"])
     # The transcript must still be THE one this row was planned against - not
@@ -5333,7 +5361,10 @@ def undo_new_row(env, op):
                 "changed, and any row it wrote is still on disk - 'doctor' "
                 "lists conversations that no account points at."
                 .format(m.get("op_id"), bad))
-        _guard_mutation(env, "remove a row from")
+        _guard_mutation(env, "remove a row from", "the session store", because=(
+                            "The app rewrites these rows as it opens sessions, "
+                            "so one added or removed underneath it can be "
+                            "overwritten or lost"))
         r = m["rows"][0]
         if not r.get("written"):
             raise Refusal("this op never wrote the row; nothing to undo")
@@ -6917,7 +6948,7 @@ def _email_of(env, account_uuid):
     return got or ""
 
 
-def _repoint_store(env, flags):
+def _repoint_store(env, flags, what="repoint"):
     """(path, label) of the store whose row is being repointed.
 
     Defaults to the LIVE account's store, and that is the whole difference
@@ -6965,10 +6996,14 @@ def _repoint_store(env, flags):
     else:
         live = live_account(env)
     if not live or not live.path:
+        # `what` names the CALLER's verb. `_new_row_store` reuses this whole
+        # function, so a `new-row` user with ambiguous identity files was told
+        # there was "no default store to repoint" by a command that repoints
+        # nothing.
         raise Refusal(
             "cannot identify the signed-in account, so there is no default store to "
-            "repoint. Name one with --store <account id, email, or path substring>, "
-            "or assert the live account with --live (RULING 5).")
+            "{0}. Name one with --store <account id, email, or path substring>, "
+            "or assert the live account with --live (RULING 5).".format(what))
     return [(live.account_uuid, getattr(live, "org_uuid", "") or "", live.path)]
 
 

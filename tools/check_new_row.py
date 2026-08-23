@@ -345,11 +345,22 @@ shutil.rmtree(root, ignore_errors=True)
 print("\n--- refusals ---")
 
 
+_last_refusal = [""]
+
+
 def refusal(label, fn, needle):
+    """Assert fn() refuses with `needle` in the message.
+
+    The message is also kept in _last_refusal so a following check can assert
+    what the refusal does NOT say - "names the right command" is two claims,
+    and only one of them fits in a needle.
+    """
+    _last_refusal[0] = ""
     try:
         fn()
         check(label, False, "no refusal")
     except ccs.Refusal as exc:
+        _last_refusal[0] = str(exc)
         check(label, needle in str(exc), str(exc)[:90])
 
 
@@ -1619,6 +1630,70 @@ except ccs.Refusal as exc:
 check("  still naming both paths", msg.count(SID + ".jsonl") == 2, msg[-90:])
 check("  and now saying what to do about them",
       "Remove or rename" in msg, msg[:140])
+shutil.rmtree(root, ignore_errors=True)
+
+
+# Three refusals this command inherited from `repoint` and `sync`, each naming
+# something that is not what a new-row user is doing.
+print("\n--- refusals that name the right command and the right store ---")
+
+# _repoint_store is reused wholesale by _new_row_store, so its "no default store
+# to repoint" reached a command that repoints nothing.
+root, env, live, dorm = build([OPENER] + prose(8))
+os.remove(os.path.join(env.home, ".claude.json"))       # identity unresolvable
+os.remove(os.path.join(root, "Claude", "config.json"))  # ...and from both
+refusal("new-row's unidentifiable-account refusal names what IT does",
+        lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
+        "no default store to add a row to")
+check("  and does not say 'repoint'",
+      "repoint" not in _last_refusal[0], _last_refusal[0][:90])
+# the same function still speaks for repoint, which is its other caller
+refusal("  while repoint's own wording is unchanged",
+        lambda: ccs._repoint_store(env, ccs.RepointFlags(store="")),
+        "no default store to repoint")
+shutil.rmtree(root, ignore_errors=True)
+
+# store_why is printed as "chosen as ..." to justify the choice before --apply,
+# so it has to be true on the path where the user named nothing at all.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+check("the default store is not described as matching something you named",
+      "what you named" not in m["store_why"], m["store_why"])
+check("  it says it is the signed-in account's, and the default",
+      "signed in" in m["store_why"] and "default" in m["store_why"],
+      m["store_why"])
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, store=ORG_L,
+                                          title="Recovered"))
+check("  while a store the user DID name still says so",
+      m["store_why"] == "the only store matching what you named", m["store_why"])
+shutil.rmtree(root, ignore_errors=True)
+
+# The running-app guard's wording. new-row's default target is the account the
+# user is signed INTO, so "another account's store" describes something they
+# did not ask for, and "the destination is dormant" is not the claim.
+root, env, live, dorm = build([OPENER] + prose(8))
+env.process_lister = lambda: [DESKTOP]
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+refusal("the running-app guard refuses new-row",
+        lambda: ccs.run_new_row(env, m), "desktop app appears to be running")
+check("  naming the session store, not 'another account's store'",
+      "another account's store" not in _last_refusal[0]
+      and "the session store" in _last_refusal[0], _last_refusal[0][:120])
+check("  and giving the reason that applies to THIS command",
+      "rewrites these rows" in _last_refusal[0], _last_refusal[0][:150])
+shutil.rmtree(root, ignore_errors=True)
+
+# sync keeps the defaults, which are written for it: it really does write into
+# an account you are not signed into.
+root, env, live, dorm = build([OPENER] + prose(8))
+env.process_lister = lambda: [DESKTOP]
+try:
+    ccs._guard_mutation(env, "write to")
+    check("sync's wording is untouched", False, "no refusal")
+except ccs.Refusal as exc:
+    check("sync's wording is untouched",
+          "another account's store" in str(exc)
+          and "the destination is dormant" in str(exc), str(exc)[:120])
 shutil.rmtree(root, ignore_errors=True)
 
 
