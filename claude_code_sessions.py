@@ -6585,8 +6585,17 @@ def _repoint_claimed_later(env, m, r):
     journal held exactly that - two stuck ops and one completed op on one row.
 
     _sync_paths_claimed_elsewhere does this for sync and filters op_type
-    != "sync"; this is the repoint-shaped equivalent. Ids are timestamp-prefixed
-    and sort chronologically, which is what "later" means here.
+    != "sync"; this is the repoint-shaped equivalent.
+
+    ANY other terminal op that wrote this row disqualifies the restore - not
+    only a demonstrably later one. Op ids are timestamp-prefixed at SECOND
+    resolution, so two created in the same second order by their random suffix,
+    and a 20-run stress of the test caught that being flaky 8 times before a
+    user could. Ordering is therefore not reliable evidence here, and the two
+    failure modes are not symmetric: declining wrongly closes the record without
+    reverting, which is safe, while restoring wrongly destroys a completed
+    operation's work. So the question is not "who went last" but "can we prove
+    these bytes are ours" - and if another op wrote the same row, we cannot.
 
     Never raises - every caller is on a path that must terminate.
     """
@@ -6596,7 +6605,7 @@ def _repoint_claimed_later(env, m, r):
         for o in list_ops(env):
             om = o.manifest
             oid = om.get("op_id") or ""
-            if oid <= mine or om.get("status") not in TERMINAL:
+            if oid == mine or om.get("status") not in TERMINAL:
                 continue
             for orow in om.get("rows") or []:
                 p = orow.get("dest_path")
