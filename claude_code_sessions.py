@@ -1785,17 +1785,48 @@ def classify_op(env, op):
     status = m["status"]
 
     if m.get("op_type") == "repoint":
-        # One row, one field, one atomic write - there is no partial state to
-        # roll forward. A non-terminal repoint means the write never landed (the
-        # row still holds its original pointer), so nothing needs recovering and
-        # re-running is the fix. Returning no resolutions is the honest answer;
-        # falling through to the move shape below would invent source/dest keys
-        # this manifest does not have.
+        # "There is no partial state to roll forward" was wrong, and it left
+        # every stuck repoint with resolutions: [] - which cmd_recover's gate
+        # turns into a refusal. Non-terminal ops are never rotated, so those
+        # records sat in the journal permanently, holding `doctor` at exit 1
+        # with the only advice being "run repoint again" - which starts a NEW
+        # op and closes nothing. Six of them accumulated on one machine.
+        #
+        # There is a partial state, and the row on disk says which: a write can
+        # land and the marker fail to save, exactly as it can for new-row.
+        r = (m.get("rows") or [{}])[0]
+        state = _sync_row_drift(r)
+        landed = _repoint_landed(m, r)
+        if state == "match":
+            said = "was written"
+            res = ["forward", "back"]
+        elif landed is False:
+            # THE POINTER IS THE EVIDENCE, not the bytes. A repoint changes one
+            # field, and the app rewrites the others (lastActivityAt and
+            # friends) whenever it opens the session - so a row this op never
+            # touched still reads as "drifted" days later. Asking where the row
+            # points answers the only question that matters here.
+            said = ("was not written - the row still opens what it opened "
+                    "before")
+            res = ["forward", "back"]
+        elif state == "absent":
+            said = "is gone from the store"
+            res = ["back"]
+        elif state == "unreadable":
+            said = "exists but could not be read"
+            res = ["back"]
+        else:
+            said = ("was written, and something has changed the row since - "
+                    "most likely the app")
+            res = ["back"]
         return {"status": m["status"], "source": m.get("store_label", "n/a"),
-                "dest": m.get("store_label", "n/a"), "resolutions": [],
+                "dest": m.get("store_label", "n/a"), "resolutions": res,
                 "drifted_rows": [],
-                "note": "repoint: a single-row write that did not complete; the row "
-                        "still holds its original pointer - run repoint again"}
+                "note": "repoint: the row {0}; {1}".format(
+                    said,
+                    "back closes this operation and leaves the row alone"
+                    if res == ["back"] else
+                    "forward completes it, back puts the row back as it was")}
     if m.get("op_type") == "new-row":
         # Unlike repoint, there IS a partial state worth resolving: the row may
         # or may not have landed before the crash. Both directions are real -
@@ -2120,6 +2151,54 @@ def recover_op(env, op, direction):
                        else "it no longer holds what this op wrote ({0})"
                             .format(state))
                 residue = "left {0!r} in place - {1}".format(r["name"], why)
+            if residue:
+                m["rollback_residue"] = residue
+                save_manifest(op)
+            set_status(op, "rolled_back")
+            rotate_ops(env)
+            return "rolled_back"
+        if m.get("op_type") == "repoint":
+            r = m["rows"][0]
+            state = _sync_row_drift(r)
+            if direction == "forward":
+                if state == "match":
+                    # Journal-only: the write landed and the marker did not
+                    # save. No store byte changes, so no mutation guard - the
+                    # same asymmetry the new-row arm documents. Re-validating
+                    # here would block finishing a write that already succeeded.
+                    r["written"] = True
+                    save_manifest(op)
+                    set_status(op, "completed")
+                    rotate_ops(env)
+                    return "completed"
+                set_status(op, "journaled")
+                final = execute_repoint_op(env, op)
+                rotate_ops(env)
+                return final
+            # 'back' must always terminate - it is the only exit from a stuck
+            # op, and having no exit at all is what put six of these in one
+            # journal. What it does depends on whether our write is still in
+            # effect, which the POINTER answers and the bytes do not.
+            residue = None
+            if state == "match":
+                _guard_mutation(env, "repoint")
+                try:
+                    real = ensure_contained(r["dest_path"], [m["store_path"]])
+                    if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+                        raise LayoutError("not a direct child of the store")
+                    atomic_write(r["dest_path"], _sync_pre_image(r))
+                except (OSError, LayoutError, ValueError, KeyError) as exc:
+                    residue = ("could not put {0!r} back: {1}"
+                               .format(r.get("name"), exc))
+            elif _repoint_landed(m, r) is False:
+                pass          # never took effect; nothing to undo, just close
+            else:
+                why = ("it exists but could not be read" if state == "unreadable"
+                       else "it is gone from the store" if state == "absent"
+                       else "it still opens what this op pointed it at, and no "
+                            "longer holds the bytes this op wrote, so putting "
+                            "it back would discard whatever changed it")
+                residue = "left {0!r} alone - {1}".format(r.get("name"), why)
             if residue:
                 m["rollback_residue"] = residue
                 save_manifest(op)
@@ -6382,6 +6461,32 @@ def run_sync(env, manifest):
         return final
     finally:
         release_lock(env)
+
+
+def _repoint_landed(m, r):
+    """True if the row now opens what this repoint aimed it at, False if it
+    still opens what it opened before, None if neither or unreadable.
+
+    A repoint changes ONE field. The app rewrites the others - lastActivityAt,
+    lastFocusedAt - every time it opens the session, so a row this operation
+    never touched reads as "drifted" against its own pre-image within a day.
+    Byte comparison answers "is this exactly what we wrote"; only the pointer
+    answers "did what we intended happen", which is what recovery needs.
+
+    Never raises: classify_op calls it, and classify_op must never raise.
+    """
+    try:
+        d = read_json(r["dest_path"])
+    except (LayoutError, OSError, ValueError, KeyError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    cur = d.get("cliSessionId")
+    if cur and cur == m.get("to_session"):
+        return True
+    if cur and cur == m.get("from_session"):
+        return False
+    return None
 
 
 def _sync_row_drift(r):

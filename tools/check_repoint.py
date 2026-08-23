@@ -432,6 +432,160 @@ check("the plan names the live store by email rather than a hex prefix",
       m["store_label"].startswith("live@example.com"), m["store_label"])
 shutil.rmtree(root, ignore_errors=True)
 
+
+# --------------------------------------------------------- recovery, 2026-08-23
+# A stuck repoint had NO exit. classify_op returned resolutions: [] and
+# cmd_recover's gate turned that into a refusal, while non-terminal ops are
+# never rotated - so the record sat in the journal forever, holding doctor at
+# exit 1, with the only advice being "run repoint again", which starts a new op
+# and closes nothing. Six accumulated on one machine before anyone tried to
+# clear them.
+print("\n--- a stuck repoint has an exit ---")
+
+DESKTOP = (1, r"c:\program files\windowsapps"
+              r"\claude_1.0_x64__pzs8sxrjxfjjc\app\claude.exe")
+
+
+def torn(landed=True, drift=False):
+    """A repoint left non-terminal, as a crash between write and marker does."""
+    root, env, row = build()
+    m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    op = ccs.new_op(env, m)
+    ccs.set_status(op, "journaled")
+    if landed:
+        ccs.atomic_write(m["rows"][0]["dest_path"], ccs.unb64(m["rows"][0]["post_b64"]))
+    if drift:                       # as the app does: touch a field we never set
+        d = json.load(open(row, encoding="utf-8"))
+        d["lastFocusedAt"] = 4242
+        with open(row, "w") as fh:
+            json.dump(d, fh)
+    return root, env, row, m, ccs.nonterminal_ops(env)[0]
+
+
+# 1. the write landed, the marker did not
+root, env, row, m, op = torn(landed=True)
+c = ccs.classify_op(env, op)
+check("a landed-but-unmarked repoint offers both directions",
+      sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
+check("  and says the row WAS written", "was written" in c["note"], c["note"][:70])
+env.process_lister = lambda: [DESKTOP]
+try:
+    _r = ccs.recover_op(env, op, "forward")
+except BaseException as _e:                     # noqa: BLE001 - report, do not abort
+    _r = "%s: %s" % (type(_e).__name__, str(_e)[:50])
+check("  forward finishes it even with the app running - journal only",
+      _r == "completed", str(_r))
+check("  leaving the row at the new pointer", sid_of(row) == NEW, sid_of(row))
+check("  and nothing pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# 2. back on the same state restores the original pointer
+root, env, row, m, op = torn(landed=True)
+check("back puts the original pointer back",
+      ccs.recover_op(env, op, "back") == "rolled_back")
+check("  byte-for-byte", sid_of(row) == OLD, sid_of(row))
+check("  with no residue - it reversed cleanly",
+      not [o for o in ccs.list_ops(env) if o.manifest.get("rollback_residue")])
+shutil.rmtree(root, ignore_errors=True)
+
+# 3. back refuses to touch the store while the app is running
+root, env, row, m, op = torn(landed=True)
+env.process_lister = lambda: [DESKTOP]
+try:
+    ccs.recover_op(env, op, "back")
+    check("back refuses to restore while the app runs", False, "it wrote")
+except ccs.Refusal as exc:
+    check("back refuses to restore while the app runs",
+          "desktop app" in str(exc), str(exc)[:70])
+check("  leaving the row alone", sid_of(row) == NEW)
+shutil.rmtree(root, ignore_errors=True)
+
+# 4. the write never landed: back closes clean, and touches nothing
+root, env, row, m, op = torn(landed=False)
+before = open(row, "rb").read()
+check("a repoint that never wrote closes on back",
+      ccs.recover_op(env, op, "back") == "rolled_back")
+check("  without touching the row", open(row, "rb").read() == before)
+check("  and with no residue, because it left nothing behind",
+      not [o for o in ccs.list_ops(env) if o.manifest.get("rollback_residue")])
+check("  and nothing is left pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# 5. THE POINTER IS THE EVIDENCE, NOT THE BYTES. The app rewrites fields this
+# op never set, so a row it never touched reads as "drifted" within a day. Six
+# real stuck ops looked exactly like this.
+root, env, row, m, op = torn(landed=False, drift=True)
+check("a row the app touched reads as drifted",
+      ccs._sync_row_drift(m["rows"][0]) == "drifted")
+check("  but the pointer says the write never landed",
+      ccs._repoint_landed(m, m["rows"][0]) is False)
+c = ccs.classify_op(env, op)
+check("  so classify_op still offers both directions",
+      sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
+check("  and says the row still opens what it opened before",
+      "still opens what it opened before" in c["note"], c["note"][:80])
+before = open(row, "rb").read()
+check("  back closes it", ccs.recover_op(env, op, "back") == "rolled_back")
+check("  touching nothing", open(row, "rb").read() == before)
+check("  with no residue - our write never took effect",
+      not [o for o in ccs.list_ops(env) if o.manifest.get("rollback_residue")])
+shutil.rmtree(root, ignore_errors=True)
+
+# 6. the write landed AND the app then changed the row: back cannot cleanly
+# reverse it, so it says so rather than discarding the app's own edits.
+root, env, row, m, op = torn(landed=True, drift=True)
+check("a landed-then-changed row is drifted",
+      ccs._sync_row_drift(m["rows"][0]) == "drifted")
+check("  and the pointer says our write DID land",
+      ccs._repoint_landed(m, m["rows"][0]) is True)
+c = ccs.classify_op(env, op)
+check("  so only back is offered", c["resolutions"] == ["back"], str(c["resolutions"]))
+before = open(row, "rb").read()
+try:
+    _r = ccs.recover_op(env, op, "back")
+except BaseException as _e:                     # noqa: BLE001
+    _r = "%s: %s" % (type(_e).__name__, str(_e)[:50])
+check("  back closes it", _r == "rolled_back", str(_r))
+check("  leaving the row alone rather than discarding what changed it",
+      open(row, "rb").read() == before)
+res = [o.manifest.get("rollback_residue") for o in ccs.list_ops(env)
+       if o.manifest.get("rollback_residue")]
+check("  and RECORDING that it left something behind", len(res) == 1, str(res)[:90])
+shutil.rmtree(root, ignore_errors=True)
+
+# 7. back always terminates, whatever the row is doing - it is the only exit.
+for label, wreck in (("row deleted", lambda p: os.unlink(p)),
+                     ("row replaced with junk",
+                      lambda p: open(p, "w").write("{not json")),
+                     ("row is a directory",
+                      lambda p: (os.unlink(p), os.makedirs(p)))):
+    root, env, row, m, op = torn(landed=True)
+    wreck(row)
+    try:
+        res = ccs.recover_op(env, op, "back")
+        check("back terminates when the %s" % label, res == "rolled_back", str(res))
+        check("  leaving nothing pending", not ccs.nonterminal_ops(env))
+    except (ccs.Refusal, ccs.LayoutError) as exc:
+        check("back terminates when the %s" % label, False,
+              "Refusal: " + str(exc)[:56])
+        check("  leaving nothing pending", False, "refused")
+    except BaseException as exc:                    # noqa: BLE001 - that is the bug
+        check("back terminates when the %s" % label, False,
+              "ESCAPED %s" % type(exc).__name__)
+        check("  leaving nothing pending", False, "escaped")
+    shutil.rmtree(root, ignore_errors=True)
+
+# 8. _repoint_landed never raises - classify_op depends on that.
+root, env, row, m, op = torn(landed=True)
+for bad in ({}, {"dest_path": row + ".missing"}, {"dest_path": 17}):
+    try:
+        ccs._repoint_landed(m, bad)
+        check("_repoint_landed survives %r" % (sorted(bad) or "an empty row"), True)
+    except BaseException as exc:                    # noqa: BLE001
+        check("_repoint_landed survives %r" % (sorted(bad) or "an empty row"),
+              False, type(exc).__name__)
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
