@@ -2478,6 +2478,40 @@ check("  and the row is on disk",
       any(n != "local_anything.json" for n in os.listdir(live)),
       str(os.listdir(live)))
 shutil.rmtree(root, ignore_errors=True)
+
+# The command's own closing line tells the user "'undo' removes the row again".
+# cmd_undo filters candidates by op_type, so until new-row is in that tuple the
+# promise is false in the worst way: undo silently selects an older unrelated
+# operation and reverses THAT, or refuses when none exists. undo_new_row was
+# fully built and tested in Task 4 and reachable from nothing.
+print("
+--- undo actually reaches a new-row op ---")
+
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Undo me"))
+ccs.run_new_row(env, m)
+path = m["rows"][0]["dest_path"]
+out = []
+real_bp3 = builtins.print
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    rc = ccs.cmd_undo(env, _Ns(op_id="", apply=False, verbose=True))
+finally:
+    builtins.print = real_bp3
+check("undo's dry run SEES the new-row op", rc == 0 and any(
+    m["op_id"] in line for line in out), str(out)[:110])
+check("  describing it as a new-row, not as 'session None'",
+      any("new-row" in line for line in out) and not any("session None" in line
+                                                         for line in out),
+      str(out)[:110])
+out = []
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    ccs.cmd_undo(env, _Ns(op_id="", apply=True, verbose=True))
+finally:
+    builtins.print = real_bp3
+check("  and --apply removes the row", not os.path.exists(path), str(out)[:110])
+shutil.rmtree(root, ignore_errors=True)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2612,6 +2646,44 @@ Register the subcommand in `build_parser`, after the `repoint` parser:
 **Deliberately NO `--verbose`.** The other commands use it to stop redacting paths in their reports; `_print_new_row_report` has no redaction to switch off, so accepting the flag would advertise behaviour it does not have. Add the flag in the same change that adds redaction, or not at all.
 
 And add `"new-row": cmd_new_row` to the dispatch mapping beside `"repoint": cmd_repoint`.
+
+**Then wire `undo`, in three places, or `undo_new_row` is unreachable code and
+`cmd_new_row`'s closing line is a lie.** It tells the user "'undo' removes the
+row again"; without these edits `ccs undo` cannot see a new-row op at all, so it
+silently selects the most recent *older* completed move/sync/repoint instead and
+reverses that — or refuses outright when none exists. Task 4 built and tested the
+whole careful evidence rule for this path; none of it is reachable until here.
+
+First, `cmd_undo`'s candidate filter — add `"new-row"` to the tuple:
+
+```python
+    candidates = [o for o in ops if o.manifest.get("status") == "completed"
+                 and o.manifest.get("op_type", "move") in ("move", "sync",
+                                                           "repoint", "new-row")]
+```
+
+Second, a dry-run preview branch beside the `sync` one. A new-row manifest has no
+`session_id`, so the move-shaped `else` below would print "session None" — the
+same defect the `sync` branch exists to avoid:
+
+```python
+        elif prior.manifest.get("op_type") == "new-row":
+            pm = prior.manifest
+            line = ("would undo {0} (new-row: removes the row {1!r}, which opens "
+                    "{2}); pass --apply to execute".format(
+                        pm["op_id"], pm.get("title", ""),
+                        (pm.get("to_session") or "")[:8]))
+```
+
+Third, the apply dispatch beside the other two:
+
+```python
+    elif prior.manifest.get("op_type") == "new-row":
+        final = undo_new_row(env, prior)
+```
+
+`undo_new_row` returns `"undone"`, which `cmd_undo`'s existing `success` test
+already accepts alongside `"completed"` — no change needed there.
 
 - [ ] **Step 4: Run to verify it passes, and exercise the CLI by hand**
 
@@ -2918,7 +2990,7 @@ is on disk and unopenable — 170 such transcripts were measured on one machine.
 `doctor` lists them; this turns one back into a sidebar entry.
 
 The title comes from `--title`, or the transcript's own title if it has one, or a
-placeholder like `(untitled — 2026-06-14, 181 turns, Personal)` — deliberately not a
+placeholder like `(untitled - 2026-06-14, 181 turns, Personal)` — deliberately not a
 summary, because a machine-made title that reads like one is worse than an obvious
 placeholder.
 
@@ -2932,6 +3004,21 @@ case it was built for, since an app version that rejects a row does so the first
 it opens the sidebar. A row that disappears after a busy stretch of other operations
 will go unreported.
 ```
+
+- [ ] **Step 1b: Two corrections to text this addition makes stale**
+
+`docs/internals.md`'s "The operation lock" section lists the mutating entry points
+that compete for the lock — `run_move`, `undo_move`, `recover_op`, `run_sync`,
+`undo_sync`, `run_repoint`, `undo_repoint` — and says "All seven release it in a
+`finally`." `run_new_row` and `undo_new_row` do the same, so the list is now
+missing two of the tool's mutating entry points and the count is wrong. Add both
+and change seven to nine. Find the sentence rather than trusting a line number.
+
+`README.md`'s `doctor` bullet enumerates what that command reports — stale locks,
+unresolved operations, orphaned rows, encoding-scheme ambiguity, conversations no
+sidebar points at — and does not mention the vanished-synthesized-row check the
+new `new-row` section explicitly leans on ("If a future version rejects one,
+`doctor` reports it"). Add it to that list.
 
 - [ ] **Step 2: Add an internals section**
 
