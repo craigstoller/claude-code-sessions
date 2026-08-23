@@ -4405,6 +4405,84 @@ def _synthesize_row(session_id, title, title_source, facts, row_uuid):
     return row
 
 
+def _placeholder_title(facts):
+    """A title that does NOT impersonate a summary.
+
+    Used for the orphaned conversations that carry no customTitle of their own -
+    120 of 170 on this machine, measured 2026-08-23 by the orphan query in the
+    plan's Task 1. Expect the count to drift: it moved 169 -> 170 in one day
+    simply because a new session was created, so treat it as a magnitude rather
+    than a constant. The app's titles are model-written summaries, so
+    nothing mechanical can produce one - and a machine-made title that LOOKS
+    like a summary is the failure this whole command is careful about. This one
+    is identifying, sortable, and visibly not a summary.
+
+    UTC, matching _iso_ms. time.localtime here would render the same
+    conversation as two different dates on two machines, and the row's own
+    createdAt - which IS UTC - would disagree with its title.
+    """
+    day = time.strftime("%Y-%m-%d", time.gmtime((facts["last_ms"] or 0) / 1000.0))
+    # Split on BOTH separators, never os.path.basename. The cwd comes out of a
+    # transcript, not off this filesystem, so a store synced from Windows can
+    # hand a POSIX machine `C:\Users\craig\Projects\Personal` - where basename
+    # finds no `/`, returns the whole string, and the "placeholder" becomes an
+    # absolute path. The test below pins a Windows cwd precisely so this stays
+    # correct when the suite runs on macOS or Linux.
+    #
+    # A BARE DRIVE IS NOT A LEAF. `C:\` strips to `C:` and splits to `C:`, which
+    # is truthy - so a plain split appends "C:" to the title where the intent is
+    # to append nothing. ntpath.basename returned "" here and hid the case; the
+    # cross-platform split exposes it, so it has to be handled rather than
+    # inherited. Measured: C:\ -> 'C:', D:\ -> 'D:', / -> '', \\server\share ->
+    # 'share' (a real leaf, correctly kept).
+    leaf = re.split(r"[\\/]", (facts.get("cwd") or "").rstrip("\\/"))[-1]
+    if re.match(r"^[A-Za-z]:$", leaf):
+        leaf = ""
+    turns = facts.get("turns")
+    parts = [day, "{0} turns".format(turns) if turns is not None
+             else "turns not counted"]
+    if leaf:                       # a cwd of C:\ or / has no leaf - drop the
+        parts.append(leaf)         # clause rather than dangle a comma
+    return "(untitled - {0})".format(", ".join(parts))
+
+
+def _new_row_title(explicit, facts):
+    """(title, provenance, title_source).
+
+    Provenance is printed, because the user's decision differs: a customTitle
+    was written by a person about that conversation, and a placeholder is an
+    admission that nothing was available.
+
+    title_source is what goes IN the row, and it is a claim about authorship
+    rather than a formatting detail. 533 of the 537 real rows carrying the field
+    say 'auto'; writing 'user' on a machine-made placeholder would tell the app,
+    and the next person to read the file, that someone chose it.
+    """
+    explicit = (explicit or "").strip()
+    if explicit:
+        return explicit, "yours", "user"
+    if facts.get("custom_title"):
+        return facts["custom_title"], "the transcript's custom title", "auto"
+    return _placeholder_title(facts), "placeholder", "auto"
+
+
+def _unique_title(title, existing, generated):
+    """Suffix a GENERATED title until it is unique within the account.
+
+    A user-supplied duplicate is allowed and merely reported - they asked for
+    that exact string. A customTitle counts as generated even though a person
+    wrote it: they wrote it for a different row and were never asked whether a
+    duplicate here was acceptable, and silence is not consent to a string the
+    user has not seen.
+    """
+    if not generated or title not in existing:
+        return title
+    n = 2
+    while "{0} ({1})".format(title, n) in existing:
+        n += 1
+    return "{0} ({1})".format(title, n)
+
+
 def _displaced_overlap(env, old_sid, new_sid):
     """How much of the conversation a refresh DISPLACES also lives in the one it
     brings in - a float 0.0-1.0, or None when it cannot be measured.

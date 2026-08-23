@@ -249,6 +249,78 @@ check("an uncountable transcript omits completedTurns entirely",
       "completedTurns" not in unc, str(unc.get("completedTurns")))
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------------------------------ titles
+print("\n--- title derivation ---")
+
+FACTS = {"cwd": r"C:\Users\craig\Projects\Personal", "created_ms": 0,
+         "last_ms": ccs._iso_ms("2026-06-14T10:08:00.000Z"), "turns": 181,
+         "custom_title": None, "path": "x", "model": "claude-fable-5",
+         "effort": "xhigh"}
+check("the placeholder names date, turns and the LAST path component",
+      ccs._placeholder_title(FACTS) == "(untitled - 2026-06-14, 181 turns, Personal)",
+      ccs._placeholder_title(FACTS))
+
+# The date must be UTC, matching _iso_ms. With localtime, this exact fact dict
+# renders 2026-06-14 in Seattle and 2026-06-15 in UTC+14 - so the assertion
+# above would pass or fail depending on where the suite runs.
+check("  and the date is UTC, so the title does not vary by machine timezone",
+      "2026-06-14" in ccs._placeholder_title(
+          dict(FACTS, last_ms=ccs._iso_ms("2026-06-14T23:30:00.000Z"))),
+      ccs._placeholder_title(dict(FACTS, last_ms=ccs._iso_ms("2026-06-14T23:30:00.000Z"))))
+
+ROOT_FACTS = dict(FACTS, cwd="C:\\")
+check("a root cwd drops the component instead of dangling a comma",
+      ccs._placeholder_title(ROOT_FACTS) == "(untitled - 2026-06-14, 181 turns)",
+      ccs._placeholder_title(ROOT_FACTS))
+check("  a POSIX root likewise",
+      ccs._placeholder_title(dict(FACTS, cwd="/"))
+      == "(untitled - 2026-06-14, 181 turns)",
+      ccs._placeholder_title(dict(FACTS, cwd="/")))
+check("  and a non-C drive letter is not mistaken for a folder name",
+      ccs._placeholder_title(dict(FACTS, cwd="D:\\"))
+      == "(untitled - 2026-06-14, 181 turns)",
+      ccs._placeholder_title(dict(FACTS, cwd="D:\\")))
+check("  while a UNC share IS a real leaf and is kept",
+      ccs._placeholder_title(dict(FACTS, cwd="\\\\server\\share"))
+      == "(untitled - 2026-06-14, 181 turns, share)",
+      ccs._placeholder_title(dict(FACTS, cwd="\\\\server\\share")))
+
+# The cwd comes out of a transcript, not off this filesystem. os.path.basename
+# on a POSIX host finds no '/' in a Windows path and returns the whole thing,
+# so this assertion is what keeps the suite honest when it runs on macOS.
+check("a Windows cwd yields its leaf on ANY host, not the whole path",
+      ccs._placeholder_title(FACTS).endswith("Personal)"),
+      ccs._placeholder_title(FACTS))
+check("  and a POSIX cwd works the same way",
+      ccs._placeholder_title(dict(FACTS, cwd="/home/craig/Projects/Personal"))
+      == "(untitled - 2026-06-14, 181 turns, Personal)",
+      ccs._placeholder_title(dict(FACTS, cwd="/home/craig/Projects/Personal")))
+
+check("an uncountable transcript says so rather than claiming a number",
+      ccs._placeholder_title(dict(FACTS, turns=None))
+      == "(untitled - 2026-06-14, turns not counted, Personal)",
+      ccs._placeholder_title(dict(FACTS, turns=None)))
+
+check("--title wins, is reported as yours, and records titleSource user",
+      ccs._new_row_title("Mine", FACTS) == ("Mine", "yours", "user"))
+check("customTitle is used when there is no --title, and records auto",
+      ccs._new_row_title("", dict(FACTS, custom_title="Theirs"))
+      == ("Theirs", "the transcript's custom title", "auto"))
+check("a whitespace-only --title is treated as absent, not as a title",
+      ccs._new_row_title("   ", FACTS)[2] == "auto",
+      str(ccs._new_row_title("   ", FACTS)))
+check("otherwise the placeholder, reported as such",
+      ccs._new_row_title("", FACTS)[1] == "placeholder")
+
+existing = {"Mine", "Mine (2)", "Theirs"}
+check("a user-supplied duplicate is left alone",
+      ccs._unique_title("Mine", existing, generated=False) == "Mine")
+check("a generated duplicate is suffixed past every taken variant",
+      ccs._unique_title("Mine", existing, generated=True) == "Mine (3)",
+      ccs._unique_title("Mine", existing, generated=True))
+check("  and an untaken generated title is untouched",
+      ccs._unique_title("Fresh", existing, generated=True) == "Fresh")
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
