@@ -3901,8 +3901,25 @@ def _pointed_session(blob):
     return sid if isinstance(sid, str) and sid else None
 
 
-def _other_pointers(env, dest_path):
-    """{cliSessionId: [store labels]} for every store EXCEPT dest_path.
+def _other_pointers(env, dest_path, doomed_rows=()):
+    """{cliSessionId: [store labels]} for every row that will SURVIVE this plan.
+
+    Every store is read, including `dest_path`. What is excluded is narrower and
+    exact: the rows named in `doomed_rows`, which are the destination rows this
+    plan is about to overwrite. Those cannot vouch for the conversation they
+    currently open, because they are about to stop opening it.
+
+    Until 2026-08-22 this excluded the whole destination STORE, which was the
+    wrong shape in both directions. Too coarse: a conversation still held by
+    ANOTHER row in the destination account read as about to become unreachable.
+    Hit in live use - a redundant `(fork)` row in the destination was repointed
+    at a conversation specifically to keep a second door open, and the very next
+    sync still demanded --allow-orphan, because the door it had just been given
+    sat inside the store the check skipped. And "just exclude the one row" would
+    have been too narrow the other way: a conversation held only by some OTHER
+    row this same plan also overwrites is genuinely about to be orphaned, and a
+    single-row exclusion would call it safe. Per-row, for every doomed row, is
+    the only version that gets both cases right.
 
     Answers the only question that matters before repointing a row: if this
     account stops pointing at a conversation, does anything else still point at
@@ -3919,10 +3936,10 @@ def _other_pointers(env, dest_path):
     select_sync_rows already does, but there is no reason to pay it otherwise.
     """
     real_dest = os.path.realpath(dest_path)
+    doomed = set(doomed_rows or ())
     out = {}
     for acct, org, path in _account_dirs(env):
-        if os.path.realpath(path) == real_dest:
-            continue
+        is_dest = os.path.realpath(path) == real_dest
         label = "{0}/{1}".format(acct[:8], org[:8])
         try:
             names = os.listdir(path)
@@ -3934,6 +3951,12 @@ def _other_pointers(env, dest_path):
             continue
         for name in names:
             if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            if is_dest and name in doomed:
+                # This row is about to be overwritten by THIS plan, so it cannot
+                # vouch for the conversation it currently opens. Every other row
+                # in the destination still can - that is the whole point of the
+                # change.
                 continue
             try:
                 d = read_json(os.path.join(path, name))
@@ -3956,6 +3979,45 @@ TRANSCRIPT_COMPARE_MAX_ROWS = 40
 # Below this many prose turns in the displaced conversation, report "not
 # measured" rather than a percentage a handful of messages cannot support.
 OVERLAP_MIN_SAMPLE = 8
+
+# Turns the APP writes into a transcript, which no person authored. They are
+# excluded from the overlap comparison because counting them answers the wrong
+# question: the number exists to say how much of a displaced CONVERSATION is
+# also in its replacement, and an interruption marker is not conversation.
+#
+# Measured 2026-08-22 on three real swap rows that reported 95%, 98% and 98%
+# overlap: every single non-matching turn was one of these markers. The metric
+# was reporting up to 8 turns "only there" when the true count of authored
+# content only there was ZERO - making safe overwrites read as risky, which is
+# the opposite of the error the number exists to prevent, and which trains the
+# user to click past the warning that guards the destructive case.
+#
+# Deliberately narrow. Only text the app itself emits is listed; a turn a
+# person typed is never filtered, however little it carries, because deciding
+# which of the user's own words are "real" is not this function's job. The
+# filter is a prefix match so the "... for tool use" variant is covered.
+#
+# **Over-filtering is NOT free, and an earlier version of this comment claimed
+# it was.** It said a conversation pushed below OVERLAP_MIN_SAMPLE reports NOT
+# MEASURED "never a wrong percentage", which is only the small-transcript case.
+# On a transcript with plenty of turns, dropping one turn that a person really
+# authored removes it from BOTH sides of the comparison and can lift the
+# overlap to a false 100% - the exact overstatement `_overlap_clause` is
+# written to avoid. So the bar for adding an entry here is evidence that the
+# app authors the string, not that the string looks like boilerplate.
+#
+# **"Continue from where you left off." was removed on that test.** It shipped
+# in the first draft of this list and three independent reviewers flagged the
+# same thing: it appears as a USER-role turn, nothing distinguishes it from a
+# person typing the same words, and filtering it contradicts the paragraph
+# above. The two that remain are bracketed status text and a fixed system
+# string; neither is plausible as authored prose. If a future entry is only
+# probably app-emitted, leave it in - a false alarm costs a second look, a
+# false 100% costs a conversation.
+TRANSCRIPT_PLUMBING_PREFIXES = (
+    "[Request interrupted by user",   # both the bare and "for tool use" forms
+    "No response requested.",         # emitted when a turn ends without a reply
+)
 
 
 def _message_fingerprints(path):
@@ -4017,8 +4079,11 @@ def _message_fingerprints(path):
                 else:
                     continue
                 body = " ".join(body.split())
-                if body:
-                    out.append(hashlib.sha1(body[:400].encode("utf-8")).hexdigest()[:12])
+                if not body:
+                    continue
+                if body.startswith(TRANSCRIPT_PLUMBING_PREFIXES):
+                    continue        # app-emitted, not conversation - see the constant
+                out.append(hashlib.sha1(body[:400].encode("utf-8")).hexdigest()[:12])
     except OSError:
         return None
     return out
@@ -4066,6 +4131,70 @@ def _displaced_overlap(env, old_sid, new_sid):
         return None
     seen = set(b)
     return sum(1 for h in a if h in seen) / float(len(a))
+
+
+def _displaced_sizes(env, old_sid, new_sid):
+    """(displaced_turns, incoming_turns) - prose-turn counts for the two sides
+    of a pointer swap, or (None, None) when either cannot be counted.
+
+    A LENGTH, alongside the overlap percentage, because they answer different
+    questions and only one of them was being asked. Overlap says how much of
+    the displaced conversation survives in its replacement; it says nothing
+    about whether the ROW ends up on a shorter conversation than it started on.
+
+    Both directions of that were hit in live use on 2026-08-22 and neither was
+    visible in the plan: a row going 436 -> 336 turns, and another going 338 ->
+    130, each reported only as a percentage the user had to convert into a
+    length judgement in their head. "436 -> 336 turns" needs no conversion.
+
+    Deliberately reuses the same fingerprint list the overlap uses, so the two
+    numbers can never disagree about what counts as a turn - including the
+    plumbing exclusion.
+
+    **Cost, stated accurately.** An earlier version of this docstring said it
+    "costs nothing extra" because the page cache serves the re-read. That is
+    only true of the disk I/O: this re-runs the JSON parse, the normalisation
+    and the hashing on both files. Bounded by the same
+    TRANSCRIPT_COMPARE_MAX_ROWS the overlap loop runs under, and only for rows
+    that actually swap, but it is real CPU rather than free.
+
+    **Scope of "reported even when the overlap cannot be measured."** True for
+    a row the loop reaches: a pair too short to yield an honest percentage
+    still yields a length. NOT true past the row cap - the loop breaks there
+    and the remaining rows get neither number, which is the cap working as
+    documented rather than a length-specific gap.
+    """
+    if not old_sid or not new_sid or old_sid == new_sid:
+        return (None, None)
+    old = find_transcripts(env.projects_root, old_sid)
+    new = find_transcripts(env.projects_root, new_sid)
+    if not old or not new or len(old) > 1 or len(new) > 1:
+        return (None, None)
+    a = _message_fingerprints(old[0])
+    b = _message_fingerprints(new[0])
+    if a is None or b is None:
+        return (None, None)
+    return (len(a), len(b))
+
+
+def _length_clause(before, after):
+    """One plain sentence about what a swap does to the row's LENGTH, or "" when
+    it cannot be counted.
+
+    Says nothing when the counts are unknown rather than guessing, and stays
+    silent on a wash - a row that gains or loses nothing does not need a line.
+    The shrink case is the one this exists for, so it is the one that gets the
+    blunt wording.
+    """
+    if before is None or after is None:
+        return ""
+    if after < before:
+        return ("this row goes from {0} to {1} prose turns - {2} FEWER"
+                .format(before, after, before - after))
+    if after > before:
+        return ("this row goes from {0} to {1} prose turns - {2} more"
+                .format(before, after, after - before))
+    return "both conversations have {0} prose turns".format(before)
 
 
 def _refresh_field_loss(pre, post):
@@ -4234,6 +4363,12 @@ def plan_sync(env, flags):
                      # 0.0-1.0: how much of the displaced conversation is also
                      # in the incoming one. None = not measured / not knowable.
                      "displaced_overlap": None,
+                     # prose-turn counts either side of the swap. Carried
+                     # separately from the overlap because a row can lose length
+                     # while keeping a high overlap - the case the percentage
+                     # alone hid twice on 2026-08-22.
+                     "displaced_turns": None,
+                     "incoming_turns": None,
                      # carried per row so the report, --json and the window can
                      # each say which overwrites move a row backwards without
                      # re-deriving it
@@ -4266,7 +4401,11 @@ def plan_sync(env, flags):
     # have written, 6 swapped the conversation and 5 of those orphaned it.
     swap_rows = [r for r in rows if r["swaps_conversation"]]
     if swap_rows:
-        pointers = _other_pointers(env, dest.path)
+        # Every row this plan will overwrite, not just the swapping ones: a
+        # plain refresh also replaces its row wholesale, so it stops vouching
+        # for whatever it pointed at too.
+        doomed = {r["name"] for r in rows if r.get("is_update")}
+        pointers = _other_pointers(env, dest.path, doomed)
         unreadable_store = None in pointers
         # How much of each displaced conversation survives in its replacement.
         # Bounded: past the row cap the number stops being worth the reads, and
@@ -4280,6 +4419,12 @@ def plan_sync(env, flags):
             except (KeyError, ValueError):
                 incoming = None
             r["displaced_overlap"] = _displaced_overlap(
+                env, r["displaced_session"], incoming)
+            # Lengths are cheap here - both files are already in the page cache
+            # from the overlap read - and they are reported even when the
+            # overlap could not be measured, because "436 -> 336 turns" is
+            # useful on its own and does not depend on the comparison.
+            r["displaced_turns"], r["incoming_turns"] = _displaced_sizes(
                 env, r["displaced_session"], incoming)
             # Only a row that actually produced a number spends the budget. It
             # used to increment unconditionally, so a run of cheap failures - a
@@ -4320,6 +4465,11 @@ def plan_sync(env, flags):
                      # account, which is a certainty the "unknown" rows do not
                      # have and the code one line up is careful not to claim.
                      "orphan": r["displaced_orphan"],
+                     # same reason the swap list carries them: a held row is
+                     # exactly where the user decides whether to override, so
+                     # the length belongs next to the percentage
+                     "displaced_turns": r["displaced_turns"],
+                     "incoming_turns": r["incoming_turns"],
                      "displaced_session": r["displaced_session"]})
                 continue
             kept.append(r)
@@ -5785,7 +5935,7 @@ def _print_sync_report(say, manifest):
         say("")
         say("!! NOT SENT - each of these would open a DIFFERENT conversation, and the "
             "one it opens")
-        say("   now was not confirmed reachable from any other account. Pass "
+        say("   now was not confirmed reachable from any other surviving row. Pass "
             "--allow-orphan (window:")
         say("   \"allow hiding a conversation\") to send them.")
         # Unmeasured first, then lowest overlap first. `None` sorts ahead of every
@@ -5803,6 +5953,9 @@ def _print_sync_report(say, manifest):
                 if d.get("orphan") is True else
                 "a store could not be read, so whether anything else points at "
                 "the conversation it opens now is UNKNOWN"))
+            length = _length_clause(d.get("displaced_turns"), d.get("incoming_turns"))
+            say("        " + (length or "turn counts unknown - length change "
+                                        "could not be measured"))
             say("        " + _overlap_clause(d.get("overlap")))
         if len(detail) > 15:
             say("   ... and {0} more".format(len(detail) - 15))
@@ -5855,14 +6008,27 @@ def _print_sync_report(say, manifest):
             # one: after this write that entry opens a DIFFERENT conversation.
             if r.get("swaps_conversation"):
                 orph = r.get("displaced_orphan")
+                # "another account" was accurate only while reachability was
+                # measured per STORE. Since 0.9.13 it is per row, so the voucher
+                # may be a different row in this same destination account -
+                # saying "account" would point the user at the wrong sidebar.
                 fate = ("and NOTHING else points at it - it becomes unreachable "
-                        "from every account" if orph is True else
+                        "from every sidebar" if orph is True else
                         "and it could not be confirmed reachable elsewhere"
                         if orph == "unknown" else
-                        "it stays reachable from another account")
+                        "another surviving row still opens it")
                 say("      ^ opens a DIFFERENT conversation afterwards; the one it "
                     "opens now ({0}) {1}".format(
                         (r.get("displaced_session") or "?")[:8], fate))
+                # Length first: it is the fact a reader can act on without
+                # interpreting anything, and the one a percentage cannot carry.
+                # Always a line, never silence - a reader trained to look for
+                # "FEWER" would read a missing line as "no loss", when it
+                # actually means the two sides could not be counted.
+                length = _length_clause(r.get("displaced_turns"),
+                                        r.get("incoming_turns"))
+                say("        " + (length or "turn counts unknown - length "
+                                            "change could not be measured"))
                 say("        " + _overlap_clause(r.get("displaced_overlap")))
         if len(refreshes) > 15:
             say("   ... and {0} more".format(len(refreshes) - 15))

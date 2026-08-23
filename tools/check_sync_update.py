@@ -835,8 +835,13 @@ ccs._print_sync_report(out.append, m)
 check("  the report says it opens a DIFFERENT conversation",
       any("DIFFERENT conversation" in l for l in out),
       " | ".join(l for l in out if "DIFFERENT" in l) or "(no line)")
-check("  and says the displaced one stays reachable",
-      any("stays reachable" in l for l in out))
+# 0.9.13 changed this wording deliberately: reachability is now measured per
+# ROW, so the voucher can be another row in the SAME destination account, and
+# "stays reachable from another account" would send the reader to the wrong
+# sidebar. The claim being asserted is unchanged - only where it points.
+check("  and says the displaced one is still opened by a surviving row",
+      any("another surviving row still opens it" in l for l in out),
+      " | ".join(l.strip() for l in out if "opens it" in l) or "(no line)")
 shutil.rmtree(root, ignore_errors=True)
 
 # 2. ORPHANING is detected and held back by default
@@ -865,7 +870,10 @@ check("  and it is no longer held back", m["tally"]["held_orphan"] == [])
 out = []
 ccs._print_sync_report(out.append, m)
 check("  while still saying it becomes unreachable",
-      any("unreachable from every account" in l for l in out),
+      # 0.9.13: "every account" -> "every sidebar". Reachability is measured per
+      # ROW now, so counting accounts is the wrong unit in both directions - the
+      # orphan case included, where the point is that no ROW anywhere opens it.
+      any("unreachable from every sidebar" in l for l in out),
       " | ".join(l for l in out if "unreachable" in l) or "(no line)")
 ccs.run_sync(env, m)
 check("  and the pointer really moves",

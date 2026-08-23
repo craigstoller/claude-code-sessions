@@ -375,6 +375,13 @@ class SyncApp:
                     if d.get("orphan") is True else
                     "a store could not be read - whether anything else points at "
                     "it is UNKNOWN"))
+                # The length belongs in the WINDOW, not only in the CLI report.
+                # This is where the "allow hiding a conversation" checkbox is,
+                # so this is where the number that decides it has to appear.
+                length = ccs._length_clause(d.get("displaced_turns"),
+                                            d.get("incoming_turns"))
+                lines.append("        " + (length or "turn counts unknown - "
+                                           "length change could not be measured"))
                 lines.append("        " + ccs._overlap_clause(d.get("overlap")))
             lines.append("")
 
@@ -406,13 +413,22 @@ class SyncApp:
                 # act from a metadata refresh and must not read like one.
                 if r.get("swaps_conversation"):
                     orph = r.get("displaced_orphan")
+                    # "another account" was wrong as of 0.9.13: reachability is
+                    # now per ROW, so the voucher can be a different row in this
+                    # same destination account. Saying "account" would send the
+                    # user looking in the wrong sidebar.
                     fate = ("NOTHING else points at it - it becomes unreachable"
                             if orph is True else
                             "could not confirm anything else points at it"
                             if orph == "unknown" else
-                            "still reachable from another account")
+                            "another surviving row still opens it")
                     lines.append("        ^ opens a DIFFERENT conversation after "
                                  "this; the one it opens now: " + fate)
+                    length = ccs._length_clause(r.get("displaced_turns"),
+                                                r.get("incoming_turns"))
+                    lines.append("          " + (
+                        length or "turn counts unknown - length change could "
+                                  "not be measured"))
                     lines.append("          " +
                                  ccs._overlap_clause(r.get("displaced_overlap")))
             # All three of what the CLI prints, not just the first. Printing
@@ -918,7 +934,7 @@ class SyncApp:
                           "point at a different one in each account.".format(n_swap))
         if n_hide:
             back_note += ("\n{0} of those would leave the conversation they "
-                          "displace unreachable from every account.".format(n_hide))
+                          "displace unreachable from every sidebar.".format(n_hide))
         if n_upd and not messagebox.askokcancel(
                 "Overwrite existing rows?",
                 "{0} of these {1} row(s) ALREADY EXIST in {2}. Each will have its "

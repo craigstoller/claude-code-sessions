@@ -1302,6 +1302,33 @@ review panel and a measurement of the guard, not a refactor.
 
 ## Open question — the swap report answers a question about the LINEAGE, not about the ROW (2026-08-22)
 
+**Two of the three symptoms below shipped fixed in 0.9.13. The first is still open, and it is
+the one that needs a decision rather than an implementation — read on.**
+
+- **Symptom 1 — reachability spans accounts you are not working in. STILL OPEN.** A related but
+  narrower bug (the destination's own rows being ignored) was fixed in 0.9.13; see the section
+  below. This one is different and unfixed: "still reachable from another account" remains true
+  of an account the user has not opened in weeks and may not open again. Fixing it means the
+  plan must know which accounts are *in play*, which sync does not — it knows a source and a
+  destination. Whether that pair IS the scope is a design decision, not an implementation
+  detail, and it changes what the orphan check means.
+- **Symptom 2 — the report never said a row got SHORTER. FIXED in 0.9.13.** `_displaced_sizes`
+  counts prose turns either side of a swap and `_length_clause` states the result: "this row
+  goes from 388 to 189 prose turns - 199 FEWER". Reported even when the overlap cannot be
+  measured, because a length does not depend on the comparison. Carried on the row as
+  `displaced_turns` / `incoming_turns`, so `--json` and the window get it too. `repoint` still
+  does not compare content — that gap stands.
+- **Symptom 3 — interruption markers counted as prose. FIXED in 0.9.13.**
+  `TRANSCRIPT_PLUMBING_PREFIXES` excludes app-emitted turns from the fingerprint. Deliberately
+  narrow: only text the app itself writes, never a turn a person typed, because deciding which
+  of the user's own words are "real" is not that function's job. Over-filtering degrades to NOT
+  MEASURED, never to a wrong percentage.
+
+**The original record follows, unedited — the reasoning that produced the fixes, and the cost
+argument that still applies to symptom 1.**
+
+---
+
 **Not a ruling. Three symptoms of one gap, all hit in a single afternoon of real use on
 2026-08-22, recorded because the fix is not obviously a small one.**
 
@@ -1357,10 +1384,22 @@ plans carefully and pushing back when a claim did not match what he was looking 
 evidence about the report's wording as much as its arithmetic, and the wording is what stops a
 careless reader from losing something. Worth the panel.
 
-## Known defect — the orphan check is blind to the destination's OWN other rows (2026-08-22)
+## FIXED in 0.9.13 — the orphan check was blind to the destination's OWN other rows
 
-**Not an open question. A defect with a known fix, found in live use the same evening the two
-questions above were recorded.**
+**Recorded as a defect on 2026-08-22 and fixed the same evening. Kept in full because the
+shape of the fix is the interesting part, and because the failure it caused is the one a
+future change here would most easily reintroduce.**
+
+**What shipped.** `_other_pointers(env, dest_path, doomed_rows=())` now reads EVERY store,
+including the destination, and excludes exactly the destination rows this plan will overwrite —
+by name, per row. `plan_sync` passes `{r["name"] for r in rows if r.get("is_update")}`: every
+row being overwritten, not only the swapping ones, because a plain refresh also replaces its
+row wholesale and so stops vouching for whatever it pointed at. Covered by
+`tools/check_report_fixes.py`, which asserts the voucher count directly as rows are doomed
+(2 → 1 → 0) rather than only through a plan, so a future regression cannot pass for the wrong
+reason. The `unreadable_store` sentinel is asserted to still yield `"unknown"`, never `False`.
+
+The original record follows.
 
 `_other_pointers(env, dest_path)` builds its reachability set from *"every store EXCEPT
 dest_path"*:
@@ -1406,3 +1445,63 @@ box is the last thing standing between a real orphaning and an unrecoverable one
 **Note for whoever fixes this.** `unreadable_store` (the `None` sentinel that makes an
 unreadable sibling count as "cannot rule it out") must survive the change - the fail-closed
 posture is separate from, and more important than, this fix.
+
+## The 0.9.13 review panel — what it changed, and what it left open
+
+**Codex, Gemini (agy) and DeepSeek (repo-aware) reviewed 0.9.13 before it shipped. Kimi was not
+run. Three findings changed the code; several more are recorded here unfixed.**
+
+### Changed before shipping
+
+- **`"Continue from where you left off."` was removed from `TRANSCRIPT_PLUMBING_PREFIXES`.** All
+  three engines raised it independently, and the draft's own comment had already flagged the
+  doubt: the string arrives as a USER-role turn and nothing distinguishes it from a person
+  typing those words. Codex went further and killed the accompanying claim that over-filtering
+  is safe — "degrades to NOT MEASURED, never a wrong percentage" is only true of short
+  transcripts. On a long one, dropping an authored turn removes it from BOTH sides and can lift
+  the overlap to a **false 100%**, which is precisely the overstatement `_overlap_clause` exists
+  to prevent. `tools/check_report_fixes.py` now pins that string as NOT filtered, and asserts
+  the false-1.0 case directly.
+- **The window was not showing the length at all.** 0.9.13 added `_length_clause` to
+  `_print_sync_report` only; `claude_code_sessions_gui.py` still rendered `_overlap_clause`
+  alone at both sites. Caught by Codex. That is the surface where the "allow hiding a
+  conversation" checkbox lives, so it is the one that most needed the number. Now rendered at
+  both sites, with a structural test asserting the GUI never renders fewer length clauses than
+  overlap clauses — the exact regression of adding a clause to one surface and not the other.
+- **"stays reachable from another account" became false the moment Fix 2 shipped.** Reachability
+  is per ROW now, so the voucher can be a different row in the SAME destination account, and
+  the old wording sent the reader to the wrong sidebar. Codex caught it. Now "another surviving
+  row still opens it", and the orphan case says "unreachable from every sidebar" rather than
+  "from every account" — accounts are the wrong unit in both directions.
+- **An unmeasurable length printed nothing.** Gemini's point: a reader trained to look for
+  "FEWER" reads silence as "no loss". Both surfaces now say "turn counts unknown - length
+  change could not be measured" instead.
+
+### Raised, not fixed — recorded so they are known rather than rediscovered
+
+- **Reachability is plan-time, never revalidated at apply time (Codex).** If a vouching row is
+  repointed or deleted between plan and apply, a swap approved as safe can orphan its
+  conversation with no `--allow-orphan`. Pre-existing, but 0.9.13 makes vouchers load-bearing in
+  a way they were not before, so the exposure is larger now. The fix is a re-scan under the
+  mutation lock immediately before writing.
+- **`doomed` is computed before orphaning swaps are removed from the plan (Codex, DeepSeek).**
+  Two swaps that are each other's only remaining door are both marked doomed, both classified
+  orphaning, and both held - so both survive and either could have vouched. Deterministic
+  over-conservatism: a false `--allow-orphan` demand, which is the same class of harm as the
+  false alarm this release fixed. A fixed-point pass over the executable subset would settle it.
+- **The overlap is set membership, so multiplicity and order are ignored (Codex).** One incoming
+  occurrence can mark any number of repeated displaced turns as preserved, and two long turns
+  sharing a 400-character prefix hash identically. `Counter` intersection is the cheap
+  improvement; an order-aware comparison is the real one. Long-standing, not new here.
+- **Doomed-row matching is case-sensitive (Gemini).** `name in doomed` compares filenames from
+  `os.listdir` against names carried on the row. On a case-insensitive filesystem a casing
+  difference would silently fail to exclude a doomed row, letting it vouch for a conversation it
+  is about to stop opening. Not observed - the names come from the same directory listing today
+  - but it is one refactor away from being real.
+- **`_displaced_sizes` re-parses rather than reusing the fingerprints (Codex, DeepSeek).** The
+  docstring's "costs nothing extra" was wrong and has been corrected in place: the page cache
+  spares the disk I/O, not the JSON parse, normalisation and hashing. Bounded by
+  TRANSCRIPT_COMPARE_MAX_ROWS. One pass computing both numbers would be strictly better.
+- **Error paths around `_displaced_sizes` are untested (DeepSeek).** A missing transcript, an
+  unreadable one, or a non-string `text` block should degrade to `(None, None)`; nothing pins
+  that today, so a change letting an exception escape would take `plan_sync` down with it.

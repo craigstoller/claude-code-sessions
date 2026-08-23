@@ -1,0 +1,362 @@
+"""0.9.13 - the three report fixes, each pinned to the failure that produced it.
+
+All three were found in live use on 2026-08-22, in a session where the plan was
+read carefully enough to catch what it was not saying:
+
+  A. `_message_fingerprints` counted app-emitted plumbing as conversation, so
+     three rows reported 95/98/98% overlap when the authored content only in the
+     displaced copy was ZERO.
+  B. `_other_pointers` skipped the whole destination STORE, so a conversation
+     still held by another row in the destination read as about to be orphaned.
+  C. Nothing reported that a row got SHORTER. Two swaps in one plan cost 256 and
+     100 prose turns, described only as a percentage.
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+import claude_code_sessions as ccs  # noqa: E402
+
+ok = []
+
+
+def check(name, cond, extra=""):
+    print("%s %s%s" % ("OK " if cond else "BAD", name, ("  " + extra) if extra else ""))
+    ok.append(bool(cond))
+
+
+LIVE, DORM, THIRD = "a" * 32, "b" * 32, "c" * 32
+ORG_L, ORG_D, ORG_T = "1" * 32, "2" * 32, "3" * 32
+
+
+def turns(*bodies):
+    """A transcript body: alternating user/assistant prose turns."""
+    out = []
+    for i, b in enumerate(bodies):
+        out.append(json.dumps({"type": "user" if i % 2 == 0 else "assistant",
+                               "message": {"content": b}}))
+    return "\n".join(out) + "\n"
+
+
+def prose(n, tag="t"):
+    """n distinct authored turns, comfortably above OVERLAP_MIN_SAMPLE."""
+    return ["%s turn number %d with enough words to be a real message" % (tag, i)
+            for i in range(n)]
+
+
+def build(transcripts):
+    """transcripts: {sid: [body, ...]} -> (root, env, store dirs)"""
+    root = tempfile.mkdtemp(prefix="rep-")
+    home = os.path.join(root, "home")
+    store = os.path.join(root, "Claude", "claude-code-sessions")
+    dirs = {}
+    for acct, org, key in ((LIVE, ORG_L, "live"), (DORM, ORG_D, "dorm"),
+                           (THIRD, ORG_T, "third")):
+        dirs[key] = os.path.join(store, acct, org)
+        os.makedirs(dirs[key])
+    projects = os.path.join(home, ".claude", "projects", "proj")
+    os.makedirs(projects)
+    for sid, bodies in transcripts.items():
+        with open(os.path.join(projects, sid + ".jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(turns(*bodies))
+    with open(os.path.join(home, ".claude.json"), "w") as fh:
+        json.dump({"oauthAccount": {"accountUuid": LIVE, "organizationUuid": ORG_L,
+                                    "emailAddress": "live@example.com"}}, fh)
+    with open(os.path.join(root, "Claude", "config.json"), "w") as fh:
+        json.dump({"lastKnownAccountUuid": LIVE}, fh)
+    env = ccs.default_env()
+    env.home = home
+    env.projects_root = os.path.join(home, ".claude", "projects")
+    env.store_candidates = [store]
+    env.ops_dir = os.path.join(root, "journal", "ops")
+    env.moved_log = os.path.join(root, "journal", "moved-log.jsonl")
+    env.process_lister = lambda: []
+    return root, env, dirs, projects
+
+
+def row(path, name, sid, title, when=5000):
+    with open(os.path.join(path, name), "w") as fh:
+        json.dump({"cliSessionId": sid, "title": title, "cwd": "proj",
+                   "lastActivityAt": when}, fh)
+
+
+# ==========================================================================
+# A. plumbing is not conversation
+# ==========================================================================
+print("\n--- A. app-emitted plumbing is excluded from the comparison ---")
+
+A_SID, B_SID = "%032d" % 11, "%032d" % 12
+authored = prose(10)
+noise = ["[Request interrupted by user]",
+         "[Request interrupted by user for tool use]",
+         "No response requested."]
+root, env, dirs, projects = build({A_SID: authored + noise, B_SID: authored})
+
+fa = ccs._message_fingerprints(os.path.join(projects, A_SID + ".jsonl"))
+fb = ccs._message_fingerprints(os.path.join(projects, B_SID + ".jsonl"))
+check("the plumbing markers are not fingerprinted",
+      len(fa) == 10, "got %d, expected 10" % len(fa))
+check("  a transcript with only plumbing added compares as identical",
+      fa == fb)
+check("  so its overlap is a clean 1.0, not 10/14",
+      ccs._displaced_overlap(env, A_SID, B_SID) == 1.0,
+      str(ccs._displaced_overlap(env, A_SID, B_SID)))
+check("  which prints the full-overlap wording",
+      "every prose turn" in ccs._overlap_clause(
+          ccs._displaced_overlap(env, A_SID, B_SID)))
+shutil.rmtree(root, ignore_errors=True)
+
+# the filter must never eat something a PERSON typed, however thin.
+# "Continue from where you left off." is pinned here because it SHIPPED in the
+# first draft of the prefix list and three independent reviewers flagged the
+# same thing: it arrives as a user-role turn and nothing distinguishes it from
+# a person typing those words. Dropping it removed the turn from both sides of
+# the comparison, which is how a real difference becomes a false 100%.
+C_SID, D_SID = "%032d" % 13, "%032d" % 14
+human = "I accidentally closed the app. Try again."
+resume = "Continue from where you left off."
+root, env, dirs, projects = build({C_SID: prose(10) + [human, resume],
+                                   D_SID: prose(10)})
+fc = ccs._message_fingerprints(os.path.join(projects, C_SID + ".jsonl"))
+check("a turn the USER typed is never filtered, however little it carries",
+      len(fc) == 12, "got %d, expected 12" % len(fc))
+check("  'Continue from where you left off.' is NOT in the prefix list",
+      not any(resume.startswith(p) for p in ccs.TRANSCRIPT_PLUMBING_PREFIXES),
+      str(ccs.TRANSCRIPT_PLUMBING_PREFIXES))
+check("  so it correctly shows as content only in the displaced copy",
+      ccs._displaced_overlap(env, C_SID, D_SID) < 1.0,
+      str(ccs._displaced_overlap(env, C_SID, D_SID)))
+shutil.rmtree(root, ignore_errors=True)
+
+# the specific failure the removal prevents: a filtered-but-authored turn is
+# dropped from BOTH sides, and a real difference reads as full overlap
+G_SID, H_SID = "%032d" % 17, "%032d" % 18
+root, env, dirs, projects = build({G_SID: prose(10) + [resume], H_SID: prose(10)})
+check("dropping an authored turn would have inflated overlap to a false 1.0",
+      ccs._displaced_overlap(env, G_SID, H_SID) < 1.0,
+      str(ccs._displaced_overlap(env, G_SID, H_SID)))
+check("  and the clause therefore does NOT claim every prose turn is carried",
+      "every prose turn" not in ccs._overlap_clause(
+          ccs._displaced_overlap(env, G_SID, H_SID)))
+shutil.rmtree(root, ignore_errors=True)
+
+# over-filtering degrades to NOT MEASURED, never to a wrong number
+E_SID, F_SID = "%032d" % 15, "%032d" % 16
+root, env, dirs, projects = build({E_SID: prose(3) + noise * 3, F_SID: prose(3)})
+check("filtering below OVERLAP_MIN_SAMPLE reports NOT MEASURED, not a percentage",
+      ccs._displaced_overlap(env, E_SID, F_SID) is None)
+check("  and the clause says so in words",
+      "NOT MEASURED" in ccs._overlap_clause(ccs._displaced_overlap(env, E_SID, F_SID)))
+shutil.rmtree(root, ignore_errors=True)
+
+
+# ==========================================================================
+# B. the orphan check sees the destination's OWN surviving rows
+# ==========================================================================
+print("\n--- B. reachability is per-row, not per-store ---")
+
+OLD, NEW = "%032d" % 21, "%032d" % 22
+shared = prose(12, "s")
+
+
+def build_two_rows(also_overwrite_the_second):
+    """Destination holds the same conversation on TWO rows. The plan overwrites
+    the first. Whether the second survives decides whether OLD is orphaned."""
+    root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+    row(dirs["live"], "local_one.json", NEW, "Shared slot")
+    row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+    # the destination's OTHER row, pointing at the same displaced conversation
+    row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+    if also_overwrite_the_second:
+        # ...and the source has that row too, so this plan overwrites BOTH
+        row(dirs["live"], "local_two.json", NEW, "Second door")
+    return root, env, dirs["dorm"]
+
+
+# the bug: another row in the DESTINATION still holds it
+root, env, todir = build_two_rows(also_overwrite_the_second=False)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=todir))
+r1 = [r for r in m["rows"] if r["title"] == "Shared slot"][0]
+check("a swap is still detected", r1["swaps_conversation"] is True)
+check("the destination's OWN surviving row counts - NOT orphaned",
+      r1["displaced_orphan"] is False, str(r1["displaced_orphan"]))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  and the report does not claim it becomes unreachable",
+      not any("becomes unreachable" in l for l in out))
+shutil.rmtree(root, ignore_errors=True)
+
+# the guard against over-correcting: if THIS plan also overwrites the second
+# row, that row cannot vouch for the conversation either
+root, env, todir = build_two_rows(also_overwrite_the_second=True)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=todir))
+r2 = [r for r in m["rows"] if r["title"] == "Shared slot"][0]
+check("a row THIS PLAN also overwrites does not vouch for it - IS orphaned",
+      r2["displaced_orphan"] is True, str(r2["displaced_orphan"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# a row must never vouch for its own conversation
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_solo.json", NEW, "Only slot")
+row(dirs["dorm"], "local_solo.json", OLD, "Only slot", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+r3 = [r for r in m["rows"] if r["title"] == "Only slot"][0]
+check("the doomed row does not vouch for itself - orphaned as before",
+      r3["displaced_orphan"] is True, str(r3["displaced_orphan"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# the reachability set itself: exactly which rows are allowed to vouch.
+# Asserted directly, because it is the one place the old and new behaviour
+# differ and a plan-level check could pass for the wrong reason.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+p_none = ccs._other_pointers(env, dirs["dorm"])
+p_one = ccs._other_pointers(env, dirs["dorm"], {"local_one.json"})
+p_both = ccs._other_pointers(env, dirs["dorm"], {"local_one.json", "local_two.json"})
+check("with nothing doomed, both destination rows vouch",
+      len(p_none.get(OLD, [])) == 2, str(p_none.get(OLD)))
+check("  dooming one leaves the other vouching",
+      len(p_one.get(OLD, [])) == 1, str(p_one.get(OLD)))
+check("  dooming both leaves nobody - this is the OLD store-wide behaviour",
+      OLD not in p_both, str(p_both.get(OLD)))
+shutil.rmtree(root, ignore_errors=True)
+
+# the fail-closed sentinel must survive the change
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_solo.json", NEW, "Only slot")
+row(dirs["dorm"], "local_solo.json", OLD, "Only slot", when=4000)
+row(dirs["third"], "local_other.json", OLD, "Third door", when=4000)
+third_dir = dirs["third"]
+orig_listdir = os.listdir
+
+
+def blind_listdir(p):
+    if os.path.normcase(os.path.abspath(p)) == os.path.normcase(
+            os.path.abspath(third_dir)):
+        raise OSError(13, "permission denied")
+    return orig_listdir(p)
+
+
+ccs.os.listdir = blind_listdir
+try:
+    m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True,
+                                         to=dirs["dorm"]))
+finally:
+    ccs.os.listdir = orig_listdir
+r4 = [r for r in m["rows"] if r["title"] == "Only slot"][0]
+check("an unreadable sibling store still yields 'unknown', never False",
+      r4["displaced_orphan"] == "unknown", str(r4["displaced_orphan"]))
+shutil.rmtree(root, ignore_errors=True)
+
+
+# ==========================================================================
+# C. the plan says what the swap does to the row's LENGTH
+# ==========================================================================
+print("\n--- C. per-row length, not just a percentage ---")
+
+check("shrink is stated bluntly", "100 FEWER" in ccs._length_clause(436, 336),
+      ccs._length_clause(436, 336))
+check("  naming both counts", ccs._length_clause(436, 336).startswith(
+    "this row goes from 436 to 336"))
+check("growth reads as growth", "205 more" in ccs._length_clause(130, 335))
+check("a wash says so without alarm",
+      ccs._length_clause(19, 19) == "both conversations have 19 prose turns")
+check("unknown counts say nothing rather than guess",
+      ccs._length_clause(None, 5) == "" and ccs._length_clause(5, None) == "")
+
+LONG, SHORT = "%032d" % 31, "%032d" % 32
+root, env, dirs, projects = build({LONG: prose(20, "L"), SHORT: prose(9, "L")})
+row(dirs["live"], "local_x.json", SHORT, "Going backwards")
+row(dirs["dorm"], "local_x.json", LONG, "Going backwards", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+r5 = [r for r in m["rows"] if r["title"] == "Going backwards"][0]
+check("the plan carries both turn counts",
+      (r5["displaced_turns"], r5["incoming_turns"]) == (20, 9),
+      str((r5["displaced_turns"], r5["incoming_turns"])))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  and the report states the loss in turns",
+      any("20 to 9 prose turns" in l and "FEWER" in l for l in out),
+      next((l.strip() for l in out if "prose turns" in l), "(no length line)"))
+shutil.rmtree(root, ignore_errors=True)
+
+# the length is reported even when the overlap cannot be measured
+TINY_A, TINY_B = "%032d" % 33, "%032d" % 34
+root, env, dirs, projects = build({TINY_A: prose(5, "A"), TINY_B: prose(2, "B")})
+row(dirs["live"], "local_y.json", TINY_B, "Unmeasurable")
+row(dirs["dorm"], "local_y.json", TINY_A, "Unmeasurable", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+r6 = [r for r in m["rows"] if r["title"] == "Unmeasurable"][0]
+check("overlap is unmeasurable on a short pair", r6["displaced_overlap"] is None)
+check("  but the length is still reported",
+      (r6["displaced_turns"], r6["incoming_turns"]) == (5, 2),
+      str((r6["displaced_turns"], r6["incoming_turns"])))
+out = []
+ccs._print_sync_report(out.append, m)
+check("  so the report shows a length line AND 'NOT MEASURED'",
+      any("5 to 2 prose turns" in l for l in out)
+      and any("NOT MEASURED" in l for l in out))
+shutil.rmtree(root, ignore_errors=True)
+
+
+# ==========================================================================
+# D. the wording, and the window
+# ==========================================================================
+print("\n--- D. what the two surfaces actually say ---")
+
+# "another account" was true only while reachability was per STORE. Since the
+# voucher can now be a different row in the SAME destination account, that
+# wording would send the reader to the wrong sidebar.
+root, env, dirs, projects = build({OLD: shared, NEW: shared + prose(4, "n")})
+row(dirs["live"], "local_one.json", NEW, "Shared slot")
+row(dirs["dorm"], "local_one.json", OLD, "Shared slot", when=4000)
+row(dirs["dorm"], "local_two.json", OLD, "Second door", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+out = []
+ccs._print_sync_report(out.append, m)
+joined = "\n".join(out)
+check("the report says 'another surviving row', not 'another account'",
+      "another surviving row" in joined and
+      "stays reachable from another account" not in joined)
+shutil.rmtree(root, ignore_errors=True)
+
+# an unmeasurable length must SAY so, never print nothing - a reader trained to
+# look for "FEWER" reads a missing line as "no loss"
+root, env, dirs, projects = build({TINY_A: prose(5, "A"), TINY_B: prose(2, "B")})
+row(dirs["live"], "local_y.json", TINY_B, "Unmeasurable")
+row(dirs["dorm"], "local_y.json", TINY_A, "Unmeasurable", when=4000)
+m = ccs.plan_sync(env, ccs.SyncFlags(update=True, allow_orphan=True, to=dirs["dorm"]))
+m["rows"][0]["displaced_turns"] = None       # force the unknown branch
+m["rows"][0]["incoming_turns"] = None
+out = []
+ccs._print_sync_report(out.append, m)
+check("an unknown length prints a line rather than silence",
+      any("turn counts unknown" in l for l in out),
+      next((l.strip() for l in out if "unknown" in l), "(silent)"))
+shutil.rmtree(root, ignore_errors=True)
+
+# The window is where the "allow hiding a conversation" checkbox lives, so it
+# is where the length has to appear. 0.9.13 shipped it to the CLI report only;
+# a reviewer caught that the GUI still rendered the percentage alone. This is a
+# STRUCTURAL check on the source, not a behavioural one - it exists to catch
+# exactly that regression: a clause added to one surface and not the other.
+gui = os.path.join(REPO, "claude_code_sessions_gui.py")
+src = open(gui, encoding="utf-8").read()
+check("the window renders the length clause, not only the overlap clause",
+      src.count("_length_clause") >= 2, "found %d" % src.count("_length_clause"))
+check("  at every site where it renders the overlap clause",
+      src.count("_length_clause") >= src.count("_overlap_clause"),
+      "length %d vs overlap %d" % (src.count("_length_clause"),
+                                   src.count("_overlap_clause")))
+check("  and it does not say 'another account' either",
+      "reachable from another account" not in src)
+
+print()
+print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
+sys.exit(0 if all(ok) else 1)

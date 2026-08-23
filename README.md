@@ -469,6 +469,16 @@ window into `journaled`/`completed`/`rolled_back`.
   the mutation never came through this tool — so what shipped is detection (`doctor` ranks
   conversations nothing points at) and repair (`repoint` puts a pointer back, journalled and
   undoable).
+- **0.9.13 makes the swap report answer the question people actually ask.** A long real session
+  on 2026-08-22 found three ways the plan described a pointer swap without saying what mattered.
+  It now states the **length**: "this row goes from 388 to 189 prose turns — 199 FEWER", because
+  a percentage is not a loss and every reader was converting one into the other in their head.
+  Reachability is now checked **per row rather than per store**, so a conversation still held by
+  another row *in the destination account* no longer reads as about to be orphaned — a false
+  alarm whose only cure was ticking the override that guards the real case. And app-emitted
+  plumbing (`[Request interrupted by user]`, `No response requested.`) no longer counts as
+  conversation: three rows reporting 95–98% overlap turned out to have **zero** authored turns
+  only in the displaced copy. See `docs/internals.md`.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
