@@ -627,6 +627,189 @@ refusal("undo reports an already-absent row distinctly from drift",
         lambda: ccs.undo_new_row(env, op), "already gone")
 shutil.rmtree(root, ignore_errors=True)
 
+# ------------------------------------------------------------ recovery
+print("\n--- a crash after the write, before the journal marker ---")
+
+
+def crashed():
+    root, env, live, dorm = build([OPENER] + prose(8))
+    m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+    fired = {"n": 0}
+
+    def crash_once(point):
+        if point == "new-row-write-before-save" and fired["n"] == 0:
+            fired["n"] += 1
+            raise KeyboardInterrupt("killed after the write, before the marker")
+
+    ccs._crash_hook = crash_once
+    try:
+        ccs.run_new_row(env, m)
+    except BaseException:                      # noqa: BLE001 - the simulated kill
+        pass
+    finally:
+        ccs._crash_hook = None
+    return root, env, m
+
+
+root, env, m = crashed()
+pending = ccs.nonterminal_ops(env)
+check("the op is left non-terminal", len(pending) == 1)
+check("  with the row already on disk - the torn state",
+      os.path.exists(m["rows"][0]["dest_path"]))
+c = ccs.classify_op(env, pending[0])
+check("  classify_op knows the new-row shape rather than falling through",
+      c["status"] in ("journaled", "writing"), c["status"])
+check("  and offers both directions",
+      sorted(c["resolutions"]) == ["back", "forward"], str(c["resolutions"]))
+check("  with a note naming the command", "new-row" in c["note"], c["note"][:70])
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, m = crashed()
+check("recover --forward completes",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward") == "completed")
+check("  and the row is on disk", os.path.exists(m["rows"][0]["dest_path"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# The write already landed, and the transcript has since gone. recover MUST
+# still finish the bookkeeping: the row's facts were consumed at plan time and
+# are already committed to the bytes on disk, so re-validating the source of an
+# answer that is already written would make the one command whose job is to
+# unstick the user refuse on a write that succeeded.
+root, env, m = crashed()
+os.unlink(m["transcript"])
+check("recover --forward finishes an already-written row even with the "
+      "transcript gone",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward") == "completed")
+check("  leaving the row in place", os.path.exists(m["rows"][0]["dest_path"]))
+check("  and nothing pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# ...but a row that did NOT land still gets the full preflight on the way
+# forward, because nothing has been committed and the facts must still hold.
+root, env, m = crashed()
+os.unlink(m["rows"][0]["dest_path"])
+os.unlink(m["transcript"])
+refusal("recover --forward on an unwritten row still refuses a gone transcript",
+        lambda: ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward"),
+        "no longer on disk")
+shutil.rmtree(root, ignore_errors=True)
+
+# classify_op's note is what the user reads to choose a direction. A drifted
+# row must not be described as never written.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 4242
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+note = ccs.classify_op(env, ccs.nonterminal_ops(env)[0])["note"]
+check("a drifted row is NOT reported as 'was not written'",
+      "was not written" not in note, note)
+check("  it is reported as written and since changed",
+      "since changed" in note, note)
+# And forcing forward on it must say something TRUE. "a different row already
+# exists ... nothing was written" is false twice over: it is our row, and we
+# did write it.
+try:
+    ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward")
+    check("  forcing forward on a drifted row refuses", False, "it did not")
+except ccs.Refusal as exc:
+    check("  forcing forward on a drifted row refuses", True)
+    check("    without claiming nothing was written",
+          "Nothing was written" not in str(exc), str(exc)[:100])
+    check("    and names the app as the likely cause",
+          "the app" in str(exc), str(exc)[:100])
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, m = crashed()
+check("recover --back closes the op",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  removing the row it had written",
+      not os.path.exists(m["rows"][0]["dest_path"]))
+check("  and nothing is left pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# A crash BEFORE the write: nothing on disk, and 'back' must still terminate.
+root, env, live, dorm = build([OPENER] + prose(8))
+m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Recovered"))
+fired = {"n": 0}
+
+
+def crash_early(point):
+    if point == "new-row-write-before-save" and fired["n"] == 0:
+        fired["n"] += 1
+        raise KeyboardInterrupt("killed")
+
+
+ccs._crash_hook = crash_early
+try:
+    ccs.run_new_row(env, m)
+except BaseException:                          # noqa: BLE001
+    pass
+finally:
+    ccs._crash_hook = None
+os.unlink(m["rows"][0]["dest_path"])           # simulate the no-row-yet state
+check("recover --back terminates even with no row on disk",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+check("  and nothing is left pending", not ccs.nonterminal_ops(env))
+shutil.rmtree(root, ignore_errors=True)
+
+# RULING 4 on the recovery path. recover_op calls _guard_mutation for no op
+# type at all, so before this fix, crashing, reopening the app, and then
+# recovering backward would delete a row out from under a running app that is
+# reading and rewriting that same store.
+DESKTOP = (1, r"c:\program files\windowsapps"
+              r"\claude_1.0_x64__pzs8sxrjxfjjc\app\claude.exe")
+
+root, env, m = crashed()
+env.process_lister = lambda: [DESKTOP]
+refusal("recover --back refuses while the desktop app is running",
+        lambda: ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back"),
+        "desktop app appears to be running")
+check("  leaving the row alone", os.path.exists(m["rows"][0]["dest_path"]))
+check("  and the op still recoverable once the app is closed",
+      len(ccs.nonterminal_ops(env)) == 1)
+env.process_lister = lambda: []
+check("  which it then is",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
+shutil.rmtree(root, ignore_errors=True)
+
+# Forward is asymmetric, and deliberately so. On an ALREADY-WRITTEN row it
+# touches only the journal - no store bytes change - so refusing it while the
+# app runs would block harmless bookkeeping and leave the user stuck for no
+# safety gain. On an UNWRITTEN row it is about to write the store, so the guard
+# applies. The split falls out of _new_row_preflight running only in the second
+# case; these two checks pin that it is real and not incidental.
+root, env, m = crashed()
+env.process_lister = lambda: [DESKTOP]
+check("recover --forward on an already-written row is journal-only, so it "
+      "completes even with the app running",
+      ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward") == "completed")
+shutil.rmtree(root, ignore_errors=True)
+
+root, env, m = crashed()
+os.unlink(m["rows"][0]["dest_path"])           # nothing landed
+env.process_lister = lambda: [DESKTOP]
+refusal("recover --forward on an UNwritten row refuses while the app runs",
+        lambda: ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "forward"),
+        "desktop app appears to be running")
+shutil.rmtree(root, ignore_errors=True)
+
+# A drifted row is NOT deleted by 'back', and 'back' must say so rather than
+# reporting a clean rollback that left a row behind.
+root, env, m = crashed()
+d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+d["lastFocusedAt"] = 999
+with open(m["rows"][0]["dest_path"], "w") as fh:
+    json.dump(d, fh)
+res = ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+check("back closes an op whose row drifted", res == "rolled_back")
+check("  leaving the drifted row alone", os.path.exists(m["rows"][0]["dest_path"]))
+left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
+check("  and RECORDING that it left something behind",
+      bool(left.manifest.get("rollback_residue")),
+      str(left.manifest.get("rollback_residue")))
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

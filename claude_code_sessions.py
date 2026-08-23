@@ -1760,6 +1760,31 @@ def classify_op(env, op):
                 "drifted_rows": [],
                 "note": "repoint: a single-row write that did not complete; the row "
                         "still holds its original pointer - run repoint again"}
+    if m.get("op_type") == "new-row":
+        # Unlike repoint, there IS a partial state worth resolving: the row may
+        # or may not have landed before the crash. Both directions are real -
+        # forward finishes the write, back removes what landed - so offer them
+        # rather than returning the empty list repoint returns.
+        r = (m.get("rows") or [{}])[0]
+        # Map the ACTUAL state, all five of them. `== "match"` collapsed four
+        # states into "was not written", so a row the app had already reopened
+        # and rewritten - the plan's own stated risk - was reported as never
+        # written while sitting on disk. That note is what the user reads to
+        # choose a direction, and it was wrong in the direction that invites a
+        # careless `forward`.
+        state = _sync_row_drift(r)
+        said = {"match": "was written",
+                "absent": "was not written",
+                "drifted": "was written and something has since changed it",
+                "pristine": "was written and something has since changed it",
+                "unreadable": "exists but could not be read"}.get(
+                    state, "is in an unrecognized state ({0})".format(state))
+        return {"status": m["status"], "source": m.get("store_label", "n/a"),
+                "dest": m.get("store_label", "n/a"),
+                "resolutions": ["forward", "back"], "drifted_rows": [],
+                "note": "new-row: the row {0}; forward finishes creating it, "
+                        "back removes it only if it still matches what this op "
+                        "wrote".format(said)}
     if m.get("op_type") == "sync":
         return classify_sync_op(env, op)
 
@@ -1949,7 +1974,7 @@ def recover_op(env, op, direction):
         # raised a bare KeyError out of recover - and main() catches only
         # Refusal/LayoutError, so the user got a traceback from the one command
         # that exists to get them unstuck.
-        if op.manifest.get("op_type") not in ("sync", "repoint"):
+        if op.manifest.get("op_type") not in ("sync", "repoint", "new-row"):
             _validate_manifest_paths(env, op.manifest)
 
         c = classify_op(env, op)
@@ -1958,6 +1983,56 @@ def recover_op(env, op, direction):
                           .format(direction, op.manifest["op_id"], c["note"],
                                   c["resolutions"] or "none - manual intervention"))
         m = op.manifest
+        if m.get("op_type") == "new-row":
+            if direction == "forward":
+                # The preflight moved out of execute_new_row_op, so this arm
+                # owns it - and only for a row that did NOT land. A landed row
+                # needs no re-validation (its facts are already committed) and
+                # no mutation guard (it writes only the journal).
+                if _sync_row_drift(m["rows"][0]) != "match":
+                    _new_row_preflight(env, m)
+                set_status(op, "journaled")
+                final = execute_new_row_op(env, op)
+                rotate_ops(env)
+                return final
+            # The running-app guard, which this arm did not have. `recover_op`
+            # never calls _guard_mutation for any op type, and every other
+            # deleting path in this module does - so after a crash, reopening
+            # the app and then recovering backward would delete a row out from
+            # under a running app that is reading and rewriting that store. The
+            # exact race the whole command otherwise refuses to run into.
+            _guard_mutation(env, "remove a row from")
+            r = m["rows"][0]
+            # 'back' must always terminate - it is the only exit from a stuck
+            # op - so a row it cannot safely remove is SKIPPED rather than
+            # refused, the same asymmetry _sync_delete_targets documents against
+            # undo. But skipping SILENTLY would report a clean rollback while
+            # leaving a row on disk that nothing afterwards looks for: doctor's
+            # vanished-row check reads only 'completed' ops, so a rolled_back op
+            # with a surviving row is invisible everywhere. Record it instead.
+            residue = None
+            state = _sync_row_drift(r)
+            if state == "match":
+                try:
+                    # Containment is re-established here, not inherited. This
+                    # arm deletes a path out of a journal file, and a journal
+                    # can be edited or corrupted; the write and undo paths both
+                    # check, so the recovery path must too.
+                    real = ensure_contained(r["dest_path"], [m["store_path"]])
+                    if os.path.dirname(real) != os.path.realpath(m["store_path"]):
+                        raise LayoutError("not a direct child of the store")
+                    os.unlink(r["dest_path"])
+                except (OSError, LayoutError) as exc:
+                    residue = "could not remove {0!r}: {1}".format(r["name"], exc)
+            elif state != "absent":
+                residue = ("left {0!r} in place - it no longer holds what this op "
+                           "wrote ({1})".format(r["name"], state))
+            if residue:
+                m["rollback_residue"] = residue
+                save_manifest(op)
+            set_status(op, "rolled_back")
+            rotate_ops(env)
+            return "rolled_back"
         if m.get("op_type") == "sync":
             # direction is already guaranteed to be a member of c["resolutions"]
             # by the check above, and classify_sync_op only ever offers
@@ -2742,6 +2817,10 @@ def cmd_recover(env, ns):
     print("result: " + final)
     if final != "completed":
         _print_abort_reason(env, ns, matches[0])
+    if matches[0].manifest.get("rollback_residue"):
+        line = "[observed] rollback left something behind: {0}".format(
+            matches[0].manifest["rollback_residue"])
+        print(line if ns.verbose else redact(env, line))
     return 0
 
 
