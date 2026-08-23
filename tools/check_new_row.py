@@ -1431,6 +1431,97 @@ check("    and the row created by the re-run untouched",
 shutil.rmtree(root, ignore_errors=True)
 
 
+# The rollback residue was WRITE-ONLY. `recover --back` records that it left a
+# row it could not remove, and `_collides` pins that op against rotation forever
+# on the stated grounds that "a rolled_back op with a surviving row is invisible
+# everywhere" - but nothing ever read the key back. gather_doctor read only
+# 'completed' ops; cmd_recover's listing only non-terminal ones. The only reader
+# was cmd_recover printing it during the call that wrote it, which the user may
+# never see again. Probed: the pinned op survived 25 later ops, surfaced by
+# nothing. The hold was protecting a record with no reader.
+print("\n--- doctor surfaces a rollback that left a row behind ---")
+
+
+def rolled_back_with_residue():
+    """A torn new-row op whose row DRIFTED, rolled back - so 'back' skips the
+    delete and records what it left. The row is on disk afterwards."""
+    root, env, m = crashed()
+    d = json.load(open(m["rows"][0]["dest_path"], encoding="utf-8"))
+    d["lastFocusedAt"] = 777
+    with open(m["rows"][0]["dest_path"], "w") as fh:
+        json.dump(d, fh)
+    ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back")
+    return root, env, m
+
+
+root, env, m = rolled_back_with_residue()
+check("the setup really did leave a row behind",
+      os.path.exists(m["rows"][0]["dest_path"]))
+check("  on a TERMINAL op, which is why nothing else could see it",
+      [o.manifest["status"] for o in ccs.list_ops(env)] == ["rolled_back"],
+      str([o.manifest["status"] for o in ccs.list_ops(env)]))
+check("  so recover's listing does not mention it",
+      not ccs.nonterminal_ops(env))
+d = ccs.gather_doctor(env)
+check("doctor now reports it", len(d.get("rollback_residue") or []) == 1,
+      str(d.get("rollback_residue")))
+if d.get("rollback_residue"):
+    r0 = d["rollback_residue"][0]
+    check("  naming the op that left it", r0["op_id"] == m["op_id"], str(r0["op_id"]))
+    check("  and the row itself", m["rows"][0]["name"] in r0["detail"],
+          r0["detail"][:90])
+check("  and it counts toward the exit code, like a vanished row does",
+      d["exit_code"] == 1, str(d["exit_code"]))
+
+# The human report has to say it too - a report key nobody prints is the same
+# write-only failure one layer up.
+out = []
+real_bp4 = builtins.print
+builtins.print = lambda *a, **k: out.append(" ".join(str(x) for x in a))
+try:
+    rc = ccs.cmd_doctor(env, _Ns(json=False, verbose=True))
+finally:
+    builtins.print = real_bp4
+check("cmd_doctor prints it", rc == 1 and any(
+    "left a row in the store" in line for line in out), str(out)[:100])
+check("  naming the row left behind", any(m["rows"][0]["name"] in line
+                                          for line in out))
+check("  and the op that left it", any(m["op_id"] in line for line in out))
+
+# ASK THE STORE, NOT THE JOURNAL. The residue is what was true at rollback time;
+# once the user deletes that session in the app there is nothing left to report,
+# and an alert that could never clear would be a permanent exit 1 over a
+# resolved condition - the exact trap the vanished-row check was reshaped to
+# avoid.
+os.unlink(m["rows"][0]["dest_path"])
+d = ccs.gather_doctor(env)
+check("  the alert clears once the row is actually gone",
+      not d.get("rollback_residue"), str(d.get("rollback_residue")))
+check("    taking doctor's exit code back to clean", d["exit_code"] == 0,
+      str(d["exit_code"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# The residue survives rotation - that is what the hold is for - and doctor
+# still finds it after other operations have come and gone.
+root, env, m = rolled_back_with_residue()
+with open(os.path.join(env.projects_root, "proj", ("%032d" % 73) + ".jsonl"), "w",
+          encoding="utf-8") as fh:
+    fh.write("\n".join([OPENER] + prose(8)) + "\n")
+for i in range(12):
+    m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session="%032d" % 73,
+                                               title="Filler %d" % i))
+    ccs.run_new_row(env, m2)
+    ccs.undo_new_row(env, [o for o in ccs.list_ops(env)
+                           if o.manifest["op_id"] == m2["op_id"]][0])
+check("12 later operations rotate the journal",
+      len(ccs.list_ops(env)) <= 12, str(len(ccs.list_ops(env))))
+d = ccs.gather_doctor(env)
+check("  and doctor STILL reports the residue - what the hold is for",
+      [r["op_id"] for r in d.get("rollback_residue") or []] == [m["op_id"]],
+      str(d.get("rollback_residue")))
+shutil.rmtree(root, ignore_errors=True)
+
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

@@ -2480,8 +2480,50 @@ def gather_doctor(env):
     # answer needs a standalone registry of synthesized rows - noted in the
     # README's known limits rather than silently implied here.
     vanished_new = []
+    # A ROLLBACK THAT LEFT A ROW BEHIND. `recover --back` is the only exit from
+    # a stuck operation, so it must always terminate - which means a row it
+    # cannot safely remove is skipped rather than refused, and the fact is
+    # recorded on the manifest as `rollback_residue`. `_collides` then pins that
+    # op against rotation forever, on the stated grounds that "a rolled_back op
+    # with a surviving row is invisible everywhere".
+    #
+    # It was: nothing ever read the key back. gather_doctor's vanished-row check
+    # reads only 'completed' ops and cmd_recover's listing only non-terminal
+    # ones, so the only reader was cmd_recover printing it during the very call
+    # that wrote it. Probed 2026-08-23: the pinned op survived 25 subsequent
+    # operations and was surfaced by nothing. The retention hold was write-only,
+    # protecting a record no reader existed for. This is that reader.
+    rollback_residue = []
     for _op in list_ops(env):
         _m = _op.manifest
+        _res = _m.get("rollback_residue")
+        if _res:
+            _rows = _m.get("rows")
+            _r0 = (_rows[0] if isinstance(_rows, list) and _rows
+                   and isinstance(_rows[0], dict) else {})
+            # ASK THE STORE, NOT THE JOURNAL - the same rule the vanished-row
+            # check below follows, for the same reason. The residue records what
+            # was true at the moment of the rollback; if the user has since
+            # deleted that session in the app there is nothing left to report,
+            # and an alert that could never clear would be a permanent exit 1
+            # over a resolved condition. A path that cannot be checked is
+            # reported, never hidden - "couldn't look" is never "nothing there".
+            _dest, _left = _r0.get("dest_path"), True
+            if isinstance(_dest, str) and _dest:
+                try:
+                    os.stat(_dest)
+                except FileNotFoundError:
+                    _left = False
+                except OSError:
+                    _left = True
+            if _left:
+                rollback_residue.append({
+                    "op_id": _m.get("op_id"), "op_type": _m.get("op_type"),
+                    "status": _m.get("status"), "title": _m.get("title"),
+                    "name": _r0.get("name") or "",
+                    "store_label": _m.get("store_label") or "",
+                    "detail": _res if isinstance(_res, str) else str(_res),
+                })
         if _m.get("op_type") != "new-row" or _m.get("status") != "completed":
             continue
         # SHAPE-VALIDATE FIRST, like every other consumer of a new-row manifest.
@@ -2541,10 +2583,12 @@ def gather_doctor(env):
         "stale_lock": lock_is_stale(env),
         "unknown_layout": unknown_layout,
         "vanished_new_rows": vanished_new,
+        "rollback_residue": rollback_residue,
     }
     if disc.status == "error" or row_errors or unknown_layout:
         report["exit_code"] = 2
-    elif blank or dead or nt or report["stale_lock"] or legacy_folders or vanished_new:
+    elif (blank or dead or nt or report["stale_lock"] or legacy_folders
+            or vanished_new or rollback_residue):
         report["exit_code"] = 1
     else:
         report["exit_code"] = 0
@@ -2629,6 +2673,15 @@ def cmd_doctor(env, ns):
                 "folders, so 'new-row' would refuse to guess between them. "
                 "Resolve that first.".format(v["to_session"],
                                              v["transcript_count"]))
+    for res in rep.get("rollback_residue") or []:
+        say_ids("[observed] a rolled-back operation left a row in the store: {0} "
+                "(op {1}, {2})".format(res["detail"], res["op_id"],
+                                       res["store_label"] or res["op_type"] or "?"))
+        say("[hypothesis]   'recover --back' is the only exit from a stuck "
+            "operation, so it closes even when it cannot remove what that "
+            "operation wrote. Nothing else looks for that row - delete the "
+            "session from the app if it is not wanted, or leave it if it is, "
+            "and this clears.")
     say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
         .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
     say("[observed] encoding evidence (all rows): current={0} legacy={1}"
