@@ -876,7 +876,8 @@ is a claim, not a formatting detail."
   - `_new_row_store(env, flags) -> (acct, org, path, why, heuristic)` — `why` is a human sentence naming how the store was chosen; `heuristic` is True when row counts broke a tie, and `--apply` refuses on it
   - `_row_already_opens(store, session_id) -> (name | None, titles set)` — **fails closed**
   - `NewRowFlags` dataclass: `to_session: str = ""`, `store: str = ""`, `title: str = ""`, `live: str = ""`
-  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `store_is_a_guess`, `store_org`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
+  - `plan_new_row(env, flags) -> manifest` with keys `op_type="new-row"`, `store_path`, `store_label`, `store_why`, `store_is_a_guess`, `store_org`, `name`, `row_path`, `title`, `title_provenance`, `title_collision`, `to_session`, `transcript`, `transcript_size`, `transcript_mtime`,
+    `transcript_mb`, `turns`, `cwd`, `model`, `rows=[{name, dest_path, title, pre_b64: None, post_b64, is_update: False, written: False}]`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1027,7 +1028,8 @@ Add `import uuid` on the line above `_new_row_store`, following Task 1's placeme
 
 ```python
 def _new_row_store(env, flags):
-    """(acct, org, path, why) - exactly one store, and how it was chosen.
+    """(acct, org, path, why, heuristic) - exactly one store, and how it was
+    chosen.
 
     `_repoint_store` returns a LIST, and refusing whenever it returns more than
     one would refuse the ordinary case: an account owns one directory per org, so
@@ -1044,8 +1046,10 @@ def _new_row_store(env, flags):
 
     So the guess is allowed to PLAN and not to WRITE. `heuristic` comes back
     True whenever row counts broke the tie, `plan_new_row` carries it into the
-    manifest, and `cmd_new_row` refuses `--apply` on it, naming the exact
-    `--store <path>` that would settle it. An earlier draft relied on printing
+    manifest, and `cmd_new_row` refuses `--apply` on it, naming the
+    ORGANIZATION ID that would settle it - never a path, because _repoint_store
+    forward-slashes the candidate and not the argument, so a Windows path
+    pasted back from this tool matches nothing. An earlier draft relied on printing
     the reasoning before the write instead - which is not a safeguard at all in
     a one-shot `--apply`, because there is no moment between the print and the
     write in which anyone can intervene, and no saved plan to approve. A dry run
@@ -1113,10 +1117,13 @@ def _row_already_opens(store, session_id):
                 "the row {0!r} in this store could not be read ({1}), so this "
                 "command cannot tell whether it already opens {2}. Refusing "
                 "rather than risk a second row for the same conversation. "
-                "Nothing was written.".format(name, exc, session_id[:8]))
+                "Nothing was written. Open that file and repair or remove it - "
+                "'doctor' reports rows it cannot parse - then re-run."
+                .format(name, exc, session_id[:8]))
         if not isinstance(d, dict):
             raise Refusal("the row {0!r} is not a JSON object; refusing to add "
-                          "a row beside it. Nothing was written.".format(name))
+                          "a row beside it. Nothing was written. Open that file "
+                          "and repair or remove it, then re-run.".format(name))
         if d.get("cliSessionId") == session_id:
             hit = name
         if isinstance(d.get("title"), str):
@@ -1190,7 +1197,14 @@ def plan_new_row(env, flags):
             # baseline and the very drift this is meant to catch would validate.
             "transcript_size": facts["size"],
             "transcript_mtime": facts["mtime"],
-            "transcript_mb": round(os.path.getsize(facts["path"]) / 1e6, 1),
+            # Derived from the SAME snapshot, not a fresh stat. A second
+            # os.path.getsize here would undo the two lines above it: real
+            # I/O happens in between (_row_already_opens scans every row in
+            # the store), so the size reported could disagree with the size
+            # validated - and a file deleted in that window raises a bare
+            # OSError, which main() does not catch and which would surface as
+            # an unredacted traceback carrying paths and account uuids.
+            "transcript_mb": round(facts["size"] / 1e6, 1),
             "turns": facts["turns"], "cwd": facts["cwd"], "model": facts["model"],
             "rows": [{"name": name, "dest_path": os.path.join(store, name),
                       "title": title, "pre_b64": None, "post_b64": b64(post),
