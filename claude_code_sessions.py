@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.9.17"
+__version__ = "0.10.0"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived

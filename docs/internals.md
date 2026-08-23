@@ -1720,3 +1720,62 @@ mid-sync does not need the file deleted by hand.
 **Not documented before 2026-08-22, and not tested at all.** That is how a real guarantee ended
 up written down as a missing one. The test file exists to make the property checkable rather than
 inferable from a call-site reading.
+
+## Creating a listing row
+
+*(the code is `_transcript_facts`, `NEW_ROW_DEFAULTS`, `_synthesize_row`; pinned by
+`tools/check_new_row.py`)*
+
+**The store has no index.** `load_rows` finds every row by globbing `local_*.json` across each
+account/org folder — the same enumeration `list`, `doctor`, and everything else in this tool
+does, and the whole reason a synthesized row is visible at all: nothing consults a registry
+that would need to know a given row was built by this tool rather than issued by the app.
+
+**The row template comes from a census, not a design meeting.** Measured 2026-08-22 across 987
+real rows on this machine: 52 distinct keys exist, and only 12 appear on every one of them, so
+there is no fixed row shape to copy. `NEW_ROW_DEFAULTS` follows a three-tier policy instead —
+transcript-derived first, then a field at ≥95% presence *with a defensible zero value*, then
+omission. Clearing the threshold is necessary and not sufficient: `classifierSummaryEnabled`
+sits at 97.6% but is `True` on every row that carries it, which is behaviour asserted rather
+than a zero, so it is omitted regardless of the number. An earlier draft asserted
+`reportFindingsCard`, `chromeTabGroupId`, `lastSpawnRootDetected` and `remoteControlAutoEligible`
+on every synthesized row; measured presence across the census is 60.2%, 5.6%, 2.7% and **0.9%**.
+Writing a field that 99.1% of real rows do not carry is exactly the "plausible-looking default"
+the policy exists to forbid.
+
+**`model` and `effort` are read from the transcript, never defaulted.** An earlier draft
+hardcoded `"model": "claude-opus-5"` as the account default; the same census says otherwise —
+`claude-fable-5` leads `claude-opus-5` 522 to 243 across the 987 rows. `_transcript_facts` keeps
+the **last** `message.model` and top-level `effort` it sees, because what the session was
+running when it stopped is what a resumed row should carry — the opposite of `cwd`, which is
+first-wins because `originCwd` should name where the session began, not wherever it was when it
+stopped. A transcript with no assistant reply has no `model` to read and no zero value to fall
+back to (`model` sits at 100% of the 987 rows), so `_transcript_facts` refuses rather than
+invent one; if that ever costs someone a real conversation, the fix is a `--model` flag, not a
+silent default.
+
+**`lastFocusedAt` is seeded, then overwritten by the app.** It is set to the transcript's last
+activity at creation time rather than omitted, because the 2026-08-22 prototype showed the app
+rewriting the field the first time the row is focused — so seeding it is transient either way,
+and omitting it risks the app sorting a fresh row to the bottom of the sidebar, which reads as
+the command having failed.
+
+**`doctor`'s detection of a rejected row is bounded by journal retention, not by time.**
+`rotate_ops` keeps the ten most recent *terminal* ops across every operation type, and
+`_collides` — the check that shields an unresolved `sync` claim from that rotation — never
+shields a `new-row` op the same way. So the window `gather_doctor`'s `vanished_new_rows` check
+can see is however many other operations happen to run next, not a number of days. Measured
+2026-08-23: after 15 sequential `new-row` runs, the first run's op had aged out of the journal,
+its vanished-row alert was gone, and `doctor` returned to exit 0 — with nothing about the row
+itself having changed to explain the alert clearing. In practice this covers the case the
+command was built for, since an app version that rejects a synthesized row does so the first
+time it opens the sidebar, before ten more operations of any kind have a chance to run. A busy
+stretch of other `ccs` usage between the rejection and the next `doctor` run is the failure
+mode, and closing it needs a standalone registry with its own retention, not a bigger number
+here — recorded as an open limit in the README and in the plan's self-review.
+
+**The app accepting a row it did not issue rests on one experiment, not documentation.** There
+is no official word on what the sidebar will and won't accept; a row created by hand on
+2026-08-22, opened successfully by the app, is the entire evidentiary basis for this command
+existing. Nothing in this file or in `tools/check_new_row.py` proves that holds across app
+versions — the `doctor` check above is the mitigation for that, not a substitute for it.

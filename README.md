@@ -122,7 +122,7 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Eight commands. All mutating commands default to a dry run; add `--apply` to execute.
+Nine commands. All mutating commands default to a dry run; add `--apply` to execute.
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
@@ -173,6 +173,32 @@ takes a `cliSessionId` — `doctor` lists the ones nothing currently points at. 
 the account (id, org, email, or path substring); it defaults to the account that is signed in,
 which is the one difference from `sync`: this command exists to fix the sidebar you are looking
 at. The app must be closed either way, and `undo` puts the old pointer back.
+
+**`new-row`** — create a sidebar row for a conversation that has none:
+
+```
+ccs new-row --to 174eb7c1-879f-4f0e-abff-8fdc7210f3d9
+```
+
+`repoint` moves an existing row and `sync` copies one between accounts; neither can
+make one where none exists. A conversation whose row was overwritten, or never copied,
+is on disk and unopenable — 170 such transcripts were measured on one machine.
+`doctor` lists them; this turns one back into a sidebar entry.
+
+The title comes from `--title`, or the transcript's own title if it has one, or a
+placeholder like `(untitled — 2026-06-14, 181 turns, Personal)` — deliberately not a
+summary, because a machine-made title that reads like one is worse than an obvious
+placeholder.
+
+**Unofficial and unverified across app versions.** The app accepting a row it did not
+create was established by experiment, not documentation. The row is built from fields
+measured across 987 real rows plus values read out of the transcript itself, and it
+asserts nothing beyond those. If a future version rejects one, `doctor` reports it —
+but only while the creating operation is still in the journal, and that journal keeps
+just the last ten finished operations of any kind. In practice the alert covers the
+case it was built for, since an app version that rejects a row does so the first time
+it opens the sidebar. A row that disappears after a busy stretch of other operations
+will go unreported.
 
 **`move`** — relocate a session to another project folder:
 
