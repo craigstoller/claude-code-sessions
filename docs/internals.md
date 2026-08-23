@@ -1664,7 +1664,21 @@ change here should know both arguments existed rather than rediscovering one of 
   problem.
 - **Untested paths** (Codex): a crash between a row write and its `written` marker; drift that
   changes a row's swap classification between plan and apply; a voucher *repointed* rather than
-  deleted; two applies interleaved between check and write.
+  deleted; two applies interleaved between check and write. **All four now covered by
+  `tools/check_apply_edges.py` (2026-08-22), and all four already behaved correctly** - the gap
+  was coverage, not conduct:
+
+  | Path | What the test found |
+  |---|---|
+  | crash between write and marker | recovery is idempotent - `current == post` marks it written rather than re-writing, so the row is byte-identical afterwards |
+  | drift changing swap classification | the write loop's own `current != pre` drift refusal catches it before the reachability question arises; the destination keeps what it had |
+  | voucher repointed, not deleted | caught - the check asks what a row POINTS AT, not whether the file exists, so a repointed voucher is a lost voucher |
+  | two applies interleaved | the second refuses on the lock, **attempted from inside the first one's write loop** |
+
+  That last test is the strongest evidence for the lock in the suite. `check_serialization.py`
+  watches whether the lock file exists during a write; this one re-enters `run_sync` from within
+  the write loop and shows the second call is refused - the interleaving itself, not a proxy
+  for it.
 
 ## The operation lock — the serialization boundary, and exactly what it binds
 
