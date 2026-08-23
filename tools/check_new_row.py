@@ -453,8 +453,12 @@ try:
 except ccs.Refusal as exc:
     check("all-empty candidates refuse by naming them", ORG_D in str(exc),
           str(exc)[:130])
-    check("  naming ORG IDS, not paths - a Windows path pasted back would not "
-          "match", "organization ids" in str(exc), str(exc)[:130])
+    # Org ids are the headline because they are what distinguishes these
+    # candidates. Paths are printed beside them and, since the 2026-08-23
+    # _repoint_store fix, work when pasted back too - they did not when this
+    # advice was written.
+    check("  naming ORG IDS, which are what tells the candidates apart",
+          "organization ids" in str(exc), str(exc)[:130])
 shutil.rmtree(root, ignore_errors=True)
 
 # zero prose turns is ALLOWED - a policy choice must not masquerade as a
