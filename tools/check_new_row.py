@@ -1178,6 +1178,93 @@ check("  taking doctor's exit code back to clean", d["exit_code"] == 0,
       str(d["exit_code"]))
 shutil.rmtree(root, ignore_errors=True)
 
+# A DAMAGED op record must not take doctor down. `doctor` is the command you run
+# when something is already wrong, and it read (_m.get("rows") or [{}])[0]
+# straight out of a journal file a user can edit: 'rows' as a dict raises
+# KeyError: 0, a row with no dest_path raises KeyError out of _sync_row_drift,
+# and a row that is a string raises AttributeError - none caught by main(), so
+# the user got an unredacted traceback carrying store paths and account uuids.
+# _new_row_shape_error existed, was documented NEVER RAISES, and was wired into
+# classify_op and recover_op; this loop was the one consumer that skipped it.
+print("\n--- doctor survives a damaged new-row op record ---")
+
+SID2 = "%032d" % 72
+
+
+def damage_last_new_row(env, mutate):
+    """Corrupt the most recent new-row manifest the way a hand edit would."""
+    ops = [o for o in ccs.list_ops(env) if o.manifest.get("op_type") == "new-row"]
+    mutate(ops[-1].manifest)
+    ccs.save_manifest(ops[-1])
+    return ops[-1].manifest["op_id"]
+
+
+for label, mutate in (
+        ("'rows' is a dict", lambda mm: mm.__setitem__("rows", {"name": "x"})),
+        ("the row has no dest_path", lambda mm: mm["rows"][0].pop("dest_path")),
+        ("the row is a string", lambda mm: mm.__setitem__("rows", ["nope"])),
+        ("'rows' is empty", lambda mm: mm.__setitem__("rows", [])),
+):
+    root, env, live, dorm = build([OPENER] + prose(8))
+    # A HEALTHY op whose row vanished, so the test can tell "skipped the damaged
+    # one" from "bailed out of the whole loop".
+    m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Healthy"))
+    ccs.run_new_row(env, m)
+    os.unlink(m["rows"][0]["dest_path"])
+    with open(os.path.join(env.projects_root, "proj", SID2 + ".jsonl"), "w",
+              encoding="utf-8") as fh:
+        fh.write("\n".join([OPENER] + prose(8)) + "\n")
+    m2 = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID2, title="Damaged"))
+    ccs.run_new_row(env, m2)
+    bad_id = damage_last_new_row(env, mutate)
+    try:
+        d = ccs.gather_doctor(env)
+        check("doctor survives a completed new-row op where %s" % label, True)
+        check("  and still reports the healthy op's vanished row",
+              [v["op_id"] for v in d["vanished_new_rows"]] == [m["op_id"]],
+              str([v["op_id"] for v in d["vanished_new_rows"]]))
+        check("  without inventing a finding for the damaged one",
+              bad_id not in [v["op_id"] for v in d["vanished_new_rows"]])
+    except BaseException as exc:                   # noqa: BLE001 - that is the bug
+        check("doctor survives a completed new-row op where %s" % label, False,
+              "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+        check("  and still reports the healthy op's vanished row", False, "no report")
+        check("  without inventing a finding for the damaged one", False, "no report")
+    shutil.rmtree(root, ignore_errors=True)
+
+# undo shape-validates too. The branch closed this hole for `recover` and left
+# it open for `undo`, which dereferences the same m["rows"][0] out of the same
+# editable file - KeyError/IndexError, which main() does not catch either.
+print("\n--- undo refuses a damaged record instead of tracebacking ---")
+
+for label, mutate in (
+        ("'rows' is a dict", lambda mm: mm.__setitem__("rows", {"name": "x"})),
+        ("'rows' is empty", lambda mm: mm.__setitem__("rows", [])),
+        ("the row has no dest_path", lambda mm: mm["rows"][0].pop("dest_path")),
+        ("there is no store_path", lambda mm: mm.pop("store_path")),
+):
+    root, env, live, dorm = build([OPENER] + prose(8))
+    m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID, title="Undo me"))
+    ccs.run_new_row(env, m)
+    path = m["rows"][0]["dest_path"]
+    damage_last_new_row(env, mutate)
+    op = [o for o in ccs.list_ops(env) if o.manifest.get("op_type") == "new-row"][-1]
+    try:
+        ccs.undo_new_row(env, op)
+        check("undo refuses when %s" % label, False, "it did not refuse")
+        check("  and the row is left alone", os.path.exists(path))
+    except ccs.Refusal as exc:
+        check("undo refuses when %s" % label, "damaged" in str(exc), str(exc)[:80])
+        check("  and the row is left alone", os.path.exists(path))
+    except BaseException as exc:                   # noqa: BLE001 - that is the bug
+        check("undo refuses when %s" % label, False,
+              "%s: %s" % (type(exc).__name__, str(exc)[:70]))
+        check("  and the row is left alone", os.path.exists(path))
+    # the lock must not survive the refusal - undo_new_row releases in a finally
+    check("  and the lock is released", not os.path.exists(ccs._lock_path(env)))
+    shutil.rmtree(root, ignore_errors=True)
+
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)

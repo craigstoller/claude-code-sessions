@@ -2484,7 +2484,24 @@ def gather_doctor(env):
         _m = _op.manifest
         if _m.get("op_type") != "new-row" or _m.get("status") != "completed":
             continue
-        _r = (_m.get("rows") or [{}])[0]
+        # SHAPE-VALIDATE FIRST, like every other consumer of a new-row manifest.
+        # `(_m.get("rows") or [{}])[0]` reads a file a user can edit and a crash
+        # can truncate: measured 2026-08-23, a 'rows' that is a dict raises
+        # KeyError: 0 here, a row missing 'dest_path' raises KeyError out of
+        # _sync_row_drift, and a row that is a string raises AttributeError.
+        # main() catches only Refusal and LayoutError, so `doctor` - the command
+        # you run when something is already wrong - died with an unredacted
+        # traceback carrying store paths and account uuids. The same damage to a
+        # repoint op leaves doctor healthy, so this loop was the one consumer
+        # that skipped the validator built for exactly this.
+        #
+        # Skipping is the right answer, not reporting: every field below comes
+        # out of the row this rejects, so there is nothing to report about it -
+        # and a damaged record is `recover`'s subject, where classify_op already
+        # names the damage in its listing.
+        if _new_row_shape_error(_m):
+            continue
+        _r = _m["rows"][0]
         if _r.get("written") and _sync_row_drift(_r) == "absent":
             # ONE PATH BEING ABSENT IS NOT THE QUESTION. The question is whether
             # the account can still open the conversation, and those come apart
@@ -5192,6 +5209,23 @@ def undo_new_row(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
+        # Shape-validated here for the same reason recover_op validates: `undo`
+        # dereferences m["rows"][0] and m["store_path"] straight out of a
+        # journal file, and a damaged one raised KeyError or IndexError, which
+        # main() does not catch. The branch closed that hole for `recover` and
+        # left it open for `undo`.
+        #
+        # BEFORE _guard_mutation deliberately: a record this cannot read is
+        # refusable without enumerating the process list, which is the slowest
+        # thing either command does.
+        bad = _new_row_shape_error(m)
+        if bad:
+            raise Refusal(
+                "the record for {0} is damaged ({1}), so undo cannot tell which "
+                "row it created; refusing rather than guess. Nothing was "
+                "changed, and any row it wrote is still on disk - 'doctor' "
+                "lists conversations that no account points at."
+                .format(m.get("op_id"), bad))
         _guard_mutation(env, "remove a row from")
         r = m["rows"][0]
         if not r.get("written"):
