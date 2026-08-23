@@ -3111,6 +3111,20 @@ Recorded as **limits rather than fixed**, both with reasons in the self-review: 
 
 **Loop closed at the 3-round cap.** Rounds 1 and 2 each found real defects in the previous round's fixes, and round 3 did too — so the honest reading is that this plan is *better reviewed*, not *proven clean*. What remains open is recorded below.
 
+**Execution (2026-08-23) — eight tasks, subagent-driven, with a task review after each and a whole-branch review at the end.** Recorded because the shape of what it found is the useful part.
+
+**Eleven defects were found during execution. Every one was in this plan's text or in already-shipped code; none was an implementation error.** Four were caught by implementers who stopped and refused to code around something broken — a test calling functions two tasks away, `--store` advice that cannot work on Windows, a `say()` helper that does not exist in `cmd_recover`, and an op that could refuse against its own row after a crash.
+
+The reviews that found real defects did so by **executing probes**, not by reading. Reading found style; probing found `execute_new_row_op` overwriting a row it could not read (because `os.path.exists` returns False when `stat` fails), `recover --forward` telling the user "Nothing was written" about a row on disk, and `undo_new_row` fully built, fully tested, and reachable from nowhere — `cmd_undo`'s candidate tuple never learned the op type, while `cmd_new_row` told users to run it.
+
+That last one is the pattern worth carrying forward: **every test called `undo_new_row` directly**, so it was proven correct and proven unreachable at the same time. The same shape produced `doctor` handing users `new-row --to 174eb7c1…` — a truncated id, not a command — invisible to the whole suite because every fixture id is 32 digits with no hyphens and `_UUID_RE` does not match that shape. A fixture that does not resemble reality exercises nothing.
+
+Two verification gaps in this plan itself: `tests/` holds **326 pytest tests** covering exactly the machinery these tasks edit, and the Global Constraints named only `tools/check_*.py` — seven tasks were verified without them (all passed, which was luck). And the retention limit was documented as "days" when it is **the next ten finished operations of any kind**; measured, the alert clears after exactly ten.
+
+**The census decays.** Re-measured one day later: `chromeTabGroupId` 5.6% → 14.6%, `lastSpawnRootDetected` 2.7% → 6.9%, `remoteControlAutoEligible` 0.9% → 2.3%, with every row carrying the last two written in the preceding two days. The app is rolling those fields onto rows as it touches them, which makes omitting them *more* strongly right — a field mid-rollout is exactly what a synthesized row must not assert. A final sweep for stale figures also turned up `permissionMode` counts summing to 987 rather than 988, wrong rather than merely stale; the comment now states the sum so the next drift shows up as arithmetic that does not add up.
+
+**Found in shipped code, filed separately, not fixed here:** `--store <the live account's own email>` matches nothing (`account_email` resolves dormant accounts only), and `--store <a Windows path>` matches nothing (the candidate is forward-slashed, the argument is not).
+
 ## Self-review
 
 **Spec coverage.** Command surface → Task 6. Field derivation and the census → Task 1. Title derivation, provenance, collision → Task 2. Refusals → Task 3 (reachability incl. unreadable rows, missing/ambiguous transcript, unusable transcript, ambiguous store, zero turns allowed) and Task 4 (transcript gone, moved, or duplicated between plan and apply; another writer got there first). Journal/undo/lock → Tasks 3–4. `--json` filter → Task 6. `recover`/`classify_op` → Task 5. `doctor` detection → Task 7. Known limits in docs → Task 8. RULING 4 and RULING 5 come free via `_repoint_store` and `_guard_mutation`.
