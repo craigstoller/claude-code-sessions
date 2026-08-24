@@ -2889,6 +2889,221 @@ def gather_doctor(env):
     return report
 
 
+ALIGNMENT_DETAIL_LIMIT = 10
+
+
+def gather_alignment(env):
+    """How close the accounts are to holding one coherent history.
+
+    `doctor` answers "is anything broken or stuck". This answers a different
+    question that was being re-derived by hand, in chat, every single session:
+    **how far are the three sidebars from agreeing with each other, and which
+    way is it moving.** Five properties, measured, none of them inferable from
+    the others:
+
+      reachable       a conversation opens from SOME sidebar
+      distinguishable no two rows in ONE sidebar share a title
+      consistent      a row file opens the SAME conversation in every account
+      complete        a conversation opens from EVERY sidebar
+      safe            no dead, blank or unreadable rows
+
+    They fail independently, and fixing one can worsen another - converging
+    accounts (complete) lands both halves of a disagreeing pair in every sidebar
+    under one name, which is a direct hit to distinguishable. Reporting a single
+    "aligned: yes/no" would hide exactly the trade-off the reader has to make,
+    so this reports five numbers and never averages them.
+
+    Reads only. No transcript CONTENT is opened - filenames and row files only -
+    so this stays fast on a store with gigabytes of history behind it.
+    """
+    disc = discover_stores(env)
+    rows, row_errors = load_rows(disc.roots)
+    transcripts = iter_transcripts(env.projects_root)
+    tids = {os.path.splitext(os.path.basename(p))[0] for _, p in transcripts}
+
+    def acct(r):
+        return os.path.basename(os.path.dirname(os.path.dirname(r.path)))
+
+    accounts = sorted({acct(r) for r in rows})
+    n_acct = len(accounts)
+    labels = {a: (_email_of(env, a) or a[:8]) for a in accounts}
+
+    # ---- safe ------------------------------------------------------------
+    blank = sorted(r.local_id for r in rows if not r.cli_session_id)
+    dead = sorted(r.local_id for r in rows
+                  if r.cli_session_id and r.cli_session_id not in tids)
+
+    # ---- reachable -------------------------------------------------------
+    listed = {r.cli_session_id for r in rows if r.cli_session_id}
+    orphans = sorted(tids - listed)
+
+    # ---- complete --------------------------------------------------------
+    reach = {}
+    for r in rows:
+        if r.cli_session_id:
+            reach.setdefault(r.cli_session_id, set()).add(acct(r))
+    by_count = {}
+    for accs in reach.values():
+        by_count[len(accs)] = by_count.get(len(accs), 0) + 1
+    short = sum(n for k, n in by_count.items() if k < n_acct)
+
+    # ---- consistent ------------------------------------------------------
+    # Keyed by row FILENAME, because that is what sync copies: one row file
+    # lands in several accounts and each account's copy can drift to a
+    # different cliSessionId. Same file, different destination.
+    byfile = {}
+    for r in rows:
+        byfile.setdefault(os.path.basename(r.path), {})[acct(r)] = r.cli_session_id
+    disagree = []
+    for name in sorted(byfile):
+        per = byfile[name]
+        if len({v for v in per.values()}) <= 1:
+            continue
+        # A disagreement only COSTS something when one of the conversations it
+        # names is short of a sidebar. If both are reachable everywhere by some
+        # other row, the accounts merely disagree about which row opens which -
+        # untidy, not lossy. Separating these stops the report crying wolf.
+        gap = sorted({s for s in per.values()
+                      if s and len(reach.get(s, ())) < n_acct})
+        disagree.append({
+            "row": name,
+            "opens": dict((labels[a], per[a]) for a in sorted(per)),
+            "short_of_all_accounts": gap,
+        })
+    with_gap = [d for d in disagree if d["short_of_all_accounts"]]
+
+    # ---- distinguishable -------------------------------------------------
+    # PER ACCOUNT, never machine-wide. Grouping titles across all three stores
+    # reports pairs that no sidebar ever shows together, and an earlier version
+    # of this analysis did exactly that - it proposed removing an account's only
+    # copy of a conversation because a DIFFERENT account also had one.
+    dup_per, dup_titles = {}, {}
+    for a in accounts:
+        seen = {}
+        for r in rows:
+            if acct(r) != a or not r.cli_session_id:
+                continue
+            data = r.data if isinstance(r.data, dict) else {}
+            title = ((data.get("title") or "")).strip()
+            if title:
+                seen.setdefault(title, set()).add(r.cli_session_id)
+        for title, sids in seen.items():
+            if len(sids) > 1:
+                dup_per[labels[a]] = dup_per.get(labels[a], 0) + 1
+                dup_titles.setdefault(title, {})[labels[a]] = sorted(sids)
+    for a in accounts:
+        dup_per.setdefault(labels[a], 0)
+
+    return {
+        "stores": {"status": disc.status, "detail": disc.detail, "roots": disc.roots},
+        "accounts": [{"account": a, "label": labels[a],
+                      "rows": sum(1 for r in rows if acct(r) == a)}
+                     for a in accounts],
+        "row_errors": row_errors,
+        "reachable": {"transcripts": len(tids),
+                      "reachable": len(listed & tids),
+                      "orphans": len(orphans),
+                      "orphan_ids": orphans},
+        "distinguishable": {"duplicate_titles": len(dup_titles),
+                            "per_account": dup_per,
+                            "titles": dup_titles},
+        "consistent": {"disagreeing_rows": len(disagree),
+                       "leaving_a_gap": len(with_gap),
+                       "rows": disagree},
+        "complete": {"conversations": len(reach),
+                     "in_all_accounts": by_count.get(n_acct, 0),
+                     "short": short,
+                     "by_account_count": dict((str(k), v) for k, v in sorted(by_count.items()))},
+        "safe": {"dead_rows": len(dead), "blank_rows": len(blank),
+                 "unreadable_rows": len(row_errors)},
+        # Always 0 when the report could be produced. This is a scoreboard, not
+        # a check: the numbers stay non-zero for as long as the work takes, and
+        # a command that exits 1 for months trains you to stop reading it. That
+        # failure already happened once in this project, to `doctor`.
+        "exit_code": 0 if disc.status == "found" else 1,
+    }
+
+
+def cmd_alignment(env, ns):
+    rep = gather_alignment(env)
+    if ns.json:
+        print(json.dumps(rep, indent=1))
+        return rep["exit_code"]
+
+    def say(line):
+        print(line if ns.verbose else redact(env, line))
+
+    if rep["stores"]["status"] != "found":
+        say("[observed] store: {0} ({1})".format(rep["stores"]["status"],
+                                                 rep["stores"]["detail"]))
+        return rep["exit_code"]
+
+    n_acct = len(rep["accounts"])
+    say("[observed] {0} account(s):".format(n_acct))
+    for a in rep["accounts"]:
+        say("[observed]   {0:<28} {1:>4} rows".format(a["label"], a["rows"]))
+    for e in rep["row_errors"]:
+        say("[observed] UNREADABLE ROW (mutations blocked): " + e)
+
+    r = rep["reachable"]
+    say("[observed] reachable       {0} of {1} transcript(s) open from a sidebar; "
+        "{2} orphaned".format(r["reachable"], r["transcripts"], r["orphans"]))
+    if r["orphans"]:
+        say("[hypothesis]   an orphan is usually the earlier half of a compacted "
+            "session - the row follows")
+        say("[hypothesis]   the resumed conversation and leaves the original "
+            "behind. 'doctor' ranks the ones")
+        say("[hypothesis]   worth a second look by size and recency; this line "
+            "only counts them.")
+
+    d = rep["distinguishable"]
+    say("[observed] distinguishable {0} title(s) duplicated inside a single sidebar"
+        .format(d["duplicate_titles"]))
+    for label in sorted(d["per_account"]):
+        say("[observed]   {0:<28} {1:>4}".format(label, d["per_account"][label]))
+    shown = 0
+    for title in sorted(d["titles"]):
+        if shown >= ALIGNMENT_DETAIL_LIMIT:
+            say("[observed]   ... and {0} more (all of them in --json)"
+                .format(len(d["titles"]) - shown))
+            break
+        where = d["titles"][title]
+        say("[observed]   {0!r} in {1}".format(title[:56], ", ".join(sorted(where))))
+        shown += 1
+
+    c = rep["consistent"]
+    say("[observed] consistent      {0} row file(s) open a different conversation "
+        "depending on the account".format(c["disagreeing_rows"]))
+    if c["disagreeing_rows"]:
+        # The number that decides whether to care. A disagreement whose
+        # conversations are all reachable elsewhere costs nothing.
+        say("[observed]                   {0} of those leave a conversation short "
+            "of at least one sidebar".format(c["leaving_a_gap"]))
+        if c["leaving_a_gap"] == 0:
+            say("[hypothesis]   none of them lose you anything - every conversation "
+                "involved is still reachable")
+            say("[hypothesis]   from every account by some other row. Untidy "
+                "bookkeeping, not lost history.")
+
+    m = rep["complete"]
+    say("[observed] complete        {0} of {1} conversation(s) reachable from all "
+        "{2} account(s); {3} short"
+        .format(m["in_all_accounts"], m["conversations"], n_acct, m["short"]))
+    for k in sorted(m["by_account_count"], key=lambda s: -int(s)):
+        say("[observed]   in {0} of {1} account(s)          {2:>4}"
+            .format(k, n_acct, m["by_account_count"][k]))
+
+    s = rep["safe"]
+    say("[observed] safe            {0} dead, {1} blank, {2} unreadable row(s)"
+        .format(s["dead_rows"], s["blank_rows"], s["unreadable_rows"]))
+    if s["dead_rows"]:
+        say("[hypothesis]   a dead row points at a transcript that no longer "
+            "exists - usually retention.")
+        say("[hypothesis]   'cleanupPeriodDays' defaults to 30; raising it stops "
+            "the backlog rebuilding.")
+    return rep["exit_code"]
+
+
 def cmd_doctor(env, ns):
     rep = gather_doctor(env)
     if ns.json:
@@ -3128,6 +3343,12 @@ def build_parser():
     common(sp)
 
     sp = sub.add_parser("doctor", help="read-only health report")
+    sp.add_argument("--json", action="store_true")
+    common(sp)
+
+    sp = sub.add_parser(
+        "alignment",
+        help="read-only report: how close your accounts are to one shared history")
     sp.add_argument("--json", action="store_true")
     common(sp)
 
@@ -3479,6 +3700,7 @@ def main(argv=None):
     ns = build_parser().parse_args(argv)
     env = default_env()
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
+                "alignment": cmd_alignment,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
                 "repoint": cmd_repoint, "new-row": cmd_new_row,
                 "trust-signed-helper": cmd_trust_signed_helper}

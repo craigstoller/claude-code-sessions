@@ -124,7 +124,7 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Nine commands. All mutating commands default to a dry run; add `--apply` to execute.
+Ten commands. All mutating commands default to a dry run; add `--apply` to execute.
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
@@ -159,6 +159,33 @@ only the top few are printed, with the total alongside (the full list is in `--j
 Resuming a session while signed into a different account repoints its row, which can leave the
 conversation you were in an hour ago reachable from no sidebar at all. That is what this
 ranking is for, and `repoint` is how you put it back.
+
+**`alignment`** — read-only scoreboard: how close your accounts are to holding one shared
+history. `doctor` answers "is anything broken"; this answers "how far apart are my sidebars,
+and which way is it moving":
+
+```
+claude-code-sessions alignment
+```
+
+Five properties, reported separately and never averaged, because they fail independently:
+**reachable** (a conversation opens from *some* sidebar), **distinguishable** (no two rows in
+*one* sidebar share a title), **consistent** (a row file opens the *same* conversation in every
+account), **complete** (a conversation opens from *every* sidebar), and **safe** (no dead, blank
+or unreadable rows).
+
+Two of those actively trade against each other: making a conversation reachable everywhere lands
+both halves of a disagreeing pair in every sidebar under one name, which is a direct hit to
+*distinguishable*. A single "aligned: yes/no" would hide exactly the decision you have to make.
+
+It reads row files and transcript **filenames** only — no transcript content — so it stays fast
+on a store with gigabytes behind it. **It always exits 0** when it could produce the report. It
+is a scoreboard, not a check: these numbers stay non-zero for as long as the work takes, and a
+command that exits 1 for months trains you to stop reading it.
+
+Duplicate titles are counted **per sidebar**, never machine-wide. One conversation synced to
+three accounts shows one row in each — that is not a duplicate, and treating it as one leads to
+proposing the removal of an account's only copy.
 
 **`repoint`** — point one sidebar entry at a different conversation:
 
