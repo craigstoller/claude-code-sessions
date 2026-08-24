@@ -655,6 +655,141 @@ check("  so applying that plan writes no swap row",
       not any(r["title"] == "Swap slot" for r in m2["rows"]))
 shutil.rmtree(root, ignore_errors=True)
 
+
+# ==========================================================================
+# H. conversations that share a title, with overlap reported BOTH ways
+# ==========================================================================
+print("\n--- H. duplicate titles: containment is asymmetric, so say both ---")
+
+# SUB is an earlier segment wholly inside SUPER. Reporting a bare "100%
+# contained" without naming WHICH is contained lets a reader delete the
+# superset - so every pair carries both directions and each number names its
+# own subject.
+SUB, SUPER, OTHER = "%032d" % 71, "%032d" % 72, "%032d" % 73
+shared = prose(20, "s")
+root, env, dirs, projects = build({SUB: shared,
+                                   SUPER: shared + prose(20, "x"),
+                                   OTHER: prose(15, "z")})
+row(dirs["live"], "local_a.json", SUB, "Same name")
+row(dirs["live"], "local_b.json", SUPER, "Same name")
+row(dirs["live"], "local_c.json", OTHER, "Different name")
+rep = ccs.gather_doctor(env)
+groups = {g["title"]: g for g in rep["duplicate_titles"]}
+check("a shared title is reported", "Same name" in groups, str(list(groups)))
+check("  and a unique one is NOT", "Different name" not in groups)
+g = groups.get("Same name", {"pairs": [], "sessions": []})
+check("  with one pair for two conversations", len(g["pairs"]) == 1)
+p = g["pairs"][0] if g["pairs"] else {}
+a_in_b = p.get("a_in_b") if p.get("a") == SUB else p.get("b_in_a")
+b_in_a = p.get("b_in_a") if p.get("a") == SUB else p.get("a_in_b")
+check("  the SUBSET reports ~100% of itself inside the superset",
+      a_in_b is not None and a_in_b >= 99, str(a_in_b))
+check("  the SUPERSET reports only ~half of itself inside the subset",
+      b_in_a is not None and 40 <= b_in_a <= 60, str(b_in_a))
+check("  which is the whole point - one number alone is ambiguous",
+      a_in_b != b_in_a)
+check("  and doctor's exit code is NOT affected by a duplicate title",
+      rep["exit_code"] == 0, str(rep["exit_code"]))
+shutil.rmtree(root, ignore_errors=True)
+
+# The same conversation listed in three accounts is ONE conversation. A report
+# whose purpose is to reduce noise must not treble it.
+root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
+for d in ("live", "dorm", "third"):
+    row(dirs[d], "local_a.json", SUB, "Same name")
+    row(dirs[d], "local_b.json", SUPER, "Same name")
+rep = ccs.gather_doctor(env)
+g = [x for x in rep["duplicate_titles"] if x["title"] == "Same name"][0]
+check("a duplicate synced to three accounts is listed once, not three times",
+      len(g["sessions"]) == 2, str(len(g["sessions"])))
+check("  and yields one pair, not nine", len(g["pairs"]) == 1, str(len(g["pairs"])))
+shutil.rmtree(root, ignore_errors=True)
+
+# "Not compared" must never render as 0%. A transcript past the comparison cap
+# shares an unknown amount, and printing a zero reads as "shares nothing" -
+# the one conclusion most likely to delete the wrong conversation.
+root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
+row(dirs["live"], "local_a.json", SUB, "Same name")
+row(dirs["live"], "local_b.json", SUPER, "Same name")
+real_cap = ccs.TRANSCRIPT_COMPARE_MAX_BYTES
+ccs.TRANSCRIPT_COMPARE_MAX_BYTES = 1        # everything is now "too large"
+try:
+    rep = ccs.gather_doctor(env)
+finally:
+    ccs.TRANSCRIPT_COMPARE_MAX_BYTES = real_cap
+g = [x for x in rep["duplicate_titles"] if x["title"] == "Same name"][0]
+check("an uncomparable transcript reports turns as unknown, not zero",
+      all(s["turns"] is None for s in g["sessions"]),
+      str([s["turns"] for s in g["sessions"]]))
+check("  saying WHY it could not be compared",
+      all(s["unmeasured"] == "too large to compare" for s in g["sessions"]),
+      str([s["unmeasured"] for s in g["sessions"]]))
+check("  and the pair is marked not-compared rather than 0%",
+      g["pairs"][0]["unmeasured"] is True
+      and g["pairs"][0]["a_in_b"] is None,
+      str(g["pairs"][0]))
+shutil.rmtree(root, ignore_errors=True)
+
+# Four conversations under one name produce all six pairs, both ways each.
+A4, B4, C4, D4 = ["%032d" % n for n in (74, 75, 76, 77)]
+root, env, dirs, projects = build({A4: prose(10, "a"), B4: prose(10, "b"),
+                                   C4: prose(10, "c"), D4: prose(10, "d")})
+for i, s in enumerate((A4, B4, C4, D4)):
+    row(dirs["live"], "local_%d.json" % i, s, "Four of these")
+g = [x for x in ccs.gather_doctor(env)["duplicate_titles"]
+     if x["title"] == "Four of these"][0]
+check("four conversations yield all six pairs", len(g["pairs"]) == 6,
+      str(len(g["pairs"])))
+check("  every pair carries BOTH directions",
+      all(p["a_in_b"] is not None and p["b_in_a"] is not None for p in g["pairs"]))
+check("  and unrelated conversations report ~0 both ways",
+      all(p["a_in_b"] == 0 and p["b_in_a"] == 0 for p in g["pairs"]),
+      str([(p["a_in_b"], p["b_in_a"]) for p in g["pairs"]][:3]))
+shutil.rmtree(root, ignore_errors=True)
+
+
+# Two conditions wear the same shape, and only one is sidebar friction. An
+# earlier version grouped by title across the whole machine and called both
+# "duplicates": nine of the twenty groups here were accounts DISAGREEING about
+# what one title opens, where each sidebar shows exactly one row. A cleanup
+# list built from that told the user to remove a row that was an account's only
+# copy. They caught it because a title the report called duplicated appeared
+# once in the sidebar in front of them.
+root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
+row(dirs["live"], "local_a.json", SUB, "Two in one sidebar")
+row(dirs["live"], "local_b.json", SUPER, "Two in one sidebar")
+row(dirs["dorm"], "local_c.json", SUB, "One each, different targets")
+row(dirs["third"], "local_d.json", SUPER, "One each, different targets")
+rep = ccs.gather_doctor(env)
+byt = {g["title"]: g for g in rep["duplicate_titles"]}
+check("two rows in ONE account are scoped 'sidebar'",
+      byt["Two in one sidebar"]["scope"] == "sidebar",
+      byt["Two in one sidebar"]["scope"])
+check("one row each in DIFFERENT accounts is scoped 'cross-account'",
+      byt["One each, different targets"]["scope"] == "cross-account",
+      byt["One each, different targets"]["scope"])
+check("  and it names which account opens which conversation",
+      set(byt["One each, different targets"]["accounts"]) == {DORM, THIRD},
+      str(sorted(byt["One each, different targets"]["accounts"])))
+check("sidebar duplicates sort ahead of cross-account ones",
+      rep["duplicate_titles"][0]["scope"] == "sidebar")
+shutil.rmtree(root, ignore_errors=True)
+
+# A row this tool cannot parse must not take the report down with it.
+root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
+row(dirs["live"], "local_a.json", SUB, "Same name")
+row(dirs["live"], "local_b.json", SUPER, "Same name")
+with open(os.path.join(dirs["live"], "local_broken.json"), "w") as fh:
+    fh.write("{not json")
+try:
+    rep = ccs.gather_doctor(env)
+    check("an unparseable row does not break the duplicate report",
+          any(x["title"] == "Same name" for x in rep["duplicate_titles"]))
+except BaseException as exc:                       # noqa: BLE001 - that is the bug
+    check("an unparseable row does not break the duplicate report", False,
+          type(exc).__name__)
+shutil.rmtree(root, ignore_errors=True)
+
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
