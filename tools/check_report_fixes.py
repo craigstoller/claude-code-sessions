@@ -747,6 +747,34 @@ check("  and unrelated conversations report ~0 both ways",
       str([(p["a_in_b"], p["b_in_a"]) for p in g["pairs"]][:3]))
 shutil.rmtree(root, ignore_errors=True)
 
+
+# Two conditions wear the same shape, and only one is sidebar friction. An
+# earlier version grouped by title across the whole machine and called both
+# "duplicates": nine of the twenty groups here were accounts DISAGREEING about
+# what one title opens, where each sidebar shows exactly one row. A cleanup
+# list built from that told the user to remove a row that was an account's only
+# copy. They caught it because a title the report called duplicated appeared
+# once in the sidebar in front of them.
+root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
+row(dirs["live"], "local_a.json", SUB, "Two in one sidebar")
+row(dirs["live"], "local_b.json", SUPER, "Two in one sidebar")
+row(dirs["dorm"], "local_c.json", SUB, "One each, different targets")
+row(dirs["third"], "local_d.json", SUPER, "One each, different targets")
+rep = ccs.gather_doctor(env)
+byt = {g["title"]: g for g in rep["duplicate_titles"]}
+check("two rows in ONE account are scoped 'sidebar'",
+      byt["Two in one sidebar"]["scope"] == "sidebar",
+      byt["Two in one sidebar"]["scope"])
+check("one row each in DIFFERENT accounts is scoped 'cross-account'",
+      byt["One each, different targets"]["scope"] == "cross-account",
+      byt["One each, different targets"]["scope"])
+check("  and it names which account opens which conversation",
+      set(byt["One each, different targets"]["accounts"]) == {DORM, THIRD},
+      str(sorted(byt["One each, different targets"]["accounts"])))
+check("sidebar duplicates sort ahead of cross-account ones",
+      rep["duplicate_titles"][0]["scope"] == "sidebar")
+shutil.rmtree(root, ignore_errors=True)
+
 # A row this tool cannot parse must not take the report down with it.
 root, env, dirs, projects = build({SUB: shared, SUPER: shared + prose(20, "x")})
 row(dirs["live"], "local_a.json", SUB, "Same name")

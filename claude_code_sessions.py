@@ -2554,6 +2554,25 @@ def _duplicate_title_groups(env, rows):
     than being given a 0, which would read as "shares nothing" and invite exactly
     the wrong deletion.
 
+    TWO DIFFERENT CONDITIONS WEAR THE SAME SHAPE, and only one of them is the
+    sidebar friction people mean:
+
+      scope "sidebar"       - one account holds two or more rows under this
+                              title. That is the clicking-the-wrong-one problem,
+                              and removing the redundant member may be right.
+      scope "cross-account" - each account holds ONE row under this title, but
+                              they open DIFFERENT conversations. No sidebar ever
+                              shows two, so there is nothing to declutter -
+                              removing a member strips an account's only door to
+                              that conversation while the others keep pointing
+                              elsewhere.
+
+    An earlier version grouped by title across the whole machine and reported
+    both as one thing. It listed nine cross-account groups as duplicates, and a
+    cleanup list built from it proposed removing a row that was an account's
+    only copy. The user noticed because a title the report called duplicated
+    appeared exactly once in the sidebar they were looking at.
+
     Read-only, and deliberately NOT part of doctor's exit code: two conversations
     sharing a name is normal, not a fault.
     """
@@ -2569,17 +2588,25 @@ def _duplicate_title_groups(env, rows):
         title = d.get("title")
         if not isinstance(title, str) or not title.strip():
             continue
-        seen = by_title.setdefault(title, {})
+        entry = by_title.setdefault(title, {"members": {}, "per_account": {}})
         # One entry per CONVERSATION, not per row: the same duplicate exists in
         # every synced account, and listing it three times would treble a report
         # whose whole purpose is to reduce noise.
-        if r.cli_session_id not in seen:
-            seen[r.cli_session_id] = (r.path, d)
+        if r.cli_session_id not in entry["members"]:
+            entry["members"][r.cli_session_id] = (r.path, d)
+        # ...but WHICH accounts hold it is what separates a sidebar duplicate
+        # from a cross-account disagreement, so that is tracked alongside.
+        acct = os.path.basename(os.path.dirname(os.path.dirname(r.path)))
+        entry["per_account"].setdefault(acct, set()).add(r.cli_session_id)
 
     out = []
-    for title, members in by_title.items():
+    for title, entry in by_title.items():
+        members, per_account = entry["members"], entry["per_account"]
         if len(members) < 2:
             continue
+        # "sidebar" the moment ANY single account holds two of them.
+        sidebar = [a for a, s in per_account.items() if len(s) > 1]
+        scope = "sidebar" if sidebar else "cross-account"
         sessions, prints = [], {}
         for sid, (rowpath, d) in sorted(members.items()):
             found = find_transcripts(env.projects_root, sid)
@@ -2631,8 +2658,11 @@ def _duplicate_title_groups(env, rows):
                 if v is not None and v > worst:
                     worst = v
         out.append({"title": title, "sessions": sessions, "pairs": pairs,
-                    "max_containment": worst})
-    out.sort(key=lambda g: (-g["max_containment"], g["title"]))
+                    "max_containment": worst, "scope": scope,
+                    "accounts": {a: sorted(s) for a, s in per_account.items()}})
+    # Sidebar duplicates first - they are the ones a person can act on.
+    out.sort(key=lambda g: (g["scope"] != "sidebar", -g["max_containment"],
+                            g["title"]))
     return out
 
 
@@ -2969,12 +2999,17 @@ def cmd_doctor(env, ns):
             "session from the app if it is not wanted, or leave it if it is, "
             "and this clears.")
     dupes = rep.get("duplicate_titles") or []
-    if dupes:
-        say("[observed] {0} title(s) are shared by more than one conversation - the "
-            "app writes these titles itself, so related work gets the same "
-            "sentence".format(len(dupes)))
+    # Split before printing. These are two different conditions that happen to
+    # look alike, and reporting them together produced a cleanup list that told
+    # a user to remove an account's only copy of a conversation.
+    same_sidebar = [g for g in dupes if g.get("scope") == "sidebar"]
+    across = [g for g in dupes if g.get("scope") != "sidebar"]
+    if same_sidebar:
+        say("[observed] {0} title(s) appear MORE THAN ONCE IN A SINGLE SIDEBAR - "
+            "the app writes these titles itself, so related work gets the same "
+            "sentence".format(len(same_sidebar)))
         shown = 0
-        for g in dupes:
+        for g in same_sidebar:
             if shown >= 5:
                 break
             shown += 1
@@ -3002,13 +3037,29 @@ def cmd_doctor(env, ns):
                 say_ids("[observed]     {0:.0f}% of {1} is also in {2}; {3:.0f}% "
                         "of {2} is also in {1}".format(
                             p["a_in_b"], p["a"][:8], p["b"][:8], p["b_in_a"]))
-        if len(dupes) > shown:
+        if len(same_sidebar) > shown:
             say("[observed]   ... and {0} more (all of them in --json)"
-                .format(len(dupes) - shown))
+                .format(len(same_sidebar) - shown))
         say("[hypothesis]   a conversation whose turns are ~all inside a sibling "
             "is an earlier segment of it and can be removed from the sidebar in "
             "the app; one with turns of its own is a separate conversation that "
             "happens to share a name - rename it there rather than removing it")
+    if across:
+        say("[observed] {0} title(s) open a DIFFERENT conversation depending on "
+            "which account you are signed into - each sidebar shows only one, so "
+            "there is nothing to declutter".format(len(across)))
+        for g in across[:5]:
+            say_ids("[observed]   {0!r}".format(g["title"]))
+            for acct, sids in sorted(g.get("accounts", {}).items()):
+                say_ids("[observed]     {0}  opens  {1}".format(
+                    _email_of(env, acct) or acct[:8], ", ".join(sids)))
+        if len(across) > 5:
+            say("[observed]   ... and {0} more (all of them in --json)"
+                .format(len(across) - 5))
+        say("[hypothesis]   removing one of these takes away an account's ONLY "
+            "door to that conversation while the others keep pointing elsewhere. "
+            "If they should agree, 'sync' the one you want everywhere; if they "
+            "are genuinely different work, rename them in the app")
     say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
         .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
     say("[observed] encoding evidence (all rows): current={0} legacy={1}"
