@@ -2532,6 +2532,110 @@ def cmd_list(env, ns):
 RETENTION_HINT_DAYS = 30
 
 
+def _duplicate_title_groups(env, rows):
+    """Conversations that share a title, with pairwise overlap in BOTH directions.
+
+    The friction this reports is real and recurring: every title in this store is
+    written by the app's summariser (measured 2026-08-23: titleSource is 'auto' on
+    every row carrying it, 'user' on none), so two conversations about the same
+    work get the same sentence. Twenty such groups here, spread across five
+    months - it is not a one-off.
+
+    BOTH DIRECTIONS, ALWAYS. Containment is asymmetric and reporting one half of
+    it is worse than reporting none: if A has 400 turns and B has 200 and every
+    one of B's is in A, then "100% contained" and "50% contained" are the same
+    fact seen from either end. A reader shown only the first number, without
+    being told WHICH conversation it describes, can delete the superset. So every
+    pair carries a_in_b and b_in_a, and the caller never has to infer a direction.
+
+    "Not compared" is not "no overlap". _message_fingerprints returns None above
+    TRANSCRIPT_COMPARE_MAX_BYTES, and four conversations here - 607 MB between
+    them, under one shared title - exceed it. They are marked unmeasured rather
+    than being given a 0, which would read as "shares nothing" and invite exactly
+    the wrong deletion.
+
+    Read-only, and deliberately NOT part of doctor's exit code: two conversations
+    sharing a name is normal, not a fault.
+    """
+    by_title = {}
+    for r in rows:
+        if not r.cli_session_id:
+            continue
+        # r.data, not a fresh read_json: load_rows already parsed every row, and
+        # re-reading all of them here doubled doctor's runtime for nothing.
+        d = r.data
+        if not isinstance(d, dict):
+            continue
+        title = d.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        seen = by_title.setdefault(title, {})
+        # One entry per CONVERSATION, not per row: the same duplicate exists in
+        # every synced account, and listing it three times would treble a report
+        # whose whole purpose is to reduce noise.
+        if r.cli_session_id not in seen:
+            seen[r.cli_session_id] = (r.path, d)
+
+    out = []
+    for title, members in by_title.items():
+        if len(members) < 2:
+            continue
+        sessions, prints = [], {}
+        for sid, (rowpath, d) in sorted(members.items()):
+            found = find_transcripts(env.projects_root, sid)
+            path = found[0] if len(found) == 1 else None
+            mb = None
+            if path:
+                try:
+                    mb = round(os.path.getsize(path) / 1e6, 1)
+                except OSError:
+                    mb = None
+            fps = _message_fingerprints(path) if path else None
+            prints[sid] = set(fps) if fps is not None else None
+            sessions.append({
+                "session_id": sid,
+                "turns": len(fps) if fps is not None else None,
+                "mb": mb,
+                "created": d.get("createdAt"),
+                # Why it could not be compared, so the reader is never left to
+                # guess whether "not compared" means missing or merely huge.
+                "unmeasured": ("no transcript" if not path
+                               else "too large to compare" if fps is None
+                               else None),
+            })
+        pairs = []
+        ids = [s["session_id"] for s in sessions]
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = ids[i], ids[j]
+                fa, fb = prints[a], prints[b]
+                if fa is None or fb is None:
+                    pairs.append({"a": a, "b": b, "a_in_b": None, "b_in_a": None,
+                                  "shared": None, "unmeasured": True})
+                    continue
+                shared = len(fa & fb)
+                pairs.append({
+                    "a": a, "b": b, "shared": shared,
+                    # Read these as: this fraction of A's turns also appear in B.
+                    "a_in_b": round(100.0 * shared / len(fa), 1) if fa else None,
+                    "b_in_a": round(100.0 * shared / len(fb), 1) if fb else None,
+                    "a_unique": len(fa - fb), "b_unique": len(fb - fa),
+                    "unmeasured": False,
+                })
+        # Most-redundant first: a group holding a conversation almost entirely
+        # inside a sibling is the one worth a decision, and a group of genuine
+        # forks is not.
+        worst = 0.0
+        for p in pairs:
+            for v in (p.get("a_in_b"), p.get("b_in_a")):
+                if v is not None and v > worst:
+                    worst = v
+        out.append({"title": title, "sessions": sessions, "pairs": pairs,
+                    "max_containment": worst})
+    out.sort(key=lambda g: (-g["max_containment"], g["title"]))
+    return out
+
+
 def gather_doctor(env):
     disc = discover_stores(env)
     rows, row_errors = load_rows(disc.roots)
@@ -2725,6 +2829,12 @@ def gather_doctor(env):
                 # of the answer, and this loop is the only place that knows.
                 "transcript_paths": _found,
             })
+    # Conversations sharing a title. Informational: it does NOT touch exit_code,
+    # because two conversations with one name is normal rather than a fault.
+    try:
+        duplicate_titles = _duplicate_title_groups(env, rows)
+    except (LayoutError, OSError, ValueError):
+        duplicate_titles = []
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
@@ -2735,6 +2845,7 @@ def gather_doctor(env):
         "legacy_folders": legacy_folders, "nonterminal_ops": nt,
         "stale_lock": lock_is_stale(env),
         "unknown_layout": unknown_layout,
+        "duplicate_titles": duplicate_titles,
         "vanished_new_rows": vanished_new,
         "rollback_residue": rollback_residue,
     }
@@ -2857,6 +2968,47 @@ def cmd_doctor(env, ns):
             "operation wrote. Nothing else looks for that row - delete the "
             "session from the app if it is not wanted, or leave it if it is, "
             "and this clears.")
+    dupes = rep.get("duplicate_titles") or []
+    if dupes:
+        say("[observed] {0} title(s) are shared by more than one conversation - the "
+            "app writes these titles itself, so related work gets the same "
+            "sentence".format(len(dupes)))
+        shown = 0
+        for g in dupes:
+            if shown >= 5:
+                break
+            shown += 1
+            say_ids("[observed]   {0!r}".format(g["title"]))
+            for s in g["sessions"]:
+                turns = ("{0} turns".format(s["turns"]) if s["turns"] is not None
+                         else "turns " + (s["unmeasured"] or "not counted"))
+                say_ids("[observed]     {0}  {1:>16}  {2}".format(
+                    s["session_id"], turns,
+                    "{0} MB".format(s["mb"]) if s["mb"] is not None else "size ?"))
+            for p in g["pairs"]:
+                if p.get("unmeasured"):
+                    # NOT "0% shared". One of these is past the comparison cap,
+                    # and printing a zero would read as "shares nothing" - which
+                    # is the one conclusion most likely to delete the wrong one.
+                    say_ids("[observed]     {0} vs {1}: not compared, one is too "
+                            "large".format(p["a"][:8], p["b"][:8]))
+                    continue
+                # BOTH DIRECTIONS ON ONE LINE, each naming its own subject.
+                # Containment is asymmetric: 100% of a 1-turn stub sits inside a
+                # 26-turn conversation while only 4% of that one sits in the
+                # stub. A reader shown a bare "100% contained" can delete the
+                # superset, so neither number is ever printed without the id it
+                # describes.
+                say_ids("[observed]     {0:.0f}% of {1} is also in {2}; {3:.0f}% "
+                        "of {2} is also in {1}".format(
+                            p["a_in_b"], p["a"][:8], p["b"][:8], p["b_in_a"]))
+        if len(dupes) > shown:
+            say("[observed]   ... and {0} more (all of them in --json)"
+                .format(len(dupes) - shown))
+        say("[hypothesis]   a conversation whose turns are ~all inside a sibling "
+            "is an earlier segment of it and can be removed from the sidebar in "
+            "the app; one with turns of its own is a separate conversation that "
+            "happens to share a name - rename it there rather than removing it")
     say("[observed] encoding evidence (recent 50): current={0} legacy={1}"
         .format(rep["encoding_recent"]["current"], rep["encoding_recent"]["legacy"]))
     say("[observed] encoding evidence (all rows): current={0} legacy={1}"
