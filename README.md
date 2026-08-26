@@ -550,6 +550,24 @@ window into `journaled`/`completed`/`rolled_back`.
   plumbing (`[Request interrupted by user]`, `No response requested.`) no longer counts as
   conversation: three rows reporting 95–98% overlap turned out to have **zero** authored turns
   only in the displaced copy. See `docs/internals.md`.
+- **0.10.0 adds `new-row` and `alignment`.** `repoint` could already reach a conversation that no
+  sidebar opened - but only by spending the row it was aimed at, which is the trade that produced
+  the loss `doctor`'s orphan ranking exists to report. **`new-row` is the additive answer**: it
+  creates a row and changes nothing that already exists. It takes its title from the transcript's
+  own `customTitle` where there is one, and a placeholder that does not impersonate a summary where
+  there is not - measured across the orphans on one machine, only 48 of 169 had a title to derive
+  from, so manufacturing the rest would have been guessing dressed as a summary. It also refuses to
+  add a second door to a conversation the account can already open.
+
+  **`alignment` answers a different question from `doctor`.** `doctor` asks whether anything is
+  broken or stuck; `alignment` asks how far apart several accounts are, as five numbers that fail
+  independently: reachable, distinguishable, consistent, complete, safe. They are reported
+  separately and never averaged, because two of them trade against each other - making a
+  conversation reachable everywhere lands both halves of a divergent pair in every sidebar under one
+  name, which is a direct hit to *distinguishable*. A single "aligned: yes/no" would hide exactly
+  the decision the reader has to make. It always exits 0 when it can produce the report: it is a
+  scoreboard, not a check, and a command that exits 1 for months trains you to stop reading it.
+
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
