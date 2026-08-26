@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
@@ -2471,11 +2471,137 @@ def clear_stale_lock(env):
 _UUID_RE = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 
 
+# Content redaction, as opposed to the machine redaction `redact` does below.
+#
+# `redact` has always replaced the home directory and shortened uuid-shaped ids
+# - everything that identifies the MACHINE. It has never touched titles, which
+# is what identifies the WORK. That gap put a named third party alongside a
+# professional-board complaint into a public repo, twice, because output that
+# advertises itself as redacted was pasted into documentation.
+#
+# Titles cannot be recognised by shape the way a path or a uuid can, so this
+# cannot be a regex. It builds a substitution table from the store instead:
+# every title this machine actually has, and every project folder name, mapped
+# to a stable opaque label.
+#
+# DELIBERATELY UNREADABLE LABELS. `<session-a1b2>` rather than a plausible fake
+# title, because a plausible fake read back later is indistinguishable from a
+# real one, and the entire failure being fixed here is real titles that looked
+# like examples. Hand-written examples should use the fake cast instead; this is
+# for pasting REAL output.
+#
+# Stable across runs (sha256 of the title), so two pasted listings can be
+# compared to each other.
+_ANONYMIZE = False
+_ANON_CACHE = {}
+_ANON_MIN = 4
+
+
+def _anon_label(kind, value):
+    return "<%s-%s>" % (kind, hashlib.sha256(value.encode("utf-8")).hexdigest()[:4])
+
+
+def _anon_pairs(env):
+    """(real, label) for every title and project folder, longest first.
+
+    Longest first matters: one title is often a prefix of another - "… (fork)"
+    is the common case here - and replacing the short one first would leave the
+    tail of the long one exposed in the output.
+    """
+    key = (env.home, tuple(env.store_candidates), env.projects_root)
+    if key in _ANON_CACHE:
+        return _ANON_CACHE[key]
+    seen = {}
+    try:
+        disc = discover_stores(env)
+        rows, _ = load_rows(disc.roots)
+    except Exception:
+        rows = []
+    for r in rows:
+        data = r.data if isinstance(r.data, dict) else {}
+        t = (data.get("title") or "").strip()
+        if len(t) >= _ANON_MIN:
+            seen[t] = _anon_label("session", t)
+    # WHOLE cwd paths, not name fragments. The first version split the encoded
+    # folder name on "-" and mapped the last piece, which turned
+    # "…\Northwind Plastic Surgery" into
+    # "…\Northwind Plastic <project-022e>" - anonymised-looking output
+    # that still named the client. A partial replacement is worse than none,
+    # because it reads as safe.
+    for r in rows:
+        c = (r.cwd or "").strip()
+        if len(c) >= _ANON_MIN:
+            # WHOLE paths only. Mapping the basename too seemed thorough and
+            # was actively harmful: "craig" and "Projects" are basenames, so
+            # the line pass rewrote 'craig@foundryside.co' into nonsense.
+            # Over-matching corrupts the report; the structured pass below is
+            # what actually guarantees coverage.
+            seen.setdefault(c, _anon_label("project", c))
+    pairs = sorted(seen.items(), key=lambda kv: -len(kv[0]))
+    _ANON_CACHE[key] = pairs
+    return pairs
+
+
+_ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title")
+_ANON_EMAIL_FIELDS = ("label", "email", "account_email")
+
+
+def anonymize_report(env, obj):
+    """Anonymise a report STRUCTURE, before anything formats it.
+
+    The line-level pass below cannot see a title that formatting has already
+    truncated to fit a column - and `list` truncates every one of them, so the
+    first version of this feature left most titles untouched while looking like
+    it had worked. Replacing the field first means truncation and column widths
+    apply to the LABEL, so the output stays aligned and nothing survives being
+    cut in half.
+
+    This is also what covers `--json`, which no line-level pass ever reaches.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            # KEYS as well as values. Reports here are keyed by the thing being
+            # counted - per-account tallies by email, duplicate-title groups by
+            # the title itself - so anonymising only values left the private
+            # string sitting in the key, one line below where it had just been
+            # replaced.
+            if isinstance(k, str):
+                if "@" in k and "." in k:
+                    k = _anon_label("account", k)
+                else:
+                    k = anonymize(env, k)
+            if k in _ANON_FIELDS and isinstance(v, str) and v.strip():
+                out[k] = anonymize(env, v)
+            elif (k in _ANON_EMAIL_FIELDS and isinstance(v, str) and "@" in v):
+                # An account address names a person and an organisation. It is
+                # not a title, so the substitution table never sees it.
+                out[k] = _anon_label("account", v)
+            else:
+                out[k] = anonymize_report(env, v)
+        return out
+    if isinstance(obj, list):
+        return [anonymize_report(env, v) for v in obj]
+    return obj
+
+
+def anonymize(env, text):
+    """Replace every real title and project name with its stable label."""
+    for real, label in _anon_pairs(env):
+        if real in text:
+            text = text.replace(real, label)
+    return text
+
+
 def redact(env, text, keep_ids=False):
     for h in {env.home, os.path.realpath(env.home)}:
         text = text.replace(h, "~")
     if not keep_ids:
         text = _UUID_RE.sub(lambda m: m.group(1) + "…", text)
+    if _ANONYMIZE:
+        # Last, so a title containing a path fragment is still caught after
+        # the home directory has been folded to ~.
+        text = anonymize(env, text)
     return text
 
 
@@ -2513,6 +2639,9 @@ def gather_list(env, query="", project=None):
 def cmd_list(env, ns):
     items = gather_list(env, query=getattr(ns, "query", "") or "",
                         project=getattr(ns, "project", None))
+    if _ANONYMIZE:
+        # Before anything formats or truncates it.
+        items = anonymize_report(env, items)
     if ns.json:
         print(json.dumps(items, indent=1))
         return 0
@@ -3026,6 +3155,9 @@ def gather_alignment(env):
 
 def cmd_alignment(env, ns):
     rep = gather_alignment(env)
+    if _ANONYMIZE:
+        # Before anything formats or truncates it.
+        rep = anonymize_report(env, rep)
     if ns.json:
         print(json.dumps(rep, indent=1))
         return rep["exit_code"]
@@ -3106,6 +3238,9 @@ def cmd_alignment(env, ns):
 
 def cmd_doctor(env, ns):
     rep = gather_doctor(env)
+    if _ANONYMIZE:
+        # Before anything formats or truncates it.
+        rep = anonymize_report(env, rep)
     if ns.json:
         print(json.dumps(rep, indent=1))
         return rep["exit_code"]
@@ -3334,6 +3469,9 @@ def build_parser():
     def common(sp):
         sp.add_argument("--verbose", action="store_true",
                         help="full paths and ids (default output is redacted)")
+
+        sp.add_argument("--anonymize", action="store_true",
+                        help="replace every session title and project name with a stable opaque label, for pasting real output somewhere public")
 
     sp = sub.add_parser("list", help="inventory sessions")
     sp.add_argument("query", nargs="?", default="")
@@ -3697,8 +3835,29 @@ def cmd_recover(env, ns):
 
 
 def main(argv=None):
+    global _ANONYMIZE
     ns = build_parser().parse_args(argv)
     env = default_env()
+    if getattr(ns, "anonymize", False):
+        if getattr(ns, "verbose", False):
+            # --verbose prints the raw line and never reaches redact(), which
+            # is where anonymisation happens. Accepting both would print real
+            # titles under a flag whose whole purpose is to hide them - the
+            # exact shape of the failure this feature exists to fix. Refuse.
+            print("refused: --anonymize and --verbose contradict each other. "
+                  "--verbose prints lines unredacted, so titles would appear "
+                  "anyway. Drop one.", file=sys.stderr)
+            return 2
+        if getattr(ns, "apply", False):
+            # A plan is what gets pasted; an apply is not. Refusing the
+            # combination keeps the anonymiser strictly a display concern and
+            # removes any path by which a substituted title could be mistaken
+            # for real data and written into a store.
+            print("refused: --anonymize is for producing output you can paste, "
+                  "and --apply writes to a store. Run the plan with "
+                  "--anonymize, then apply without it.", file=sys.stderr)
+            return 2
+        _ANONYMIZE = True
     handlers = {"list": cmd_list, "doctor": cmd_doctor, "move": cmd_move,
                 "alignment": cmd_alignment,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,

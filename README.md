@@ -513,6 +513,36 @@ other command, its output carries the destination account's account/org uuids an
 in the clear, regardless of `--verbose`, because those are what the plan is *about*. The
 plain-text report redacts them like everything else; the JSON does not.
 
+**`--anonymize` hides the *content*, which redaction never did.** The redaction above covers
+the **machine** — your home directory and uuid-shaped ids. It has never touched **titles**, and a
+title is a model-written summary of whatever the session was about, so it can name a client, a
+legal matter or a medical one. Output that announced itself as redacted was therefore unsafe to
+paste, and that gap is how real titles reached this repo's own documentation more than once.
+
+`--anonymize` is available on every command and replaces each title, project path and account
+address with a stable opaque label:
+
+```
+claude-code-sessions list --anonymize
+
+f41ea19e…  <session-69f9>       <project-0c8f>
+e82cfaac…  <session-9c06>       <project-1a20>
+```
+
+The labels are deliberately unreadable rather than plausible fake titles — a convincing fake read
+back later is indistinguishable from a real one, and that confusion is the original problem. They
+are stable (a hash of the value), so two pasted listings can still be compared to each other, and
+session ids are left alone because they are random and are what makes the output useful.
+
+It covers `--json` too, which no amount of care with plain-text output would have.
+
+Two combinations are refused rather than half-honoured:
+
+| | |
+|---|---|
+| `--anonymize --verbose` | `--verbose` prints lines unredacted and never reaches the redaction path, so titles would appear anyway |
+| `--anonymize --apply` | a plan is what gets pasted; an apply writes to a store, and a substituted title must never be mistaken for real data |
+
 **Windows durability note.** The commit step fsyncs every file it writes before deleting the
 source, but Windows has no equivalent of a directory fsync, so the directory-entry update
 itself (the rename, the delete) is not separately forced to disk. The spec accepts this as a
