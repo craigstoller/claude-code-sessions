@@ -3827,7 +3827,12 @@ def build_parser():
     cv = sub.add_parser(
         "converge",
         help="create the missing sidebar rows so every conversation any "
-             "account can open is openable from EVERY account")
+             "account can open is openable from EVERY account",
+        description="Create the missing sidebar rows so every conversation "
+                    "any account can open is openable from EVERY account. "
+                    "Purely additive - existing rows are never repointed, "
+                    "refreshed, or deleted - and the target set is derived, "
+                    "so there is no --to, --from, or --store to name.")
     cv.add_argument("--only", default="", metavar="TITLE_OR_ID",
                     help="narrow to one conversation: a title substring, or a "
                          "cliSessionId prefix - must resolve to exactly one "
