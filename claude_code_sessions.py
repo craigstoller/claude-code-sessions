@@ -3675,6 +3675,32 @@ def build_parser():
     # clear and had no --verbose to offer, so `new-row --verbose` exited 2.
     nr.add_argument("--verbose", action="store_true", help="do not redact paths")
 
+    rt = sub.add_parser(
+        "retitle",
+        help="rename a conversation's sidebar row in every account that holds it")
+    rt.add_argument("--only", default="", metavar="TITLE_OR_ID",
+                    help="the conversation to rename: a title substring, or a "
+                         "cliSessionId prefix - must resolve to exactly one "
+                         "conversation. An ambiguous match (expected when the "
+                         "title itself collides) lists the candidates with ids")
+    rt.add_argument("--title", default="", metavar="TEXT",
+                    help="the new title, stored trimmed, with titleSource pinned "
+                         "to 'user' so the app stops resummarising the row. This "
+                         "is a SIDEBAR rename: the transcript's own customTitle "
+                         "is deliberately not touched")
+    rt.add_argument("--store", default="", metavar="SUBSTRING",
+                    help="narrow the rename to one account's store (account id, "
+                         "org id, path, or email), to repair a single sidebar. "
+                         "Default is every account whose sidebar holds the "
+                         "conversation, so they keep reading the same")
+    rt.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into "
+                         "(RULING 5), when the identity files disagree")
+    rt.add_argument("--apply", action="store_true",
+                    help="actually rewrite the rows")
+    rt.add_argument("--json", action="store_true", help="print the plan as JSON")
+    common(rt)
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -3984,6 +4010,7 @@ def main(argv=None):
                 "alignment": cmd_alignment,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
                 "repoint": cmd_repoint, "new-row": cmd_new_row,
+                "retitle": cmd_retitle,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -9133,6 +9160,126 @@ def classify_retitle_op(env, op):
                     "checks first), back restores every renamed row from its "
                     "journaled preimage - either way the sidebars end up "
                     "agreeing".format(len(written), len(pending))}
+
+
+def _public_retitle_manifest(env, m):
+    """The retitle manifest with both row images removed, for --json and for
+    the printed report - the same exposure rule as _public_repoint_manifest,
+    for the same reason: a pre-image is an account's row VERBATIM, connector
+    config and permission state included.
+
+    Also where --anonymize is honoured. Existing titles - the rows' current
+    ones, the siblings' - go through the standard substitution map. The
+    PROPOSED title exists nowhere yet, so no map can cover it; it becomes the
+    fixed label <proposed-title>, which keeps an anonymized plan strictly a
+    thing to look at or paste (--anonymize --apply is refused globally).
+    """
+    out = {k: v for k, v in m.items() if k != "rows"}
+    out["rows"] = [{k: v for k, v in r.items()
+                    if k not in ("pre_b64", "post_b64")}
+                   for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        out = anonymize_report(env, out)
+        out["new_title"] = "<proposed-title>"
+        # anonymize_report knows "label"; the manifest-level store label is
+        # not one of its field names, so cover it here.
+        if isinstance(out.get("store_label"), str) and "@" in out["store_label"]:
+            out["store_label"] = _anon_label("account", out["store_label"])
+    return out
+
+
+def _print_retitle_report(say, m):
+    """The plan, per account: the row file, the current title, the new title.
+    M is the PUBLIC manifest (row images stripped, --anonymize already
+    applied), never the raw one."""
+    if m.get("store_path"):
+        say("store   : {0}".format(m.get("store_label", "")))
+        say("          chosen as {0}".format(m.get("store_why", "")))
+        if m.get("store_is_a_guess"):
+            say("          ^ that is a GUESS from row counts, not an "
+                "identification. --apply")
+            say("            will refuse until you name the store with --store.")
+    say("conversation : {0}".format(m.get("cli_session_id", "")))
+    say("new title    : {0}".format(m.get("new_title", "")))
+    say("titleSource  : pinned to 'user' - the app stops resummarising the row")
+    say("")
+    for r in m.get("rows", []):
+        say("{0}".format(r.get("label", "")))
+        say("   row   : {0}".format(r.get("name", "")))
+        say("   title : {0!r}  ->  {1!r}".format(r.get("title", ""),
+                                                 m.get("new_title", "")))
+    if m.get("store_path") and m.get("siblings"):
+        say("")
+        if m.get("sibling_divergence"):
+            # A one-account rename can CREATE the cross-account drift a
+            # default-scope rename removes; forbidding it would kill the
+            # repair use, so the plan says it out loud instead.
+            say("WARNING: this renames ONE account's copy, and the sibling "
+                "accounts will")
+            say("read differently afterwards. Their current titles:")
+        else:
+            say("The sibling accounts will read the same after this rename:")
+        for e in m["siblings"]:
+            say("   {0}   {1!r}".format(e.get("label", ""), e.get("title", "")))
+    say("")
+    say("Only the row's title and titleSource change. This is a SIDEBAR rename -")
+    say("the conversation itself, including its own customTitle, is not touched.")
+
+
+def cmd_retitle(env, ns):
+    flags = RetitleFlags(only=ns.only, title=ns.title, store=ns.store,
+                         live=ns.live)
+    m = plan_retitle(env, flags)
+
+    def say(line):
+        """cmd_new_row's wrapper, for the same two reasons: the report is
+        mostly titles (arbitrary text), and piped Windows stdout is the
+        console codepage, where an unprintable character must become a
+        replacement character rather than a traceback."""
+        text = line if ns.verbose else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
+    if not ns.json:
+        # Report BEFORE the write, as cmd_new_row orders it and for the same
+        # reason: under --store the account may have been chosen by a
+        # heuristic, and a heuristic the user sees before anything happens is
+        # a different promise from one they cannot.
+        _print_retitle_report(say, _public_retitle_manifest(env, m))
+        if ns.apply:
+            say("")
+    # A guessed store may PLAN and never WRITE - same contract as new-row.
+    if ns.apply and m.get("store_is_a_guess"):
+        raise Refusal(
+            "which account's copy to rename was decided by counting rows, not "
+            "by anything that identifies the account: {0}. That is fine for a "
+            "dry run and not fine for a write. Re-run with --store {1!r} if "
+            "that is the one you mean. Nothing was written."
+            .format(m["store_why"], m["store_path"]))
+    final = run_retitle(env, m) if ns.apply else None
+    if ns.json:
+        # Built AFTER the apply so the written flags and op_id are real - the
+        # order cmd_sync and cmd_repoint settled on, because a plan printed
+        # with exit 0 is what automation reads as a completed operation.
+        pub = _public_retitle_manifest(env, m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        return 0 if final in (None, "completed") else 1
+    if final is None:
+        say("\ndry run - pass --apply to retitle")
+        return 0
+    say("result  : {0}".format(final))
+    if final == "completed":
+        say("Reopen the app - every targeted sidebar shows the new title. "
+            "'undo' puts the previous titles back.")
+        return 0
+    # execute_retitle_op can only return "completed" or raise today; the
+    # explicit non-zero exit is the trap-avoidance cmd_new_row documents.
+    return 1
 
 
 def _public_manifest(m):

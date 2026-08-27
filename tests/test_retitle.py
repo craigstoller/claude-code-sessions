@@ -624,3 +624,154 @@ def test_undo_preview_names_the_retitle(mkenv, tmp_path, write_row, capsys):
     out = capsys.readouterr().out
     assert "retitle: 3 row(s)" in out
     assert "previous titles" in out
+
+
+# ----------------------------------------------------------------- the command
+
+def rt_ns(**kw):
+    d = {"json": False, "verbose": False, "anonymize": False, "apply": False,
+         "only": "", "title": "", "store": "", "live": ""}
+    d.update(kw)
+    return types.SimpleNamespace(**d)
+
+
+def test_cmd_dry_run_names_every_account_and_writes_nothing(
+        mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    paths = three_accounts(env, write_row)
+    before = {p: read_bytes(p) for p in paths}
+    rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "dry run" in out
+    assert out.count("ACME-REVIEW") >= 3            # per-account old -> new lines
+    assert "Quarterly board report finalization" in out
+    assert "SIDEBAR" in out
+    assert {p: read_bytes(p) for p in paths} == before
+    assert ct.list_ops(env) == []
+
+
+def test_cmd_apply_end_to_end(mkenv, tmp_path, write_row, capsys):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW",
+                                   apply=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "result  : completed" in out
+    for p in paths:
+        assert json.loads(read_bytes(p).decode("utf-8"))["title"] == "ACME-REVIEW"
+
+
+def test_cmd_refuses_to_apply_a_guessed_store(mkenv, tmp_path, write_row,
+                                              capsys):
+    """The spec's --store test: an email/id matching several org directories
+    is a row-count guess - shown in the dry run, refused at apply."""
+    env = _monotonic_now(mkenv(tmp_path))
+    p = write_row(env, 0, A1, O1, "local_1", row_data(SID, "Old name"))
+    os.makedirs(os.path.join(env.store_candidates[0], A1, O2))
+    rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW",
+                                   store=A1[:8]))
+    assert rc == 0
+    assert "GUESS" in capsys.readouterr().out
+    before = read_bytes(p)
+    with pytest.raises(ct.Refusal, match="counting rows"):
+        ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW",
+                                  store=A1[:8], apply=True))
+    assert read_bytes(p) == before
+    assert ct.list_ops(env) == []
+
+
+def test_cmd_store_prints_the_sibling_warning_iff_diverging(
+        mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    write_row(env, 0, A1, O1, "local_1", row_data(SID, "Old name"))
+    write_row(env, 0, A2, O2, "local_1", row_data(SID, "ACME-REVIEW"))
+    ct.cmd_retitle(env, rt_ns(only=SID[:8], title="Northwind kickoff",
+                              store=A1[:8]))
+    assert "WARNING" in capsys.readouterr().out
+    ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW",
+                              store=A1[:8]))
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+    assert "read the same" in out
+
+
+def test_cmd_json_strips_row_images(mkenv, tmp_path, write_row, capsys):
+    env = mkenv(tmp_path)
+    three_accounts(env, write_row)
+    rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="ACME-REVIEW",
+                                   json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["new_title"] == "ACME-REVIEW"
+    assert len(payload["rows"]) == 3
+    for r in payload["rows"]:
+        assert "pre_b64" not in r and "post_b64" not in r
+
+
+def test_anonymized_plan_labels_both_titles(mkenv, tmp_path, write_transcript,
+                                            write_row, capsys):
+    """--anonymize is view-only here by construction. The current title goes
+    through the standard substitution map; the proposed one exists nowhere
+    yet, so it becomes the fixed label <proposed-title>."""
+    env = mkenv(tmp_path)
+    old = "Quarterly board report finalization"
+    three_accounts(env, write_row, title=old)
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    try:
+        rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="Northwind kickoff",
+                                       anonymize=True))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert old not in out
+        assert "board report" not in out
+        assert "<session-" in out
+        assert "Northwind kickoff" not in out
+        assert "<proposed-title>" in out
+
+        rc = ct.cmd_retitle(env, rt_ns(only=SID[:8], title="Northwind kickoff",
+                                       anonymize=True, json=True))
+        payload = capsys.readouterr().out
+        assert rc == 0
+        assert old not in payload and "Northwind kickoff" not in payload
+        assert json.loads(payload)["new_title"] == "<proposed-title>"
+    finally:
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
+
+
+def test_anonymized_ambiguity_listing_is_labeled(mkenv, tmp_path, write_row,
+                                                 capsys):
+    """The candidate listing from an ambiguous --only is anonymized the same
+    way (it flows through the refusal, which main() redacts)."""
+    env = mkenv(tmp_path)
+    title = "Quarterly board report finalization"
+    write_row(env, 0, A1, O1, "local_1", row_data(SID, title))
+    write_row(env, 0, A1, O1, "local_2", row_data(SID_B, title))
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    try:
+        with pytest.raises(ct.Refusal) as exc:
+            ct.plan_retitle(env, ct.RetitleFlags(only=title, title="ACME-X"))
+        assert title not in ct.redact(env, str(exc.value))
+    finally:
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
+
+
+def test_retitle_help_says_sidebar(capsys):
+    with pytest.raises(SystemExit) as exc:
+        ct.main(["retitle", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "SIDEBAR" in out
+    assert "customTitle" in out
+
+
+def test_anonymize_apply_is_refused_globally(capsys):
+    rc = ct.main(["retitle", "--only", "x", "--title", "y",
+                  "--anonymize", "--apply"])
+    assert rc == 2
+    assert "--anonymize" in capsys.readouterr().err
