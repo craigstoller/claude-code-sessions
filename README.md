@@ -124,7 +124,7 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Ten commands. All mutating commands default to a dry run; add `--apply` to execute.
+Eleven commands. All mutating commands default to a dry run; add `--apply` to execute.
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
@@ -232,6 +232,36 @@ of any kind is exactly the window this alert has. In practice the alert covers t
 case it was built for, since an app version that rejects a row does so the first time
 it opens the sidebar. A row that disappears after a busy stretch of other operations
 will go unreported.
+
+**`retitle`** — rename a conversation's sidebar row in every account that holds it:
+
+```
+claude-code-sessions retitle --only <cliSessionId> --title "ACME-REVIEW" --apply
+```
+
+Every sidebar title is written by the app's summariser, so two conversations about the same
+work get the same sentence — roughly 15 such collisions accumulate per month on the machine
+this was measured on — and the app's own rename surface is one row, in one account, at a time.
+This command renames a **conversation**: `--only` takes a title substring or a `cliSessionId`
+prefix, must resolve to exactly one conversation, and the rename lands on its row in *every*
+account, so the sidebars keep reading the same. Resolving a colliding title is *expected* to
+refuse the first time — a colliding title names several conversations by construction — and the
+refusal lists each candidate with its id, so the retry is a copy-paste.
+
+The stored title is the trimmed input, `titleSource` is pinned to `"user"` (measured on
+desktop app 1.34493.1.0: the app leaves such a title alone when it reopens the session), and
+retitling to the *same* title is allowed because that pin is still a useful write. A new title
+that equals another conversation's title in any target sidebar is refused with no override —
+two rows in one sidebar under one name is the state this tool spends effort removing — and
+every check re-runs at `--apply` against the store as it is then, including re-enumerating
+which accounts hold the conversation. The op journal records the complete prior bytes of every
+row *before* any row is touched, so an interruption is recoverable in both directions
+(`recover --back` restores every written row, `--forward` finishes the rest) and `undo` is
+all-or-nothing and exact — including fields the rename never touched. `--store` narrows the
+rename to one account for repair work; because that can leave the accounts reading
+differently, the plan prints the sibling accounts' current titles and a warning when they
+would diverge. This is a **sidebar** rename: the transcript's own `customTitle` is
+deliberately not touched.
 
 **`move`** — relocate a session to another project folder:
 
@@ -598,6 +628,21 @@ window into `journaled`/`completed`/`rolled_back`.
   the decision the reader has to make. It always exits 0 when it can produce the report: it is a
   scoreboard, not a check, and a command that exits 1 for months trains you to stop reading it.
 
+- **0.11.0 adds `retitle` and `--anonymize`.** The case for `retitle` is not that renaming is
+  hard but that renaming *outside* the journal had already failed twice: an August cleanup of 69
+  rows went through a throwaway script, and the script's backups silently overwrote each other
+  (one conversation's three copies share a filename across accounts, so second-resolution
+  backup names collided — 33 writes produced 20 backups) while its `--undo` restored the newest
+  run forever, so stacked runs could never be unwound. Both are defects the op journal already
+  prevents for `move`, `sync`, `repoint` and `new-row`; `retitle` puts renaming behind the same
+  machinery — complete prior bytes journaled before any row is touched, recovery in both
+  directions, an all-or-nothing consuming undo — and renames the *conversation* across every
+  account instead of one row in one sidebar. **`--anonymize`** exists because the redaction
+  layer hides *where* things are, not *what* they are called: it replaces every title, project
+  path and account address with a stable opaque label, so real output can be pasted somewhere
+  public. It refuses to combine with `--verbose` (which bypasses redaction) and with `--apply`
+  (a substituted title must never be mistaken for real data), which keeps it strictly a display
+  concern.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
