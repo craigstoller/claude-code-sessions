@@ -284,3 +284,198 @@ def test_default_scope_has_no_sibling_report(mkenv, tmp_path, write_row):
     m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
     assert m["siblings"] == []
     assert m["sibling_divergence"] is False
+
+
+# ------------------------------------------------------------------- writing
+
+def test_apply_renames_all_three_and_changes_nothing_else(
+        mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    originals = {p: json.loads(read_bytes(p).decode("utf-8")) for p in paths}
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    assert ct.run_retitle(env, m) == "completed"
+    for p in paths:
+        after = json.loads(read_bytes(p).decode("utf-8"))
+        assert after["title"] == "ACME-REVIEW"
+        assert after["titleSource"] == "user"
+        rest_before = {k: v for k, v in originals[p].items()
+                       if k not in ("title", "titleSource")}
+        rest_after = {k: v for k, v in after.items()
+                      if k not in ("title", "titleSource")}
+        assert rest_after == rest_before
+    op = ct.list_ops(env)[-1]
+    assert op.manifest["op_type"] == "retitle"
+    assert op.manifest["status"] == "completed"
+    assert all(r["written"] for r in op.manifest["rows"])
+    assert len(op.manifest["rows"]) == 3
+    assert ct.read_lock(env) is None
+    assert m["op_id"] == op.manifest["op_id"]
+
+
+def test_same_title_apply_pins_titlesource(mkenv, tmp_path, write_row):
+    """Retitling to the target's own current title is a useful write: it pins
+    titleSource to 'user' so the app stops resummarising."""
+    env = _monotonic_now(mkenv(tmp_path))
+    title = "Quarterly board report finalization"
+    paths = three_accounts(env, write_row, title=title)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title=title))
+    assert ct.run_retitle(env, m) == "completed"
+    for p in paths:
+        after = json.loads(read_bytes(p).decode("utf-8"))
+        assert after["title"] == title
+        assert after["titleSource"] == "user"
+
+
+def test_apply_time_drift_refuses_and_journals_nothing(
+        mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    # The app moves underneath, between plan and apply.
+    drifted = json.loads(read_bytes(paths[1]).decode("utf-8"))
+    drifted["title"] = "Renamed by the app meanwhile"
+    with open(paths[1], "w", encoding="utf-8") as fh:
+        json.dump(drifted, fh)
+    before = {p: read_bytes(p) for p in paths}
+    with pytest.raises(ct.Refusal, match="changed since"):
+        ct.run_retitle(env, m)
+    assert {p: read_bytes(p) for p in paths} == before
+    # The re-check runs BEFORE the journal entry: a refused run leaves no op.
+    assert ct.list_ops(env) == []
+    assert ct.read_lock(env) is None
+
+
+def test_apply_time_target_set_drift_refuses_and_journals_nothing(
+        mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    # sync lands the conversation in a FOURTH account between plan and apply.
+    p4 = write_row(env, 0, "99999999-0000-0000-0000-000000000009",
+                   "88888888-0000-0000-0000-000000000008", "local_1",
+                   row_data(SID, "Quarterly board report finalization"))
+    before = {p: read_bytes(p) for p in paths + [p4]}
+    with pytest.raises(ct.Refusal, match="every account"):
+        ct.run_retitle(env, m)
+    assert {p: read_bytes(p) for p in paths + [p4]} == before
+    assert ct.list_ops(env) == []
+
+
+def test_apply_time_collision_refuses_and_journals_nothing(
+        mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    three_accounts(env, write_row)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    write_row(env, 0, A1, O1, "local_late", row_data(SID_B, "ACME-REVIEW"))
+    with pytest.raises(ct.Refusal, match="now names a different conversation"):
+        ct.run_retitle(env, m)
+    assert ct.list_ops(env) == []
+
+
+def test_journal_write_failure_touches_nothing(mkenv, tmp_path, write_row,
+                                               monkeypatch):
+    """The op record is written and fsynced BEFORE any row is touched, so a
+    failure writing it is the one clean failure: nothing landed, nothing to
+    recover."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    before = {p: read_bytes(p) for p in paths}
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+
+    def boom(env_, manifest):
+        raise OSError("disk full")
+    monkeypatch.setattr(ct, "new_op", boom)
+    with pytest.raises(ct.Refusal, match="nothing to recover"):
+        ct.run_retitle(env, m)
+    assert {p: read_bytes(p) for p in paths} == before
+    assert ct.read_lock(env) is None
+
+
+# ---------------------------------------------------- fault injection, recovery
+
+def _crash_after_first_row(env, write_row, point="retitle-mid-write"):
+    paths = three_accounts(env, write_row)
+    originals = {p: read_bytes(p) for p in paths}
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+
+    def hook(p):
+        if p == point:
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_retitle(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    return paths, originals, op
+
+
+def test_crash_after_row_one_then_back_restores_agreement(
+        mkenv, tmp_path, write_row):
+    """The spec's fault-injection case, direction one: kill after row 1 of 3,
+    recover --back, and every preimage is restored - the operation never
+    happened and the three sidebars agree."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths, originals, op = _crash_after_first_row(env, write_row)
+    assert [r["written"] for r in op.manifest["rows"]] == [True, False, False]
+    c = ct.classify_op(env, op)
+    assert sorted(c["resolutions"]) == ["back", "forward"]
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert {p: read_bytes(p) for p in paths} == originals
+    assert op.manifest["status"] == "rolled_back"
+    assert ct.read_lock(env) is None
+
+
+def test_crash_after_row_one_then_forward_finishes_the_rename(
+        mkenv, tmp_path, write_row):
+    """Direction two: recover --forward completes the remaining writes from
+    the journaled plan (re-running the apply-time checks first) and the three
+    sidebars agree on the NEW title."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths, _originals, op = _crash_after_first_row(env, write_row)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    for p in paths:
+        after = json.loads(read_bytes(p).decode("utf-8"))
+        assert after["title"] == "ACME-REVIEW"
+        assert after["titleSource"] == "user"
+    assert all(r["written"] for r in op.manifest["rows"])
+
+
+def test_hard_kill_window_is_reversed_by_disk_evidence(
+        mkenv, tmp_path, write_row):
+    """A kill between atomic_write and save_manifest leaves the row holding
+    this op's bytes with `written` still False. Back consults the disk, not
+    the flag, and restores it anyway."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths, originals, op = _crash_after_first_row(
+        env, write_row, point="retitle-write-before-save")
+    assert [r["written"] for r in op.manifest["rows"]] == [False, False, False]
+    on_disk = read_bytes(op.manifest["rows"][0]["dest_path"])
+    assert on_disk == ct.unb64(op.manifest["rows"][0]["post_b64"])
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert {p: read_bytes(p) for p in paths} == originals
+
+
+def test_pending_row_drift_withdraws_forward(mkenv, tmp_path, write_row):
+    """A pending row the app rewrote can never be rolled forward
+    (execute refuses it on every re-entry), so classify offers back alone -
+    the same shape as sync's."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths, originals, op = _crash_after_first_row(env, write_row)
+    pending = op.manifest["rows"][1]
+    changed = json.loads(read_bytes(pending["dest_path"]).decode("utf-8"))
+    changed["lastActivityAt"] = 999
+    with open(pending["dest_path"], "w", encoding="utf-8") as fh:
+        json.dump(changed, fh)
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == ["back"]
+    with pytest.raises(ct.Refusal, match="not a safe resolution"):
+        ct.recover_op(env, op, "forward")
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    # The written row went back to its original; the drifted pending row keeps
+    # whatever changed it (back never overwrites what it cannot verify).
+    assert read_bytes(paths[0]) == originals[paths[0]]
+    assert json.loads(read_bytes(paths[1]).decode("utf-8"))["lastActivityAt"] == 999

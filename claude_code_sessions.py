@@ -476,10 +476,14 @@ def rotate_ops(env):
     # expire - on exactly the "came back to a stuck op weeks later" case recover
     # exists for. So keep a claimant for as long as anything could collide with
     # it; this holds back only ops that actually share a destination row.
+    # Retitle ops carry the same exposure since 0.11.0: their undo/back
+    # ownership rule (_retitle_claimed_elsewhere) reads other ops' journals
+    # for the same dest_path, so a terminal claimant is evidence there too.
     live = set()
     for o in ops:
         om = o.manifest
-        if om.get("op_type") != "sync" or om.get("status") not in NONTERMINAL:
+        if om.get("op_type") not in ("sync", "retitle") \
+                or om.get("status") not in NONTERMINAL:
             continue
         for r in om.get("rows") or []:
             p = r.get("dest_path")
@@ -494,7 +498,7 @@ def rotate_ops(env):
         # vanished-row check reads only 'completed' ops, deliberately. Hold it.
         if om.get("rollback_residue"):
             return True
-        if not live or om.get("op_type") != "sync":
+        if not live or om.get("op_type") not in ("sync", "retitle"):
             return False
         if om.get("status") in ("undone", "rolled_back"):
             return False          # claim withdrawn; nothing left to protect
@@ -1907,6 +1911,8 @@ def classify_op(env, op):
                     "still matches what this op wrote")}
     if m.get("op_type") == "sync":
         return classify_sync_op(env, op)
+    if m.get("op_type") == "retitle":
+        return classify_retitle_op(env, op)
 
     def _src_state():
         transcript_present = os.path.isfile(m["source_transcript"])
@@ -2094,7 +2100,8 @@ def recover_op(env, op, direction):
         # raised a bare KeyError out of recover - and main() catches only
         # Refusal/LayoutError, so the user got a traceback from the one command
         # that exists to get them unstuck.
-        if op.manifest.get("op_type") not in ("sync", "repoint", "new-row"):
+        if op.manifest.get("op_type") not in ("sync", "repoint", "new-row",
+                                              "retitle"):
             _validate_manifest_paths(env, op.manifest)
         elif op.manifest.get("op_type") == "new-row":
             # The allowlist above skips the move-shaped validator, so this op
@@ -2189,6 +2196,106 @@ def recover_op(env, op, direction):
             if residue:
                 m["rollback_residue"] = residue
                 save_manifest(op)
+            set_status(op, "rolled_back")
+            rotate_ops(env)
+            return "rolled_back"
+        if m.get("op_type") == "retitle":
+            bad = _retitle_shape_error(m)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed."
+                    .format(m.get("op_id"), bad))
+            if direction == "forward":
+                if all(_sync_row_drift(r) == "match" for r in m["rows"]):
+                    # Every write landed; only the completion marker is
+                    # missing. Journal-only, so no mutation guard and no
+                    # recheck - the same asymmetry the repoint arm documents:
+                    # re-validating would block finishing bookkeeping for
+                    # writes that already succeeded.
+                    for r in m["rows"]:
+                        r["written"] = True
+                    save_manifest(op)
+                    set_status(op, "completed")
+                    rotate_ops(env)
+                    return "completed"
+                _guard_mutation(env, "retitle rows in", NEW_ROW_STORE,
+                                because=RETITLE_GUARD_WHY)
+                # The spec's contract for forward: complete the remaining
+                # writes from the journaled plan, RE-RUNNING THE APPLY-TIME
+                # CHECKS FIRST against the store as it now is.
+                _retitle_recheck(env, m)
+                set_status(op, "journaled")
+                final = execute_retitle_op(env, op)
+                rotate_ops(env)
+                return final
+            # 'back' must always terminate - it is the only exit from a stuck
+            # op - so rows it cannot verify are SKIPPED and recorded, never
+            # refused (undo is the all-or-nothing arm; this one closes ops).
+            # Restores go by disk evidence, not the `written` flag alone: a
+            # hard kill between atomic_write and save_manifest leaves a row
+            # holding this op's post-image with the flag unset, and walking
+            # past it would report a clean rollback that restored nothing -
+            # the same window _sync_delete_targets documents.
+            roots = _retitle_roots(env)
+            restorable, skipped = [], []
+            for r in m["rows"]:
+                try:
+                    _retitle_contained(r, roots)
+                except LayoutError:
+                    if r.get("written"):
+                        raise
+                    continue                 # never landed and not ours to touch
+                state = _sync_row_drift(r)
+                if not r.get("written") and state != "match":
+                    continue                 # never landed; nothing to reverse
+                if state == "match":
+                    claim = _retitle_claimed_elsewhere(env, m, r)
+                    if claim:
+                        skipped.append(
+                            "{0} (operation {1} also records writing these "
+                            "bytes, so putting ours back could reverse its "
+                            "work)".format(r.get("name"), claim))
+                        continue
+                    try:
+                        restorable.append((r["dest_path"], _sync_pre_image(r)))
+                    except (KeyError, ValueError):
+                        skipped.append("{0} (its journaled pre-image cannot be "
+                                       "read)".format(r.get("name")))
+                elif state == "pristine":
+                    continue                 # already exactly as it was
+                elif state == "absent":
+                    skipped.append(
+                        "{0} (gone from the store - restoring it would "
+                        "resurrect a row that account removed)"
+                        .format(r.get("name")))
+                elif state == "drifted":
+                    skipped.append(
+                        "{0} (no longer holds what this op wrote - most likely "
+                        "the app)".format(r.get("name")))
+                else:
+                    skipped.append("{0} (exists but could not be read)"
+                                   .format(r.get("name")))
+            if restorable:
+                # Guard only when something will actually be written - on
+                # every other state 'back' is a journal-only close, and
+                # putting the only exit from a stuck op behind closing the
+                # desktop app, for an operation about to touch no bytes, is
+                # the trap the repoint and new-row arms both refused.
+                _guard_mutation(env, "restore retitled rows in", NEW_ROW_STORE,
+                                because=RETITLE_GUARD_WHY)
+                _sync_restore_all(restorable)
+            if skipped:
+                m["abort_reason"] = (
+                    "back restored {0} row(s) from their journaled preimages; "
+                    "left {1} untouched: {2}".format(
+                        len(restorable), len(skipped), ", ".join(skipped)))
+            elif not restorable:
+                m["abort_reason"] = (
+                    "back restored nothing - no row still holds what this "
+                    "operation wrote, so there was nothing to take back. The "
+                    "op is closed; re-run retitle if the rename is still "
+                    "wanted.")
             set_status(op, "rolled_back")
             rotate_ops(env)
             return "rolled_back"
@@ -8478,6 +8585,408 @@ def plan_retitle(env, flags):
             "store_why": scope_why, "store_is_a_guess": scope_guess,
             "siblings": sib_entries, "sibling_divergence": divergence,
             "rows": rows}
+
+
+# What retitle's mutation routes pass to _guard_mutation. RETITLE reuses
+# new-row's `whose` (NEW_ROW_STORE, "the session store") and brings its own
+# `because`: the risk here is not a row appearing or vanishing but a title
+# being decided by the wrong writer.
+RETITLE_GUARD_WHY = ("The app holds these rows in memory and rewrites them on "
+                     "focus, so a title written underneath it is whatever the "
+                     "app decides later, not what you wrote")
+
+
+def _retitle_shape_error(m):
+    """A sentence naming what is wrong with this retitle manifest, or None.
+
+    Same job as _repoint_shape_error and _new_row_shape_error, for the
+    multi-row shape: recover and undo dereference rows straight out of a
+    journal file a user can edit, and a bare KeyError out of either escapes
+    main(). NEVER RAISES - classify_op calls it, and classify_op must never
+    raise.
+    """
+    rows = m.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return "its 'rows' is not a non-empty list"
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            return "row {0} is not an object".format(i)
+        for k in ("name", "dest_path", "store_path", "pre_b64", "post_b64"):
+            if not isinstance(r.get(k), str) or not r[k]:
+                return "row {0} has no usable {1!r}".format(i, k)
+    if not isinstance(m.get("new_title"), str) or not m["new_title"]:
+        return "it has no usable 'new_title'"
+    if not isinstance(m.get("cli_session_id"), str) or not m["cli_session_id"]:
+        return "it has no usable 'cli_session_id'"
+    return None
+
+
+def _retitle_roots(env):
+    """The discovered store roots retitle's containment checks run against.
+
+    Roots come from discover_stores, never from the journal being checked -
+    deriving a row's allowed root from the same manifest that supplied its
+    path would let a hand-edited journal authorize itself.
+    """
+    disc = discover_stores(env)
+    if disc.status == "error":
+        raise LayoutError("store discovery failed: {0}. 'Couldn't look' is "
+                          "never 'nothing there' - refusing.".format(disc.detail))
+    return disc.roots
+
+
+def _retitle_contained(r, roots):
+    """The row's real path, after the same two-step check every other row
+    write in this module makes: inside a discovered store root, AND a direct
+    child of the store this op recorded for it - atomic_write's scratch file
+    lands in the row's parent directory, so 'under the root somewhere' is not
+    enough."""
+    real = ensure_contained(r["dest_path"], roots)
+    if os.path.dirname(real) != os.path.realpath(r["store_path"]):
+        raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
+                          .format(r["dest_path"], r["store_path"]))
+    return real
+
+
+def _retitle_recheck(env, m):
+    """The plan's refusals, re-run against the store AS IT NOW IS - under the
+    operation lock, before anything is journaled (run_retitle) or resumed
+    (recover --forward). Raises Refusal; returns nothing.
+
+    Three re-checks, in the order the spec states them:
+    - the target set is re-enumerated: a row added by sync or removed in the
+      app between plan and apply changes what "every account" means, and
+      renaming the set the plan showed while reporting success against the set
+      that now exists would be a quiet lie;
+    - the collision rule, against titles as they are now;
+    - every not-yet-written row must still hold the exact bytes the plan
+      measured (its journaled pre-image) - drift means the app or another op
+      moved underneath, and the answer is a replan, never a blind overwrite.
+    """
+    sid = m["cli_session_id"]
+    new_title = m["new_title"]
+    records = _retitle_scan(env, store_path=m.get("store_path") or "")
+    current = {}
+    for rec in records:
+        if (rec.data.get("cliSessionId") or "") == sid:
+            current[os.path.normcase(os.path.abspath(rec.path))] = rec
+    planned = {os.path.normcase(os.path.abspath(r["dest_path"])): r
+               for r in m["rows"]}
+    appeared = sorted(set(current) - set(planned))
+    vanished = sorted(set(planned) - set(current))
+    if appeared or vanished:
+        parts = []
+        if appeared:
+            parts.append("appeared since: " + ", ".join(
+                "{0} ({1})".format(current[k].name, current[k].label)
+                for k in appeared))
+        if vanished:
+            parts.append("gone since: " + ", ".join(
+                planned[k].get("name", "?") for k in vanished))
+        raise Refusal(
+            "the set of rows holding this conversation changed between planning "
+            "and applying ({0}), so what \"every account\" means has changed. "
+            "Nothing was written - re-run to plan against the store as it is "
+            "now.".format("; ".join(parts)))
+    target_keys = {os.path.normcase(os.path.realpath(r["store_path"]))
+                   for r in m["rows"]}
+    for rec in records:
+        if os.path.normcase(os.path.realpath(rec.store)) not in target_keys:
+            continue
+        if (rec.data.get("cliSessionId") or "") == sid:
+            continue
+        if (rec.data.get("title") or "").strip() == new_title:
+            raise Refusal(
+                "that title now names a different conversation in {0}: row "
+                "{1!r} appeared or was renamed since this plan was made. Nothing "
+                "was written - re-run to replan.".format(rec.label, rec.name))
+    for r in m["rows"]:
+        if r.get("written"):
+            continue
+        rec = current[os.path.normcase(os.path.abspath(r["dest_path"]))]
+        try:
+            pre = _sync_pre_image(r)
+            post = unb64(r["post_b64"])
+        except (KeyError, ValueError) as exc:
+            raise Refusal(
+                "row {0!r}: this plan's journaled images cannot be read ({1}); "
+                "refusing rather than write from a record that could not restore "
+                "what it replaced. Nothing was written.".format(r.get("name"), exc))
+        if rec.raw != pre and rec.raw != post:
+            raise Refusal(
+                "row {0!r} in {1} changed since this plan was made - writing "
+                "would discard whatever changed it, most likely the app. Nothing "
+                "was written; re-run to plan against its current state."
+                .format(r.get("name"), r.get("label", "")))
+
+
+def _retitle_write_rows(op, m, roots):
+    """execute_retitle_op's write loop, split out so its caller can wrap it in
+    the journal-on-the-way-out handler. Per row: containment, byte-drift
+    re-check, atomic write, then the verify the scaffold taught - re-read and
+    confirm `title` and `titleSource` changed and EVERY other field is
+    value-identical after parsing to the journaled preimage (value-identical,
+    not byte-identical: the row is re-serialised from a dict, so
+    representation may change; content may not).
+    """
+    rows = m["rows"]
+    new_title = m["new_title"]
+    for i, r in enumerate(rows):
+        if r.get("written"):
+            continue
+        _retitle_contained(r, roots)
+        try:
+            pre = _sync_pre_image(r)
+            post = unb64(r["post_b64"])
+        except (KeyError, ValueError) as exc:
+            raise Refusal(
+                "row {0!r}: the journaled images cannot be read ({1}); refusing "
+                "rather than write a row whose original bytes this op could no "
+                "longer restore. The op is left at 'writing' - 'recover "
+                "--resolve {2} --back' reverses what did land."
+                .format(r.get("name"), exc, m.get("op_id", "")))
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                current = fh.read()
+        except FileNotFoundError:
+            raise Refusal(
+                "row {0!r} ({1}) is gone from the store since this plan was "
+                "made - that account removed it, and re-creating it to rename "
+                "it would resurrect a row the account deleted. The op is left "
+                "at 'writing' - 'recover --resolve {2} --back' reverses what "
+                "did land.".format(r["name"], r.get("label", ""),
+                                   m.get("op_id", "")))
+        except OSError as exc:
+            raise Refusal(
+                "could not read row {0!r} to check it for changes since "
+                "planning: {1}. The op is left at 'writing' - resolve the row, "
+                "then re-run.".format(r["name"], exc))
+        if current == post:
+            r["written"] = True             # already holds this op's bytes
+            save_manifest(op)
+            continue
+        if current != pre:
+            raise Refusal(
+                "row {0!r} ({1}) changed since this retitle was planned - "
+                "writing would discard whatever changed it, most likely the "
+                "app. The op is left at 'writing' - re-run to replan, or "
+                "'recover --resolve {2} --back' to restore the rows already "
+                "renamed.".format(r["name"], r.get("label", ""),
+                                  m.get("op_id", "")))
+        try:
+            atomic_write(r["dest_path"], post)
+        except OSError as exc:
+            raise Refusal(
+                "could not write row {0!r}: {1}. The op is left at 'writing' - "
+                "re-run, or 'recover --resolve {2} --back' to restore what "
+                "landed.".format(r["name"], exc, m.get("op_id", "")))
+        _maybe_crash("retitle-write-before-save")
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                check = json.loads(fh.read().decode("utf-8"))
+            before = json.loads(pre.decode("utf-8"))
+        except (OSError, ValueError) as exc:
+            r["written"] = True
+            save_manifest(op)
+            raise LayoutError(
+                "verify failed on {0!r}: the row could not be re-read after "
+                "writing ({1}). Its original bytes are in the journal - "
+                "'recover --resolve {2} --back --apply' restores every row this "
+                "operation wrote.".format(r["name"], exc, m.get("op_id", "")))
+        rest_now = {k: v for k, v in check.items()
+                    if k not in ("title", "titleSource")}
+        rest_was = {k: v for k, v in before.items()
+                    if k not in ("title", "titleSource")}
+        if (check.get("title") != new_title or check.get("titleSource") != "user"
+                or rest_now != rest_was):
+            r["written"] = True
+            save_manifest(op)
+            raise LayoutError(
+                "verify failed on {0!r}: the row on disk after the write is not "
+                "the planned rename of the journaled original. Nothing more will "
+                "be written; 'recover --resolve {1} --back --apply' restores "
+                "every row this operation wrote from its journaled preimage."
+                .format(r["name"], m.get("op_id", "")))
+        r["written"] = True
+        save_manifest(op)
+        if i < len(rows) - 1:
+            _maybe_crash("retitle-mid-write")
+
+
+def execute_retitle_op(env, op):
+    """journaled -> writing -> completed. N rows, two fields each.
+
+    The order is the contract (spec, "Writing"): by the time this runs, the op
+    record already holds the complete prior bytes of every target row - new_op
+    wrote and fsynced it before this was called - so an interruption anywhere
+    in the loop strands nothing: `recover --back` restores every written row
+    from its preimage, `recover --forward` finishes the rest after re-running
+    the apply-time checks. Both callers (run_retitle, recover_op's forward
+    arm) own the RULING 4 guard and the recheck; running either here as well
+    would enumerate the process list twice per apply for one answer, which is
+    the duplication run_new_row's refactor removed.
+    """
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_retitle_op runs ops from 'journaled'; use "
+                          "recover for interrupted ops")
+    roots = _retitle_roots(env)
+    set_status(op, "writing")
+    try:
+        _retitle_write_rows(op, m, roots)
+    except BaseException:
+        # Journal what actually landed before the failure propagates - the
+        # same on-the-way-out save execute_sync_op makes, for the same reason:
+        # recover needs an exact record of which rows hold new bytes.
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_retitle(env, manifest):
+    """Guard, lock, re-check, journal, execute, rotate.
+
+    The re-check runs BEFORE new_op, so every plan-level refusal - drift, a
+    changed target set, a new collision - leaves no op behind (run_new_row's
+    lesson: a refusal after journaling turns "this changed nothing" into a
+    doctor finding). The journal entry itself is the transactional heart: it
+    holds the complete prior bytes of every row before any row is touched. A
+    failure writing IT is therefore the one clean failure: nothing landed,
+    nothing to recover, and the refusal says so.
+    """
+    _guard_mutation(env, "retitle rows in", NEW_ROW_STORE,
+                    because=RETITLE_GUARD_WHY)
+    acquire_lock(env, "retitle")
+    try:
+        _retitle_recheck(env, manifest)
+        try:
+            op = new_op(env, manifest)
+        except OSError as exc:
+            raise Refusal(
+                "could not write the operation record ({0}). The journal is "
+                "written before any row is touched, so nothing landed and there "
+                "is nothing to recover - fix the space or permissions under "
+                "{1} and re-run.".format(exc, env.ops_dir))
+        # Hand the op_id back, as run_sync and run_repoint do: new_op
+        # shallow-copies the manifest, so without this the caller cannot name
+        # the op it just ran.
+        manifest["op_id"] = op.manifest["op_id"]
+        final = execute_retitle_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def _retitle_claimed_elsewhere(env, m, r):
+    """The op_id of ANOTHER operation whose journal equally accounts for the
+    bytes now at this row, or None.
+
+    The restore rule "the file holds this op's post-image, so this op wrote
+    it" is sound only while nobody else can mint those bytes - and a second
+    retitle of the same row to the same title mints them exactly, the same
+    determinism _repoint_claimed_later documents. Per that function's lesson
+    (and the spec's): op ids are second-resolution, so "who went last" is not
+    decidable evidence - the question is EXCLUSIVITY, "can we prove these
+    bytes are ours". Another live op whose journal records writing this path
+    with these same bytes means we cannot; one whose recorded bytes DIFFER
+    from what is on disk is no obstacle, because matching our post-image
+    already proves the disk does not hold theirs. Ops that were undone or
+    rolled back have withdrawn their claim (their rows were deleted or put
+    back), so they never block - without that, a chain of retitles could
+    never be unwound: undoing the newest restores bytes identical to the
+    previous op's post-image, and that previous op must then still be
+    undoable.
+
+    Never raises - every caller is on a path that must terminate.
+    """
+    try:
+        mine = m.get("op_id") or ""
+        dest = os.path.normcase(os.path.abspath(r["dest_path"]))
+        post = unb64(r["post_b64"])
+        for o in list_ops(env):
+            om = o.manifest
+            oid = om.get("op_id") or ""
+            if oid == mine:
+                continue
+            if om.get("status") in ("undone", "rolled_back"):
+                continue                     # claim withdrawn
+            for orow in om.get("rows") or []:
+                p = orow.get("dest_path")
+                if not isinstance(p, str) or not orow.get("written"):
+                    continue
+                if os.path.normcase(os.path.abspath(p)) != dest:
+                    continue
+                raw = orow.get("post_b64")
+                if not isinstance(raw, str):
+                    return oid               # cannot prove the bytes are not theirs
+                try:
+                    theirs = unb64(raw)
+                except ValueError:
+                    return oid
+                if theirs == post:
+                    return oid
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return None
+
+
+def classify_retitle_op(env, op):
+    """Retitle's recovery shape - deliberately the same as sync's, because a
+    retitle with rows landed and no completion marker IS the equivalent sync
+    state: some sidebars hold the new title, some the old, and they disagree
+    until one direction is taken. Forward completes the remaining renames
+    after re-running the plan's apply-time checks; back restores every
+    written row from its journaled preimage. Both exits leave the sidebars
+    agreeing, which is the drift this command exists to remove.
+
+    Never raises (classify_op's contract - cmd_recover classifies every
+    pending op to print its listing).
+    """
+    m = op.manifest
+    bad = _retitle_shape_error(m)
+    if bad:
+        return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "retitle: this operation's record is damaged ({0}), so "
+                        "neither direction can be run from it".format(bad)}
+    written = [r for r in m["rows"] if r.get("written")]
+    pending = [r for r in m["rows"] if not r.get("written")]
+    if m["status"] not in NONTERMINAL:
+        return {"status": m["status"], "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "retitle: {0} row(s) renamed, {1} pending (use undo to "
+                        "restore a completed retitle's previous titles)"
+                        .format(len(written), len(pending))}
+    pend_changed, pend_unreadable, pend_deleted = _sync_drift_titles(pending)
+    if pend_changed or pend_unreadable or pend_deleted:
+        blocking = pend_changed + pend_unreadable + pend_deleted
+        skip_changed, skip_unreadable, skip_deleted = _sync_drift_titles(written)
+        skipped = skip_changed + skip_unreadable + skip_deleted
+        note = ("retitle: row(s) {0}; it can no longer be rolled forward - "
+                "'back' restores the row(s) this op safely can from their "
+                "journaled preimages".format(
+                    _drift_clause(pend_changed, pend_unreadable, pend_deleted)))
+        if skipped:
+            note += ("; it will also skip {0} already-renamed row(s) it cannot "
+                     "verify ({1})".format(
+                         len(skipped),
+                         _drift_clause(skip_changed, skip_unreadable,
+                                       skip_deleted)))
+        return {"status": m["status"], "source": "n/a", "dest": "n/a",
+                "resolutions": ["back"], "note": note,
+                "drifted_rows": list(dict.fromkeys(blocking + skipped))}
+    return {"status": m["status"], "source": "n/a", "dest": "n/a",
+            "resolutions": ["forward", "back"], "drifted_rows": [],
+            "note": "retitle: {0} row(s) renamed, {1} pending; forward "
+                    "completes the remaining renames (re-running the plan's "
+                    "checks first), back restores every renamed row from its "
+                    "journaled preimage - either way the sidebars end up "
+                    "agreeing".format(len(written), len(pending))}
 
 
 def _public_manifest(m):
