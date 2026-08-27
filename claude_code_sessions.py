@@ -3775,10 +3775,10 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is one of the four this command
-    # can actually reverse - "move", "sync", "repoint", "new-row" (or missing,
-    # which in practice never happens - every manifest sets op_type) - is
-    # eligible as "the operation to undo". A completed *undo* op is itself
+    # delta: only a completed op whose op_type is one of the five this command
+    # can actually reverse - "move", "sync", "repoint", "new-row", "retitle"
+    # (or missing, which in practice never happens - every manifest sets
+    # op_type) - is eligible as "the operation to undo". A completed *undo* op is itself
     # terminal from cmd_undo's point of view - plan_undo always refuses an
     # undo-of-undo ("to redo, run move again") - so selecting one here would
     # only ever produce that refusal instead of reaching an older, still-
@@ -3791,7 +3791,8 @@ def cmd_undo(env, ns):
     # happen. Anything added here has to be added there.
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
                  and o.manifest.get("op_type", "move") in ("move", "sync",
-                                                           "repoint", "new-row")]
+                                                           "repoint", "new-row",
+                                                           "retitle")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -3825,6 +3826,12 @@ def cmd_undo(env, ns):
                     "{2}); pass --apply to execute".format(
                         pm["op_id"], pm.get("title", ""),
                         (pm.get("to_session") or "")[:8]))
+        elif prior.manifest.get("op_type") == "retitle":
+            pm = prior.manifest
+            n_written = sum(1 for r in pm.get("rows", []) if r.get("written"))
+            line = ("would undo {0} (retitle: {1} row(s) get their previous "
+                    "titles back, dropping {2!r}); pass --apply to execute"
+                    .format(pm["op_id"], n_written, pm.get("new_title", "")))
         else:
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
@@ -3841,9 +3848,17 @@ def cmd_undo(env, ns):
         final = undo_sync(env, prior)
     elif prior.manifest.get("op_type") == "new-row":
         final = undo_new_row(env, prior)
+    elif prior.manifest.get("op_type") == "retitle":
+        final = undo_retitle(env, prior)
     else:
         final = run_undo(env, prior)
     print("result: " + final)
+    # Undo restores history even when history collides (exact restoration
+    # outranks distinguishability); when it did, the report has to say a
+    # collision now exists rather than leave it to be found by 'alignment'.
+    if prior.manifest.get("undo_collision_note"):
+        line = "note: " + prior.manifest["undo_collision_note"]
+        print(line if ns.verbose else redact(env, line))
     # undo_sync's own terminal status is "undone" (it mutates the completed
     # sync op in place rather than journaling a fresh reversal op the way
     # run_undo/execute_op do) - "completed" remains the success value for
@@ -8933,6 +8948,137 @@ def _retitle_claimed_elsewhere(env, m, r):
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
     return None
+
+
+def _retitle_restored_collision_note(env, m):
+    """After a successful undo: does any restored title now collide with a
+    DIFFERENT conversation in the same sidebar? A sentence naming each hit,
+    or "".
+
+    Undo restores history even when history collides - exact restoration
+    outranks the distinguishability invariant, because undo's one job is to
+    put things back, and a silent partial restore in the name of tidiness is
+    the scaffold's bug wearing a new hat. So this never blocks anything; it
+    only makes the collision visible in the report. Best-effort and NEVER
+    RAISES: the undo has already succeeded, and a reporting failure must not
+    retroactively turn it into an error.
+    """
+    try:
+        sid = m.get("cli_session_id") or ""
+        hits = []
+        for r in m.get("rows") or []:
+            try:
+                old = (json.loads(_sync_pre_image(r).decode("utf-8"))
+                       .get("title") or "").strip()
+            except Exception:
+                continue
+            if not old:
+                continue
+            store = r.get("store_path") or ""
+            for name in sorted(os.listdir(store)):
+                if not (name.startswith("local_") and name.endswith(".json")):
+                    continue
+                if name == r.get("name"):
+                    continue
+                try:
+                    d = read_json(os.path.join(store, name))
+                except LayoutError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                if (d.get("cliSessionId") or "") == sid:
+                    continue
+                if (d.get("title") or "").strip() == old:
+                    hits.append("{0!r} is also row {1} in {2}".format(
+                        old, name, r.get("label") or store))
+                    break
+        if not hits:
+            return ""
+        return ("the restored title(s) now collide with another conversation: "
+                "{0}. Restored anyway - undo's job is exact restoration, and "
+                "'alignment' counts these per sidebar.".format("; ".join(hits)))
+    except Exception:
+        return ""
+
+
+def undo_retitle(env, op):
+    """Restore every row this retitle wrote to its journaled preimage - all of
+    them or none of them, and consume the op so a second undo reaches the one
+    beneath it (both halves are the scaffold's two bugs, stated as behaviour).
+
+    All-or-nothing is the deliberate asymmetry with recover's 'back' arm: a
+    partial undo would leave the accounts disagreeing about the title, which
+    is the drift this command exists to remove, so a single row that changed
+    since - or that another live operation's journal also accounts for -
+    refuses the whole reversal and names the row. Byte preimages make the
+    restore exact by construction, including titleSource on rows where it was
+    absent - the field the scaffold recorded too little to put back.
+    """
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "retitle":
+            raise Refusal("not a retitle op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        # Shape before the guard, as undo_new_row orders it: a record this
+        # cannot read is refusable without enumerating the process list.
+        bad = _retitle_shape_error(m)
+        if bad:
+            raise Refusal(
+                "the record for {0} is damaged ({1}), so undo cannot tell "
+                "which rows it renamed; refusing rather than guess. Nothing "
+                "was changed.".format(m.get("op_id"), bad))
+        _guard_mutation(env, "restore retitled rows in", NEW_ROW_STORE,
+                        because=RETITLE_GUARD_WHY)
+        roots = _retitle_roots(env)
+        blocked, pairs = [], []
+        for r in m["rows"]:
+            if not r.get("written"):
+                continue                     # never landed; nothing to restore
+            _retitle_contained(r, roots)
+            state = _sync_row_drift(r)
+            if state == "match":
+                claim = _retitle_claimed_elsewhere(env, m, r)
+                if claim:
+                    blocked.append((r, "operation {0} also records writing "
+                                       "these bytes, so this op can no longer "
+                                       "prove they are its own - undo that "
+                                       "operation instead".format(claim)))
+                    continue
+                try:
+                    pairs.append((r["dest_path"], _sync_pre_image(r)))
+                except (KeyError, ValueError):
+                    blocked.append((r, "its journaled pre-image cannot be read"))
+            elif state == "absent":
+                blocked.append((r, "it is gone from that store - the account "
+                                   "removed it, and restoring it would "
+                                   "resurrect a row the account deleted"))
+            elif state == "drifted":
+                blocked.append((r, "it no longer holds what this op wrote - "
+                                   "most likely the app, which rewrites these "
+                                   "rows whenever it opens the session"))
+            else:
+                blocked.append((r, "it exists but could not be read"))
+        if blocked:
+            raise Refusal(
+                "cannot undo {0}: {1}. A partial undo would leave the accounts "
+                "disagreeing about the title - the exact drift this command "
+                "exists to remove - so nothing was changed.".format(
+                    m["op_id"],
+                    "; ".join("row {0!r} in {1}: {2}".format(
+                        r.get("name"), r.get("label", "?"), why)
+                        for r, why in blocked)))
+        _sync_restore_all(pairs)
+        note = _retitle_restored_collision_note(env, m)
+        if note:
+            m["undo_collision_note"] = note
+        set_status(op, "undone")
+        rotate_ops(env)
+        return "undone"
+    finally:
+        release_lock(env)
 
 
 def classify_retitle_op(env, op):

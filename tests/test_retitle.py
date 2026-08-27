@@ -7,10 +7,18 @@ finalization") - never a real one.
 """
 import json
 import os
+import types
 
 import pytest
 
 import claude_code_sessions as ct
+
+
+def undo_ns(**kw):
+    d = {"json": False, "verbose": False, "anonymize": False, "apply": False,
+         "show": False, "op_id": None}
+    d.update(kw)
+    return types.SimpleNamespace(**d)
 
 
 # Three accounts, mirroring the real <accountUuid>/<organizationUuid> layout.
@@ -479,3 +487,140 @@ def test_pending_row_drift_withdraws_forward(mkenv, tmp_path, write_row):
     # whatever changed it (back never overwrites what it cannot verify).
     assert read_bytes(paths[0]) == originals[paths[0]]
     assert json.loads(read_bytes(paths[1]).decode("utf-8"))["lastActivityAt"] == 999
+
+
+# ---------------------------------------------------------------------- undo
+
+def test_undo_restores_byte_exact_including_absent_titlesource(
+        mkenv, tmp_path, write_row):
+    """Bytes make undo exact by construction - including titleSource on the
+    row where it was ABSENT, the field the scaffold recorded too little to
+    restore."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    originals = {p: read_bytes(p) for p in paths}
+    assert b"titleSource" not in originals[paths[2]]
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    assert ct.run_retitle(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    assert ct.undo_retitle(env, op) == "undone"
+    assert {p: read_bytes(p) for p in paths} == originals
+    assert op.manifest["status"] == "undone"
+
+
+def test_stacked_undo_reverses_newest_first_and_consumes_each(
+        mkenv, tmp_path, write_row, capsys):
+    """The scaffold's second bug, pinned: retitle A, retitle B, undo, undo -
+    B's preimages restored first, then A's, both byte-exact, each op
+    consumed so the second undo reaches the first op."""
+    env = _monotonic_now(mkenv(tmp_path))
+    pa1 = write_row(env, 0, A1, O1, "local_a",
+                    row_data(SID, "Quarterly board report finalization"))
+    pa2 = write_row(env, 0, A2, O2, "local_a",
+                    row_data(SID, "Quarterly board report finalization"))
+    pb = write_row(env, 0, A1, O1, "local_b",
+                   row_data(SID_B, "Northwind intake notes"))
+    originals = {p: read_bytes(p) for p in (pa1, pa2, pb)}
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID_B[:8], title="Northwind kickoff")))
+    op_a, op_b = ct.list_ops(env)[-2:]
+    assert op_a.manifest["cli_session_id"] == SID
+    assert op_b.manifest["cli_session_id"] == SID_B
+
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    assert read_bytes(pb) == originals[pb]               # B restored first
+    assert json.loads(read_bytes(pa1).decode("utf-8"))["title"] == "ACME-REVIEW"
+
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    assert {p: read_bytes(p) for p in (pa1, pa2, pb)} == originals
+    statuses = {o.manifest["op_id"]: o.manifest["status"]
+                for o in ct.list_ops(env)}
+    assert statuses[op_a.manifest["op_id"]] == "undone"
+    assert statuses[op_b.manifest["op_id"]] == "undone"
+
+
+def test_chained_retitles_unwind_in_order(mkenv, tmp_path, write_row):
+    """Retitle X -> T1, then T1 -> T2, then undo twice. Undoing the newest
+    restores bytes identical to the older op's post-image, and the older op
+    must then still be undoable - the withdrawn-claim rule in
+    _retitle_claimed_elsewhere is what makes the chain unwind."""
+    env = _monotonic_now(mkenv(tmp_path))
+    p = write_row(env, 0, A1, O1, "local_1",
+                  row_data(SID, "Quarterly board report finalization"))
+    original = read_bytes(p)
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="Northwind kickoff")))
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    assert json.loads(read_bytes(p).decode("utf-8"))["title"] == "ACME-REVIEW"
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    assert read_bytes(p) == original
+
+
+def test_undo_is_all_or_nothing_on_drift(mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW"))
+    ct.run_retitle(env, m)
+    op = ct.list_ops(env)[-1]
+    # One account opens the session; the app rewrites its row.
+    changed = json.loads(read_bytes(paths[1]).decode("utf-8"))
+    changed["lastActivityAt"] = 999
+    with open(paths[1], "w", encoding="utf-8") as fh:
+        json.dump(changed, fh)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_retitle(env, op)
+    msg = str(exc.value)
+    assert "local_1" in msg and "disagreeing" in msg
+    # NOTHING was restored - not even the two clean rows.
+    for p in (paths[0], paths[2]):
+        assert json.loads(read_bytes(p).decode("utf-8"))["title"] == "ACME-REVIEW"
+    assert op.manifest["status"] == "completed"
+
+
+def test_undo_refuses_when_a_renamed_row_was_deleted(mkenv, tmp_path, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = three_accounts(env, write_row)
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    op = ct.list_ops(env)[-1]
+    os.unlink(paths[2])
+    with pytest.raises(ct.Refusal, match="resurrect"):
+        ct.undo_retitle(env, op)
+    assert json.loads(read_bytes(paths[0]).decode("utf-8"))["title"] == "ACME-REVIEW"
+
+
+def test_undo_restores_even_when_history_collides_and_says_so(
+        mkenv, tmp_path, write_row, capsys):
+    """Exact restoration outranks the distinguishability invariant - the
+    restore proceeds and the report says a collision now exists."""
+    env = _monotonic_now(mkenv(tmp_path))
+    old = "Quarterly board report finalization"
+    p = write_row(env, 0, A1, O1, "local_1", row_data(SID, old))
+    original = read_bytes(p)
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    # Another conversation adopts the old title while the retitle stands.
+    write_row(env, 0, A1, O1, "local_2", row_data(SID_B, old))
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    out = capsys.readouterr().out
+    assert read_bytes(p) == original
+    assert "note:" in out and "collide" in out
+    op = [o for o in ct.list_ops(env)
+          if o.manifest.get("op_type") == "retitle"][-1]
+    assert op.manifest["status"] == "undone"
+    assert "collide" in op.manifest["undo_collision_note"]
+
+
+def test_undo_preview_names_the_retitle(mkenv, tmp_path, write_row, capsys):
+    env = _monotonic_now(mkenv(tmp_path))
+    three_accounts(env, write_row)
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    assert ct.cmd_undo(env, undo_ns(apply=False)) == 0
+    out = capsys.readouterr().out
+    assert "retitle: 3 row(s)" in out
+    assert "previous titles" in out

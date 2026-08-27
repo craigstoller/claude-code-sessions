@@ -802,13 +802,15 @@ class SyncApp:
         is a lie. It read ("move", "sync") while cmd_undo grew "repoint" and
         then "new-row": with a completed new-row as the most recent operation,
         this skipped straight past it to an older sync and offered to undo THAT,
-        while `ccs undo` would have reversed the new-row.
+        while `ccs undo` would have reversed the new-row. "retitle" joined the
+        tuple in 0.11.0 for the same reason.
         """
         try:
             ops = [o for o in ccs.list_ops(self.env)
                    if o.manifest.get("status") == "completed"
                    and o.manifest.get("op_type", "move") in ("move", "sync",
-                                                             "repoint", "new-row")]
+                                                             "repoint", "new-row",
+                                                             "retitle")]
         except Exception:
             return None
         if not ops or ops[-1].manifest.get("op_type") != "sync":
