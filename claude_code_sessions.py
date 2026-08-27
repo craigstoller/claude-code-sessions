@@ -8201,6 +8201,285 @@ def cmd_repoint(env, ns):
     return 0
 
 
+# ------------------------------------------------------------------ retitle
+# Design and its measured facts: docs/specs/2026-08-26-retitle-design.md. The
+# short version: renaming OUTSIDE the journal already failed twice (backups
+# that overwrote each other, an undo that restored the newest run forever),
+# and this command exists to put renaming inside the machinery that prevents
+# both.
+
+
+@dataclasses.dataclass
+class RetitleFlags:
+    """Which conversation to rename, to what, and in which account(s)."""
+    only: str = ""          # title substring, or a cliSessionId prefix
+    title: str = ""         # the new title; stored trimmed
+    store: str = ""         # substring naming ONE account; default = every account
+    live: str = ""          # RULING 5 assertion, as sync and new-row use it
+
+
+def _valid_new_title(raw):
+    """The trimmed title this command would store, or a Refusal.
+
+    The stored value is the TRIMMED input, and every comparison anywhere in
+    this command uses that same trimmed form - the spec's first draft trimmed
+    for comparison and stored the raw input, which is two titles pretending to
+    be one. No length cap and no Unicode normalisation: the app imposes
+    neither (titles with em-dashes, arrows and 70+ characters exist and
+    render), and a command stricter than the surface it manages would refuse
+    titles the app itself writes.
+    """
+    title = (raw or "").strip()
+    if not title:
+        raise Refusal(
+            "--title is empty once surrounding whitespace is trimmed. An empty "
+            "title can leave the row unclickable in the app; nothing useful is "
+            "behind allowing it.")
+    bad = sorted({"U+{0:04X}".format(ord(ch)) for ch in title if ord(ch) < 0x20})
+    if bad:
+        raise Refusal(
+            "--title contains control character(s) ({0}); newlines and C0 "
+            "controls are refused, not stripped - silently altering the name "
+            "you typed is how surprises ship.".format(", ".join(bad)))
+    return title
+
+
+def _strict_row_dict(raw):
+    """A row's parsed dict, refusing what json.loads would silently accept.
+
+    json.loads keeps the LAST of two duplicate keys, so a row carrying
+    {"title": "A", "title": "B"} parses cleanly and re-serialises with half its
+    story gone. This command rewrites whole rows from their parse, which is
+    exactly the operation that would launder such a row - so a duplicate key is
+    treated as unreadable rather than collapsed. Raises ValueError.
+    """
+    def no_dupes(pairs):
+        d = {}
+        for k, v in pairs:
+            if k in d:
+                raise ValueError("duplicate JSON key {0!r}".format(k))
+            d[k] = v
+        return d
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=no_dupes)
+
+
+@dataclasses.dataclass
+class _RetitleRow:
+    """One row file as the scan saw it: where, whose, and its exact bytes."""
+    account: str
+    org: str
+    store: str
+    label: str
+    name: str
+    path: str
+    raw: bytes
+    data: dict
+
+
+def _retitle_scan(env, live=_LIVE_UNRESOLVED, store_path=""):
+    """Every local_*.json row in scope, strictly read. Refuses on ANY row it
+    cannot parse: an unreadable row could be a copy of the very conversation
+    being renamed, or already hold the new title - "couldn't look" is never
+    "nothing there", and both the target set and the collision rule depend on
+    having looked. STORE_PATH narrows the scan to one resolved account
+    directory (the --store scope); default is every account on the machine.
+    """
+    if live is _LIVE_UNRESOLVED:
+        live = live_account(env)
+    dirs = _account_dirs(env)
+    if store_path:
+        key = os.path.normcase(os.path.realpath(store_path))
+        dirs = [(a, o, p) for a, o, p in dirs
+                if os.path.normcase(os.path.realpath(p)) == key]
+        if not dirs:
+            raise Refusal("the store this plan named no longer exists on disk: "
+                          "{0}. Re-run to replan.".format(store_path))
+    out = []
+    for acct, org, store in dirs:
+        label = "{0} ({1}{2})".format(_email_of(env, acct, live) or acct[:8],
+                                      acct[:8], "/" + org[:8] if org else "")
+        for name in sorted(_listdir_or_refuse(store, "an account directory")):
+            if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            path = os.path.join(store, name)
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                data = _strict_row_dict(raw)
+            except (OSError, ValueError) as exc:
+                raise Refusal(
+                    "the row {0!r} in {1} could not be read ({2}), so this "
+                    "command cannot tell whether it belongs to the conversation "
+                    "being renamed or already holds the new title. Refusing; "
+                    "nothing was written. 'doctor' reports rows it cannot parse "
+                    "- repair or remove it, then re-run.".format(name, label, exc))
+            if not isinstance(data, dict):
+                raise Refusal(
+                    "the row {0!r} in {1} is not a JSON object; refusing to plan "
+                    "around it. Nothing was written. Repair or remove it, then "
+                    "re-run.".format(name, label))
+            out.append(_RetitleRow(acct, org, store, label, name, path, raw, data))
+    return out
+
+
+def _retitle_candidate_listing(conversations):
+    """One line per candidate conversation: id, title, accounts, last activity.
+
+    This listing is the WORKFLOW, not a dead end: a colliding title matches
+    several conversations by construction, so the expected first run refuses
+    with this list and the retry is a copy-paste of an id (--only takes a
+    prefix, so the 8 characters printed here are enough while they are unique).
+    """
+    lines = []
+    for cid in sorted(conversations):
+        recs = conversations[cid]
+        newest = max(recs, key=lambda rec: _activity_of(rec.data) or 0)
+        ms = _activity_of(newest.data)
+        try:
+            when = (time.strftime("%Y-%m-%d", time.gmtime(ms / 1000.0))
+                    if ms else "unknown")
+        except (OverflowError, OSError, ValueError):
+            when = "unknown"
+        labels = sorted({rec.label for rec in recs})
+        lines.append("   {0}   {1:<52}  {2} account(s): {3}   last activity {4}"
+                     .format(cid[:8], (newest.data.get("title") or "(untitled)")[:52],
+                             len(labels), ", ".join(labels), when))
+    return "\n".join(lines)
+
+
+def plan_retitle(env, flags):
+    """Build a retitle manifest. Pure planning - writes nothing.
+
+    A "conversation" is a cliSessionId, and the default target set is every
+    row, in every account, whose cliSessionId equals the resolved id - the
+    recurring need is "this conversation reads the same everywhere", and the
+    failure mode of per-account renaming is three sidebars drifting apart.
+    --only resolves the way repoint's does (a title substring, or an id
+    prefix) but to a CONVERSATION rather than a row, because the same
+    conversation legitimately has one row per account.
+
+    Every refusal computed here is re-checked at apply time against the store
+    as it then is (_retitle_recheck); this pass exists for the dry run and to
+    keep a doomed plan from ever reaching the journal.
+    """
+    if not flags.only:
+        raise Refusal("--only is required: a title substring, or a cliSessionId "
+                      "prefix, naming exactly one conversation")
+    if not flags.title:
+        raise Refusal("--title is required: the new sidebar title")
+    new_title = _valid_new_title(flags.title)
+    if flags.live:
+        live = _resolve_live_assertion(env, flags.live, _account_dirs(env))
+    else:
+        live = live_account(env)
+    scope_store = scope_label = scope_why = ""
+    scope_guess = False
+    if flags.store:
+        # The same matcher new-row uses, guess semantics included: a store
+        # picked by row counts may PLAN and never WRITE (cmd_retitle refuses
+        # --apply on it, naming the path that would settle it).
+        acct, org, scope_store, scope_why, scope_guess = _new_row_store(env, flags)
+        scope_label = "{0} ({1}{2})".format(_email_of(env, acct, live) or acct[:8],
+                                            acct[:8], "/" + org[:8] if org else "")
+
+    # The scan is ALWAYS machine-wide, even under --store: --only resolves to
+    # a conversation across every account (the row in the narrowed store may
+    # carry the drifted title that made the repair necessary), and the sibling
+    # report below needs the other accounts' copies either way.
+    records = _retitle_scan(env, live=live)
+    want = flags.only.lower()
+    conversations = {}
+    for rec in records:
+        cid = rec.data.get("cliSessionId") or ""
+        if not cid:
+            continue                    # a row that opens nothing is not a conversation
+        title = rec.data.get("title") or ""
+        if want in title.lower() or cid.lower().startswith(want):
+            conversations.setdefault(cid, []).append(rec)
+    if not conversations:
+        raise Refusal(
+            "no row in any account matches --only {0!r} (a title substring, or "
+            "a cliSessionId prefix). If the conversation exists on disk but no "
+            "account has a row for it, renaming is not the gap - creating a row "
+            "is 'new-row's job: claude-code-sessions new-row --to <cliSessionId>."
+            .format(flags.only))
+    if len(conversations) > 1:
+        raise Refusal(
+            "--only {0!r} matches {1} conversations - expected when resolving a "
+            "colliding title, since a colliding title names several by "
+            "construction. Re-run with the session id of the one you mean (a "
+            "prefix is enough):\n{2}".format(
+                flags.only, len(conversations),
+                _retitle_candidate_listing(conversations)))
+    sid = next(iter(conversations))
+
+    # The target set is re-collected from the FULL scan, not from the rows that
+    # matched --only: a conversation whose titles have already drifted apart
+    # across accounts - the exact state --store repairs - matches on some rows
+    # and not others, and all of them are the conversation.
+    targets = [rec for rec in records
+               if (rec.data.get("cliSessionId") or "") == sid]
+    siblings = []
+    if scope_store:
+        skey = os.path.normcase(os.path.realpath(scope_store))
+        in_scope = [rec for rec in targets
+                    if os.path.normcase(os.path.realpath(rec.store)) == skey]
+        siblings = [rec for rec in targets
+                    if os.path.normcase(os.path.realpath(rec.store)) != skey]
+        if not in_scope:
+            raise Refusal(
+                "no row in {0} opens {1}, so there is nothing there to rename. "
+                "Creating one is 'new-row's job: claude-code-sessions new-row "
+                "--to {1} --store <path>.".format(scope_label or flags.store, sid))
+        targets = in_scope
+
+    # The new title must not equal an existing title in any TARGET sidebar
+    # (trimmed exact match), excluding the target conversation's own rows. The
+    # exclusion matters twice: a case-only or punctuation fix must not collide
+    # with itself, and retitling to the SAME title is allowed because it still
+    # performs a useful write - pinning titleSource to "user" so the app stops
+    # resummarising.
+    target_keys = {os.path.normcase(os.path.realpath(rec.store)) for rec in targets}
+    for rec in records:
+        if os.path.normcase(os.path.realpath(rec.store)) not in target_keys:
+            continue
+        if (rec.data.get("cliSessionId") or "") == sid:
+            continue
+        if (rec.data.get("title") or "").strip() == new_title:
+            raise Refusal(
+                "that title already names a different conversation in {0}: row "
+                "{1!r} (opens {2}). Two rows in one sidebar under one name is "
+                "the state this command exists to remove, so there is no "
+                "override - retitle that row first if the name is truly wanted. "
+                "Nothing was written.".format(
+                    rec.label, rec.name, (rec.data.get("cliSessionId") or "?")[:8]))
+
+    # A one-account rename can CREATE cross-account divergence; the plan says
+    # so rather than forbidding it. alignment's `distinguishable` line counts
+    # per sidebar, so a --store rename cannot increase it - but the accounts
+    # can end up reading differently, which is what this reports.
+    sib_entries = [{"label": rec.label, "title": rec.data.get("title") or ""}
+                   for rec in sorted(siblings, key=lambda rec: (rec.store, rec.name))]
+    divergence = any((e["title"] or "").strip() != new_title for e in sib_entries)
+
+    rows = []
+    for rec in sorted(targets, key=lambda rec: (rec.store, rec.name)):
+        post_data = dict(rec.data)
+        post_data["title"] = new_title
+        post_data["titleSource"] = "user"
+        post = json.dumps(post_data, separators=(",", ":")).encode("utf-8")
+        rows.append({"name": rec.name, "dest_path": rec.path,
+                     "store_path": rec.store, "label": rec.label,
+                     "title": rec.data.get("title") or "(untitled)",
+                     "pre_b64": b64(rec.raw), "post_b64": b64(post),
+                     "is_update": True, "written": False})
+    return {"op_type": "retitle", "cli_session_id": sid, "new_title": new_title,
+            "store_path": scope_store, "store_label": scope_label,
+            "store_why": scope_why, "store_is_a_guess": scope_guess,
+            "siblings": sib_entries, "sibling_divergence": divergence,
+            "rows": rows}
+
+
 def _public_manifest(m):
     """The manifest with refresh pre-images removed, for --json.
 
