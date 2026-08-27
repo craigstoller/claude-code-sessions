@@ -22,7 +22,7 @@ import sys
 # only answer worth printing. A hardcoded duplicate in pyproject could disagree
 # with the module after a partial bump, and the disagreement would surface as a
 # user reporting a bug against a version they were not running.
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 SCHEME_CURRENT = r"[^A-Za-z0-9]"    # app >= ~2026-07-12: underscores also become '-'
 SCHEME_LEGACY = r"[^A-Za-z0-9_]"    # before: underscores survived
@@ -1913,6 +1913,8 @@ def classify_op(env, op):
         return classify_sync_op(env, op)
     if m.get("op_type") == "retitle":
         return classify_retitle_op(env, op)
+    if m.get("op_type") == "converge":
+        return classify_converge_op(env, op)
 
     def _src_state():
         transcript_present = os.path.isfile(m["source_transcript"])
@@ -2101,7 +2103,7 @@ def recover_op(env, op, direction):
         # Refusal/LayoutError, so the user got a traceback from the one command
         # that exists to get them unstuck.
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row",
-                                              "retitle"):
+                                              "retitle", "converge"):
             _validate_manifest_paths(env, op.manifest)
         elif op.manifest.get("op_type") == "new-row":
             # The allowlist above skips the move-shaped validator, so this op
@@ -2296,6 +2298,90 @@ def recover_op(env, op, direction):
                     "operation wrote, so there was nothing to take back. The "
                     "op is closed; re-run retitle if the rename is still "
                     "wanted.")
+            set_status(op, "rolled_back")
+            rotate_ops(env)
+            return "rolled_back"
+        if m.get("op_type") == "converge":
+            bad = _converge_shape_error(m)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed."
+                    .format(m.get("op_id"), bad))
+            if direction == "forward":
+                pending = [r for r in m["rows"]
+                           if not r.get("written") and not r.get("skipped")]
+                if all(_sync_row_drift(r) == "match" for r in pending):
+                    # Every write landed (or none were pending); only the
+                    # completion marker is missing. Journal-only, so no
+                    # mutation guard and no recheck - the same asymmetry the
+                    # repoint and retitle arms document.
+                    for r in pending:
+                        r["written"] = True
+                    save_manifest(op)
+                    set_status(op, "completed")
+                    rotate_ops(env)
+                    return "completed"
+                _guard_mutation(env, "create rows in", NEW_ROW_STORE,
+                                because=NEW_ROW_GUARD_WHY)
+                # Forward recovery is a FRESH RE-EVALUATION (the spec's
+                # contract, stated so recovery is not read as replay): the
+                # guards and per-pair checks re-run against the store as it
+                # now is. A pair whose destination gained a row in the window
+                # becomes an already_present skip; a pair that held at plan
+                # time is not in `rows` and stays unwritten even if its
+                # collision has since cleared.
+                _converge_recheck(env, m)
+                save_manifest(op)         # the skips just decided are durable
+                set_status(op, "journaled")
+                final = execute_converge_op(env, op)
+                rotate_ops(env)
+                return final
+            # 'back' must always terminate - it is the only exit from a stuck
+            # op - so a row it cannot verify is SKIPPED and recorded, never
+            # refused. Deletions go by disk evidence, not the `written` flag
+            # alone: a hard kill between atomic_write and save_manifest
+            # leaves a row holding this op's bytes with the flag unset (the
+            # same window the retitle arm documents). The rows are pointers;
+            # the conversations keep their rows elsewhere.
+            deletable, residue = [], []
+            for r in m["rows"]:
+                state = _sync_row_drift(r)
+                if state == "match":
+                    deletable.append(r)
+                elif state == "absent":
+                    continue                  # never landed, or already gone
+                elif r.get("written"):
+                    why = ("it exists but could not be read"
+                           if state == "unreadable"
+                           else "it no longer holds what this op wrote ({0})"
+                                .format(state))
+                    residue.append("left {0!r} in place - {1}".format(
+                        r.get("name"), why))
+                # not written and not holding our bytes: not ours to touch
+            if deletable:
+                # Guard only when something will actually be deleted - on
+                # every other state 'back' is a journal-only close, and
+                # putting the only exit from a stuck op behind closing the
+                # desktop app, for an operation about to touch no bytes, is
+                # the trap the sibling arms all refused.
+                _guard_mutation(env, "remove rows from", NEW_ROW_STORE,
+                                because=NEW_ROW_GUARD_WHY)
+                for r in deletable:
+                    try:
+                        real = ensure_contained(r["dest_path"],
+                                                [r["store_path"]])
+                        if os.path.dirname(real) != \
+                                os.path.realpath(r["store_path"]):
+                            raise LayoutError("not a direct child of the "
+                                              "store")
+                        os.unlink(r["dest_path"])
+                    except (OSError, LayoutError) as exc:
+                        residue.append("could not remove {0!r}: {1}".format(
+                            r.get("name"), exc))
+            if residue:
+                m["rollback_residue"] = "; ".join(residue)
+                save_manifest(op)
             set_status(op, "rolled_back")
             rotate_ops(env)
             return "rolled_back"
@@ -3043,7 +3129,7 @@ def gather_doctor(env):
                     "store_label": _m.get("store_label") or "",
                     "detail": _res if isinstance(_res, str) else str(_res),
                 })
-        if _m.get("op_type") != "new-row" or _m.get("status") != "completed":
+        if _m.get("status") != "completed":
             continue
         # SHAPE-VALIDATE FIRST, like every other consumer of a new-row manifest.
         # `(_m.get("rows") or [{}])[0]` reads a file a user can edit and a crash
@@ -3060,10 +3146,30 @@ def gather_doctor(env):
         # out of the row this rejects, so there is nothing to report about it -
         # and a damaged record is `recover`'s subject, where classify_op already
         # names the damage in its listing.
-        if _new_row_shape_error(_m):
+        #
+        # CONVERGE ROWS ARE COVERED TOO, per its design's Interactions section:
+        # a converge op records every created row in the same per-row shape a
+        # new-row op uses (name/dest_path/post_b64/written plus a store and
+        # session), so this one check extends across both - at converge's
+        # fan-out, a low per-row chance of the app rejecting a synthesized row
+        # becomes worth watching.
+        if _m.get("op_type") == "new-row":
+            if _new_row_shape_error(_m):
+                continue
+            _watch = [(_m["rows"][0], _m.get("store_path") or "",
+                       _m.get("to_session") or "", _m.get("title"),
+                       _m.get("store_label"))]
+        elif _m.get("op_type") == "converge":
+            if _converge_shape_error(_m):
+                continue
+            _watch = [(_r, _r.get("store_path") or "", _r.get("session") or "",
+                       _r.get("title"), _r.get("label"))
+                      for _r in _m["rows"]]
+        else:
             continue
-        _r = _m["rows"][0]
-        if _r.get("written") and _sync_row_drift(_r) == "absent":
+        for _r, _store, _sid, _title, _slabel in _watch:
+            if not (_r.get("written") and _sync_row_drift(_r) == "absent"):
+                continue
             # ONE PATH BEING ABSENT IS NOT THE QUESTION. The question is whether
             # the account can still open the conversation, and those come apart
             # in two ordinary ways: the user takes doctor's own advice and
@@ -3073,17 +3179,16 @@ def gather_doctor(env):
             # user deletes the row deliberately. Either way, reporting a
             # tombstone is wrong. Ask the store, not the journal.
             try:
-                _still, _ = _row_already_opens(_m.get("store_path") or "",
-                                               _m.get("to_session") or "")
+                _still, _ = _row_already_opens(_store, _sid)
             except (Refusal, LayoutError, OSError):
                 _still = None       # unreadable store: report it, do not hide it
             if _still:
                 continue
-            _found = find_transcripts(env.projects_root, _m.get("to_session") or "")
+            _found = find_transcripts(env.projects_root, _sid)
             vanished_new.append({
-                "op_id": _m.get("op_id"), "title": _m.get("title"),
-                "to_session": _m.get("to_session"),
-                "store_label": _m.get("store_label"),
+                "op_id": _m.get("op_id"), "title": _title,
+                "to_session": _sid,
+                "store_label": _slabel,
                 # Checked, not assumed - and counted, not merely tested for
                 # truthiness. The diagnostic below offers `new-row --to <id>`,
                 # which refuses when the id resolves to more than one project
@@ -3126,6 +3231,20 @@ def gather_doctor(env):
 
 
 ALIGNMENT_DETAIL_LIMIT = 10
+
+
+def title_key(title):
+    """The duplicate-title comparator: trimmed exact match.
+
+    ONE function, shared by `alignment`'s distinguishable grouping and
+    `converge`'s collision hold, so "the collision hold guarantees
+    `distinguishable` does not move" holds by construction rather than by two
+    parallel implementations happening to agree (converge design, "Holds").
+    A non-string compares as "" - the same fail-closed reading every caller
+    gives an untitled row - where the old inline `.strip()` raised
+    AttributeError on a malformed row.
+    """
+    return title.strip() if isinstance(title, str) else ""
 
 
 def gather_alignment(env):
@@ -3213,6 +3332,10 @@ def gather_alignment(env):
     # reports pairs that no sidebar ever shows together, and an earlier version
     # of this analysis did exactly that - it proposed removing an account's only
     # copy of a conversation because a DIFFERENT account also had one.
+    #
+    # The grouping key is title_key - THE shared comparator, the same one
+    # converge's collision hold uses, which is what makes "converge cannot
+    # move this number" true by construction.
     dup_per, dup_titles = {}, {}
     for a in accounts:
         seen = {}
@@ -3220,7 +3343,7 @@ def gather_alignment(env):
             if acct(r) != a or not r.cli_session_id:
                 continue
             data = r.data if isinstance(r.data, dict) else {}
-            title = ((data.get("title") or "")).strip()
+            title = title_key(data.get("title"))
             if title:
                 seen.setdefault(title, set()).add(r.cli_session_id)
         for title, sids in seen.items():
@@ -3701,6 +3824,25 @@ def build_parser():
     rt.add_argument("--json", action="store_true", help="print the plan as JSON")
     common(rt)
 
+    cv = sub.add_parser(
+        "converge",
+        help="create the missing sidebar rows so every conversation any "
+             "account can open is openable from EVERY account")
+    cv.add_argument("--only", default="", metavar="TITLE_OR_ID",
+                    help="narrow to one conversation: a title substring, or a "
+                         "cliSessionId prefix - must resolve to exactly one "
+                         "conversation; an ambiguous match lists the "
+                         "candidates with ids")
+    cv.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into "
+                         "(RULING 5), when the identity files disagree")
+    cv.add_argument("--apply", action="store_true",
+                    help="actually create the rows. Purely additive: nothing "
+                         "existing is changed, refreshed, or deleted. Exits 3 "
+                         "when hold(s) remain - each printed with its fix")
+    cv.add_argument("--json", action="store_true", help="print the plan as JSON")
+    common(cv)
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -3801,10 +3943,10 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is one of the five this command
-    # can actually reverse - "move", "sync", "repoint", "new-row", "retitle"
-    # (or missing, which in practice never happens - every manifest sets
-    # op_type) - is eligible as "the operation to undo". A completed *undo* op is itself
+    # delta: only a completed op whose op_type is one of the six this command
+    # can actually reverse - "move", "sync", "repoint", "new-row", "retitle",
+    # "converge" (or missing, which in practice never happens - every manifest
+    # sets op_type) - is eligible as "the operation to undo". A completed *undo* op is itself
     # terminal from cmd_undo's point of view - plan_undo always refuses an
     # undo-of-undo ("to redo, run move again") - so selecting one here would
     # only ever produce that refusal instead of reaching an older, still-
@@ -3818,7 +3960,8 @@ def cmd_undo(env, ns):
     candidates = [o for o in ops if o.manifest.get("status") == "completed"
                  and o.manifest.get("op_type", "move") in ("move", "sync",
                                                            "repoint", "new-row",
-                                                           "retitle")]
+                                                           "retitle",
+                                                           "converge")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -3858,6 +4001,14 @@ def cmd_undo(env, ns):
             line = ("would undo {0} (retitle: {1} row(s) get their previous "
                     "titles back, dropping {2!r}); pass --apply to execute"
                     .format(pm["op_id"], n_written, pm.get("new_title", "")))
+        elif prior.manifest.get("op_type") == "converge":
+            pm = prior.manifest
+            created = [r for r in pm.get("rows", []) if r.get("written")]
+            n_acct = len({r.get("account") for r in created})
+            line = ("would undo {0} (converge: removes the {1} row(s) it "
+                    "created across {2} account(s), skipping any that is now "
+                    "load-bearing); pass --apply to execute"
+                    .format(pm["op_id"], len(created), n_acct))
         else:
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
@@ -3876,9 +4027,26 @@ def cmd_undo(env, ns):
         final = undo_new_row(env, prior)
     elif prior.manifest.get("op_type") == "retitle":
         final = undo_retitle(env, prior)
+    elif prior.manifest.get("op_type") == "converge":
+        final = undo_converge(env, prior)
     else:
         final = run_undo(env, prior)
     print("result: " + final)
+    # Converge's undo is FORGIVING - it deletes what is still redundant and
+    # skips what became load-bearing - so a bare "undone" would hide exactly
+    # the rows it deliberately left. Print the tally the spec requires:
+    # deleted / skipped-by-reason / already-gone.
+    if prior.manifest.get("op_type") == "converge" \
+            and prior.manifest.get("undo_report"):
+        rep = prior.manifest["undo_report"]
+        line = "removed {0} row(s); {1} already gone".format(
+            rep.get("deleted", 0), rep.get("already_gone", 0))
+        print(line if ns.verbose else redact(env, line))
+        for s in rep.get("skipped") or []:
+            line = "kept {0} in {1} - {2}: {3}".format(
+                s.get("name"), s.get("label"), s.get("reason"),
+                s.get("detail"))
+            print(line if ns.verbose else redact(env, line))
     # Undo restores history even when history collides (exact restoration
     # outranks distinguishability); when it did, the report has to say a
     # collision now exists rather than leave it to be found by 'alignment'.
@@ -4010,7 +4178,7 @@ def main(argv=None):
                 "alignment": cmd_alignment,
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
                 "repoint": cmd_repoint, "new-row": cmd_new_row,
-                "retitle": cmd_retitle,
+                "retitle": cmd_retitle, "converge": cmd_converge,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -8425,13 +8593,17 @@ class _RetitleRow:
     data: dict
 
 
-def _retitle_scan(env, live=_LIVE_UNRESOLVED, store_path=""):
+def _retitle_scan(env, live=_LIVE_UNRESOLVED, store_path="",
+                  why=("whether it belongs to the conversation being renamed "
+                       "or already holds the new title")):
     """Every local_*.json row in scope, strictly read. Refuses on ANY row it
     cannot parse: an unreadable row could be a copy of the very conversation
     being renamed, or already hold the new title - "couldn't look" is never
     "nothing there", and both the target set and the collision rule depend on
     having looked. STORE_PATH narrows the scan to one resolved account
     directory (the --store scope); default is every account on the machine.
+    WHY names, in the refusal, what the unreadable row leaves undecidable -
+    `converge` shares this scan and its stakes are worded differently.
     """
     if live is _LIVE_UNRESOLVED:
         live = live_account(env)
@@ -8458,10 +8630,10 @@ def _retitle_scan(env, live=_LIVE_UNRESOLVED, store_path=""):
             except (OSError, ValueError) as exc:
                 raise Refusal(
                     "the row {0!r} in {1} could not be read ({2}), so this "
-                    "command cannot tell whether it belongs to the conversation "
-                    "being renamed or already holds the new title. Refusing; "
+                    "command cannot tell {3}. Refusing; "
                     "nothing was written. 'doctor' reports rows it cannot parse "
-                    "- repair or remove it, then re-run.".format(name, label, exc))
+                    "- repair or remove it, then re-run.".format(name, label,
+                                                                 exc, why))
             if not isinstance(data, dict):
                 raise Refusal(
                     "the row {0!r} in {1} is not a JSON object; refusing to plan "
@@ -9664,6 +9836,894 @@ def _print_sync_report(say, manifest):
         say("   {0}{1}".format("!! " if r.get("overrode_tombstone") else "", r["title"]))
     if len(adds) > 15:
         say("   ... and {0} more".format(len(adds) - 15))
+
+
+# ------------------------------------------------------------- 9. converge
+# "Every conversation some sidebar can open should be openable from every
+# sidebar." Purely additive: for every (eligible conversation, destination
+# account) pair where the account holds no row, create one. Never repoints,
+# never refreshes, never deletes, never resurrects - the whole safety case is
+# having no overwrite path at all. Design: docs/specs/2026-08-26-converge-design.md.
+
+
+@dataclasses.dataclass
+class ConvergeFlags:
+    """Narrowing and identity assertion only. No --to, no --from, no --store:
+    naming a direction is the interface converge exists to delete - the target
+    set is derived."""
+    only: str = ""          # title substring, or a cliSessionId prefix
+    live: str = ""          # RULING 5 assertion, as sync and retitle use it
+
+
+# What the unreadable-row refusal says converge could not decide. The scan is
+# _retitle_scan's; the stakes here are eligibility and the collision hold, not
+# a rename.
+_CONVERGE_SCAN_WHY = ("which conversations that account already holds, or "
+                      "which titles its sidebar carries - both the target set "
+                      "and the collision hold depend on having looked")
+
+
+def _converge_destinations(env, records):
+    """({account: {account, org, path, label, rows}}, non_destinations).
+
+    StoreKey (spec, "Keys, eligibility, and the target set"): an account's
+    destination store is the org directory that already holds that account's
+    rows - the same evidence sync's candidate listing uses. Measured on the
+    machine this was designed on: each account has three org directories and
+    exactly one is populated. An account whose every org directory is empty is
+    NOT a destination - there is no evidence which org is real, and writing
+    into a guessed one is the exact move new-row --apply refuses - and the
+    plan says so rather than silently shrinking "every sidebar".
+
+    An account with rows in MORE than one org directory (two store roots after
+    an installer migration can do this) fails the populated-one rule outright:
+    refusing to guess beats writing into one of two stores that both claim to
+    be real. Measured reality is exactly-one-populated, so this refusal should
+    never fire outside a layout worth a human's attention.
+    """
+    populated = {}
+    for rec in records:
+        populated.setdefault(rec.account, {})[
+            os.path.normcase(os.path.realpath(rec.store))] = rec
+    dests = {}
+    counts = {}
+    for rec in records:
+        counts[rec.account] = counts.get(rec.account, 0) + 1
+    for acct in sorted(populated):
+        stores = populated[acct]
+        if len(stores) > 1:
+            raise Refusal(
+                "account {0} holds rows in more than one org directory, so the "
+                "populated-one rule cannot resolve which store is its real "
+                "sidebar; refusing to guess. Nothing was written:\n{1}".format(
+                    acct[:8], "\n".join(
+                        "   " + rec.store for rec in stores.values())))
+        rec = next(iter(stores.values()))
+        dests[acct] = {"account": acct, "org": rec.org, "path": rec.store,
+                       "label": rec.label, "rows": counts.get(acct, 0)}
+    non_dest = []
+    for acct, org, path in _account_dirs(env):
+        if acct in dests or any(nd["account"] == acct for nd in non_dest):
+            continue
+        non_dest.append({"account": acct,
+                         "label": _email_of(env, acct) or acct[:8]})
+    return dests, non_dest
+
+
+def _retitle_command(sid, title):
+    """The pastable remedy every hold and disagreement note prints, by name
+    (spec, "Interactions"). An 8-char id prefix on purpose: --only takes a
+    prefix, and the full uuid would be shortened by redact() into something
+    that cannot be pasted back."""
+    return ('claude-code-sessions retitle --only {0} --title "{1}" '
+            '--apply'.format(sid[:8], title))
+
+
+def _converge_title(recs, facts):
+    """(title, title_source, disagreement, holder_titles) for one conversation.
+
+    The holder whose row has the greatest `lastActivityAt` names it - that
+    field is a snapshot of the conversation's own activity, not of any
+    account's attention (`lastFocusedAt` is, and is not used). Missing values
+    compare as zero; an exact tie breaks to the lexicographically greatest
+    account uuid - arbitrary, deterministic, stated - and then the row
+    filename, for the duplicate-rows-in-one-account case the account rule
+    cannot split. The stored value is the TRIMMED title (title_key's form),
+    retitle's lesson: comparing trimmed while storing raw is two titles
+    pretending to be one.
+
+    titleSource travels with the title it qualifies: a holder row saying
+    "user" records that a person chose that name for this conversation, and
+    dropping the pin would invite the app to resummarise the new row back
+    into the drift the disagreement note exists to surface. It is a claim
+    about the title's authorship, not per-account state.
+
+    Rows with no usable title do not compete. If NO holder carries one, fall
+    back to new-row's own derivation (the transcript's customTitle, else the
+    placeholder that does not impersonate a summary).
+    """
+    titled = [rec for rec in recs if title_key(rec.data.get("title"))]
+    if not titled:
+        title, _provenance, source = _new_row_title("", facts)
+        return title, source, False, []
+    best = max(titled, key=lambda rec: (_activity_of(rec.data) or 0,
+                                        rec.account, rec.name))
+    title = title_key(best.data.get("title"))
+    source = "user" if best.data.get("titleSource") == "user" else "auto"
+    distinct = {title_key(rec.data.get("title")) for rec in titled}
+    holder_titles = [{"label": rec.label, "title": rec.data.get("title") or ""}
+                     for rec in sorted(titled, key=lambda rec: (rec.store,
+                                                                rec.name))]
+    return title, source, len(distinct) > 1, holder_titles
+
+
+def plan_converge(env, flags):
+    """Build a converge manifest. Pure planning - writes nothing.
+
+    The keys, stated because the review found them implicitly assumed:
+    ConversationKey is the cliSessionId (several rows in one account are ONE
+    holding); transcripts are machine-global, so "transcript exists" is a
+    property of the conversation, never of a holder; a conversation is
+    ELIGIBLE iff its transcript is on disk AND at least one account holds a
+    row for it. Dead-only groups (rows everywhere, transcript gone) are
+    excluded from the work and from the completeness denominator - they are
+    doctor's dead-row report, not convergence. Transcripts with no row
+    anywhere are equally out: retired stays retired; first rows are new-row's
+    job. The target set is every (eligible conversation, destination account)
+    pair where that account holds no row for it.
+
+    The tool's premise, stated rather than assumed: every discovered account
+    belongs to the operator - already the premise of sync, repoint --store
+    and new-row --store; converge adds fan-out, not a new trust boundary. The
+    per-destination `email (acct/org)` lines are where an operator with
+    accounts that must not mix would see it before --apply.
+    """
+    if flags.live:
+        live = _resolve_live_assertion(env, flags.live, _account_dirs(env))
+    else:
+        live = live_account(env)
+    # Strict machine-wide scan - refuses on ANY unreadable row, because both
+    # the holdings census and the collision hold depend on having looked.
+    records = _retitle_scan(env, live=live, why=_CONVERGE_SCAN_WHY)
+    dests, non_dest = _converge_destinations(env, records)
+
+    conversations = {}
+    for rec in records:
+        sid = rec.data.get("cliSessionId") or ""
+        if sid:
+            conversations.setdefault(sid, []).append(rec)
+    tids = {os.path.splitext(os.path.basename(p))[0]
+            for _, p in iter_transcripts(env.projects_root)}
+
+    only_sid = ""
+    if flags.only:
+        want = flags.only.lower()
+        matches = {sid: recs for sid, recs in conversations.items()
+                   if sid.lower().startswith(want)
+                   or any(want in (rec.data.get("title") or "").lower()
+                          for rec in recs)}
+        if not matches:
+            raise Refusal(
+                "no row in any account matches --only {0!r} (a title "
+                "substring, or a cliSessionId prefix). A transcript no account "
+                "points at is not converge's gap - first rows are 'new-row's "
+                "job: claude-code-sessions new-row --to <cliSessionId>."
+                .format(flags.only))
+        if len(matches) > 1:
+            raise Refusal(
+                "--only {0!r} matches {1} conversations - expected when the "
+                "title itself collides. Re-run with the session id of the one "
+                "you mean (a prefix is enough):\n{2}".format(
+                    flags.only, len(matches),
+                    _retitle_candidate_listing(matches)))
+        only_sid = next(iter(matches))
+        if only_sid not in tids:
+            raise Refusal(
+                "the conversation --only names ({0}) has no transcript on "
+                "disk - its rows are dead, and a new row for it would open "
+                "nothing. Dead rows are 'doctor's report, not convergence. "
+                "Nothing was written.".format(only_sid[:8]))
+
+    eligible = {sid: recs for sid, recs in conversations.items()
+                if sid in tids}
+    dead_excluded = len(conversations) - len(eligible)
+    if only_sid:
+        eligible = {only_sid: eligible[only_sid]}
+
+    # Holdings are per ACCOUNT, matching alignment's `complete` - a row in any
+    # of the account's org directories means the account reaches it, so a pair
+    # is only missing when no row anywhere under that account opens the
+    # conversation. That is what makes "complete rises by exactly the applied
+    # count" arithmetic rather than aspiration.
+    short, complete_now = [], 0
+    for sid in sorted(eligible):
+        held_by = {rec.account for rec in eligible[sid]}
+        missing = [a for a in sorted(dests) if a not in held_by]
+        if missing:
+            short.append((sid, missing))
+        else:
+            complete_now += 1
+
+    # The existing-title census for the collision hold, per account (the same
+    # scope alignment's distinguishable uses), keyed by title_key - THE shared
+    # comparator.
+    acct_titles = {}
+    for rec in records:
+        k = title_key(rec.data.get("title"))
+        if k:
+            acct_titles.setdefault(rec.account, {}).setdefault(
+                k, (rec.data.get("cliSessionId") or "", rec.name))
+
+    rows, holds, notes = [], [], []
+    planned_titles = {}          # account -> {title_key: sid this plan places}
+    for sid, missing in short:
+        recs = eligible[sid]
+        holder_labels = sorted({rec.label for rec in recs})
+        try:
+            facts = _transcript_facts(env, sid)
+        except Refusal as exc:
+            # Not fatal to the rest (spec, "Holds"): a transcript that exists
+            # but cannot populate a row - duplicated across project folders,
+            # missing a cwd or a model, being written right now - holds this
+            # conversation's pairs with the reason attached, and every other
+            # pair proceeds. Refusing the whole bulk run over one such
+            # conversation would leave the monthly chore permanently stuck on
+            # its weirdest member.
+            for acct in missing:
+                holds.append({"session": sid, "account": acct,
+                              "label": dests[acct]["label"], "title": "",
+                              "reason": "held_transcript_unusable",
+                              "detail": str(exc), "retitle": ""})
+            continue
+        title, title_source, disagree, holder_titles = _converge_title(recs,
+                                                                       facts)
+        if disagree:
+            notes.append({"session": sid, "title": title,
+                          "holder_titles": holder_titles,
+                          "retitle": _retitle_command(sid, title)})
+        k = title_key(title)
+        for acct in missing:
+            d = dests[acct]
+            hit = acct_titles.get(acct, {}).get(k)
+            if hit is not None and hit[0] != sid:
+                # held_title_collision: the chosen title already names a
+                # DIFFERENT conversation in that sidebar. new-row warns and
+                # proceeds on this; converge holds, because converge is bulk
+                # and unattended where new-row is single and watched.
+                # Deliberately NO auto-suffix - a store full of generic titles
+                # mass-holding is converge refusing to spread a mess, and the
+                # holds arrive with their fixes attached. A non-colliding
+                # minority title is NOT substituted either: canonical
+                # consistency outranks maximising placements.
+                holds.append({
+                    "session": sid, "account": acct, "label": d["label"],
+                    "title": title, "reason": "held_title_collision",
+                    "detail": "{0!r} already names a different conversation "
+                              "in that sidebar: row {1} (opens {2})".format(
+                                  title, hit[1], (hit[0] or "?")[:8]),
+                    "retitle": (_retitle_command(hit[0], "<new title>")
+                                if hit[0] else "")})
+                continue
+            planned = planned_titles.get(acct, {}).get(k)
+            if planned is not None and planned != sid:
+                # Two eligible conversations converging on one destination
+                # under one chosen title. Writing both recreates the duplicate
+                # this store spent a cleanup removing, so the later one (sid
+                # order - deterministic) holds; at apply time the same state
+                # is what the per-pair re-check would produce, so the plan
+                # says it now rather than surprising the applier.
+                holds.append({
+                    "session": sid, "account": acct, "label": d["label"],
+                    "title": title, "reason": "held_title_collision",
+                    "detail": "this plan already creates a row named {0!r} "
+                              "there, for conversation {1}".format(
+                                  title, planned[:8]),
+                    "retitle": _retitle_command(sid, "<new title>")})
+                continue
+            # The uuid is minted at plan time (spec, "Applying") so the
+            # journalled op can list the complete bytes to write, and so
+            # landed-versus-unattempted is decidable from the record alone.
+            row_uuid = str(uuid.uuid4())
+            row = _synthesize_row(sid, title, title_source, facts, row_uuid)
+            name = "local_{0}.json".format(row_uuid)
+            post = json.dumps(row, separators=(",", ":")).encode("utf-8")
+            rows.append({"name": name,
+                         "dest_path": os.path.join(d["path"], name),
+                         "store_path": d["path"], "account": acct,
+                         "org": d["org"], "label": d["label"],
+                         "session": sid, "title": title,
+                         "title_source": title_source,
+                         "holders": holder_labels,
+                         "pre_b64": None, "post_b64": b64(post),
+                         "is_update": False, "written": False})
+            planned_titles.setdefault(acct, {})[k] = sid
+
+    # Truthful completeness math: projected from the pairs that will actually
+    # be written, never a promised full house. A short conversation with any
+    # held pair stays short.
+    held_sids = {h["session"] for h in holds}
+    total = len(eligible)
+    after = complete_now + sum(1 for sid, _m in short if sid not in held_sids)
+    held_conversations = sum(1 for sid, _m in short if sid in held_sids)
+
+    return {"op_type": "converge",
+            "live_asserted": (live.account_uuid
+                              if flags.live and live else ""),
+            "only": flags.only, "only_session": only_sid,
+            "destinations": [dests[a] for a in sorted(dests)],
+            "non_destinations": non_dest,
+            "complete": {"now": complete_now, "of": total, "after": after,
+                         "held": held_conversations,
+                         "scoped": bool(only_sid)},
+            "dead_excluded": dead_excluded,
+            "notes": notes, "holds": holds, "rows": rows}
+
+
+def _converge_shape_error(m):
+    """A sentence naming what is wrong with this converge manifest, or None.
+
+    Same job as _retitle_shape_error, for the additive multi-row shape:
+    recover and undo dereference rows straight out of a journal file a user
+    can edit. pre_b64 is deliberately NOT required - converge rows are adds,
+    and their pre-image is uniformly absent. NEVER RAISES (classify_op's
+    contract).
+    """
+    rows = m.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return "its 'rows' is not a non-empty list"
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            return "row {0} is not an object".format(i)
+        for k in ("name", "dest_path", "store_path", "post_b64", "account",
+                  "session", "title"):
+            if not isinstance(r.get(k), str) or not r[k]:
+                return "row {0} has no usable {1!r}".format(i, k)
+    return None
+
+
+def _converge_recheck(env, m):
+    """Every apply-time guard and per-pair revalidation, under the operation
+    lock, BEFORE the op record exists. Raises Refusal; MARKS apply-time skips
+    on the manifest's rows (`skipped` + `skip_detail`) rather than returning
+    anything.
+
+    Runs pre-journal for the same reason run_retitle's recheck does, with the
+    spec's own sharpening: a zero-write apply - store already complete,
+    everything held or already present - must create NO op at all, and only a
+    recheck that precedes new_op can know that in time. Nothing can change
+    between this pass and the writes: the lock is held and RULING 4 has
+    already established the app is closed, so the write loop's own checks are
+    against I/O surprises, not concurrent editors.
+
+    Per pair, against the store as it now is: a row that appeared since - the
+    app, a sync, another converge - makes that pair an `already_present` skip,
+    not an error; a transcript that left the disk makes it `transcript_gone`;
+    and the collision hold re-runs, so a collision that appeared since plan
+    time holds now. A pair that held at PLAN time is never written even if
+    the collision has since cleared - it is not in `rows` at all; clearing it
+    changed the sidebar, so the user replans rather than the tool guessing.
+    """
+    # RULING 5. Converge writes every account's store, so there is no dormant
+    # side to protect - but a machine whose identity files disagree is a
+    # machine in a state this module never mutates under silently. --live
+    # (validated at plan time by _resolve_live_assertion) arbitrates it.
+    dis = _identity_disagreement(env)
+    if dis and (m.get("live_asserted") or "") not in dis:
+        raise Refusal(
+            "~/.claude.json ({0}) and config.json ({1}) disagree about the "
+            "signed-in account (RULING 5). Re-authenticate the CLI (run "
+            "'claude', then /login) or switch the desktop app so the two "
+            "agree, or re-plan with --live naming one of the two accounts. "
+            "Nothing was written.".format(dis[0][:8], dis[1][:8]))
+    # The plan's stores are re-discovered and must still resolve to the same
+    # populated-one answer - a store that moved since planning is a replan,
+    # never a guess.
+    records = _retitle_scan(env, why=_CONVERGE_SCAN_WHY)
+    dests, _non = _converge_destinations(env, records)
+    for r in m["rows"]:
+        d = dests.get(r.get("account") or "")
+        if d is None or (os.path.normcase(os.path.realpath(d["path"]))
+                         != os.path.normcase(os.path.realpath(
+                             r["store_path"]))):
+            raise Refusal(
+                "the destination store this plan recorded for {0} no longer "
+                "resolves ({1}) - the store layout moved since planning. "
+                "Nothing was written; re-run to replan.".format(
+                    r.get("label") or (r.get("account") or "?")[:8],
+                    r.get("store_path")))
+    acct_sids, acct_titles = {}, {}
+    for rec in records:
+        sid = rec.data.get("cliSessionId") or ""
+        if sid:
+            acct_sids.setdefault(rec.account, set()).add(sid)
+        k = title_key(rec.data.get("title"))
+        if k:
+            acct_titles.setdefault(rec.account, {}).setdefault(
+                k, (rec.data.get("cliSessionId") or "", rec.name))
+    for r in m["rows"]:
+        if r.get("written") or r.get("skipped"):
+            continue        # landed rows are settled; skips stay skipped
+        acct = r["account"]
+        if r["session"] in acct_sids.get(acct, set()):
+            r["skipped"] = "already_present"
+            r["skip_detail"] = ("a row for it appeared in {0} since this was "
+                               "planned".format(r.get("label") or acct[:8]))
+            continue
+        if not find_transcripts(env.projects_root, r["session"]):
+            r["skipped"] = "transcript_gone"
+            r["skip_detail"] = ("its transcript left the disk since this was "
+                               "planned, so the row would open nothing")
+            continue
+        k = title_key(r["title"])
+        hit = acct_titles.get(acct, {}).get(k)
+        if hit is not None and hit[0] != r["session"]:
+            r["skipped"] = "held_title_collision"
+            r["skip_detail"] = ("{0!r} now names a different conversation "
+                               "there: row {1} (opens {2})".format(
+                                   r["title"], hit[1], (hit[0] or "?")[:8]))
+            continue
+        # This pair will be written; later pairs in this same run must see it
+        # - the sequential-write semantics, decided here where the whole run
+        # is visible.
+        acct_sids.setdefault(acct, set()).add(r["session"])
+        if k:
+            acct_titles.setdefault(acct, {}).setdefault(k, (r["session"],
+                                                            r["name"]))
+
+
+def _converge_write_rows(op, m, roots):
+    """execute_converge_op's write loop. Per pair: containment, a disk check
+    at the minted path, atomic write. The minted filename is a fresh uuid4,
+    so anything already sitting at it is either this op's own landed write
+    (crash re-entry - finish the bookkeeping) or evidence of something wrong
+    enough to stop for; there is no legitimate third party."""
+    rows = m["rows"]
+    for i, r in enumerate(rows):
+        if r.get("written") or r.get("skipped"):
+            continue
+        real = ensure_contained(r["dest_path"], roots)
+        if os.path.dirname(real) != os.path.realpath(r["store_path"]):
+            raise LayoutError("row {0!r} is not a direct child of {1!r}; "
+                              "refusing".format(r["dest_path"],
+                                                r["store_path"]))
+        state = _sync_row_drift(r)
+        if state == "match":
+            r["written"] = True          # landed before a crash; bookkeeping
+            save_manifest(op)
+            continue
+        if state == "unreadable":
+            raise Refusal(
+                "something is at {0!r} but it could not be read, so whether "
+                "it is the row this op wrote cannot be settled. Refusing "
+                "rather than overwrite a file nobody can see. The op is left "
+                "at 'writing' - 'recover --resolve {1} --back --apply' "
+                "removes what this op verifiably wrote and closes it."
+                .format(r["name"], m.get("op_id", "")))
+        if state != "absent":
+            raise Refusal(
+                "a different row already exists at {0!r}; refusing to "
+                "overwrite it - this command only adds. The op is left at "
+                "'writing' - 'recover --resolve {1} --back --apply' removes "
+                "what this op verifiably wrote and closes it."
+                .format(r["name"], m.get("op_id", "")))
+        post = unb64(r["post_b64"])      # cannot raise: 'unreadable' covers it
+        try:
+            atomic_write(r["dest_path"], post)
+        except OSError as exc:
+            raise Refusal(
+                "could not write row {0!r}: {1}. The op is left at 'writing' "
+                "- re-run 'recover --resolve {2} --forward --apply' once the "
+                "store is writable, or '--back' to remove what did land."
+                .format(r["name"], exc, m.get("op_id", "")))
+        _maybe_crash("converge-write-before-save")
+        r["written"] = True
+        save_manifest(op)
+        if i < len(rows) - 1:
+            _maybe_crash("converge-mid-write")
+
+
+def execute_converge_op(env, op):
+    """journaled -> writing -> completed. N rows, all adds.
+
+    By the time this runs, the op record already lists every planned row -
+    destination store path, minted filename, the complete bytes to write -
+    and was fsynced by new_op, so an interruption anywhere in the loop
+    strands nothing: back removes what landed, forward re-evaluates and
+    finishes. Both callers (run_converge, recover_op's forward arm) own the
+    RULING 4 guard and the recheck - the once-per-apply rule run_new_row's
+    refactor established.
+    """
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_converge_op runs ops from 'journaled'; "
+                          "use recover for interrupted ops")
+    roots = _retitle_roots(env)
+    set_status(op, "writing")
+    try:
+        _converge_write_rows(op, m, roots)
+    except BaseException:
+        # Journal what actually landed before the failure propagates - the
+        # same on-the-way-out save execute_sync_op and execute_retitle_op
+        # make, so recover reads an exact record.
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    _maybe_crash("converge-before-complete")
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_converge(env, manifest):
+    """Guard, lock, re-check, journal, execute, rotate - and the one shape no
+    sibling has: a run whose re-check leaves nothing to write returns
+    "unchanged" WITHOUT creating an op. Nothing durable happened, there is
+    nothing to undo, and a journal entry would be residue for recover to
+    clean up after a command that touched nothing (spec, "Applying" step 5).
+    """
+    _guard_mutation(env, "create rows in", NEW_ROW_STORE,
+                    because=NEW_ROW_GUARD_WHY)
+    acquire_lock(env, "converge")
+    try:
+        _converge_recheck(env, manifest)
+        if not any(not r.get("written") and not r.get("skipped")
+                   for r in manifest["rows"]):
+            return "unchanged"
+        try:
+            op = new_op(env, manifest)
+        except OSError as exc:
+            raise Refusal(
+                "could not write the operation record ({0}). The journal is "
+                "written before any row is touched, so nothing landed and "
+                "there is nothing to recover - fix the space or permissions "
+                "under {1} and re-run.".format(exc, env.ops_dir))
+        manifest["op_id"] = op.manifest["op_id"]
+        final = execute_converge_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def undo_converge(env, op):
+    """Remove the rows this converge created - FORGIVING, not all-or-nothing,
+    the deliberate opposite of retitle's rule: retitle's undo restores prior
+    states that must agree across accounts, while converge's undo deletes
+    independent creations whose prior state is uniformly ABSENT. Per created
+    row, in the spec's order:
+
+    - NEVER DELETE THE LAST POINTER. If this row is now the only row in any
+      account reaching the conversation (the holders it was copied from have
+      since been removed), skip it and say so - undo's job is to remove
+      redundant presence, and this presence is no longer redundant.
+    - A changed cliSessionId: skip - someone repointed it, and deleting would
+      destroy their work.
+    - A changed title or titleSource: skip - someone curated it, and a
+      curated row is theirs now. (A moved lastFocusedAt alone is not
+      curation - the app writes that on focus.)
+    - Otherwise delete. Already gone counts as done.
+
+    The report tallies deleted / skipped-by-reason / already-gone, and the op
+    is consumed either way. No claimed-elsewhere machinery: every row's bytes
+    embed a uuid4 this op minted, so no other operation can account for them
+    (the same argument that keeps converge out of sync's claim protocol).
+    """
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "converge":
+            raise Refusal("not a converge op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        # Shape before the guard, as undo_new_row orders it: a record this
+        # cannot read is refusable without enumerating the process list.
+        bad = _converge_shape_error(m)
+        if bad:
+            raise Refusal(
+                "the record for {0} is damaged ({1}), so undo cannot tell "
+                "which rows it created; refusing rather than guess. Nothing "
+                "was changed.".format(m.get("op_id"), bad))
+        _guard_mutation(env, "remove rows from", NEW_ROW_STORE,
+                        because=NEW_ROW_GUARD_WHY)
+        roots = _retitle_roots(env)
+        # The pointer census the last-pointer rule reads. load_rows is
+        # best-effort (it collects unreadable rows instead of raising), and
+        # that is SAFE here by construction: an unreadable row can never
+        # prove another pointer exists, so it can only push a decision
+        # toward skipping - the direction that never deletes.
+        all_rows, _errs = load_rows(discover_stores(env).roots)
+        pointers = {}
+        for row in all_rows:
+            if row.cli_session_id:
+                pointers.setdefault(row.cli_session_id, set()).add(
+                    os.path.normcase(os.path.realpath(row.path)))
+        deleted, already_gone, skips = 0, 0, []
+        for r in m["rows"]:
+            if not r.get("written"):
+                continue
+            real = ensure_contained(r["dest_path"], roots)
+            if os.path.dirname(real) != os.path.realpath(r["store_path"]):
+                raise LayoutError("row {0!r} is not a direct child of {1!r}; "
+                                  "refusing".format(r["dest_path"],
+                                                    r["store_path"]))
+            state = _sync_row_drift(r)
+            if state == "absent":
+                already_gone += 1
+                continue
+            if state == "unreadable":
+                skips.append((r, "unreadable",
+                              "it exists but could not be read"))
+                continue
+            if state == "drifted":
+                try:
+                    with open(r["dest_path"], "rb") as fh:
+                        cur = json.loads(fh.read().decode("utf-8"))
+                except (OSError, ValueError):
+                    skips.append((r, "unreadable",
+                                  "it exists but could not be read"))
+                    continue
+                if not isinstance(cur, dict):
+                    skips.append((r, "unreadable",
+                                  "it is no longer a JSON object"))
+                    continue
+                if cur.get("cliSessionId") != r["session"]:
+                    skips.append((r, "repointed",
+                                  "someone repointed it at {0} since; "
+                                  "deleting it would destroy their work"
+                                  .format(str(cur.get("cliSessionId")
+                                              or "?")[:8])))
+                    continue
+                if (cur.get("title") != r.get("title")
+                        or cur.get("titleSource") != r.get("title_source")):
+                    skips.append((r, "curated",
+                                  "its title was changed since, so the row "
+                                  "is that account's now"))
+                    continue
+                # Only per-account state moved (focus times and the like) -
+                # the app touched it, which is not curation. Fall through.
+            key = os.path.normcase(os.path.realpath(r["dest_path"]))
+            others = pointers.get(r["session"], set()) - {key}
+            if not others:
+                skips.append((r, "last_pointer",
+                              "it is now the only row in any account that "
+                              "reaches this conversation - the holders it "
+                              "was copied from are gone, so this presence "
+                              "is no longer redundant"))
+                continue
+            try:
+                os.unlink(r["dest_path"])
+            except OSError as exc:
+                skips.append((r, "unremovable",
+                              "could not remove it: {0}".format(exc)))
+                continue
+            pointers.get(r["session"], set()).discard(key)
+            deleted += 1
+        m["undo_report"] = {
+            "deleted": deleted, "already_gone": already_gone,
+            "skipped": [{"name": r.get("name"), "label": r.get("label"),
+                         "session": r.get("session"), "reason": reason,
+                         "detail": detail} for r, reason, detail in skips]}
+        set_status(op, "undone")
+        rotate_ops(env)
+        return "undone"
+    finally:
+        release_lock(env)
+
+
+def classify_converge_op(env, op):
+    """Converge's recovery shape. Forward is a FRESH RE-EVALUATION of the
+    remaining pairs - it re-runs the apply-time guards and per-pair checks
+    against the store as it stands, so a pair whose situation changed in the
+    window resolves against reality rather than against the plan's snapshot;
+    recovery is never replay. Back removes the rows the op created (they are
+    pointers; the conversations keep their rows elsewhere). A converge with
+    rows landed and no completion marker is the equivalent new-row state,
+    multiplied.
+
+    Never raises (classify_op's contract).
+    """
+    m = op.manifest
+    bad = _converge_shape_error(m)
+    if bad:
+        return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "converge: this operation's record is damaged ({0}), "
+                        "so neither direction can be run from it".format(bad)}
+    written = sum(1 for r in m["rows"] if r.get("written"))
+    skipped = sum(1 for r in m["rows"] if r.get("skipped"))
+    pending = sum(1 for r in m["rows"]
+                  if not r.get("written") and not r.get("skipped"))
+    if m["status"] not in NONTERMINAL:
+        return {"status": m["status"], "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "converge: {0} row(s) created, {1} skipped (use undo "
+                        "to remove a completed converge's rows)"
+                        .format(written, skipped)}
+    return {"status": m["status"], "source": "n/a", "dest": "n/a",
+            "resolutions": ["forward", "back"], "drifted_rows": [],
+            "note": "converge: {0} row(s) created, {1} pending, {2} skipped; "
+                    "forward re-evaluates the remaining pairs against the "
+                    "store as it now is (fresh guards and checks, never a "
+                    "replay), back removes the rows this operation created"
+                    .format(written, pending, skipped)}
+
+
+def _public_converge_manifest(env, m):
+    """The converge manifest with row post-images removed, for --json and the
+    printed report - the same exposure rule as every sibling's public
+    manifest, and where --anonymize is honoured. The structured pass covers
+    the named fields (title, label); the free-text strings that EMBED titles
+    - hold details, the pastable retitle commands, the holder labels inside
+    `holders` - are scrubbed here, because anonymize_report only knows field
+    names and a title inside a sentence is not a field.
+    """
+    out = {k: v for k, v in m.items() if k != "rows"}
+    out["rows"] = [{k: v for k, v in r.items()
+                    if k not in ("pre_b64", "post_b64")}
+                   for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        out = anonymize_report(env, out)
+
+        def _scrub(s):
+            return anonymize(env, s) if isinstance(s, str) else s
+
+        def _scrub_label(s):
+            if isinstance(s, str) and "@" in s:
+                return _anon_label("account", s)
+            return _scrub(s)
+
+        for h in out.get("holds") or []:
+            if isinstance(h, dict):
+                h["detail"] = _scrub(h.get("detail"))
+                h["retitle"] = _scrub(h.get("retitle"))
+        for note in out.get("notes") or []:
+            if isinstance(note, dict):
+                note["retitle"] = _scrub(note.get("retitle"))
+        for r in out["rows"]:
+            if isinstance(r.get("holders"), list):
+                r["holders"] = [_scrub_label(x) for x in r["holders"]]
+            if isinstance(r.get("skip_detail"), str):
+                r["skip_detail"] = _scrub(r["skip_detail"])
+    return out
+
+
+def _print_converge_report(say, m):
+    """The plan: destinations first (the resolution is visible before
+    anything is written), then the rows grouped by destination account, then
+    the disagreement notes and holds with their pastable fixes, ending with
+    the truthful completeness line. M is the PUBLIC manifest."""
+    say("destinations:")
+    for d in m.get("destinations", []):
+        say("   {0:<44} {1}".format(d.get("label", ""), d.get("path", "")))
+    for nd in m.get("non_destinations", []):
+        say("   {0:<44} NOT a destination - every org directory under it is "
+            "empty, so there is no evidence which one is real"
+            .format(nd.get("label", "")))
+    say("")
+    rows = m.get("rows", [])
+    holds = m.get("holds", [])
+    if not rows and not holds:
+        say("nothing to do - every eligible conversation already opens from "
+            "every destination sidebar")
+    for d in m.get("destinations", []):
+        mine = [r for r in rows if r.get("account") == d.get("account")]
+        if not mine:
+            continue
+        say("-> {0}".format(d.get("label", "")))
+        for r in mine:
+            line = "   {0}  {1!r}   held by: {2}".format(
+                (r.get("session") or "")[:8], r.get("title", ""),
+                ", ".join(r.get("holders") or []))
+            if r.get("skipped"):
+                line += "   [{0}: {1}]".format(r["skipped"],
+                                               r.get("skip_detail", ""))
+            say(line)
+        say("")
+    for note in m.get("notes", []):
+        say("titles disagree across the holders of {0}; the newest "
+            "activity's title {1!r} is used, the minority copies keep "
+            "theirs:".format((note.get("session") or "")[:8],
+                             note.get("title", "")))
+        for e in note.get("holder_titles", []):
+            say("   {0}   {1!r}".format(e.get("label", ""),
+                                        e.get("title", "")))
+        say("   level them: {0}".format(note.get("retitle", "")))
+        say("")
+    if holds:
+        say("held - not applied, each with its fix:")
+        for h in holds:
+            say("   {0} -> {1}: {2} - {3}".format(
+                (h.get("session") or "")[:8], h.get("label", ""),
+                h.get("reason", ""), h.get("detail", "")))
+            if h.get("retitle"):
+                say("      {0}".format(h["retitle"]))
+        say("")
+    c = m.get("complete", {})
+    say("complete{0} : {1} of {2}  ->  {3} of {2}   ({4} held)".format(
+        " (scoped to --only)" if c.get("scoped") else "",
+        c.get("now"), c.get("of"), c.get("after"), c.get("held")))
+    if m.get("dead_excluded"):
+        say("({0} dead conversation(s) excluded from the count - rows exist "
+            "but the transcript is gone; 'doctor' reports them)"
+            .format(m["dead_excluded"]))
+
+
+def cmd_converge(env, ns):
+    flags = ConvergeFlags(only=ns.only, live=ns.live)
+    m = plan_converge(env, flags)
+
+    def say(line):
+        """cmd_new_row's wrapper, for the same two reasons: the report is
+        mostly titles (arbitrary text), and piped Windows stdout is the
+        console codepage, where an unprintable character must become a
+        replacement character rather than a traceback."""
+        text = line if ns.verbose else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
+    if not ns.json:
+        # Report BEFORE the write, as cmd_new_row orders it: the destination
+        # resolution is the plan's one derived judgement, and it must be on
+        # screen before anything lands in a store.
+        _print_converge_report(say, _public_converge_manifest(env, m))
+        if ns.apply:
+            say("")
+
+    final = None
+    if ns.apply:
+        # A zero-row plan skips run_converge the way cmd_sync skips run_sync:
+        # there is nothing to journal, and "nothing to do is not an error".
+        final = run_converge(env, m) if m["rows"] else "unchanged"
+
+    def holds_remain():
+        # Plan-time holds plus pairs the apply-time re-check held. Exit 3 is
+        # the documented partial code for a run with holds - "bulk and
+        # unattended" is exactly where a status code gets trusted without
+        # reading prose.
+        return bool(m.get("holds")) or any(
+            r.get("skipped") == "held_title_collision"
+            for r in m.get("rows", []))
+
+    if ns.json:
+        pub = _public_converge_manifest(env, m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        if final is None:
+            return 0
+        if final not in ("completed", "unchanged"):
+            return 1
+        return 3 if holds_remain() else 0
+
+    if final is None:
+        say("\ndry run - pass --apply to create the rows")
+        return 0
+    created = sum(1 for r in m["rows"] if r.get("written"))
+    say("result  : {0}".format(final))
+    say("created : {0} row(s)".format(created))
+    for r in m["rows"]:
+        if r.get("skipped"):
+            say("skipped : {0} -> {1}: {2} - {3}".format(
+                (r.get("session") or "")[:8], r.get("label", ""),
+                r["skipped"], r.get("skip_detail", "")))
+    if final == "unchanged":
+        say("nothing was written, so no operation was journalled and there "
+            "is nothing to undo.")
+    elif final == "completed" and created:
+        say("Reopen the app - the sessions appear in every destination "
+            "sidebar. 'undo' removes the created rows again.")
+    if final not in ("completed", "unchanged"):
+        return 1
+    if holds_remain():
+        say("exit 3: hold(s) remain - each is listed above with the fix "
+            "that clears it.")
+        return 3
+    return 0
 
 
 if __name__ == "__main__":
