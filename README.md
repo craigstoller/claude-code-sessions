@@ -124,7 +124,7 @@ if a refusal names that process, fully exit Chrome too (the refusal always names
 
 ## Usage
 
-Eleven commands. All mutating commands default to a dry run; add `--apply` to execute.
+Twelve commands. All mutating commands default to a dry run; add `--apply` to execute.
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
@@ -421,6 +421,56 @@ is always a preview will misread `sync --apply --json`.
   app is enough to fix it.
 - Sign into the other account (or restart the app) to see the results.
 
+**`converge`** — create the missing sidebar rows so every conversation any account can open is
+openable from *every* account:
+
+```
+claude-code-sessions converge --apply
+```
+
+`sync` copies rows **from the account you are signed into** into one other account, so levelling
+three sidebars means signing into each in turn, app closed for every write. The recurring chore
+is narrower than sync: new sessions exist only where they were created, so `alignment`'s
+*complete* line decays with every burst of work in one account — measured, 21 conversations went
+short within two days of full convergence. `converge` derives the whole target set itself —
+every (conversation, account) pair where the transcript is on disk, *some* account holds a row,
+and that account holds none — and creates exactly those rows in one pass, from any holder,
+without the sign-in dance. There is deliberately no `--to`, `--from`, or `--store`: naming a
+direction is the interface this command exists to delete. `--only` narrows to one conversation,
+resolved the way `retitle --only` is.
+
+**Purely additive.** It never repoints (accounts that disagree about what a row opens keep their
+disagreement — measured across four such groups, both sides held real unique work, so "pick a
+winner" destroys by construction), never refreshes (a stale row is `sync --update`'s job), never
+deletes, never resurrects. Each new row is synthesized from the transcript the way `new-row`
+builds one — nothing is cloned from a holding account, so focus times, archive flags, and
+permission state never cross accounts. The title comes from the holder whose row shows the
+newest conversation activity; when holders disagree about the name, the plan flags it and prints
+the `retitle` command that would level them.
+
+A pair is **held** — reported with a reason, never silently skipped, never fatal to the rest —
+when creating the row would damage the destination sidebar: chiefly when the chosen title
+already names a *different* conversation there. The comparison is the same trimmed-exact
+comparator `alignment` counts duplicates with, so a converge can never raise that count — and
+there is deliberately no auto-suffix, because a `(2)` is a collision avoided, not a name. Each
+hold prints the colliding row and a pastable fix, and an applied run that ends with holds
+**exits 3**: bulk and unattended is exactly where an exit code gets trusted without reading
+prose. The plan ends with truthful math projected from what will actually be written —
+`complete : 337 of 359 -> 356 of 359 (3 held)` — never a promised full house.
+
+The whole run is one journalled operation, and every guard — the running-app check, identity
+resolution, store re-discovery, per-pair revalidation — passes *before* the record is written,
+so a refused or zero-write run (everything already present, or everything held) leaves no
+journal residue at all. An interrupted run recovers in both directions: `recover --back`
+removes the rows it created, `recover --forward` re-evaluates the remaining pairs against the
+store as it stands rather than replaying the plan. `undo` of a completed converge is
+deliberately *forgiving* where `retitle`'s is all-or-nothing: it removes the rows the op
+created but skips, by name, a row that is now the conversation's only pointer in any account,
+a row someone has repointed, and a row someone has retitled since — presence it created that
+stopped being redundant is presence it leaves alone. `doctor`'s vanished-row check watches
+converge-created rows the same way it watches `new-row`'s, with the same journal-retention
+window.
+
 ## Safety design
 
 - **Dry-run by default.** Every mutating command prints its plan and does nothing until you
@@ -643,6 +693,23 @@ window into `journaled`/`completed`/`rolled_back`.
   public. It refuses to combine with `--verbose` (which bypasses redaction) and with `--apply`
   (a substituted title must never be mistaken for real data), which keeps it strictly a display
   concern.
+- **0.12.0 adds `converge`.** The case is a chore with a measured recurrence: making every
+  conversation openable from every sidebar meant generating a shell script of `new-row` calls —
+  28, then 30, then a pending ~22, three times in one week — because `sync` only copies *from*
+  the signed-in account and no command said "level them all" in one word. Each script had to
+  rediscover the same four things (full store paths, because an account id matches several org
+  directories; explicit titles, because derived ones collide; a tolerant-rerun wrapper, because
+  "already there" is success on a rerun; a per-call journal, because there was no batch op);
+  `converge` owns all four once — and the chore is permanent, because new sessions exist only
+  where they were created and the *complete* count decays with every burst of work in one
+  account. It is purely additive — never repoints, refreshes, deletes, or resurrects — which is
+  why it may read and write every store in one pass without sync's sign-in dance. A title
+  collision **holds** the pair rather than spreading a duplicate (the comparator is
+  `alignment`'s own, so *distinguishable* cannot move by construction), every hold prints its
+  pastable `retitle` fix, and an applied run with holds exits 3. Its undo is deliberately
+  forgiving where `retitle`'s is all-or-nothing: it removes the rows the op created except one
+  that became the conversation's last pointer anywhere, or that someone repointed or retitled
+  since — deleting those would destroy work the undo was never asked to touch.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
