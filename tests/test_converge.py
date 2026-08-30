@@ -1153,6 +1153,141 @@ def test_warning_then_clean_apply_when_disagreement_clears(
     assert len(store_rows(env, A2, O2)) == 2
 
 
+# ------------------------------------ 0.13.0: --live resolves at account scope
+
+# The spec's fake pair, shaped so the anchored-prefix rules are visible:
+# account ids aaaa1111.../bbbb2222..., org ids cccc3333.../dddd4444.... LA
+# deliberately ENDS in its own first group, so a mid-uuid fragment like
+# '1111/cccc' sits inside its normalized store path as a real SUBSTRING -
+# which is how test 9 can prove pair-shaped queries never fall back to
+# substring matching.
+LA = "aaaa1111-0000-4000-8000-0000aaaa1111"
+LOA = "cccc3333-0000-4000-8000-000000000003"
+LB = "bbbb2222-0000-4000-8000-000000000002"
+LOB = "dddd4444-0000-4000-8000-000000000004"
+
+
+def live_pair_env(mkenv, tmp_path, write_transcript, write_row):
+    """Two accounts holding one conversation each, the identity files
+    disagreeing about which is signed in (oauth: LA, config: LB)."""
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, t_entries())
+    write_transcript(env, "C--p", S2, t_entries())
+    write_row(env, 0, LA, LOA, "local_s1", row_data(S1, "ACME-REVIEW"))
+    write_row(env, 0, LB, LOB, "local_s2", row_data(S2, "Northwind"))
+    identity_files(env, LA, LB)
+    return env
+
+
+def test_printed_pair_form_resolves_live(mkenv, tmp_path, write_transcript,
+                                         write_row):
+    """`--live "aaaa1111/cccc3333"` - the exact form every report prints -
+    resolves under a disagreement."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    acc = ct._resolve_live_assertion(env, "aaaa1111/cccc3333",
+                                     ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LA
+    assert acc.resolved_from == "user"
+
+
+def test_full_uuid_pair_form_resolves_live(mkenv, tmp_path, write_transcript,
+                                           write_row):
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    acc = ct._resolve_live_assertion(env, LA + "/" + LOA,
+                                     ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LA
+
+
+def test_arbitrary_prefix_pair_resolves(mkenv, tmp_path, write_transcript,
+                                        write_row):
+    """Anchored prefixes are what a human shortening an id actually types."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    acc = ct._resolve_live_assertion(env, "aaaa/cccc", ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LA
+
+
+def test_mid_uuid_fragment_pair_is_refused(mkenv, tmp_path, write_transcript,
+                                           write_row):
+    """'1111/cccc' IS a substring of LA's normalized store path (the uuid
+    ends in aaa1111, the org starts cccc3333), so acceptance here would
+    prove a silent fall back into substring semantics. It must instead get
+    the ordinary no-match refusal, with the candidate listing."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._resolve_live_assertion(env, "1111/cccc", ct._account_dirs(env),
+                                   account_scope=True)
+    msg = str(exc.value)
+    assert "matched neither account" in msg
+    assert LA[:8] in msg and LB[:8] in msg
+
+
+def test_non_hex_slash_query_stays_substring(mkenv, tmp_path,
+                                             write_transcript, write_row):
+    """A one-slash query with a non-hex half is NOT pair-shaped; it keeps
+    substring semantics, paths included - 'sessions/aaaa1111' names LA's
+    store the way a pasted path fragment always has. (Were it misread as a
+    pair, 'sessions' prefixes no account uuid and it would refuse.)"""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    acc = ct._resolve_live_assertion(env, "sessions/aaaa1111",
+                                     ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LA
+
+
+def test_email_live_accepted_at_account_scope(mkenv, tmp_path,
+                                              write_transcript, write_row):
+    """The measured refusal this change deletes: an email - the natural way
+    a person names an account, unambiguous as one - was refused for
+    matching the account's three org dirs. At account scope it resolves,
+    and the returned Account carries EMPTY org and path: the assertion is
+    account-level, so the label reads aaaa1111/- rather than a concrete
+    pair a user might trust or re-paste."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    for org in ("eeee5555-0000-4000-8000-000000000005",
+                "ffff6666-0000-4000-8000-000000000006"):
+        os.makedirs(os.path.join(env.store_candidates[0], LA, org))
+    acc = ct._resolve_live_assertion(env, "alice@example.com",
+                                     ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LA
+    assert acc.org_uuid == "" and acc.path == ""
+    assert "{0}/{1}".format(acc.account_uuid[:8],
+                            acc.org_uuid[:8] or "-") == "aaaa1111/-"
+    m = ct.plan_converge(env, ct.ConvergeFlags(live="alice@example.com"))
+    assert m["live_asserted"] == LA
+
+
+def test_account_scope_works_with_no_store_dirs(mkenv, tmp_path,
+                                                write_transcript, write_row):
+    """An account whose store dirs are missing entirely is still assertable
+    by uuid or email: the PRINCIPAL exists even when no directory does -
+    the edge a store-backed resolver could never cover."""
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, t_entries())
+    write_row(env, 0, LA, LOA, "local_s1", row_data(S1, "ACME-REVIEW"))
+    identity_files(env, LA, LB)          # LB owns no directory anywhere
+    acc = ct._resolve_live_assertion(env, "bbbb2222", ct._account_dirs(env),
+                                     account_scope=True)
+    assert acc.account_uuid == LB
+    assert acc.org_uuid == "" and acc.path == ""
+    m = ct.plan_converge(env, ct.ConvergeFlags(live="bbbb2222"))
+    assert m["live_asserted"] == LB
+
+
+def test_account_scope_refuses_across_accounts(mkenv, tmp_path,
+                                               write_transcript, write_row):
+    """A string matching BOTH principals refuses even at account scope -
+    widening what one account's principal absorbs never widens what an
+    ambiguous string selects."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    with pytest.raises(ct.Refusal, match="matches both accounts"):
+        ct._resolve_live_assertion(env, "-0000-", ct._account_dirs(env),
+                                   account_scope=True)
+
+
 def test_remedy_lines_fall_back_when_emails_collide(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """Two accounts under one address would print two identical, unusable

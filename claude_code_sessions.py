@@ -4917,7 +4917,47 @@ def _pair_matches(pair, account_uuid, org_uuid):
             and org_uuid.lower().startswith(right))
 
 
-def _resolve_live_assertion(env, live, dirs):
+def _principal_matches(query, pair, uuid, email, own_dirs):
+    """Whether one account's PRINCIPAL - its uuid, its email where known,
+    and every store dir it owns - matches the user's string.
+
+    Pair-shaped queries resolve per _pair_query against the principal's own
+    (account, org) dirs; anything else is a substring of the principal's
+    combined uuid/email/org/path text. Paths are folded through
+    _path_match_key on both sides for the reason that function documents:
+    the fragments this tool prints, and a person pastes back, carry forward
+    slashes whatever the platform's separator is.
+    """
+    if pair is not None:
+        return any(_pair_matches(pair, a, o) for a, o, _p in own_dirs)
+    want = _path_match_key(query)
+    hay = " ".join([uuid, email or ""]
+                   + [o for _a, o, _p in own_dirs]
+                   + [_path_match_key(p) for _a, _o, p in own_dirs]).lower()
+    return want in hay
+
+
+def _principal_listing(principals):
+    """The candidate listing grouped per ACCOUNT, for account-scope --live
+    refusals: each account's header line (email where known, then id), its
+    org half rendered '-' because the assertion is account-level, then its
+    stores. An account with no store directory is still listed - and named
+    still assertable - because the principal exists even when no directory
+    does."""
+    lines = []
+    for u, email, own in principals:
+        lines.append("   {0} ({1}/-)".format(email, u[:8]) if email
+                     else "   {0}/-".format(u[:8]))
+        for a, o, p in own:
+            lines.append("   " + _candidate_line(a, o, p,
+                                                 _listing_row_count(p)))
+        if not own:
+            lines.append("      (no store directory on disk - still "
+                         "assertable by its id or email)")
+    return "\n".join(lines)
+
+
+def _resolve_live_assertion(env, live, dirs, account_scope=False):
     """The Account the user certifies as desktop-live via --live (RULING 5).
 
     The certified fact is deliberately narrow: "this is the account the
@@ -4938,13 +4978,32 @@ def _resolve_live_assertion(env, live, dirs):
     unnecessary, and the no-evidence and config-only-ambiguous-org states
     would have it certify a bit no file corroborates at all.
 
-    Matching reuses --to's disambiguation semantics over the two named
-    accounts' on-disk stores - a pair-shaped value resolves as the printed
-    account form (_pair_query), anything else as a substring - with one
-    addition: an empty or whitespace-only value is refused outright -
-    substring containment would make it match every candidate, which on a
-    one-candidate machine is exactly the bare force flag this design
-    refuses to be.
+    ACCOUNT_SCOPE (converge passes True; sync, repoint, new-row and retitle
+    keep the store-strict default) resolves the ACCOUNT rather than a
+    store. The certified fact was always account-level - config.json does
+    not even record an org - yet the store-strict matching refused an email
+    (the natural way a person names an account, and unambiguous as one) for
+    matching the account's three org directories. At account scope the
+    string is matched against each disagreeing account's PRINCIPAL - uuid,
+    email where known, every store dir it owns (_principal_matches) - and
+    exactly one principal matching is acceptance; both or neither keep the
+    refusals, with the listing grouped per account. The returned Account
+    carries an EMPTY org and path: nothing consumes a display
+    representative (converge's recheck tests the account uuid, the labels
+    take the email and render a missing org as nothing), a guessed concrete
+    pair is something a user might trust or re-paste, and an account whose
+    store dirs are missing entirely stays assertable, because the principal
+    exists even when no directory does. Sync stays store-strict because its
+    resolved store is the SOURCE it reads - there the org half is
+    load-bearing.
+
+    Store-scope matching reuses --to's disambiguation semantics over the
+    two named accounts' on-disk stores - a pair-shaped value resolves as
+    the printed account form (_pair_query), anything else as a substring -
+    with one addition: an empty or whitespace-only value is refused
+    outright - substring containment would make it match every candidate,
+    which on a one-candidate machine is exactly the bare force flag this
+    design refuses to be.
     """
     if not live.strip():
         raise Refusal(
@@ -4969,6 +5028,33 @@ def _resolve_live_assertion(env, live, dirs):
             "then /login) so a file names the account, then re-run without --live.")
     oauth_uuid, config_uuid = dis
     oauth_email = _oauth_email_for(env, oauth_uuid)
+    if account_scope:
+        pair = _pair_query(live)
+        principals = [
+            (u,
+             (oauth_email if u == oauth_uuid and oauth_email
+              else account_email(env, u)[0]),
+             [(a, o, p) for a, o, p in dirs if a == u])
+            for u in (oauth_uuid, config_uuid)]
+        matched = [pr for pr in principals
+                   if _principal_matches(live, pair, *pr)]
+        if len(matched) == 1:
+            u, email, _own = matched[0]
+            return Account(u, "", email, "", "user")
+        listing = _principal_listing(principals)
+        if matched:
+            raise Refusal(
+                "--live {0!r} matches both accounts the disagreeing "
+                "identity files name; be more specific - an email, a "
+                "longer id, or the printed account form, e.g. "
+                "'aaaa1111/cccc3333':\n{1}".format(live, listing))
+        raise Refusal(
+            "--live {0!r} matched neither account the disagreeing identity "
+            "files name ({1}, {2}). If it names some other account: an "
+            "account named by neither file is evidence of something else "
+            "being wrong - investigate before writing. The two named "
+            "accounts:\n{3}".format(live, oauth_uuid[:8], config_uuid[:8],
+                                    listing))
     cands = []
     for a, o, p in dirs:
         if a not in (oauth_uuid, config_uuid):
@@ -10073,7 +10159,12 @@ def plan_converge(env, flags):
     # files fresh under the lock, in both directions.
     dis = _identity_disagreement(env)
     if flags.live:
-        live = _resolve_live_assertion(env, flags.live, _account_dirs(env))
+        # account_scope: converge consumes the account uuid (the recheck's
+        # membership test) and the email (the scan's labels) - never a
+        # store, so --live here asserts the account-level fact RULING 5
+        # actually certifies. See _resolve_live_assertion.
+        live = _resolve_live_assertion(env, flags.live, _account_dirs(env),
+                                       account_scope=True)
     else:
         live = live_account(env)
     # Strict machine-wide scan - refuses on ANY unreadable row, because both

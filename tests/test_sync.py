@@ -2643,6 +2643,26 @@ class TestLiveOverride:
         assert source.resolved_from == "user"
         assert os.path.normcase(source.path) == os.path.normcase(dst)
 
+    def test_email_live_still_store_strict_for_sync(self, two_account_env,
+                                                    tmp_path):
+        """Account-scope resolution is converge's (0.13.0 change 3a); sync
+        keeps the store-strict default, because the resolved store is the
+        SOURCE sync reads - there the org half is load-bearing. The same
+        email converge accepts still refuses here, with the N-stores
+        listing now carrying the pair-form hint."""
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        for org in ("eeeeeeee-0000-0000-0000-000000000007",
+                    "ffffffff-0000-0000-0000-000000000008"):
+            os.makedirs(os.path.join(env.store_candidates[0], SOURCE_ACCT,
+                                     org))
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, live="me@example.com")
+        msg = str(exc.value)
+        assert "matched 3 stores" in msg
+        assert "be more specific" in msg
+        assert "printed account form works too" in msg
+
     def test_matching_by_recovered_email_works(self, two_account_env, tmp_path):
         env, src, dst = two_account_env(tmp_path)
         self._e4(env)
