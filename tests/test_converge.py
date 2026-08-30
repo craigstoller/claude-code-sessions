@@ -2283,6 +2283,113 @@ def test_holds_free_plan_adds_no_measurement_reads(
     assert calls["fingerprints"] == []
 
 
+def test_apply_time_hold_carries_no_measured_key(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 11d: the apply-time re-check hold keeps its 0.13.0 shape -
+    no `measured` key. Re-measuring under the lock would add I/O to the
+    write path for a message."""
+    env = _monotonic_now(mkenv(tmp_path))
+    mixed_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    write_row(env, 0, A3, O3, "local_late", row_data(S3.replace("a", "b", 1),
+                                                     "ACME-REVIEW"))
+    assert ct.run_converge(env, m) == "completed"
+    held = [r for r in m["rows"]
+            if r["session"] == S1 and r["account"] == A3]
+    assert held[0]["skipped"] == "held_title_collision"
+    assert "measured" not in held[0]
+    assert "measured_line" not in held[0]
+    pub = ct._public_converge_manifest(env, m)
+    skipped = [r for r in pub["rows"] if r.get("skipped")]
+    assert skipped and all("measured" not in r for r in skipped)
+
+
+MEASURED_KEYS = {"classification", "reason", "superseded", "current",
+                 "shared", "a", "a_total", "b", "b_total",
+                 "suggested_title", "degrade_reason", "command_runnable"}
+
+
+def json_holds(env, capsys):
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    holds = [h for h in payload["holds"]
+             if h["reason"] == "held_title_collision"]
+    assert holds
+    for h in holds:
+        assert set(h["measured"]) == MEASURED_KEYS
+    return holds
+
+
+def test_json_measured_schema(mkenv, tmp_path, write_transcript, write_row,
+                              capsys):
+    """Spec test 26: the full `measured` object per class - a runnable
+    supersession, a DEGRADED supersession, a distinct pair, a one-sided
+    unmeasured pair - nullability per §4, parseable."""
+    env = mkenv(tmp_path / "runnable")
+    measured_pair(env, write_transcript, write_row)
+    for h in json_holds(env, capsys):
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["reason"] is None
+        assert mm["superseded"] == S1 and mm["current"] == S2
+        assert isinstance(mm["shared"], int)
+        assert isinstance(mm["a_total"], int) and isinstance(
+            mm["b_total"], int)
+        assert mm["suggested_title"] == SUGGESTED
+        assert mm["degrade_reason"] is None
+        assert mm["command_runnable"] is True
+        assert h["retitle"].endswith('--title "{0}" --apply'.format(
+            SUGGESTED))
+
+    env = mkenv(tmp_path / "degraded")
+    measured_pair(env, write_transcript, write_row, title="ACME $ review")
+    for h in json_holds(env, capsys):
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["command_runnable"] is False
+        assert mm["degrade_reason"] == "title not shell-safe"
+        assert mm["suggested_title"] == "ACME $ review - earlier leg " \
+                                        "(Aug 24-28)"
+        assert "<new title>" in h["retitle"]
+
+    env = mkenv(tmp_path / "distinct")
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(turn_labels("a", 10)))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(turn_labels("b", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    for h in json_holds(env, capsys):
+        mm = h["measured"]
+        assert mm["classification"] == "distinct"
+        assert mm["reason"] is None
+        assert mm["superseded"] is None and mm["current"] is None
+        assert (mm["shared"], mm["a_total"], mm["b_total"]) == (0, 10, 10)
+        assert mm["suggested_title"] is None
+        assert mm["command_runnable"] is False
+
+    env = mkenv(tmp_path / "onesided")
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(turn_labels("a", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_dead", row_data(S3, T_COLL))
+    for h in json_holds(env, capsys):
+        mm = h["measured"]
+        assert mm["classification"] == "unmeasured"
+        assert mm["reason"] == "no transcript"
+        assert {mm["a"], mm["b"]} == {S1, S3}
+        assert mm["shared"] is None
+        assert mm["a_total"] is None and mm["b_total"] is None
+        assert mm["command_runnable"] is False
+
+
 def test_title_validation_is_retitles_own(mkenv, tmp_path, write_transcript,
                                           write_row, monkeypatch):
     """Spec test 15: generation routes through _valid_new_title rather than

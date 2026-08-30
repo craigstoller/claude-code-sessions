@@ -2715,6 +2715,19 @@ def _anon_pairs(env):
         t = (data.get("title") or "").strip()
         if len(t) >= _ANON_MIN:
             seen[t] = _anon_label("session", t)
+            # A stored title wearing the EXACT generated leg suffix (see
+            # _LEG_SUFFIX_RE) also contributes its stripped base: converge's
+            # suffix-REPLACEMENT path generates '<base> - earlier leg
+            # (<new range>)', which contains no stored title verbatim - the
+            # stored one carries the old range - so without this pair the
+            # base would survive anonymisation in the one path where the
+            # design's "the base is a stored title" argument does not hold.
+            # Exact-grammar matching keeps this from chewing prose: the
+            # suffix is tool provenance, so the base is title-derived
+            # content, not a coincidental fragment.
+            stripped = _LEG_SUFFIX_RE.sub("", t)
+            if stripped != t and len(stripped) >= _ANON_MIN:
+                seen.setdefault(stripped, _anon_label("session", stripped))
     # WHOLE cwd paths, not name fragments. The first version split the encoded
     # folder name on "-" and mapped the last piece, which turned
     # "…\Northwind Plastic Surgery" into
@@ -2735,7 +2748,8 @@ def _anon_pairs(env):
     return pairs
 
 
-_ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title")
+_ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
+                "suggested_title")
 _ANON_EMAIL_FIELDS = ("label", "email", "account_email")
 
 

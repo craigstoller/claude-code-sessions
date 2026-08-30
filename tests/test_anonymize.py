@@ -126,3 +126,62 @@ def test_anonymize_with_verbose_is_refused(mkenv, tmp_path, capsys):
     rc = ct.main(["list", "--anonymize", "--verbose"])
     assert rc == 2
     assert "contradict" in capsys.readouterr().err
+
+
+# ------------------- 0.14.0: measured hold remedies (hold-remedies design)
+
+def test_anonymized_output_is_never_runnable(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 25e: anonymized reports are display artifacts. The rendered
+    command necessarily carries an opaque label where the title was - a
+    command that would literally rename a conversation to that label - so
+    `command_runnable` is forced false under --anonymize."""
+    from test_converge import cv_ns, measured_pair
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    holds = [h for h in payload["holds"]
+             if h["reason"] == "held_title_collision"]
+    assert len(holds) == 2
+    for h in holds:
+        assert h["measured"]["command_runnable"] is False
+        assert "ACME-REVIEW" not in h["retitle"]
+        assert "<session-" in h["retitle"]
+        assert "earlier leg" in h["retitle"]
+
+
+def test_anonymize_covers_the_rendered_command(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 27: under --anonymize the generated title survives in
+    neither the measured line, the suggested_title field, nor the rendered
+    retitle string - text or JSON - INCLUDING the suffix-replacement path,
+    where the generated title's base is a stored title's stripped base
+    rather than any stored title verbatim."""
+    from test_converge import cv_ns, measured_pair
+    for sub, title in (("plain", "ACME-REVIEW session"),
+                       ("worn", "ACME-REVIEW session - earlier leg "
+                                "(Aug 1-3)")):
+        env = mkenv(tmp_path / sub)
+        measured_pair(env, write_transcript, write_row, title=title)
+        ct._ANONYMIZE = True
+        ct._ANON_CACHE.clear()
+        rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "ACME-REVIEW" not in out
+        assert "<session-" in out
+        rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+        payload = capsys.readouterr().out
+        assert rc == 0
+        assert "ACME-REVIEW" not in payload
+        holds = [h for h in json.loads(payload)["holds"]
+                 if h["reason"] == "held_title_collision"]
+        for h in holds:
+            assert "ACME-REVIEW" not in (h["measured"]["suggested_title"]
+                                         or "")
+            assert "ACME-REVIEW" not in h["retitle"]
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
