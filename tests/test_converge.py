@@ -1996,6 +1996,75 @@ def test_two_different_targets_cannot_share_a_suggestion(
     assert all(mm["suggested_title"] is None for mm in second)
 
 
+def counting_measure(monkeypatch):
+    """Instrument the measurement layer: census-excluded groups must never
+    reach _measure_fingerprints at all, and added READS are visible at the
+    _measure_load seam."""
+    calls = {"fingerprints": [], "loads": []}
+    real_fp = ct._measure_fingerprints
+    real_load = ct._measure_load
+
+    def fp(env, sid, cache, budget):
+        calls["fingerprints"].append(sid)
+        return real_fp(env, sid, cache, budget)
+
+    def load(path):
+        calls["loads"].append(path)
+        return real_load(path)
+    monkeypatch.setattr(ct, "_measure_fingerprints", fp)
+    monkeypatch.setattr(ct, "_measure_load", load)
+    return calls
+
+
+def test_three_leg_group_degrades_every_hold(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Spec test 11c: three conversations on one title_key form a collision
+    graph no single rename clears - every hold degrades wholesale, and
+    nothing is fingerprinted for the group."""
+    env = mkenv(tmp_path)
+    calls = counting_measure(monkeypatch)
+    for i, (sid, acct, org) in enumerate(((S1, A1, O1), (S2, A2, O2),
+                                          (S3, A3, O3))):
+        write_transcript(env, "C--p", sid,
+                         prose_transcript(turn_labels("g{0}x".format(i), 10)))
+        write_row(env, 0, acct, org, "local_g{0}".format(i),
+                  row_data(sid, T_COLL, createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 25 + i)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 6
+    for h in held:
+        assert h["measured"]["classification"] == "unmeasured"
+        assert h["measured"]["reason"] == \
+            "more than two legs share this title"
+        assert h["measured"]["a_total"] is None
+        assert "<new title>" in h["retitle"]
+    assert calls["fingerprints"] == []
+    assert calls["loads"] == []
+
+
+def test_planned_three_way_collision_degrades(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 25b: three conversations whose CHOSEN titles coincide while
+    no existing row carries the key - untitled rows, one customTitle - are
+    caught by the same prepass census as a three-row group."""
+    env = mkenv(tmp_path)
+    for i, (sid, acct, org) in enumerate(((S1, A1, O1), (S2, A2, O2),
+                                          (S3, A3, O3))):
+        entries = prose_transcript(turn_labels("p{0}x".format(i), 10))
+        entries.append({"customTitle": T_COLL})
+        write_transcript(env, "C--p", sid, entries)
+        write_row(env, 0, acct, org, "local_p{0}".format(i),
+                  row_data(sid, "", createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 25 + i)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert held
+    assert all(h["measured"]["reason"] ==
+               "more than two legs share this title" for h in held)
+    assert all("already creates" in h["detail"] for h in held)
+
+
 def test_title_validation_is_retitles_own(mkenv, tmp_path, write_transcript,
                                           write_row, monkeypatch):
     """Spec test 15: generation routes through _valid_new_title rather than

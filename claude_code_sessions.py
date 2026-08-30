@@ -10294,6 +10294,19 @@ def _leg_span(sid, records):
     return (min(created), max(last))
 
 
+def _unmeasured_pair(sid_a, sid_b, reason):
+    """The `measured` object's unmeasured shape (§4): the pair's sids are
+    always present once a pair exists; everything derived is null. REASON is
+    the fixed classification-level vocabulary - never a title or a path,
+    which is what keeps --anonymize trivially safe for reasons."""
+    return {"classification": "unmeasured", "reason": reason,
+            "superseded": None, "current": None,
+            "shared": None, "a": sid_a, "a_total": None,
+            "b": sid_b, "b_total": None,
+            "suggested_title": None, "degrade_reason": None,
+            "command_runnable": False}
+
+
 def _overlap_verdict(env, sid_a, sid_b, records, cache, budget):
     """The `measured` object for one collision pair (§2, §4): classification
     supersession / distinct / unmeasured, the superseded side picked by
@@ -10321,12 +10334,7 @@ def _overlap_verdict(env, sid_a, sid_b, records, cache, budget):
     Title generation is deliberately NOT here: B2 (row retirement) consumes
     this verdict without it. The three generation fields come back neutral
     and the collision hold's composer fills them in."""
-    out = {"classification": "unmeasured", "reason": None,
-           "superseded": None, "current": None,
-           "shared": None, "a": sid_a, "a_total": None,
-           "b": sid_b, "b_total": None,
-           "suggested_title": None, "degrade_reason": None,
-           "command_runnable": False}
+    out = _unmeasured_pair(sid_a, sid_b, None)
     st_a, why_a, fps_a = _measure_fingerprints(env, sid_a, cache, budget)
     st_b, why_b, fps_b = _measure_fingerprints(env, sid_b, cache, budget)
     if st_a != "ok" or st_b != "ok":
@@ -10520,7 +10528,7 @@ def _measured_line(mm, records):
 
 
 def _measure_collision_hold(env, hold, sid, other, title, records,
-                            conversations, cache, budget, suggested):
+                            conversations, group, cache, budget, suggested):
     """Measure one held_title_collision pair and attach the verdict to HOLD:
     the `measured` object (§4), the title-free `measured_line` the report
     prints, and - on a supersession whose §3 checks all pass - the complete
@@ -10529,12 +10537,23 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
     today's targets, because without a measured basis to redirect, current
     behavior is the honest default.
 
+    GROUP is the census of every conversation holding this title_key -
+    existing rows AND the plan's chosen titles. Three or more legs form a
+    complete collision graph where no single rename clears everything and
+    pairwise verdicts could disagree about who supersedes whom, so such a
+    group is not measured at all - checked before any fingerprinting.
+
     Advisory by construction, including against exceptions: the whole
     pipeline - measurement AND title generation - degrades to today's remedy
     plus 'measurement failed (<type>)' rather than raising. A plan that died
     on a corrupt transcript would convert advice into a guard nobody asked
     for."""
     try:
+        if len(group) > 2:
+            hold["measured"] = _unmeasured_pair(
+                sid, other, "more than two legs share this title")
+            hold["measured_line"] = hold["measured"]["reason"]
+            return
         mm = _overlap_verdict(env, sid, other, records, cache, budget)
         line = _measured_line(mm, records)
         if mm["classification"] == "supersession":
@@ -10563,14 +10582,8 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
                 # "earlier" until a human notices.
                 hold["leg_suffix_note"] = True
     except Exception as exc:
-        mm = {"classification": "unmeasured",
-              "reason": "measurement failed ({0})".format(
-                  type(exc).__name__),
-              "superseded": None, "current": None,
-              "shared": None, "a": sid, "a_total": None,
-              "b": other, "b_total": None,
-              "suggested_title": None, "degrade_reason": None,
-              "command_runnable": False}
+        mm = _unmeasured_pair(sid, other, "measurement failed ({0})".format(
+            type(exc).__name__))
         line = mm["reason"]
     hold["measured"] = mm
     hold["measured_line"] = line
@@ -10733,12 +10746,35 @@ def plan_converge(env, flags):
     # already made, so two different targets can never share one name.
     measure_cache, measure_budget = {}, {"spent": 0}
     measure_suggested = {}       # title_key(generated) -> superseded sid
-    for sid, missing in short:
-        recs = eligible[sid]
-        holder_labels = sorted({rec.label for rec in recs})
+    # Facts and the chosen title first, for EVERY short conversation, so the
+    # leg census below can count this plan's chosen titles alongside
+    # existing rows before any hold is measured - a three-way shape-(b)
+    # collision (chosen titles coinciding while no row carries the key yet)
+    # is caught exactly like a three-row one (hold-remedies design §2).
+    prepared = {}
+    for sid, _missing in short:
         try:
             facts = _transcript_facts(env, sid, fps_cache=measure_cache)
         except Refusal as exc:
+            prepared[sid] = exc
+            continue
+        prepared[sid] = (facts,) + _converge_title(eligible[sid], facts)
+    key_legs = {}
+    for rec in records:
+        k = title_key(rec.data.get("title"))
+        cid = rec.data.get("cliSessionId") or ""
+        if k and cid:
+            key_legs.setdefault(k, set()).add(cid)
+    for sid, prep in prepared.items():
+        if not isinstance(prep, Refusal):
+            k = title_key(prep[1])
+            if k:
+                key_legs.setdefault(k, set()).add(sid)
+    for sid, missing in short:
+        recs = eligible[sid]
+        holder_labels = sorted({rec.label for rec in recs})
+        prep = prepared[sid]
+        if isinstance(prep, Refusal):
             # Not fatal to the rest (spec, "Holds"): a transcript that exists
             # but cannot populate a row - duplicated across project folders,
             # missing a cwd or a model, being written right now - holds this
@@ -10750,10 +10786,9 @@ def plan_converge(env, flags):
                 holds.append({"session": sid, "account": acct,
                               "label": dests[acct]["label"], "title": "",
                               "reason": "held_transcript_unusable",
-                              "detail": str(exc), "retitle": ""})
+                              "detail": str(prep), "retitle": ""})
             continue
-        title, title_source, disagree, holder_titles = _converge_title(recs,
-                                                                       facts)
+        facts, title, title_source, disagree, holder_titles = prep
         if disagree:
             notes.append({"session": sid, "title": title,
                           "holder_titles": holder_titles,
@@ -10785,6 +10820,7 @@ def plan_converge(env, flags):
                 # row with no sid measures as 'no transcript', which is true.
                 _measure_collision_hold(env, hold, sid, hit[0], title,
                                         records, conversations,
+                                        key_legs.get(k) or (),
                                         measure_cache, measure_budget,
                                         measure_suggested)
                 holds.append(hold)
@@ -10806,6 +10842,7 @@ def plan_converge(env, flags):
                     "retitle": _retitle_command(sid, "<new title>")}
                 _measure_collision_hold(env, hold, sid, planned, title,
                                         records, conversations,
+                                        key_legs.get(k) or (),
                                         measure_cache, measure_budget,
                                         measure_suggested)
                 holds.append(hold)
