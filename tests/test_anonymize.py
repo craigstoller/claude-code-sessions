@@ -183,5 +183,3 @@ def test_anonymize_covers_the_rendered_command(
             assert "ACME-REVIEW" not in (h["measured"]["suggested_title"]
                                          or "")
             assert "ACME-REVIEW" not in h["retitle"]
-        ct._ANONYMIZE = False
-        ct._ANON_CACHE.clear()

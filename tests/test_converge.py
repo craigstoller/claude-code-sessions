@@ -1735,7 +1735,9 @@ def test_band_edges(mkenv, tmp_path, write_transcript, write_row):
               row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
                        lastActivityAt=ms_local(2026, 8, 29)))
     m = ct.plan_converge(env, ct.ConvergeFlags())
-    for h in collision_holds(m):
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
         assert h["measured"]["classification"] == "supersession"
         assert h["measured"]["superseded"] == S1
 
@@ -1752,7 +1754,9 @@ def test_band_edges(mkenv, tmp_path, write_transcript, write_row):
               row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
                        lastActivityAt=ms_local(2026, 8, 29)))
     m = ct.plan_converge(env, ct.ConvergeFlags())
-    for h in collision_holds(m):
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
         assert h["measured"]["classification"] == "distinct"
 
 
@@ -1885,7 +1889,9 @@ def test_unprintable_title_drops_the_suggestion(
     env = mkenv(tmp_path / "bel")
     measured_pair(env, write_transcript, write_row, title="ACME\x07review")
     m = ct.plan_converge(env, ct.ConvergeFlags())
-    for h in collision_holds(m):
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
         mm = h["measured"]
         assert mm["degrade_reason"] == "title not printable"
         assert mm["suggested_title"] is None
@@ -1899,7 +1905,9 @@ def test_unprintable_title_drops_the_suggestion(
     env = mkenv(tmp_path / "nl")
     measured_pair(env, write_transcript, write_row, title="ACME\nreview")
     m = ct.plan_converge(env, ct.ConvergeFlags())
-    for h in collision_holds(m):
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
         assert h["measured"]["degrade_reason"] == "title not printable"
         assert h["measured"]["suggested_title"] is None
 
@@ -2283,6 +2291,142 @@ def test_holds_free_plan_adds_no_measurement_reads(
     assert m["rows"] and not m["holds"]
     assert calls["loads"] == []
     assert calls["fingerprints"] == []
+
+
+def test_refused_facts_leave_no_cache_entry(mkenv, tmp_path,
+                                            write_transcript, monkeypatch):
+    """A transcript appended-to during the facts read is refused as
+    describing 'no single version of the file' - and the fingerprints from
+    that torn read must not survive in the measurement cache, where a later
+    collision pair would classify from them confidently."""
+    env = mkenv(tmp_path)
+    path = write_transcript(env, "C--p", S1,
+                            prose_transcript(turn_labels("a", 10)))
+    real = ct._message_fingerprints
+
+    def read_that_races(p):
+        fps = real(p)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n")
+        return fps
+    monkeypatch.setattr(ct, "_message_fingerprints", read_that_races)
+    cache = {}
+    with pytest.raises(ct.Refusal, match="being written"):
+        ct._transcript_facts(env, S1, fps_cache=cache)
+    assert S1 not in cache
+
+
+def test_shell_unsafe_and_taken_nulls_the_suggestion(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A shell-unsafe title survives its degrade as prose ONLY when the
+    other checks pass - a name that is also taken is not a suggestion, and
+    handing it to the GUI would apply a title this feature itself rejects."""
+    env = mkenv(tmp_path)
+    unsafe = "ACME $ review"
+    measured_pair(env, write_transcript, write_row, title=unsafe)
+    write_row(env, 0, A1, O1, "local_taken",
+              row_data(PAD, unsafe + " - earlier leg (Aug 24-28)"))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        mm = h["measured"]
+        assert mm["degrade_reason"] == "suggested name already taken"
+        assert mm["suggested_title"] is None
+
+
+def test_suggestion_taken_by_a_planned_title_degrades(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The name-must-be-free check consults the plan's own chosen titles
+    too: a conversation whose transcript customTitle equals the would-be
+    suggestion is about to place rows under that very name."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    entries = prose_transcript(turn_labels("z", 10))
+    entries.append({"customTitle": SUGGESTED})
+    write_transcript(env, "C--p", S3, entries)
+    write_row(env, 0, A1, O1, "local_s3",
+              row_data(S3, "", createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 27)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in collision_holds(m)
+            if h["measured"]["classification"] == "supersession"]
+    assert held
+    for h in held:
+        assert h["measured"]["degrade_reason"] == \
+            "suggested name already taken"
+        assert h["measured"]["suggested_title"] is None
+    assert any(r["session"] == S3 and r["title"] == SUGGESTED
+               for r in m["rows"])
+
+
+def test_untitled_row_does_not_divide_the_leg(
+        mkenv, tmp_path, write_transcript, write_row):
+    """An untitled row on the superseded leg is not an intentional
+    difference a global rename would flatten - rows with no usable title do
+    not compete (the module's own _converge_title rule), so the remedy still
+    generates."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    write_row(env, 0, A3, O3, "local_s1b",
+              row_data(S1, "", createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 27)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in collision_holds(m)
+            if h["measured"]["classification"] == "supersession"]
+    assert held
+    for h in held:
+        assert h["measured"]["degrade_reason"] is None
+        assert h["measured"]["suggested_title"] == SUGGESTED
+        assert h["measured"]["command_runnable"] is True
+
+
+def test_exception_after_classification_keeps_todays_target(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """An exception in title generation degrades the WHOLE pipeline to
+    today's remedy - including the remedy's target, which must not stay
+    redirected on the authority of a measurement the hold itself declares
+    failed."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+
+    def boom(base, rows):
+        raise RuntimeError("synthetic")
+    monkeypatch.setattr(ct, "_superseded_leg_title", boom)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = {h["session"]: h for h in collision_holds(m)}
+    assert set(held) == {S1, S2}
+    for h in held.values():
+        assert h["measured"]["reason"] == "measurement failed (RuntimeError)"
+    # Shape (a)'s placeholder targets the BLOCKING row's conversation.
+    assert "--only {0}".format(S2[:8]) in held[S1]["retitle"]
+    assert "--only {0}".format(S1[:8]) in held[S2]["retitle"]
+
+
+def test_failed_side_stops_the_pair_before_the_other_read(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """When one side already failed, the pair can no longer classify -
+    reading the other side anyway would charge the plan-wide budget for
+    nothing and could starve later, measurable pairs."""
+    env = mkenv(tmp_path)
+    calls = counting_measure(monkeypatch)
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(turn_labels("a", 300)))
+    write_transcript(env, "C--p", S3,
+                     prose_transcript(turn_labels("c", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    for acct, org, name in ((A1, O1, "local_s3a"), (A2, O2, "local_s3b")):
+        write_row(env, 0, acct, org, name,
+                  row_data(S3, T_COLL, createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 29)))
+    # The held side's own transcript is over the cap (prefilled as failed);
+    # the small blocker must then not be read at all.
+    monkeypatch.setattr(ct, "TRANSCRIPT_COMPARE_MAX_BYTES", 5000)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "unreadable or too large", count=1)
+    assert calls["loads"] == []
 
 
 def test_apply_time_hold_carries_no_measured_key(

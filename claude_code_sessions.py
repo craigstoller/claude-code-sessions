@@ -2724,7 +2724,11 @@ def _anon_pairs(env):
             # design's "the base is a stored title" argument does not hold.
             # Exact-grammar matching keeps this from chewing prose: the
             # suffix is tool provenance, so the base is title-derived
-            # content, not a coincidental fragment.
+            # content, not a coincidental fragment. The residual - a very
+            # short generic base could still substring-match unrelated text,
+            # the hazard the WHOLE-paths comment below records - is accepted
+            # here because the alternative leaks the real title, and a
+            # partial anonymisation that reads as safe is the worse failure.
             stripped = _LEG_SUFFIX_RE.sub("", t)
             if stripped != t and len(stripped) >= _ANON_MIN:
                 seen.setdefault(stripped, _anon_label("session", stripped))
@@ -6029,9 +6033,6 @@ def _transcript_facts(env, session_id, fps_cache=None):
     except OSError as exc:
         raise Refusal("could not count the turns in {0}: {1}. Nothing was "
                       "written.".format(session_id, exc))
-    if fps_cache is not None:
-        fps_cache[session_id] = (("ok", None, fps) if fps is not None else
-                                 ("failed", "unreadable or too large", None))
     # Stat AFTER both reads and compare against the stat taken BEFORE them. The
     # apply-time check re-stats this file and compares, so whatever is recorded
     # here becomes the definition of "unchanged" - and a stat taken only at the
@@ -6049,6 +6050,13 @@ def _transcript_facts(env, session_id, fps_cache=None):
             "the transcript for {0} was being written while this read it, so the "
             "facts gathered describe no single version of the file. Nothing was "
             "written - re-run once the session is idle.".format(session_id))
+    if fps_cache is not None:
+        # AFTER the stat comparison above, on purpose: fingerprints from a
+        # torn read must not survive in the cache - a later collision pair
+        # would classify confidently from the exact file version this
+        # function just refused as describing no single version.
+        fps_cache[session_id] = (("ok", None, fps) if fps is not None else
+                                 ("failed", "unreadable or too large", None))
     return {"path": path, "cwd": cwd, "created_ms": first_ms, "last_ms": last_ms,
             "turns": len(fps) if fps is not None else None,
             "custom_title": custom, "model": model, "effort": effort,
@@ -10350,9 +10358,15 @@ def _overlap_verdict(env, sid_a, sid_b, records, cache, budget):
     and the collision hold's composer fills them in."""
     out = _unmeasured_pair(sid_a, sid_b, None)
     st_a, why_a, fps_a = _measure_fingerprints(env, sid_a, cache, budget)
+    if st_a != "ok":
+        # A one-sided failure already fixes the verdict at unmeasured -
+        # reading the other side anyway would charge the plan-wide budget
+        # for a pair that can no longer classify.
+        out["reason"] = why_a
+        return out
     st_b, why_b, fps_b = _measure_fingerprints(env, sid_b, cache, budget)
-    if st_a != "ok" or st_b != "ok":
-        out["reason"] = why_a if st_a != "ok" else why_b
+    if st_b != "ok":
+        out["reason"] = why_b
         return out
     set_a, set_b = set(fps_a), set(fps_b)
     shared = len(set_a & set_b)
@@ -10475,29 +10489,39 @@ def _superseded_leg_title(base, rows):
 _SHELL_UNSAFE = '"$`\\!%'
 
 
-def _generation_check(generated, sup, records, conversations, suggested):
-    """The §3 check ladder for a generated remedy title, in order; the first
-    failure names the degrade, or None when the command may print.
+def _generation_check(generated, sup, records, conversations, key_legs,
+                      suggested):
+    """The §3 check ladder for a generated remedy title; the first failure
+    names the degrade, or None when the command may print.
 
     Printability outranks everything (a control character forges report
-    lines); shell safety degrades only the command (the title itself is
-    valid, so the caller keeps it as prose); a superseded leg whose titles
-    already diverge across accounts is mid-repair by other means; the name
-    must be free machine-wide - the plan's full scan, the later leg's own
-    title included - and free of any DIFFERENT-target suggestion this plan
-    already made (the same (sid, title) repeating across a group's holds is
-    one suggestion, not a collision); and what retitle's own validator would
-    reject is never printed, checked by calling it rather than re-deriving
-    its rules."""
+    lines). A superseded leg whose TITLED rows diverge across accounts is
+    mid-repair by other means - rows with no usable title do not compete,
+    _converge_title's own rule, because retitle giving one a name flattens
+    nothing. The name must be free machine-wide: the plan's full scan, the
+    later leg's own title included, the titles this plan itself chose to
+    place (KEY_LEGS carries them), and any DIFFERENT-target suggestion this
+    plan already made - the same (sid, title) repeating across a group's
+    holds is one suggestion, not a collision. What retitle's own validator
+    would reject is never printed, checked by calling it rather than
+    re-deriving its rules.
+
+    Shell safety comes LAST, deliberately below the spec's §3 listing
+    order: it is the one degrade the suggestion survives as prose for the
+    GUI, and a suggestion that is also taken, divergent-unsafe or
+    validator-refused must not survive on the strength of being unsafe too
+    - handing it over would apply a title every other rung rejected. A
+    surviving shell-unsafe suggestion registers like a runnable one, so two
+    targets can never share a name through the prose path either."""
     if any(ord(ch) < 0x20 for ch in generated):
         return "title not printable"
-    if any(ch in _SHELL_UNSAFE for ch in generated):
-        return "title not shell-safe"
-    if len({title_key(rec.data.get("title"))
-            for rec in conversations.get(sup, [])}) > 1:
+    if len({k for k in (title_key(rec.data.get("title"))
+                        for rec in conversations.get(sup, [])) if k}) > 1:
         return "the leg's titles diverge across accounts"
     gk = title_key(generated)
     if any(title_key(rec.data.get("title")) == gk for rec in records):
+        return "suggested name already taken"
+    if gk in key_legs:
         return "suggested name already taken"
     if suggested.get(gk, sup) != sup:
         return "suggested name already taken"
@@ -10506,6 +10530,8 @@ def _generation_check(generated, sup, records, conversations, suggested):
     except Refusal:
         return "title rejected by retitle's validation"
     suggested[gk] = sup
+    if any(ch in _SHELL_UNSAFE for ch in generated):
+        return "title not shell-safe"
     return None
 
 
@@ -10542,7 +10568,8 @@ def _measured_line(mm, records):
 
 
 def _measure_collision_hold(env, hold, sid, other, title, records,
-                            conversations, group, cache, budget, suggested):
+                            conversations, key_legs, cache, budget,
+                            suggested):
     """Measure one held_title_collision pair and attach the verdict to HOLD:
     the `measured` object (§4), the title-free `measured_line` the report
     prints, and - on a supersession whose §3 checks all pass - the complete
@@ -10551,19 +10578,22 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
     today's targets, because without a measured basis to redirect, current
     behavior is the honest default.
 
-    GROUP is the census of every conversation holding this title_key -
-    existing rows AND the plan's chosen titles. Three or more legs form a
-    complete collision graph where no single rename clears everything and
-    pairwise verdicts could disagree about who supersedes whom, so such a
-    group is not measured at all - checked before any fingerprinting.
+    KEY_LEGS is the census of every conversation holding each title_key -
+    existing rows AND the plan's chosen titles. Three or more legs on this
+    hold's key form a complete collision graph where no single rename clears
+    everything and pairwise verdicts could disagree about who supersedes
+    whom, so such a group is not measured at all - checked before any
+    fingerprinting.
 
     Advisory by construction, including against exceptions: the whole
     pipeline - measurement AND title generation - degrades to today's remedy
-    plus 'measurement failed (<type>)' rather than raising. A plan that died
-    on a corrupt transcript would convert advice into a guard nobody asked
-    for."""
+    plus 'measurement failed (<type>)' rather than raising, and the remedy's
+    target is restored with it (a target picked by a measurement the hold
+    itself declares failed is not today's remedy). A plan that died on a
+    corrupt transcript would convert advice into a guard nobody asked for."""
+    placeholder = hold.get("retitle")
     try:
-        if len(group) > 2:
+        if len(key_legs.get(title_key(title)) or ()) > 2:
             hold["measured"] = _unmeasured_pair(
                 sid, other, "more than two legs share this title")
             hold["measured_line"] = hold["measured"]["reason"]
@@ -10577,7 +10607,7 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
                 title, [rec.data for rec in conversations.get(sup, [])])
             if why is None:
                 why = _generation_check(generated, sup, records,
-                                        conversations, suggested)
+                                        conversations, key_legs, suggested)
             if why is None:
                 mm["suggested_title"] = generated
                 mm["command_runnable"] = True
@@ -10599,6 +10629,8 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
         mm = _unmeasured_pair(sid, other, "measurement failed ({0})".format(
             type(exc).__name__))
         line = mm["reason"]
+        hold["retitle"] = placeholder
+        hold.pop("leg_suffix_note", None)
     hold["measured"] = mm
     hold["measured_line"] = line
 
@@ -10833,8 +10865,7 @@ def plan_converge(env, flags):
                 # to plan-time collision holds, this one included. A blocking
                 # row with no sid measures as 'no transcript', which is true.
                 _measure_collision_hold(env, hold, sid, hit[0], title,
-                                        records, conversations,
-                                        key_legs.get(k) or (),
+                                        records, conversations, key_legs,
                                         measure_cache, measure_budget,
                                         measure_suggested)
                 holds.append(hold)
@@ -10855,8 +10886,7 @@ def plan_converge(env, flags):
                                   title, planned[:8]),
                     "retitle": _retitle_command(sid, "<new title>")}
                 _measure_collision_hold(env, hold, sid, planned, title,
-                                        records, conversations,
-                                        key_legs.get(k) or (),
+                                        records, conversations, key_legs,
                                         measure_cache, measure_budget,
                                         measure_suggested)
                 holds.append(hold)
