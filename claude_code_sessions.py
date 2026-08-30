@@ -10444,6 +10444,49 @@ def _superseded_leg_title(base, rows):
     return "{0} - earlier leg ({1})".format(base, rng), None
 
 
+# Characters still live inside double quotes in at least one target shell:
+# PowerShell and POSIX shells interpret $, backtick, backslash and the quote
+# itself; bash history expansion fires on ! and cmd on %. Refusing rather
+# than escaping is deliberate - one printed string cannot be correctly
+# escaped for two shell families at once, and an injectable remedy is worse
+# than no remedy.
+_SHELL_UNSAFE = '"$`\\!%'
+
+
+def _generation_check(generated, sup, records, conversations, suggested):
+    """The §3 check ladder for a generated remedy title, in order; the first
+    failure names the degrade, or None when the command may print.
+
+    Printability outranks everything (a control character forges report
+    lines); shell safety degrades only the command (the title itself is
+    valid, so the caller keeps it as prose); a superseded leg whose titles
+    already diverge across accounts is mid-repair by other means; the name
+    must be free machine-wide - the plan's full scan, the later leg's own
+    title included - and free of any DIFFERENT-target suggestion this plan
+    already made (the same (sid, title) repeating across a group's holds is
+    one suggestion, not a collision); and what retitle's own validator would
+    reject is never printed, checked by calling it rather than re-deriving
+    its rules."""
+    if any(ord(ch) < 0x20 for ch in generated):
+        return "title not printable"
+    if any(ch in _SHELL_UNSAFE for ch in generated):
+        return "title not shell-safe"
+    if len({title_key(rec.data.get("title"))
+            for rec in conversations.get(sup, [])}) > 1:
+        return "the leg's titles diverge across accounts"
+    gk = title_key(generated)
+    if any(title_key(rec.data.get("title")) == gk for rec in records):
+        return "suggested name already taken"
+    if suggested.get(gk, sup) != sup:
+        return "suggested name already taken"
+    try:
+        _valid_new_title(generated)
+    except Refusal:
+        return "title rejected by retitle's validation"
+    suggested[gk] = sup
+    return None
+
+
 def _measured_line(mm, records):
     """The prose body of a hold's measured / not-measured line, title-free
     by construction: only sids, counts, ratios and dates enter it, which is
@@ -10477,7 +10520,7 @@ def _measured_line(mm, records):
 
 
 def _measure_collision_hold(env, hold, sid, other, title, records,
-                            conversations, cache, budget):
+                            conversations, cache, budget, suggested):
     """Measure one held_title_collision pair and attach the verdict to HOLD:
     the `measured` object (§4), the title-free `measured_line` the report
     prints, and - on a supersession whose §3 checks all pass - the complete
@@ -10500,11 +10543,19 @@ def _measure_collision_hold(env, hold, sid, other, title, records,
             generated, why = _superseded_leg_title(
                 title, [rec.data for rec in conversations.get(sup, [])])
             if why is None:
+                why = _generation_check(generated, sup, records,
+                                        conversations, suggested)
+            if why is None:
                 mm["suggested_title"] = generated
                 mm["command_runnable"] = True
                 hold["retitle"] = _retitle_command(sup, generated)
             else:
                 mm["degrade_reason"] = why
+                if why == "title not shell-safe":
+                    # The one degrade the suggestion survives: the title is
+                    # valid, the GUI applies it through plan_retitle with no
+                    # shell involved; only the pasted string would be unsafe.
+                    mm["suggested_title"] = generated
             if _LEG_SUFFIX_RE.search(title.strip()):
                 # The current leg inherited '… - earlier leg (…)' from the
                 # fork it came from; the remedy renames only the superseded
@@ -10677,9 +10728,11 @@ def plan_converge(env, flags):
     planned_titles = {}          # account -> {title_key: sid this plan places}
     # This plan run's measurement state (hold-remedies design §1): the typed
     # fingerprint cache, prefilled by the _transcript_facts pass below so
-    # fingerprints the plan computes anyway are reused, and the byte budget
-    # bounding measurement-ADDED reads.
+    # fingerprints the plan computes anyway are reused; the byte budget
+    # bounding measurement-ADDED reads; and the suggestions this plan has
+    # already made, so two different targets can never share one name.
     measure_cache, measure_budget = {}, {"spent": 0}
+    measure_suggested = {}       # title_key(generated) -> superseded sid
     for sid, missing in short:
         recs = eligible[sid]
         holder_labels = sorted({rec.label for rec in recs})
@@ -10732,7 +10785,8 @@ def plan_converge(env, flags):
                 # row with no sid measures as 'no transcript', which is true.
                 _measure_collision_hold(env, hold, sid, hit[0], title,
                                         records, conversations,
-                                        measure_cache, measure_budget)
+                                        measure_cache, measure_budget,
+                                        measure_suggested)
                 holds.append(hold)
                 continue
             planned = planned_titles.get(acct, {}).get(k)
@@ -10752,7 +10806,8 @@ def plan_converge(env, flags):
                     "retitle": _retitle_command(sid, "<new title>")}
                 _measure_collision_hold(env, hold, sid, planned, title,
                                         records, conversations,
-                                        measure_cache, measure_budget)
+                                        measure_cache, measure_budget,
+                                        measure_suggested)
                 holds.append(hold)
                 continue
             # The uuid is minted at plan time (spec, "Applying") so the

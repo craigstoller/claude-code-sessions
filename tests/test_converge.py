@@ -1470,6 +1470,7 @@ def test_exact_suffix_is_replaced_lookalike_degrades():
 
 T_COLL = "ACME-REVIEW session"
 SUGGESTED = "ACME-REVIEW session - earlier leg (Aug 24-28)"
+S4 = "fedcba98-9abc-def0-1234-56789abcdef0"
 
 
 def prose_transcript(labels, cwd="C:\\Users\\u\\Projects\\Northwind"):
@@ -1843,3 +1844,174 @@ def test_symmetric_recency_below_margin_is_unmeasured(
                   late_last=ms_local(2026, 8, 28, 12, 4))
     m = ct.plan_converge(env, ct.ConvergeFlags())
     assert_unmeasured(m, "legs cannot be ordered")
+
+
+@pytest.mark.parametrize("ch", ['"', "$", "`", "\\", "!", "%"])
+def test_shell_unsafe_title_degrades_but_suggests(
+        mkenv, tmp_path, write_transcript, write_row, ch, capsys):
+    """Spec test 11: each metacharacter that stays live inside double quotes
+    in at least one target shell degrades the COMMAND only - the title
+    itself is valid, so the suggestion survives as prose for the GUI."""
+    env = mkenv(tmp_path)
+    unsafe = "ACME {0} review".format(ch)
+    measured_pair(env, write_transcript, write_row, title=unsafe)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    want = unsafe + " - earlier leg (Aug 24-28)"
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["degrade_reason"] == "title not shell-safe"
+        assert mm["command_runnable"] is False
+        assert mm["suggested_title"] == want
+        assert "<new title>" in h["retitle"]
+        assert "--only {0}".format(S1[:8]) in h["retitle"]
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "suggested name: {0}".format(want) in out
+    assert not any(want in ln for ln in out.splitlines()
+                   if "retitle --only" in ln)
+
+
+def test_unprintable_title_drops_the_suggestion(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 11b: a control character forges report lines, so that
+    degrade nulls the suggestion entirely - and no raw control byte appears
+    anywhere in the rendered report."""
+    env = mkenv(tmp_path / "bel")
+    measured_pair(env, write_transcript, write_row, title="ACME\x07review")
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    for h in collision_holds(m):
+        mm = h["measured"]
+        assert mm["degrade_reason"] == "title not printable"
+        assert mm["suggested_title"] is None
+        assert mm["command_runnable"] is False
+        assert "<new title>" in h["retitle"]
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "\x07" not in out
+
+    env = mkenv(tmp_path / "nl")
+    measured_pair(env, write_transcript, write_row, title="ACME\nreview")
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    for h in collision_holds(m):
+        assert h["measured"]["degrade_reason"] == "title not printable"
+        assert h["measured"]["suggested_title"] is None
+
+
+def test_divergent_leg_titles_degrade(mkenv, tmp_path, write_transcript,
+                                      write_row):
+    """Spec test 12: retitle --only renames a conversation in EVERY account;
+    a leg whose titles already diverge is mid-repair by other means, and a
+    global rename would flatten intentional differences."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    # A second row of the SUPERSEDED leg, under a different title.
+    write_row(env, 0, A3, O3, "local_s1b",
+              row_data(S1, "Northwind variant",
+                       createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 27)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in collision_holds(m)
+            if h["measured"]["classification"] == "supersession"]
+    assert held
+    for h in held:
+        mm = h["measured"]
+        assert mm["superseded"] == S1
+        assert mm["degrade_reason"] == \
+            "the leg's titles diverge across accounts"
+        assert mm["suggested_title"] is None
+        assert mm["command_runnable"] is False
+
+
+def test_taken_suggestion_degrades(mkenv, tmp_path, write_transcript,
+                                   write_row):
+    """Spec test 13: a generated title whose key any account already holds
+    is not a suggestion - including when the LATER leg's own (divergent)
+    title equals it under title_key."""
+    env = mkenv(tmp_path / "row")
+    measured_pair(env, write_transcript, write_row)
+    write_row(env, 0, A3, O3, "local_taken", row_data(PAD, SUGGESTED))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in collision_holds(m)
+            if h["measured"]["classification"] == "supersession"]
+    assert held
+    for h in held:
+        assert h["measured"]["degrade_reason"] == \
+            "suggested name already taken"
+        assert h["measured"]["suggested_title"] is None
+
+    env = mkenv(tmp_path / "leg")
+    measured_pair(env, write_transcript, write_row)
+    # The later leg itself carries the would-be suggestion in a third
+    # account (whitespace variant: title_key is the comparator).
+    write_row(env, 0, A3, O3, "local_s2b",
+              row_data(S2, "  " + SUGGESTED + "  ",
+                       createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 27)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in collision_holds(m)
+            if h["measured"]["classification"] == "supersession"]
+    assert held
+    for h in held:
+        assert h["measured"]["degrade_reason"] == \
+            "suggested name already taken"
+        assert h["measured"]["suggested_title"] is None
+
+
+def test_two_different_targets_cannot_share_a_suggestion(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 14: two groups whose generated titles coincide (one base
+    plain, one wearing an exact suffix that strips to the same base and
+    range) - the second target degrades rather than printing one name for
+    two conversations."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    worn = "ACME-REVIEW session - earlier leg (Aug 1-3)"
+    shared = turn_labels("t", 48)
+    write_transcript(env, "C--p", S3,
+                     prose_transcript(shared + turn_labels("c", 2)))
+    write_transcript(env, "C--p", S4,
+                     prose_transcript(shared + turn_labels("d", 13)))
+    write_row(env, 0, A1, O1, "local_s3",
+              row_data(S3, worn, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s4",
+              row_data(S4, worn, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    per_pair = {}
+    for h in collision_holds(m):
+        pair = frozenset((h["measured"]["a"], h["measured"]["b"]))
+        per_pair.setdefault(pair, []).append(h["measured"])
+    first = per_pair[frozenset((S1, S2))]
+    second = per_pair[frozenset((S3, S4))]
+    assert all(mm["command_runnable"] for mm in first)
+    assert all(mm["suggested_title"] == SUGGESTED for mm in first)
+    assert all(mm["degrade_reason"] == "suggested name already taken"
+               for mm in second)
+    assert all(mm["suggested_title"] is None for mm in second)
+
+
+def test_title_validation_is_retitles_own(mkenv, tmp_path, write_transcript,
+                                          write_row, monkeypatch):
+    """Spec test 15: generation routes through _valid_new_title rather than
+    re-deriving its rules - what retitle would reject is never printed."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+
+    def refuse(raw):
+        raise ct.Refusal("not on my watch")
+    monkeypatch.setattr(ct, "_valid_new_title", refuse)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["degrade_reason"] == "title rejected by retitle's validation"
+        assert mm["suggested_title"] is None
+        assert mm["command_runnable"] is False
