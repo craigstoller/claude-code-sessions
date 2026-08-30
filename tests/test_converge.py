@@ -1,8 +1,10 @@
 """Tests for `ccs converge`.
 
-Implements docs/specs/2026-08-26-converge-design.md's Testing section. Every
-title is from the fake cast (ACME-REVIEW, Northwind, "Quarterly board report
-finalization") - never a real one.
+Implements docs/specs/2026-08-26-converge-design.md's Testing section, and
+the converge-side tests of docs/specs/2026-08-29-identity-ux-design.md
+(0.13.0: the RULING 5 disclosure, the pair form, account-scope --live,
+corroboration). Every title is from the fake cast (ACME-REVIEW, Northwind,
+"Quarterly board report finalization") - never a real one.
 """
 import json
 import os
