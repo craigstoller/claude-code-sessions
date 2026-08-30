@@ -221,6 +221,36 @@ def test_doctor_exit2_message_not_on_exit0(mkenv, tmp_path, capsys):
     assert rc == 0 and "unrecognized or unreadable state" not in out
 
 
+def test_repoint_text_report_is_redacted_by_default(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """cmd_repoint printed its report through bare print(), skipping redact()
+    entirely - full session ids in default mode - while its own --verbose help
+    ("do not redact paths") promises that redaction is the default. Same
+    contract test_undo_dry_run_preview_redacted pins for undo."""
+    env = mkenv(tmp_path)
+    a1 = "aaaaaaaa-0000-0000-0000-000000000001"
+    o1 = "bbbbbbbb-0000-0000-0000-000000000002"
+    sid = "12345678-9abc-def0-1234-56789abcdef0"
+    target = "87654321-9abc-def0-1234-56789abcdef0"
+    write_transcript(env, "C--p", target, [{"cwd": "C:\\p"}])
+    write_row(env, 0, a1, o1, "local_1",
+              {"sessionId": "local_1", "cliSessionId": sid,
+               "title": "Board pointer"})
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": a1,
+                                    "organizationUuid": o1,
+                                    "emailAddress": "me@example.com"}}, fh)
+    rc = ct.cmd_repoint(env, ns(only="Board pointer", to_session=target,
+                                store="", live="", apply=False))
+    out = capsys.readouterr().out
+    assert rc == 0 and "will open" in out
+    assert target not in out and "87654321…" in out
+    rc = ct.cmd_repoint(env, ns(only="Board pointer", to_session=target,
+                                store="", live="", apply=False, verbose=True))
+    assert rc == 0 and target in capsys.readouterr().out
+
+
 def test_undo_dry_run_preview_redacted(mkenv, tmp_path, write_transcript, write_row, capsys):
     """M1 (parked Task 14 finding): the undo dry-run preview line must pass
     through redact(env, ...) like every other command's output - it

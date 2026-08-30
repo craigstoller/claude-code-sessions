@@ -119,6 +119,33 @@ def test_json_is_covered(mkenv, tmp_path, write_transcript, write_row, capsys):
     assert "<session-" in payload
 
 
+def test_a_rowless_transcripts_cwd_does_not_leak_from_list(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The substitution table learned cwds from store ROWS, but `list` also
+    reports transcripts no row points at, reading their cwd from the
+    transcript itself - so a client-naming cwd survived --anonymize, in text
+    and in --json, exactly when no sidebar had registered it."""
+    env = mkenv(tmp_path)
+    seed(env, write_transcript, write_row)   # one registered, row-backed pair
+    write_transcript(env, "C--clients-GhostClient", "0abc1234-9abc-def0-1234-56789abcdef0",
+                     [{"cwd": "C:\\clients\\GhostClient"}])
+
+    # Sanity: without the flag the cwd really is in the report.
+    ct.cmd_list(env, ns())
+    assert "GhostClient" in capsys.readouterr().out
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    ct.cmd_list(env, ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert "GhostClient" not in out
+    assert "<project-" in out
+    ct.cmd_list(env, ns(anonymize=True, json=True))
+    payload = capsys.readouterr().out
+    assert "GhostClient" not in payload
+    assert "<project-" in payload
+
+
 def test_a_duplicated_transcript_hold_does_not_leak_the_project_folder(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """The transcript-unusable hold quotes _transcript_facts' refusal, and the
@@ -160,6 +187,160 @@ def test_a_duplicated_transcript_hold_does_not_leak_the_project_folder(
     assert any(h["reason"] == "held_transcript_unusable"
                for h in json.loads(payload)["holds"])
     assert "Northwind" not in payload
+
+
+A1 = "aaaaaaaa-0000-0000-0000-000000000001"
+O1 = "bbbbbbbb-0000-0000-0000-000000000002"
+
+
+def _signed_in(env):
+    import os
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": A1,
+                                    "organizationUuid": O1,
+                                    "emailAddress": "alice@example.com"}}, fh)
+
+
+def test_new_row_and_repoint_accept_anonymize():
+    """README: --anonymize is available on every command. These two defined
+    their own --verbose instead of taking the common flags, so --anonymize
+    was an argparse error on exactly the commands whose plans quote
+    transcript-derived content."""
+    p = ct.build_parser()
+    assert p.parse_args(["new-row", "--to", "x", "--anonymize"]).anonymize
+    assert p.parse_args(["repoint", "--only", "t", "--to", "x",
+                         "--anonymize"]).anonymize
+
+
+def test_new_row_anonymize_covers_transcript_derived_content(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """new-row's whole job is conversations no row registers, so its planned
+    title (the transcript's customTitle) and cwd exist in no substitution
+    pair - and its JSON manifest never met the anonymizer at all."""
+    sid = "abcdef01-9abc-def0-1234-56789abcdef0"
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--clients-GhostClient", sid, [
+        {"cwd": "C:\\clients\\GhostClient",
+         "timestamp": "2026-08-01T00:00:00.000Z", "type": "user",
+         "message": {"role": "user", "content": "hello"}},
+        {"timestamp": "2026-08-01T00:10:00.000Z", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-opus-5",
+                     "content": [{"type": "text", "text": "hi"}]}},
+        {"customTitle": "GHOST-TITLE ghost intake",
+         "timestamp": "2026-08-01T00:11:00.000Z"},
+    ])
+    write_row(env, 0, A1, O1, "local_p",
+              {"sessionId": "local_p", "cliSessionId": "other-conversation",
+               "title": "Padding", "lastActivityAt": 9})
+    _signed_in(env)
+
+    def nr(**kw):
+        return ns(to_session=sid, store="", title="", live="", apply=False,
+                  **kw)
+
+    # Sanity: the raw plan really carries both.
+    ct.cmd_new_row(env, nr(json=True))
+    raw = capsys.readouterr().out
+    assert "GHOST-TITLE" in raw and "GhostClient" in raw
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    rc = ct.cmd_new_row(env, nr())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "GHOST-TITLE" not in out and "GhostClient" not in out
+    assert "<session-" in out and "<project-" in out
+    rc = ct.cmd_new_row(env, nr(json=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert "GHOST-TITLE" not in payload and "GhostClient" not in payload
+    assert "<session-" in payload
+
+
+def test_repoint_anonymize_covers_the_row_title(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    target = "87654321-9abc-def0-1234-56789abcdef0"
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", target, [{"cwd": "C:\\p"}])
+    write_row(env, 0, A1, O1, "local_1",
+              {"sessionId": "local_1", "cliSessionId": "current-conversation",
+               "title": "ACME-REVIEW pointer", "lastActivityAt": 9})
+    _signed_in(env)
+
+    def rp(**kw):
+        return ns(only="ACME-REVIEW pointer", to_session=target, store="",
+                  live="", apply=False, **kw)
+
+    ct.cmd_repoint(env, rp(json=True))
+    assert "ACME-REVIEW" in capsys.readouterr().out
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    rc = ct.cmd_repoint(env, rp())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in out and "<session-" in out
+    rc = ct.cmd_repoint(env, rp(json=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in payload and "<session-" in payload
+
+
+def _strings(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from _strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _strings(v)
+    elif isinstance(obj, str):
+        yield obj
+
+
+def test_anonymize_json_folds_the_home_directory(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Plain --json is deliberately unredacted (README) and must stay so. But
+    --anonymize output is a display artifact for pasting, and a payload that
+    hides every title while printing C:\\Users\\<name>\\... is a partial
+    safety that reads as whole. Under the flag - and only under it - every
+    string in the structured output folds the home directory to ~."""
+    from test_converge import A1, A2, O1, O2, S1, S2, cv_ns, row_data, t_entries
+    env = mkenv(tmp_path)
+    # The duplicated-transcript hold: its detail quotes home-prefixed paths.
+    write_transcript(env, "C--clients-Northwind", S1, t_entries())
+    write_transcript(env, "C--scratch-x", S1, t_entries())
+    write_row(env, 0, A1, O1, "local_1", row_data(S1, "ACME-REVIEW handoff"))
+    write_transcript(env, "C--p", S2, t_entries(cwd="C:\\p"))
+    write_row(env, 0, A2, O2, "local_2", row_data(S2, "Padding", cwd="C:\\p"))
+
+    # The documented contract, unchanged: plain --json carries full paths.
+    ct.cmd_converge(env, cv_ns(json=True))
+    raw = json.loads(capsys.readouterr().out)
+    assert any(env.home in s for s in _strings(raw))
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    pub = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert not any(env.home in s for s in _strings(pub))
+    # Folded, not deleted: the hold detail still shows the ~-relative path.
+    held = [h for h in pub["holds"]
+            if h["reason"] == "held_transcript_unusable"]
+    assert held and "~" in held[0]["detail"]
+
+    # And the other manifest that quotes a transcript path: new-row's.
+    _signed_in(env)
+    sid = "abcdef01-9abc-def0-1234-56789abcdef0"
+    write_transcript(env, "C--p", sid, t_entries(cwd="C:\\p"))
+    rc = ct.cmd_new_row(env, ns(to_session=sid, store="", title="", live="",
+                                apply=False, json=True))
+    pub = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert not any(env.home in s for s in _strings(pub))
+    assert pub["transcript"].startswith("~")
 
 
 def test_anonymize_with_verbose_is_refused(mkenv, tmp_path, capsys):
