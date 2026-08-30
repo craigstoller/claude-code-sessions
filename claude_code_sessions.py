@@ -4854,6 +4854,22 @@ def _disagreeing_config_path(env, config_uuid):
     return ""
 
 
+def _oauth_email_for(env, account_uuid):
+    """oauthAccount's emailAddress when it names ACCOUNT_UUID, else "".
+
+    ~/.claude.json records only its own account's email, so asking for any
+    other account yields "" rather than a wrong pairing - the same standard
+    dormant_account_email holds its sandbox configs to."""
+    try:
+        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
+            oa = (json.load(fh) or {}).get("oauthAccount") or {}
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+    if isinstance(oa, dict) and oa.get("accountUuid") == account_uuid:
+        return oa.get("emailAddress") or ""
+    return ""
+
+
 _PAIR_CHARS = frozenset("0123456789abcdef-")
 
 
@@ -4952,14 +4968,7 @@ def _resolve_live_assertion(env, live, dirs):
             "(which writes config.json) or authenticate the CLI (run 'claude', "
             "then /login) so a file names the account, then re-run without --live.")
     oauth_uuid, config_uuid = dis
-    oauth_email = ""
-    try:
-        with open(os.path.join(env.home, ".claude.json"), encoding="utf-8") as fh:
-            oa = (json.load(fh) or {}).get("oauthAccount") or {}
-        if isinstance(oa, dict) and oa.get("accountUuid") == oauth_uuid:
-            oauth_email = oa.get("emailAddress") or ""
-    except (OSError, ValueError, AttributeError, TypeError):
-        pass
+    oauth_email = _oauth_email_for(env, oauth_uuid)
     cands = []
     for a, o, p in dirs:
         if a not in (oauth_uuid, config_uuid):
@@ -10055,6 +10064,14 @@ def plan_converge(env, flags):
     per-destination `email (acct/org)` lines are where an operator with
     accounts that must not mix would see it before --apply.
     """
+    # Recorded on the manifest whether or not --live arbitrates it: the
+    # RULING 5 state is knowable at plan time, and 0.12.0's dry run reading
+    # `0 held` while the apply was always going to refuse was the one gap
+    # that cost a full close-the-app cycle to discover. The field is the
+    # machine caller's warning (--json carries it); cmd_converge prints the
+    # human one. A snapshot only - _converge_recheck keeps evaluating the
+    # files fresh under the lock, in both directions.
+    dis = _identity_disagreement(env)
     if flags.live:
         live = _resolve_live_assertion(env, flags.live, _account_dirs(env))
     else:
@@ -10223,17 +10240,20 @@ def plan_converge(env, flags):
     after = complete_now + sum(1 for sid, _m in short if sid not in held_sids)
     held_conversations = sum(1 for sid, _m in short if sid in held_sids)
 
-    return {"op_type": "converge",
-            "live_asserted": (live.account_uuid
-                              if flags.live and live else ""),
-            "only": flags.only, "only_session": only_sid,
-            "destinations": [dests[a] for a in sorted(dests)],
-            "non_destinations": non_dest,
-            "complete": {"now": complete_now, "of": total, "after": after,
-                         "held": held_conversations,
-                         "scoped": bool(only_sid)},
-            "dead_excluded": dead_excluded,
-            "notes": notes, "holds": holds, "rows": rows}
+    m = {"op_type": "converge",
+         "live_asserted": (live.account_uuid
+                           if flags.live and live else ""),
+         "only": flags.only, "only_session": only_sid,
+         "destinations": [dests[a] for a in sorted(dests)],
+         "non_destinations": non_dest,
+         "complete": {"now": complete_now, "of": total, "after": after,
+                      "held": held_conversations,
+                      "scoped": bool(only_sid)},
+         "dead_excluded": dead_excluded,
+         "notes": notes, "holds": holds, "rows": rows}
+    if dis:
+        m["identity_disagreement"] = {"oauth": dis[0], "config": dis[1]}
+    return m
 
 
 def _converge_shape_error(m):
@@ -10727,6 +10747,72 @@ def _print_converge_report(say, m):
             .format(m["dead_excluded"]))
 
 
+def _identity_warning_lines(env, m):
+    """Change 1 of 0.13.0: the warning block for a converge manifest that
+    carries an identity_disagreement no valid --live arbitrated. [] when
+    there is nothing to warn about.
+
+    RULING 5 is evaluated only inside _converge_recheck, so a 0.12.0 plan
+    could read `0 held` while --apply was always going to refuse for a
+    reason fully knowable at plan time - the one break in the dry run's
+    "this is what --apply will do" promise, and it cost a close-the-app
+    cycle to discover. The wording is conditional ("while that disagreement
+    stands") because this is a snapshot: the files can change in either
+    direction before apply, and the recheck evaluates them fresh under the
+    lock. Disclosure and enforcement are different jobs at different times;
+    the plan never claims to be the gate, and the dry run still exits 0 - a
+    chained `converge && converge --apply` stops at the apply's own
+    refusal, loud, non-zero, nothing written. Machine callers read the
+    manifest field instead (--json carries it).
+
+    The remedy lines name each side by email - the oauth side's from
+    oauthAccount.emailAddress, the config side's via account_email -
+    falling back to the 8-char account id when an email is unknown OR when
+    the two sides' emails are equal (two accounts under one address would
+    print two identical, unusable remedies; the ids are already distinct,
+    so nothing longer is needed). The parenthetical "(if the app is on
+    ...)" is the honest part: the tool cannot know which - that is the
+    user's fact, which is the entire premise of RULING 5.
+    """
+    dis = m.get("identity_disagreement")
+    if not isinstance(dis, dict) or m.get("live_asserted"):
+        return []
+    oauth_u, config_u = dis.get("oauth") or "", dis.get("config") or ""
+    if not (oauth_u and config_u):
+        return []
+    oauth_email = _oauth_email_for(env, oauth_u)
+    config_email = account_email(env, config_u)[0]
+    if oauth_email and oauth_email == config_email:
+        oauth_name, config_name = oauth_u[:8], config_u[:8]
+    else:
+        oauth_name = oauth_email or oauth_u[:8]
+        config_name = config_email or config_u[:8]
+    if _ANONYMIZE:
+        # An account address names a person; the ids are machine ids. Same
+        # rule _public_converge_manifest's label scrub applies.
+        if "@" in oauth_name:
+            oauth_name = _anon_label("account", oauth_name)
+        if "@" in config_name:
+            config_name = _anon_label("account", config_name)
+    remedies = ["claude-code-sessions converge --live {0} --apply".format(n)
+                for n in (oauth_name, config_name)]
+    width = max(len(r) for r in remedies)
+    return [
+        "warning : ~/.claude.json ({0}) and config.json ({1}) disagree about"
+        .format(oauth_u[:8], config_u[:8]),
+        "   the signed-in account. While that disagreement stands, --apply "
+        "will refuse",
+        "   (RULING 5) unless you assert which account the desktop app is "
+        "on:",
+        "      {0:<{w}}    (if the app is on {1})".format(
+            remedies[0], oauth_u[:8], w=width),
+        "      {0:<{w}}    (if the app is on {1})".format(
+            remedies[1], config_u[:8], w=width),
+        "   A refusal writes nothing, so trying --apply without --live is "
+        "safe.",
+    ]
+
+
 def cmd_converge(env, ns):
     flags = ConvergeFlags(only=ns.only, live=ns.live)
     m = plan_converge(env, flags)
@@ -10748,6 +10834,8 @@ def cmd_converge(env, ns):
         # resolution is the plan's one derived judgement, and it must be on
         # screen before anything lands in a store.
         _print_converge_report(say, _public_converge_manifest(env, m))
+        for line in _identity_warning_lines(env, m):
+            say(line)
         if ns.apply:
             say("")
 

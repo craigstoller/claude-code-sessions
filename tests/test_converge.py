@@ -104,6 +104,39 @@ def mixed_holdings(env, write_transcript, write_row):
                   row_data(S3, "Northwind intake notes"))
 
 
+def desktop_config(env, account_uuid):
+    """The desktop's config.json, beside the store root - the exact location
+    _identity_disagreement reads (os.path.dirname(candidate))."""
+    cfg = os.path.join(os.path.dirname(env.store_candidates[0]), "config.json")
+    with open(cfg, "w", encoding="utf-8") as fh:
+        json.dump({"lastKnownAccountUuid": account_uuid}, fh)
+
+
+def identity_files(env, oauth_acct, config_acct, email="alice@example.com",
+                   oauth_org=""):
+    """The spec's identity-file fixture: ~/.claude.json's oauthAccount names
+    one account, config.json names the other (or the same, for agreement)."""
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": oauth_acct,
+                                    "organizationUuid": oauth_org,
+                                    "emailAddress": email}}, fh)
+    desktop_config(env, config_acct)
+
+
+def agent_mode_email(env, account_uuid, email):
+    """A per-account agent-mode sandbox config naming ACCOUNT_UUID's email -
+    the source account_email recovers a dormant account's address from."""
+    d = os.path.join(os.path.dirname(env.store_candidates[0]),
+                     "local-agent-mode-sessions", account_uuid,
+                     "dddddddd-0000-0000-0000-000000000004",
+                     "agent", "local_ditto_x", ".claude")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": account_uuid,
+                                    "emailAddress": email}}, fh)
+
+
 # ------------------------------------------------------------------ planning
 
 def test_plan_enumerates_exactly_the_missing_pairs(mkenv, tmp_path,
@@ -1000,3 +1033,138 @@ def test_anonymize_apply_is_refused_globally(capsys):
     rc = ct.main(["converge", "--anonymize", "--apply"])
     assert rc == 2
     assert "--anonymize" in capsys.readouterr().err
+
+
+# ------------------------------------- 0.13.0: the dry run discloses RULING 5
+
+def one_missing_pair(env, write_transcript, write_row):
+    """S1 held by A1 with a transcript; A2 made a destination by a PAD row
+    (dead - no transcript for it), so the plan's one write is (S1 -> A2)."""
+    write_transcript(env, "C--p", S1, t_entries())
+    write_row(env, 0, A1, O1, "local_s1", row_data(S1, "ACME-REVIEW"))
+    write_row(env, 0, A2, O2, "local_pad", row_data(PAD, "Northwind"))
+
+
+def test_dry_run_warns_when_identity_files_disagree(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The plan knew everything the apply-time refusal knew and said nothing
+    - the one dry-run gap that cost a full close-the-app cycle to discover.
+    The warning names each side's remedy as a pastable command line."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2, email="alice@example.com")
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0                       # disclosure, not enforcement
+    assert "disagree" in out
+    assert "converge --live alice@example.com --apply" in out
+    assert "converge --live {0} --apply".format(A2[:8]) in out
+    assert "(if the app is on {0})".format(A1[:8]) in out
+    assert "(if the app is on {0})".format(A2[:8]) in out
+    assert "refusal writes nothing" in out
+
+
+def test_dry_run_quiet_when_files_agree(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A1, oauth_org=O1)
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "warning" not in out
+    assert "disagree" not in out
+
+
+def test_dry_run_quiet_when_live_asserted(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """A validated --live IS the arbitration the warning asks for, so
+    printing the warning anyway would nag past the answer."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    rc = ct.cmd_converge(env, cv_ns(live=A2[:8]))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "warning" not in out
+    assert "disagree" not in out
+
+
+def test_json_manifest_carries_identity_disagreement(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """--json is the machine caller's warning: the field is the signal (the
+    dry run still exits 0), present with both ids under a disagreement,
+    absent otherwise, and --anonymize must keep its structure - the values
+    are machine ids, not content."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["identity_disagreement"] == {"oauth": A1, "config": A2}
+
+    desktop_config(env, A1)              # agreement: the key is absent
+    ct.cmd_converge(env, cv_ns(json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert "identity_disagreement" not in payload
+
+    desktop_config(env, A2)
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    try:
+        rc = ct.cmd_converge(env, cv_ns(anonymize=True, json=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert payload["identity_disagreement"] == {"oauth": A1, "config": A2}
+    finally:
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
+
+
+def test_apply_still_refuses_fresh_disagreement(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Regression for the boundary the warning must not blur: the plan is a
+    snapshot and the recheck evaluates the files FRESH under the lock - a
+    clean plan does not carry a clean apply."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A1, oauth_org=O1)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert "identity_disagreement" not in m
+    desktop_config(env, A2)              # the files fall out of agreement
+    with pytest.raises(ct.Refusal, match="RULING 5"):
+        ct.run_converge(env, m)
+    assert store_rows(env, A2, O2) == ["local_pad.json"]   # nothing written
+    assert ct.list_ops(env) == []                          # nothing journaled
+
+
+def test_warning_then_clean_apply_when_disagreement_clears(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The reverse transition: a plan that warned applies cleanly once the
+    files agree again - the warning was a snapshot, never the gate."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert m["identity_disagreement"] == {"oauth": A1, "config": A2}
+    desktop_config(env, A1)              # the disagreement clears
+    assert ct.run_converge(env, m) == "completed"
+    assert len(store_rows(env, A2, O2)) == 2
+
+
+def test_remedy_lines_fall_back_when_emails_collide(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Two accounts under one address would print two identical, unusable
+    remedies; the 8-char ids are already distinct, so they carry the lines."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2, email="alice@example.com")
+    agent_mode_email(env, A2, "alice@example.com")
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "converge --live {0} --apply".format(A1[:8]) in out
+    assert "converge --live {0} --apply".format(A2[:8]) in out
+    remedy = [line for line in out.splitlines() if "--live" in line]
+    assert remedy and all("@" not in line for line in remedy)
