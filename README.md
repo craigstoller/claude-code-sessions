@@ -309,12 +309,22 @@ files agree.
 
 When the two files **disagree**, there is a faster path than `/login`: you know which account
 your desktop app is signed into, and `--live <substring>` asserts it (an account id, org id,
-store path, or email — the same matching as `--to`; ambiguity is a refusal listing the
-candidates). It is deliberately not a `--force`: it works *only* while the files disagree, it
-must name one of the two accounts they name (anything else is refused — an account neither
-file names is evidence of something else being wrong), and the dry run, apply, `--json`
-(stderr), `undo`, and `recover` output all shout that the override was used and which file it
-overrode. The assertion is journaled with the operation and re-checked against the identity
+store path, or email — the same matching as `--to`; the printed account form works too,
+`aaaa1111/cccc3333`, resolved as two anchored prefixes rather than a substring; ambiguity is a
+refusal listing the candidates). For `sync` the assertion is store-strict — the resolved store
+is the source sync reads, so the org half is load-bearing — while `converge --live` resolves at
+*account* scope: RULING 5's certified fact is which account the app is on (`config.json` does
+not even record an org), so an email or account id is enough there even when that account owns
+several org directories, and the assertion carries no org at all (it renders as `aaaa1111/-`,
+never a concrete pair to re-paste). It is deliberately not a `--force`: for `sync` it works
+*only* while the files disagree, it must name one of the two accounts they name (anything else
+is refused — an account neither file names is evidence of something else being wrong), and the
+dry run, apply, `--json` (stderr), `undo`, and `recover` output all shout that the override was
+used and which file it overrode. `converge` alone relaxes the first clause: a `--live` naming
+the very account the files *agree* on — and no other account on the machine — proceeds with a
+note instead of a refusal, because nothing was arbitrated and refusing certifies nothing; its
+manifest records no assertion for that case. The assertion is journaled with the operation and
+re-checked against the identity
 files before every write, undo, or recover it ever performs; if the disagreement has changed
 or vanished by then, the operation refuses rather than trust a stale assertion. The
 running-app guard is completely unaffected: `--live --apply` still refuses while the desktop
@@ -457,6 +467,27 @@ hold prints the colliding row and a pastable fix, and an applied run that ends w
 **exits 3**: bulk and unattended is exactly where an exit code gets trusted without reading
 prose. The plan ends with truthful math projected from what will actually be written —
 `complete : 337 of 359 -> 356 of 359 (3 held)` — never a promised full house.
+
+The dry run also discloses the one apply-time refusal that is fully knowable at plan time:
+when `~/.claude.json` and the desktop's `config.json` disagree about the signed-in account,
+the plan says so, with each side's remedy as a pastable command — in 0.12.0 the plan could
+read `0 held` while `--apply` was always going to refuse (RULING 5), and discovering that
+cost a full close-the-app cycle:
+
+```
+warning : ~/.claude.json (aaaa1111) and config.json (bbbb2222) disagree about
+   the signed-in account. While that disagreement stands, --apply will refuse
+   (RULING 5) unless you assert which account the desktop app is on:
+      claude-code-sessions converge --live alice@example.com --apply    (if the app is on aaaa1111)
+      claude-code-sessions converge --live bob@example.com --apply      (if the app is on bbbb2222)
+   A refusal writes nothing, so trying --apply without --live is safe.
+```
+
+The dry run still exits 0 — disclosure and enforcement are different jobs at different times:
+the warning is a snapshot, the apply re-evaluates the files fresh under its lock either way,
+and a chained `converge && converge --apply` stops at the apply's own refusal with nothing
+written. `--json` carries the same fact as an `identity_disagreement` field, which is the
+machine caller's signal.
 
 The whole run is one journalled operation, and every guard — the running-app check, identity
 resolution, store re-discovery, per-pair revalidation — passes *before* the record is written,

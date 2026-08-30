@@ -1029,6 +1029,16 @@ def test_converge_help_names_the_promise(capsys):
     assert "additive" in out
 
 
+def test_live_help_mentions_the_printed_form(capsys):
+    """The pair form is only discoverable if the flag's own help names it -
+    the reports print it, so the help must close the loop."""
+    for cmd in ("converge", "sync"):
+        with pytest.raises(SystemExit) as exc:
+            ct.main([cmd, "--help"])
+        assert exc.value.code == 0
+        assert "aaaa1111/cccc3333" in capsys.readouterr().out
+
+
 def test_anonymize_apply_is_refused_globally(capsys):
     rc = ct.main(["converge", "--anonymize", "--apply"])
     assert rc == 2

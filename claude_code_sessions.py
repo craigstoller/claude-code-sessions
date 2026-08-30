@@ -3840,7 +3840,11 @@ def build_parser():
                          "candidates with ids")
     cv.add_argument("--live", default="", metavar="SUBSTRING",
                     help="assert which account the desktop app is signed into "
-                         "(RULING 5), when the identity files disagree")
+                         "(RULING 5), when the identity files disagree - an "
+                         "email, an id, or the acct/org pair reports print "
+                         "(e.g. 'aaaa1111/cccc3333'). Resolves the ACCOUNT, so "
+                         "it works even when the account owns several org "
+                         "directories")
     cv.add_argument("--apply", action="store_true",
                     help="actually create the rows. Purely additive: nothing "
                          "existing is changed, refreshed, or deleted. Exits 3 "
@@ -3855,7 +3859,8 @@ def build_parser():
     sp.add_argument("--live", default="", metavar="SUBSTRING",
                     help="when ~/.claude.json and config.json disagree about the "
                          "signed-in account, assert which one the desktop app is "
-                         "signed into (id, org, path, or email substring; refused "
+                         "signed into (id, org, path, or email substring, or the "
+                         "printed acct/org pair, e.g. 'aaaa1111/cccc3333'; refused "
                          "unless the files disagree - see RULING 5)")
     sp.add_argument("--only", default="", metavar="SUBSTRING",
                     help="only sessions whose title contains this")
