@@ -5893,8 +5893,13 @@ def _iso_ms(ts):
     return int(base.timestamp()) * 1000 + frac
 
 
-def _transcript_facts(env, session_id):
+def _transcript_facts(env, session_id, fps_cache=None):
     """Everything a synthesized row needs, read from the transcript itself.
+
+    FPS_CACHE, when given, receives this pass's fingerprints in the
+    measurement cache's typed shape (hold-remedies design §1) - converge's
+    collision measurement reuses what this pass computed anyway, so a
+    planned sid never costs a measurement-added read.
 
     Refuses rather than guessing. A row built on values that could not be read
     is a guess wearing the app's clothes, and the whole point of the template is
@@ -6010,6 +6015,9 @@ def _transcript_facts(env, session_id):
     except OSError as exc:
         raise Refusal("could not count the turns in {0}: {1}. Nothing was "
                       "written.".format(session_id, exc))
+    if fps_cache is not None:
+        fps_cache[session_id] = (("ok", None, fps) if fps is not None else
+                                 ("failed", "unreadable or too large", None))
     # Stat AFTER both reads and compare against the stat taken BEFORE them. The
     # apply-time check re-stats this file and compares, so whatever is recorded
     # here becomes the definition of "unchanged" - and a stat taken only at the
@@ -10185,6 +10193,190 @@ def _retitle_command(sid, title):
             '--apply'.format(sid[:8], title))
 
 
+# --- Measured hold remedies (docs/specs/2026-08-30-hold-remedies-design.md).
+# When converge holds a title collision, it measures the two conversations
+# against each other and - when the measurement is decisive - prints a
+# complete remedy naming the right leg. Advisory throughout: every degraded
+# or inconclusive state falls back to today's placeholder remedy plus one
+# reason line, and nothing in this block may raise past its wrapper.
+
+# Classification bands (§2) - bands, NOT a binary: at or above the first is
+# supersession-shaped, at or below the second is distinct, and everything
+# between refuses with 'inconclusive overlap' rather than producing the
+# design's most confident sentence from its most fragile number.
+# Calibration provenance, recorded so a drift is re-derived rather than
+# argued with: the 2026-08-29 pass's supersession pairs measured 0.98, 0.98
+# and 0.80 (rewind-to-edit forks copy the entire prefix, so near-total
+# overlap is how that gesture presents by construction), and its distinct
+# pairs sat near 0.0. If a real pair ever lands between the bands, re-derive
+# these constants from that measurement - do not trust them.
+SUPERSESSION_MIN_OVERLAP = 0.8
+DISTINCT_MAX_OVERLAP = 0.2
+# Recency picks the superseded side on its own only in the symmetric-overlap
+# branch (the mutual-fork shape), and only past this margin: a smaller gap is
+# 'legs cannot be ordered', so timestamp jitter and touch-updates never
+# decide. All three measured 2026-08-29 pairs clear it (15 minutes to a day).
+RECENCY_MARGIN_MS = 5 * 60 * 1000
+# Plan-wide cap on measurement-ADDED transcript bytes, charged only for
+# reads that actually happen: an over-cap file degrades its pair as
+# oversized WITHOUT spending budget on bytes never read (charging would let
+# one 200 MB file starve every later pair). Worst case is therefore ~256 MB
+# read on a pathological store and zero on a holds-free plan - the automatic
+# escape hatch that is the stated reason no --no-measure flag ships.
+MEASURE_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+
+
+def _measure_load(path):
+    """The measurement path's ONE transcript read - a seam on purpose. Reads
+    the plan performs anyway (_transcript_facts, for every planned
+    conversation) prefill the cache and never pass through here, so 'zero
+    added reads on a holds-free plan' is checkable at this line rather than
+    argued from the plan's own legitimate I/O."""
+    return _message_fingerprints(path)
+
+
+def _measure_fingerprints(env, sid, cache, budget):
+    """(status, reason, fingerprints) for one side of a collision pair,
+    through the per-plan cache and under the added-read budget (§1).
+
+    The cache is typed - failure provenance ('no transcript' vs oversized vs
+    budget) survives to reporting time instead of collapsing into None - and
+    sid-global within the plan, which is sound because transcript resolution
+    is sid-global: transcripts live under projects_root, outside any account
+    dir, so the same verdict holds for a later hold on the same sid in a
+    different destination. Multi-transcript sids are unmeasured for the
+    ~6896 helper's reason: comparing [0] would measure a file we only might
+    have meant."""
+    if sid in cache:
+        return cache[sid]
+    found = find_transcripts(env.projects_root, sid)
+    if not found:
+        entry = ("failed", "no transcript", None)
+    elif len(found) > 1:
+        entry = ("failed", "several transcripts carry this id", None)
+    else:
+        try:
+            size = os.path.getsize(found[0])
+        except OSError:
+            size = None
+        if size is None or size > TRANSCRIPT_COMPARE_MAX_BYTES:
+            # Degrades WITHOUT charging - see MEASURE_MAX_TOTAL_BYTES.
+            entry = ("failed", "unreadable or too large", None)
+        elif budget["spent"] + size > MEASURE_MAX_TOTAL_BYTES:
+            entry = ("failed", "measurement budget exhausted", None)
+        else:
+            budget["spent"] += size
+            fps = _measure_load(found[0])
+            entry = (("ok", None, fps) if fps is not None else
+                     ("failed", "unreadable or too large", None))
+    cache[sid] = entry
+    return entry
+
+
+def _leg_span(sid, records):
+    """(min createdAt, max lastActivityAt) over every row opening SID, or
+    None when any of those rows' dates are unusable (absent, null,
+    non-numeric) or the aggregate is inverted. Recency reads row dates, all
+    written by this one machine's clock - rows are local files; no
+    cross-machine skew exists in this store model."""
+    created, last = [], []
+    for rec in records:
+        if (rec.data.get("cliSessionId") or "") != sid:
+            continue
+        c, act = rec.data.get("createdAt"), rec.data.get("lastActivityAt")
+        for v in (c, act):
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                return None
+        created.append(c)
+        last.append(act)
+    if not created or min(created) > max(last):
+        return None
+    return (min(created), max(last))
+
+
+def _overlap_verdict(env, sid_a, sid_b, records, cache, budget):
+    """The `measured` object for one collision pair (§2, §4): classification
+    supersession / distinct / unmeasured, the superseded side picked by
+    OVERLAP and corroborated by recency - never by clocks alone, because
+    touching the old trunk after a fork must not rename the live leg.
+
+    The two directional ratios are doctor's own numbers (shared over each
+    side's fingerprint count), with the module's established approximation
+    inherited knowingly: _message_fingerprints hashes normalized prose
+    prefixes into a set, so repeated identical turns collapse and long turns
+    compare by their opening. The band, the two-signal agreement rule and
+    the recency margin are the margins for that approximation.
+
+    Side-selection: the candidate is the more-contained side (its content
+    continues in the other). Asymmetric ratios (apart by more than 0.1):
+    recency must AGREE the candidate is the older leg, else
+    'overlap and recency disagree'. Symmetric ratios (the mutual-fork
+    shape): the legs are the same content give or take at most 10%, so
+    "superseded" honestly degrades to "less recently touched" - recency
+    decides, guarded by RECENCY_MARGIN_MS, and the cost of it being wrong is
+    bounded by that same asymmetry. A recency tie, in either branch, is
+    'legs cannot be ordered' - checked first, so neither branch has an
+    undefined tie state.
+
+    Title generation is deliberately NOT here: B2 (row retirement) consumes
+    this verdict without it. The three generation fields come back neutral
+    and the collision hold's composer fills them in."""
+    out = {"classification": "unmeasured", "reason": None,
+           "superseded": None, "current": None,
+           "shared": None, "a": sid_a, "a_total": None,
+           "b": sid_b, "b_total": None,
+           "suggested_title": None, "degrade_reason": None,
+           "command_runnable": False}
+    st_a, why_a, fps_a = _measure_fingerprints(env, sid_a, cache, budget)
+    st_b, why_b, fps_b = _measure_fingerprints(env, sid_b, cache, budget)
+    if st_a != "ok" or st_b != "ok":
+        out["reason"] = why_a if st_a != "ok" else why_b
+        return out
+    set_a, set_b = set(fps_a), set(fps_b)
+    shared = len(set_a & set_b)
+    # The numeric trio exists iff BOTH sides were fingerprinted (§4) - an
+    # intersection with an unmeasured side does not exist.
+    out["shared"], out["a_total"], out["b_total"] = (shared, len(set_a),
+                                                     len(set_b))
+    if len(set_a) < OVERLAP_MIN_SAMPLE or len(set_b) < OVERLAP_MIN_SAMPLE:
+        out["reason"] = "too few prose turns"
+        return out
+    a_in_b = shared / float(len(set_a))
+    b_in_a = shared / float(len(set_b))
+    top = max(a_in_b, b_in_a)
+    if top <= DISTINCT_MAX_OVERLAP:
+        # Deliberately not "branch": a shared title does not prove shared
+        # ancestry, and two unrelated conversations under one generic name
+        # classify here too, correctly.
+        out["classification"] = "distinct"
+        return out
+    if top < SUPERSESSION_MIN_OVERLAP:
+        out["reason"] = "inconclusive overlap"
+        return out
+    span_a, span_b = _leg_span(sid_a, records), _leg_span(sid_b, records)
+    if span_a is None or span_b is None:
+        out["reason"] = "row dates unusable"
+        return out
+    if span_a[1] == span_b[1]:
+        out["reason"] = "legs cannot be ordered"
+        return out
+    older = sid_a if span_a[1] < span_b[1] else sid_b
+    if abs(a_in_b - b_in_a) > 0.1:      # asymmetric: real divergent work
+        candidate = sid_a if a_in_b > b_in_a else sid_b
+        if candidate != older:
+            out["reason"] = "overlap and recency disagree"
+            return out
+    else:                               # symmetric: the mutual-fork shape
+        if abs(span_a[1] - span_b[1]) < RECENCY_MARGIN_MS:
+            out["reason"] = "legs cannot be ordered"
+            return out
+        candidate = older
+    out["classification"] = "supersession"
+    out["superseded"] = candidate
+    out["current"] = sid_b if candidate == sid_a else sid_a
+    return out
+
+
 # The generated remedy title's suffix grammar (hold-remedies design, §3).
 # Fixed English month abbreviations, NOT strftime's %b: the suffix-replacement
 # rule below matches this grammar byte-exactly to decide tool provenance, and
@@ -10250,6 +10442,87 @@ def _superseded_leg_title(base, rows):
     elif _LEG_SUFFIX_LOOSE_RE.search(base):
         return None, "title already carries a leg suffix"
     return "{0} - earlier leg ({1})".format(base, rng), None
+
+
+def _measured_line(mm, records):
+    """The prose body of a hold's measured / not-measured line, title-free
+    by construction: only sids, counts, ratios and dates enter it, which is
+    what keeps --anonymize trivially safe for these lines. The one
+    title-bearing tail - the shell-unsafe 'suggested name' - is rendered at
+    emit time from the post-anonymize field instead, never stored here."""
+    c = mm["classification"]
+    if c == "supersession":
+        sup, cur = mm["superseded"], mm["current"]
+        sup_total = mm["a_total"] if sup == mm["a"] else mm["b_total"]
+        cur_total = mm["b_total"] if sup == mm["a"] else mm["a_total"]
+        return ("{0} is the earlier leg - {1} of its {2} prose turns "
+                "continue in {3}, which adds {4} more; last activity {5} "
+                "vs {6}").format(
+                    sup[:8], mm["shared"], sup_total, cur[:8],
+                    cur_total - mm["shared"],
+                    _leg_day(_leg_span(sup, records)[1]),
+                    _leg_day(_leg_span(cur, records)[1]))
+    if c == "distinct":
+        return ("largely distinct conversations - they share {0} of {1} and "
+                "{0} of {2} prose turns; both need human names").format(
+                    mm["shared"], mm["a_total"], mm["b_total"])
+    if mm["reason"] == "inconclusive overlap":
+        # The most fragile number in the design produces HEDGED output at
+        # its boundary - both ratios, never a confident wrong sentence.
+        return ("inconclusive overlap - {0:.2f} of one leg's prose turns "
+                "are in the other, {1:.2f} the other way").format(
+                    mm["shared"] / float(mm["a_total"]),
+                    mm["shared"] / float(mm["b_total"]))
+    return mm["reason"] or ""
+
+
+def _measure_collision_hold(env, hold, sid, other, title, records,
+                            conversations, cache, budget):
+    """Measure one held_title_collision pair and attach the verdict to HOLD:
+    the `measured` object (§4), the title-free `measured_line` the report
+    prints, and - on a supersession whose §3 checks all pass - the complete
+    remedy naming the superseded leg. On supersession the remedy's TARGET is
+    redirected even when generation degrades; distinct and unmeasured keep
+    today's targets, because without a measured basis to redirect, current
+    behavior is the honest default.
+
+    Advisory by construction, including against exceptions: the whole
+    pipeline - measurement AND title generation - degrades to today's remedy
+    plus 'measurement failed (<type>)' rather than raising. A plan that died
+    on a corrupt transcript would convert advice into a guard nobody asked
+    for."""
+    try:
+        mm = _overlap_verdict(env, sid, other, records, cache, budget)
+        line = _measured_line(mm, records)
+        if mm["classification"] == "supersession":
+            sup = mm["superseded"]
+            hold["retitle"] = _retitle_command(sup, "<new title>")
+            generated, why = _superseded_leg_title(
+                title, [rec.data for rec in conversations.get(sup, [])])
+            if why is None:
+                mm["suggested_title"] = generated
+                mm["command_runnable"] = True
+                hold["retitle"] = _retitle_command(sup, generated)
+            else:
+                mm["degrade_reason"] = why
+            if _LEG_SUFFIX_RE.search(title.strip()):
+                # The current leg inherited '… - earlier leg (…)' from the
+                # fork it came from; the remedy renames only the superseded
+                # side, so without this note the active leg stays branded
+                # "earlier" until a human notices.
+                hold["leg_suffix_note"] = True
+    except Exception as exc:
+        mm = {"classification": "unmeasured",
+              "reason": "measurement failed ({0})".format(
+                  type(exc).__name__),
+              "superseded": None, "current": None,
+              "shared": None, "a": sid, "a_total": None,
+              "b": other, "b_total": None,
+              "suggested_title": None, "degrade_reason": None,
+              "command_runnable": False}
+        line = mm["reason"]
+    hold["measured"] = mm
+    hold["measured_line"] = line
 
 
 def _converge_title(recs, facts):
@@ -10402,11 +10675,16 @@ def plan_converge(env, flags):
 
     rows, holds, notes = [], [], []
     planned_titles = {}          # account -> {title_key: sid this plan places}
+    # This plan run's measurement state (hold-remedies design §1): the typed
+    # fingerprint cache, prefilled by the _transcript_facts pass below so
+    # fingerprints the plan computes anyway are reused, and the byte budget
+    # bounding measurement-ADDED reads.
+    measure_cache, measure_budget = {}, {"spent": 0}
     for sid, missing in short:
         recs = eligible[sid]
         holder_labels = sorted({rec.label for rec in recs})
         try:
-            facts = _transcript_facts(env, sid)
+            facts = _transcript_facts(env, sid, fps_cache=measure_cache)
         except Refusal as exc:
             # Not fatal to the rest (spec, "Holds"): a transcript that exists
             # but cannot populate a row - duplicated across project folders,
@@ -10441,14 +10719,21 @@ def plan_converge(env, flags):
                 # holds arrive with their fixes attached. A non-colliding
                 # minority title is NOT substituted either: canonical
                 # consistency outranks maximising placements.
-                holds.append({
+                hold = {
                     "session": sid, "account": acct, "label": d["label"],
                     "title": title, "reason": "held_title_collision",
                     "detail": "{0!r} already names a different conversation "
                               "in that sidebar: row {1} (opens {2})".format(
                                   title, hit[1], (hit[0] or "?")[:8]),
                     "retitle": (_retitle_command(hit[0], "<new title>")
-                                if hit[0] else "")})
+                                if hit[0] else "")}
+                # Measured unconditionally - §4's "always present" is scoped
+                # to plan-time collision holds, this one included. A blocking
+                # row with no sid measures as 'no transcript', which is true.
+                _measure_collision_hold(env, hold, sid, hit[0], title,
+                                        records, conversations,
+                                        measure_cache, measure_budget)
+                holds.append(hold)
                 continue
             planned = planned_titles.get(acct, {}).get(k)
             if planned is not None and planned != sid:
@@ -10458,13 +10743,17 @@ def plan_converge(env, flags):
                 # order - deterministic) holds; at apply time the same state
                 # is what the per-pair re-check would produce, so the plan
                 # says it now rather than surprising the applier.
-                holds.append({
+                hold = {
                     "session": sid, "account": acct, "label": d["label"],
                     "title": title, "reason": "held_title_collision",
                     "detail": "this plan already creates a row named {0!r} "
                               "there, for conversation {1}".format(
                                   title, planned[:8]),
-                    "retitle": _retitle_command(sid, "<new title>")})
+                    "retitle": _retitle_command(sid, "<new title>")}
+                _measure_collision_hold(env, hold, sid, planned, title,
+                                        records, conversations,
+                                        measure_cache, measure_budget)
+                holds.append(hold)
                 continue
             # The uuid is minted at plan time (spec, "Applying") so the
             # journalled op can list the complete bytes to write, and so
@@ -10950,6 +11239,10 @@ def _public_converge_manifest(env, m):
             if isinstance(h, dict):
                 h["detail"] = _scrub(h.get("detail"))
                 h["retitle"] = _scrub(h.get("retitle"))
+                # Title-free by construction (_measured_line); scrubbed
+                # anyway, because "by construction" is an argument and this
+                # line is a paste target.
+                h["measured_line"] = _scrub(h.get("measured_line"))
         for note in out.get("notes") or []:
             if isinstance(note, dict):
                 note["retitle"] = _scrub(note.get("retitle"))
@@ -10958,6 +11251,26 @@ def _public_converge_manifest(env, m):
                 r["holders"] = [_scrub_label(x) for x in r["holders"]]
             if isinstance(r.get("skip_detail"), str):
                 r["skip_detail"] = _scrub(r["skip_detail"])
+    # A runnable measured remedy is DERIVED here, at emit time, from the
+    # structured fields anonymize_report has already run over - so
+    # anonymizing suggested_title anonymizes the command by construction
+    # (hold-remedies design §4), the command being derived from the field
+    # rather than stored beside it. Under --anonymize the flag is then
+    # forced false: the rendered command carries an opaque label where the
+    # title was - a command that would literally rename a conversation to
+    # that label - and a "runnable" claim on it would be false
+    # actionability. Anonymized reports are display artifacts.
+    for h in out.get("holds") or []:
+        if not isinstance(h, dict):
+            continue
+        mm = h.get("measured")
+        if not isinstance(mm, dict) or not mm.get("command_runnable"):
+            continue
+        if mm.get("superseded") and mm.get("suggested_title"):
+            h["retitle"] = _retitle_command(mm["superseded"],
+                                            mm["suggested_title"])
+        if _ANONYMIZE:
+            mm["command_runnable"] = False
     return out
 
 
@@ -11015,6 +11328,23 @@ def _print_converge_report(say, m):
             say("   {0} -> {1}: {2} - {3}".format(
                 (h.get("session") or "")[:8], h.get("label", ""),
                 h.get("reason", ""), h.get("detail", "")))
+            mm = h.get("measured")
+            if isinstance(mm, dict):
+                tag = ("not measured"
+                       if mm.get("classification") == "unmeasured"
+                       else "measured")
+                line = h.get("measured_line") or ""
+                if (mm.get("degrade_reason") == "title not shell-safe"
+                        and mm.get("suggested_title")):
+                    # The title itself is valid - only the pasted string
+                    # would be unsafe - so the suggestion survives as prose
+                    # (post-anonymize field, rendered here at emit time).
+                    line += "; suggested name: {0}".format(
+                        mm["suggested_title"])
+                say("      {0}: {1}".format(tag, line))
+                if h.get("leg_suffix_note"):
+                    say("      note: the current leg also carries a leg "
+                        "suffix and likely wants a fresh name")
             if h.get("retitle"):
                 say("      {0}".format(h["retitle"]))
         say("")

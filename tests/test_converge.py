@@ -1466,3 +1466,194 @@ def test_exact_suffix_is_replaced_lookalike_degrades():
         "ACME-REVIEW session - earlier leg (probably)", rows)
     assert title is None
     assert why == "title already carries a leg suffix"
+
+
+T_COLL = "ACME-REVIEW session"
+SUGGESTED = "ACME-REVIEW session - earlier leg (Aug 24-28)"
+
+
+def prose_transcript(labels, cwd="C:\\Users\\u\\Projects\\Northwind"):
+    """A transcript whose prose turns are exactly LABELS (each one distinct
+    prose), and which _transcript_facts can populate a row from - a cwd,
+    usable timestamps, an assistant record carrying the model."""
+    entries = [
+        {"cwd": cwd, "timestamp": "2026-08-01T00:00:00.000Z", "type": "user",
+         "message": {"role": "user", "content": "prose turn " + labels[0]}},
+        {"timestamp": "2026-08-01T00:10:00.000Z", "type": "assistant",
+         "message": {"role": "assistant", "model": "claude-opus-5",
+                     "content": [{"type": "text",
+                                  "text": "prose turn " + labels[1]}]}},
+    ]
+    for lab in labels[2:]:
+        entries.append({"type": "user",
+                        "message": {"role": "user",
+                                    "content": "prose turn " + lab}})
+    return entries
+
+
+def turn_labels(prefix, n):
+    return ["{0}{1}".format(prefix, i) for i in range(n)]
+
+
+def measured_pair(env, write_transcript, write_row, title=T_COLL,
+                  early=None, late=None, third_dest=False,
+                  early_last=None, late_last=None):
+    """The 2026-08-29 shape, fake cast: S1 the earlier leg, S2 the current
+    one, one title between them. S1 held by A1 only and S2 by A2 only, so
+    each collides with the other's row in the opposite sidebar (shape (a),
+    both directions); THIRD_DEST parks a dead PAD row in A3 so the
+    planned-vs-planned rule adds a shape (b) hold there too."""
+    shared = turn_labels("s", 48)
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + (early or turn_labels("a", 2))))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + (late or turn_labels("b", 13))))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, title, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=early_last or ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, title, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=late_last or ms_local(2026, 8, 29)))
+    if third_dest:
+        write_row(env, 0, A3, O3, "local_pad", row_data(PAD, "Padding"))
+
+
+def collision_holds(m):
+    return [h for h in m["holds"] if h["reason"] == "held_title_collision"]
+
+
+def test_supersession_hold_names_the_superseded_leg(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 1: asymmetric overlap (48/50 vs 48/61), the contained side
+    also older - the remedy names THAT sid in both directions of the hold,
+    with the generated title, complete."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    want = ('claude-code-sessions retitle --only {0} --title "{1}" '
+            '--apply'.format(S1[:8], SUGGESTED))
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["superseded"] == S1 and mm["current"] == S2
+        assert mm["shared"] == 48
+        assert {mm["a"], mm["b"]} == {S1, S2}
+        if mm["a"] == S1:
+            assert (mm["a_total"], mm["b_total"]) == (50, 61)
+        else:
+            assert (mm["a_total"], mm["b_total"]) == (61, 50)
+        assert mm["suggested_title"] == SUGGESTED
+        assert mm["degrade_reason"] is None
+        assert mm["command_runnable"] is True
+    pub = ct._public_converge_manifest(env, m)
+    assert [h["retitle"] for h in collision_holds(pub)] == [want, want]
+
+
+def test_both_directions_of_a_group_print_one_identical_remedy(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 2: holds both ways plus the shape (b) third destination -
+    every hold of the group carries the SAME command (the repeated
+    (sid, title) suggestion is one suggestion, not a self-collision)."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row, third_dest=True)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 3
+    for h in held:
+        assert h["measured"]["command_runnable"] is True
+        assert h["measured"]["degrade_reason"] is None
+        assert h["measured"]["suggested_title"] == SUGGESTED
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    want = ('claude-code-sessions retitle --only {0} --title "{1}" '
+            '--apply'.format(S1[:8], SUGGESTED))
+    assert out.count(want) == 3
+
+
+def test_replan_after_the_paste_clears_the_group(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 3: apply the suggested title to the superseded leg's rows -
+    a fresh plan holds NOTHING for the pair, shapes (a) and (b) alike,
+    because renaming either leg of a two-leg group changes its key."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row, third_dest=True)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    suggested = collision_holds(m)[0]["measured"]["suggested_title"]
+    assert suggested == SUGGESTED
+    # The paste, simulated: retitle rewrites every row of the superseded leg.
+    p = os.path.join(env.store_candidates[0], A1, O1, "local_s1.json")
+    with open(p, encoding="utf-8") as fh:
+        d = json.load(fh)
+    d["title"] = suggested
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    m2 = ct.plan_converge(env, ct.ConvergeFlags())
+    assert m2["holds"] == []
+    pairs = sorted((r["session"], r["account"]) for r in m2["rows"])
+    assert pairs == [(S1, A2), (S1, A3), (S2, A1), (S2, A3)]
+
+
+def test_overlap_picks_the_side_recency_confirms(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 4: symmetric ratios (the mutual-fork shape all three
+    2026-08-29 pairs had) - recency picks the superseded leg, past the
+    margin."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row,
+                  early=turn_labels("a", 2), late=turn_labels("b", 2))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "supersession"
+        assert mm["superseded"] == S1 and mm["current"] == S2
+        assert mm["command_runnable"] is True
+
+
+def test_planned_collision_shape_is_measured_too(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 28: the shape (b) hold - whose text otherwise never names
+    the counterpart - redirects its remedy and its measured line carries
+    both sids."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row, third_dest=True)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    shape_b = [h for h in collision_holds(m)
+               if "already creates" in h["detail"]]
+    assert len(shape_b) == 1
+    h = shape_b[0]
+    assert h["session"] == S2 and h["account"] == A3
+    assert h["measured"]["classification"] == "supersession"
+    assert h["measured"]["superseded"] == S1
+    assert S1[:8] in h["measured_line"] and S2[:8] in h["measured_line"]
+    pub = ct._public_converge_manifest(env, m)
+    b = [x for x in collision_holds(pub) if "already creates" in x["detail"]]
+    assert "--only {0}".format(S1[:8]) in b[0]["retitle"]
+    assert SUGGESTED in b[0]["retitle"]
+
+
+def test_current_leg_wearing_suffix_gets_the_note(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 25d: a fork of an already-renamed leg - the colliding title
+    itself wears the exact generated grammar. The remedy still renames only
+    the superseded side (range refreshed); the fixed note line says the
+    current leg likely wants a fresh name."""
+    env = mkenv(tmp_path)
+    worn = "ACME-REVIEW session - earlier leg (Aug 1-3)"
+    measured_pair(env, write_transcript, write_row, title=worn)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        assert h["measured"]["suggested_title"] == SUGGESTED
+        assert h["measured"]["command_runnable"] is True
+        assert h.get("leg_suffix_note") is True
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert ("note: the current leg also carries a leg suffix and likely "
+            "wants a fresh name") in out
