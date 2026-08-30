@@ -11347,8 +11347,11 @@ def _public_converge_manifest(env, m):
                 h["retitle"] = _scrub(h.get("retitle"))
                 # Title-free by construction (_measured_line); scrubbed
                 # anyway, because "by construction" is an argument and this
-                # line is a paste target.
-                h["measured_line"] = _scrub(h.get("measured_line"))
+                # line is a paste target. Only when present - a hold without
+                # one (an unusable-transcript hold, an older manifest) does
+                # not gain a null key from being displayed.
+                if isinstance(h.get("measured_line"), str):
+                    h["measured_line"] = _scrub(h["measured_line"])
         for note in out.get("notes") or []:
             if isinstance(note, dict):
                 note["retitle"] = _scrub(note.get("retitle"))
