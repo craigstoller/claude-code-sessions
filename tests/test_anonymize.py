@@ -242,6 +242,75 @@ def test_a_placeholder_title_does_not_leak_the_cwd_leaf(
     assert "Northwind" not in payload
 
 
+def test_registration_keeps_the_table_longest_first(
+        mkenv, tmp_path, write_transcript, write_row):
+    """anonymize() replaces in table order, so a registered title LONGER
+    than a stored one it contains must sort ahead of it - iteration hitting
+    the short stored pair first would partial-replace inside the long title
+    and leave the tail exposed, the exact failure longest-first exists
+    for."""
+    env = mkenv(tmp_path)
+    seed(env, write_transcript, write_row, title="ACME")
+    long_title = "ACME offboarding escalation"
+    ct._anon_register_title(env, long_title)
+    out = ct.anonymize(env, "row: " + long_title)
+    assert "offboarding" not in out
+    assert out == "row: " + ct._anon_label("session", long_title)
+
+
+def test_holder_titles_in_a_disagreement_note_are_covered(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The minority copies' titles in a disagreement note are STORED row
+    titles, covered by _anon_pairs rather than by converge's registration
+    loop - pinned here so that division of coverage stays observable if
+    either side of it ever changes."""
+    from test_converge import cv_ns, t_entries, row_data, S1, PAD, A1, O1, A2, O2, A3, O3
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, t_entries())
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, "ACME-REVIEW plan draft", lastActivityAt=5))
+    write_row(env, 0, A2, O2, "local_s1",
+              row_data(S1, "ACME-REVIEW plan final", lastActivityAt=9))
+    write_row(env, 0, A3, O3, "local_pad", row_data(PAD, "Padding"))
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in out
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert "ACME-REVIEW" not in json.dumps(payload)
+    entries = payload["notes"][0]["holder_titles"]
+    assert len(entries) == 2
+    for e in entries:
+        assert e["title"].startswith("<session-")
+
+
+def test_a_title_matching_a_structural_key_cannot_break_the_report(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """anonymize_report rewrites dict KEYS too (the third bug's fix), so a
+    registered title that IS a structural field name used to rename that key:
+    'rows' crashed _public_converge_manifest at out['rows'], and 'title'
+    dodged the field-value scrub because membership was tested on the renamed
+    key. Structural keys are schema, not data - they must never be renamed,
+    while the value under them still is."""
+    from test_converge import cv_ns, t_entries, row_data, S1, PAD, A1, O1, A2, O2
+    for colliding in ("rows", "title"):
+        env = mkenv(tmp_path / colliding)
+        write_transcript(env, "C--p", S1,
+                         t_entries() + [{"customTitle": colliding}])
+        write_row(env, 0, A1, O1, "local_s1", row_data(S1, ""))
+        write_row(env, 0, A2, O2, "local_pad", row_data(PAD, "Padding"))
+        ct._ANONYMIZE = True
+        ct._ANON_CACHE.clear()
+        rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert "rows" in payload
+        assert payload["rows"][0]["title"].startswith("<session-")
+
+
 def test_a_transcript_derived_title_survives_nowhere_in_a_hold(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """The full carrier set at once: two untitled conversations whose

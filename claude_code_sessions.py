@@ -2784,6 +2784,45 @@ def _anon_register_title(env, title):
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
                 "suggested_title")
 _ANON_EMAIL_FIELDS = ("label", "email", "account_email")
+# The fixed field vocabulary of every report anonymize_report traverses
+# (list items, doctor, alignment, the retitle and converge manifests).
+# Keys in this set are SCHEMA, never data, and must never be renamed: a
+# title in the substitution table that happens to equal one - 'rows' as a
+# terse customTitle is enough - used to rename the key, crashing
+# _public_converge_manifest at out['rows'] and dodging the _ANON_FIELDS
+# value scrub, whose membership test ran on the renamed key. The residual
+# runs the other way and is accepted: a report keyed BY titles keeps a
+# data key raw when that title IS one of these names - a generic
+# identifier-shaped word with no privacy value. A new report field name
+# belongs here; one that is missed degrades to the old corruption, never
+# to a leak.
+_ANON_STRUCTURAL_KEYS = frozenset((
+    "a", "a_in_b", "a_total", "a_unique", "account", "accounts", "after",
+    "age_days", "b", "b_in_a", "b_total", "b_unique", "blank_rows",
+    "by_account_count", "classification", "cli_session_id",
+    "command_runnable", "complete", "config", "consistent", "conversations",
+    "created", "current", "dead_excluded", "dead_rows", "degrade_reason",
+    "dest_path", "destinations", "detail", "disagreeing_rows",
+    "distinguishable", "duplicate_titles", "encoding", "encoding_recent",
+    "exit_code", "held", "holder_titles", "holders", "holds",
+    "identity_disagreement", "in_all_accounts", "is_update",
+    "last_activity", "leaving_a_gap", "leg_suffix_note", "legacy",
+    "legacy_folders", "listed", "live_asserted", "local_id",
+    "max_containment", "mb", "measured", "measured_line", "name",
+    "non_destinations", "nonterminal_ops", "notes", "now", "oauth", "of",
+    "only", "only_session", "op_id", "op_type", "orphan_ids", "orphans",
+    "pairs", "path", "per_account", "post_b64", "pre_b64", "reachable",
+    "reason", "result", "retitle", "rollback_residue", "roots",
+    "row_count", "row_errors", "rows", "safe", "scope", "scoped",
+    "session", "session_id", "sessions", "shared", "short",
+    "sibling_divergence", "siblings", "skip_detail", "skipped",
+    "stale_lock", "status", "store_is_a_guess", "store_label",
+    "store_path", "store_why", "stores", "superseded", "title_source",
+    "titles", "to_session", "transcript_count", "transcript_paths",
+    "transcripts", "turns", "unknown_layout", "unlisted_ranked",
+    "unlisted_recent", "unlisted_transcripts", "unmeasured",
+    "unreadable_rows", "vanished_new_rows", "written",
+)) | frozenset(_ANON_FIELDS) | frozenset(_ANON_EMAIL_FIELDS)
 
 
 def anonymize_report(env, obj):
@@ -2806,7 +2845,7 @@ def anonymize_report(env, obj):
             # the title itself - so anonymising only values left the private
             # string sitting in the key, one line below where it had just been
             # replaced.
-            if isinstance(k, str):
+            if isinstance(k, str) and k not in _ANON_STRUCTURAL_KEYS:
                 if "@" in k and "." in k:
                     k = _anon_label("account", k)
                 else:
@@ -11397,11 +11436,12 @@ def _public_converge_manifest(env, m):
         # substitution runs, so the chosen form is replaced wherever it is
         # embedded - a hold's detail sentence, the generated suggestion,
         # the derived command - exactly like a stored one. Read from the
-        # manifest itself, not plan state, so a manifest re-displayed by a
-        # later process is covered the same way. The suggestion is NOT
-        # registered whole: its base is a registered title and its suffix
-        # is tool provenance, the same partial-replacement rendering the
-        # stored-base path already shows.
+        # manifest itself, not plan state: the manifest is the one source
+        # both display paths (text and --json) share, so registration
+        # derives from exactly what is about to be shown. The suggestion
+        # is NOT registered whole: its base is a registered title and its
+        # suffix is tool provenance, the same partial-replacement
+        # rendering the stored-base path already shows.
         for r in out["rows"]:
             _anon_register_title(env, r.get("title"))
         for group in (out.get("holds"), out.get("notes")):
