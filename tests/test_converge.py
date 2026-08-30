@@ -1288,6 +1288,84 @@ def test_account_scope_refuses_across_accounts(mkenv, tmp_path,
                                    account_scope=True)
 
 
+# --------------------------------- 0.13.0: corroboration is a note, not an error
+
+def test_corroborated_live_proceeds_with_note(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The measured ping-pong: plain apply refused (disagreement) -> --live
+    added -> the app rewrote its file meanwhile -> --live refused
+    (agreement) -> flag stripped again. A --live naming the very account
+    the files agree on, and no other, is corroboration: the run proceeds
+    with a note, and records NO assertion - nothing was arbitrated."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A1, oauth_org=O1)
+    rc = ct.cmd_converge(env, cv_ns(live="alice@example.com"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no arbitration was needed" in out
+    m = ct.plan_converge(env, ct.ConvergeFlags(live="alice@example.com"))
+    assert m["live_asserted"] == ""
+
+
+def test_corroborated_live_ambiguous_is_refused(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The uniqueness check runs over EVERY account on the machine - with
+    no disagreement there is no two-candidate frame to bound it. A string
+    that also matches some other account's principal is refused with the
+    listing: a safe annoyance, never a mis-selection."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A1, oauth_org=O1)
+    os.makedirs(os.path.join(env.store_candidates[0],
+                             "aaaa9999-0000-0000-0000-000000000009",
+                             "bbbb8888-0000-0000-0000-000000000008"))
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_converge(env, ct.ConvergeFlags(live="aaaa"))
+    msg = str(exc.value)
+    assert "also matches" in msg
+    assert "aaaa9999" in msg
+
+
+def test_live_naming_other_account_while_agreeing_refused(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A --live naming anything OTHER than the agreed account while the
+    files agree keeps today's refusal - that case really is evidence of
+    confusion, and refusing it is the feature."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A1, oauth_org=O1)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_converge(env, ct.ConvergeFlags(live=A2[:8]))
+    msg = str(exc.value)
+    assert "do not currently disagree" in msg
+    assert "Re-run without --live" in msg
+    assert A1[:8] in msg                 # names the account that resolves
+
+
+def test_json_stdout_stays_pure(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Both changed output paths - warning present, corroborated note
+    present - emit parseable JSON with no stray prose: the warning is
+    non-JSON only (the manifest field is the machine signal), and the note
+    rides the manifest's notes array."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["identity_disagreement"] == {"oauth": A1, "config": A2}
+
+    desktop_config(env, A1)              # agreement; --live corroborates
+    rc = ct.cmd_converge(env, cv_ns(json=True, live="alice@example.com"))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["live_asserted"] == ""
+    assert any(isinstance(n, str) and "no arbitration was needed" in n
+               for n in payload["notes"])
+
+
 def test_remedy_lines_fall_back_when_emails_collide(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """Two accounts under one address would print two identical, unusable

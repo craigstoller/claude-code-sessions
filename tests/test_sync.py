@@ -2574,6 +2574,25 @@ class TestLiveOverride:
         assert "do not currently disagree" in msg
         assert "aaaaaaaa" in msg           # names the account that resolves
 
+    def test_sync_live_under_agreement_still_refused(self, two_account_env,
+                                                     tmp_path):
+        """0.13.0's corroboration (3b) is converge-only: under agreement
+        sync's source is resolved by the files and the flag selects
+        nothing, so every form - the exact live pair, a sibling-org pair,
+        the bare email - keeps today's refusal. This is the boundary the
+        design's round 3 drew by deleting the sync branch outright."""
+        env, src, dst = two_account_env(tmp_path)
+        _write_desktop_config(env, SOURCE_ACCT)          # agreement
+        os.makedirs(os.path.join(env.store_candidates[0], SOURCE_ACCT,
+                                 "eeeeeeee-0000-0000-0000-000000000007"))
+        exact = SOURCE_ACCT + "/bbbbbbbb-0000-0000-0000-000000000002"
+        for q in (exact, "aaaaaaaa/eeeeeeee", "me@example.com"):
+            with pytest.raises(ct.Refusal) as exc:
+                ct.resolve_sync_endpoints(env, live=q)
+            msg = str(exc.value)
+            assert "do not currently disagree" in msg
+            assert "Re-run without --live" in msg
+
     def test_refused_when_oauth_alone_resolves(self, two_account_env, tmp_path):
         env, src, dst = two_account_env(tmp_path)     # no config.json at all
         with pytest.raises(ct.Refusal, match="do not currently disagree"):

@@ -4206,6 +4206,10 @@ class Account:
     #   "config" - only config.json's lastKnownAccountUuid named it.
     #   "user"   - the user asserted it with sync --live while the identity
     #              files disagreed (RULING 5, _resolve_live_assertion).
+    #   "corroborated" - converge --live named the account the identity
+    #              files already AGREE on, uniquely (_corroborated_live):
+    #              no arbitration happened, the flag was redundant, and the
+    #              caller records no assertion - live_asserted stays "".
     #   ""       - not a live-account determination at all (every dormant
     #              candidate resolve_sync_endpoints builds).
     # Since RULING 4 (2026-08-02) provenance buys no guard exemption - E4
@@ -4957,6 +4961,66 @@ def _principal_listing(principals):
     return "\n".join(lines)
 
 
+def _corroborated_live(env, live, dirs, res):
+    """Change 3b (0.13.0), converge only: RES with
+    resolved_from="corroborated" when LIVE names the account the identity
+    files already agree on and no other account on the machine; None when
+    it does not name RES at all (the caller keeps today's refusal
+    verbatim - a --live naming anything else under agreement really is
+    evidence of confusion, and refusing it is the feature).
+
+    The measured ping-pong this removes (2026-08-29 runbook, documented in
+    both directions): plain apply refused under a disagreement -> the user
+    re-runs with --live -> the app meanwhile rewrote its file -> --live
+    refused under the agreement -> the flag comes off again. When the
+    string names the very account the files agree on, refusing certifies
+    nothing; it only round-trips the user.
+
+    The uniqueness check runs over EVERY discovered account, because with
+    no disagreement there is no two-candidate frame to bound it - without
+    it, `--live a` would silently resolve to whichever account the files
+    happen to agree on while also naming others. Deliberately
+    conservative: a string that incidentally substring-matches some other
+    account's path text raises the listing refusal - a safe annoyance,
+    never a mis-selection.
+
+    Sync never reaches this (account_scope=False keeps both
+    agreement-branch refusals standing): under agreement sync's source is
+    resolved by the files and the flag selects nothing - the design's
+    round 3 resolved 3b's defect there by deleting the sync branch rather
+    than refining it.
+    """
+    pair = _pair_query(live)
+    res_matched, others = False, []
+    seen = set()
+    for a, _o, _p in dirs:
+        if a in seen:
+            continue
+        seen.add(a)
+        email = (res.email if a == res.account_uuid
+                 else account_email(env, a)[0])
+        own = [(x, o, p) for x, o, p in dirs if x == a]
+        hit = _principal_matches(live, pair, a, email, own)
+        if a == res.account_uuid:
+            res_matched = hit
+        elif hit:
+            others.append((a, email, own))
+    if not res_matched:
+        return None
+    if others:
+        raise Refusal(
+            "--live {0!r} names the account the identity files already "
+            "agree on ({1}) but also matches {2} other account(s) on this "
+            "machine; refusing to treat an ambiguous string as "
+            "corroboration. Re-run without --live (the files agree, so "
+            "the flag selects nothing), or use a value only that account "
+            "matches - the printed account form works too, e.g. "
+            "'aaaa1111/cccc3333':\n{3}".format(
+                live, res.account_uuid[:8], len(others),
+                _principal_listing(others)))
+    return dataclasses.replace(res, resolved_from="corroborated")
+
+
 def _resolve_live_assertion(env, live, dirs, account_scope=False):
     """The Account the user certifies as desktop-live via --live (RULING 5).
 
@@ -4976,7 +5040,11 @@ def _resolve_live_assertion(env, live, dirs, account_scope=False):
     a specific two-way tie, cross-checked against a file that already names
     the account. With no disagreement it is refused: agreeing files make it
     unnecessary, and the no-evidence and config-only-ambiguous-org states
-    would have it certify a bit no file corroborates at all.
+    would have it certify a bit no file corroborates at all. One
+    converge-only exception (change 3b, _corroborated_live): at
+    ACCOUNT_SCOPE, a --live naming exactly the account the files agree on -
+    and no other - returns that account marked "corroborated" instead of
+    refusing; the caller notes it and records no assertion.
 
     ACCOUNT_SCOPE (converge passes True; sync, repoint, new-row and retitle
     keep the store-strict default) resolves the ACCOUNT rather than a
@@ -5014,6 +5082,14 @@ def _resolve_live_assertion(env, live, dirs, account_scope=False):
     if dis is None:
         res = live_account(env)
         if res is not None:
+            if account_scope:
+                # Converge-only (3b): a --live naming the agreed account,
+                # uniquely, is corroboration - a note, not an error. The
+                # caller records NO assertion for it (live_asserted stays
+                # ""), because nothing was arbitrated.
+                got = _corroborated_live(env, live, dirs, res)
+                if got is not None:
+                    return got
             raise Refusal(
                 "--live arbitrates a disagreement between ~/.claude.json and "
                 "config.json, and they do not currently disagree - the signed-in "
@@ -10034,6 +10110,13 @@ _CONVERGE_SCAN_WHY = ("which conversations that account already holds, or "
                       "which titles its sidebar carries - both the target set "
                       "and the collision hold depend on having looked")
 
+# 3b's one line. In non-JSON output it is printed (prefixed "note: "); under
+# --json the same sentence rides the manifest's `notes` array so stdout stays
+# pure JSON. It travels as a plain string among the dict-shaped title notes -
+# _print_converge_report branches on the type.
+_CORROBORATED_NOTE = ("--live names the account the identity files already "
+                      "agree on; no arbitration was needed.")
+
 
 def _converge_destinations(env, records):
     """({account: {account, org, path, label, rows}}, non_destinations).
@@ -10331,9 +10414,16 @@ def plan_converge(env, flags):
     after = complete_now + sum(1 for sid, _m in short if sid not in held_sids)
     held_conversations = sum(1 for sid, _m in short if sid in held_sids)
 
+    if flags.live and live and live.resolved_from == "corroborated":
+        notes.insert(0, _CORROBORATED_NOTE)
     m = {"op_type": "converge",
+         # A corroborated --live records NO assertion: nothing was
+         # arbitrated, the flag was redundant, and an unearned uuid here
+         # would let the recheck treat agreement-time corroboration as a
+         # disagreement-time certification (3b).
          "live_asserted": (live.account_uuid
-                           if flags.live and live else ""),
+                           if flags.live and live
+                           and live.resolved_from == "user" else ""),
          "only": flags.only, "only_session": only_sid,
          "destinations": [dests[a] for a in sorted(dests)],
          "non_destinations": non_dest,
@@ -10810,6 +10900,12 @@ def _print_converge_report(say, m):
             say(line)
         say("")
     for note in m.get("notes", []):
+        if isinstance(note, str):
+            # 3b's corroboration note: one line, not a title-disagreement
+            # block.
+            say("note: {0}".format(note))
+            say("")
+            continue
         say("titles disagree across the holders of {0}; the newest "
             "activity's title {1!r} is used, the minority copies keep "
             "theirs:".format((note.get("session") or "")[:8],
