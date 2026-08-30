@@ -2766,7 +2766,9 @@ def _anon_register_title(env, title):
     _ANON_MIN, the stripped base of an exact leg suffix, and the list is
     re-sorted because anonymize() depends on longest-first. Mutates the
     cached list in place, so every later anonymize() this process runs sees
-    the pair - harmless, since the string is a real title either way.
+    the pair - harmless, since anything registered here is a title the plan
+    chose (the transcript's custom one, or the generated placeholder) and
+    deserves its label anywhere it later appears.
     """
     t = title.strip() if isinstance(title, str) else ""
     pairs = _anon_pairs(env)
@@ -2810,11 +2812,12 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "legacy_folders", "listed", "live_asserted", "local_id",
     "max_containment", "mb", "measured", "measured_line", "name",
     "non_destinations", "nonterminal_ops", "notes", "now", "oauth", "of",
-    "only", "only_session", "op_id", "op_type", "orphan_ids", "orphans",
-    "pairs", "path", "per_account", "post_b64", "pre_b64", "reachable",
-    "reason", "result", "retitle", "rollback_residue", "roots",
-    "row_count", "row_errors", "rows", "safe", "scope", "scoped",
-    "session", "session_id", "sessions", "shared", "short",
+    "only", "only_session", "op_id", "op_type", "opens", "org",
+    "orphan_ids", "orphans", "pairs", "path", "per_account", "post_b64",
+    "pre_b64", "reachable", "reason", "result", "retitle",
+    "rollback_declined", "rollback_residue", "roots", "row", "row_count",
+    "row_errors", "rows", "safe", "scope", "scoped", "session",
+    "session_id", "sessions", "shared", "short", "short_of_all_accounts",
     "sibling_divergence", "siblings", "skip_detail", "skipped",
     "stale_lock", "status", "store_is_a_guess", "store_label",
     "store_path", "store_why", "stores", "superseded", "title_source",
@@ -11449,6 +11452,13 @@ def _public_converge_manifest(env, m):
                 if isinstance(entry, dict):
                     _anon_register_title(env, entry.get("title"))
         out = anonymize_report(env, out)
+        # --only is a user-typed TITLE SUBSTRING echoed back by the
+        # manifest, and a substring matches no whole registered title, so
+        # the table structurally cannot cover it. A fixed marker instead -
+        # retitle's <proposed-title> move - while complete.scoped keeps
+        # the scoped-ness readable.
+        if out.get("only"):
+            out["only"] = "<only-filter>"
 
         def _scrub(s):
             return anonymize(env, s) if isinstance(s, str) else s

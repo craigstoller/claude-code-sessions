@@ -311,6 +311,111 @@ def test_a_title_matching_a_structural_key_cannot_break_the_report(
         assert payload["rows"][0]["title"].startswith("<session-")
 
 
+def test_a_title_colliding_with_an_alignment_entry_key_leaves_it_alone(
+        mkenv, tmp_path, write_row, capsys):
+    """Round-2 catch: the structural set missed alignment's disagree-entry
+    keys (row, opens, short_of_all_accounts), so a stored title 'opens'
+    renamed that key and silently changed the --json schema."""
+    from test_converge import row_data, A1, O1, A2, O2
+    env = mkenv(tmp_path)
+    write_row(env, 0, A1, O1, "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s-1",
+               "cwd": "C:\\p", "title": "opens", "lastActivityAt": 9})
+    write_row(env, 0, A2, O2, "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s-2",
+               "cwd": "C:\\p", "title": "Something else", "lastActivityAt": 9})
+    ct._ANONYMIZE = True
+    rc = ct.cmd_alignment(env, ns(anonymize=True, json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    entry = payload["consistent"]["rows"][0]
+    assert set(entry) == {"row", "opens", "short_of_all_accounts"}
+
+
+def test_the_only_filter_is_not_echoed_into_anonymized_output(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Round-2 catch: --only is a user-typed TITLE SUBSTRING and the
+    manifest echoed it back verbatim - a substring matches no whole
+    registered title, so no table can cover it. It becomes a fixed marker,
+    the same move retitle makes with <proposed-title>; scoped-ness stays
+    readable in complete.scoped."""
+    from test_converge import cv_ns, t_entries, row_data, S1, PAD, A1, O1, A2, O2
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, t_entries())
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, "ACME-REVIEW offboarding escalation"))
+    write_row(env, 0, A2, O2, "local_pad", row_data(PAD, "Padding"))
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True,
+                                    only="offboarding"))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert "offboarding" not in json.dumps(payload)
+    assert payload["only"] == "<only-filter>"
+    assert payload["complete"]["scoped"] is True
+
+
+# The dict keys under these names are DATA (titles, account labels or uuids,
+# stringified counts), not schema - the walker below skips membership checks
+# for their whole subtree, mirroring anonymize_report's own key handling.
+DATA_KEYED_PARENTS = {"titles", "per_account", "opens", "accounts",
+                      "by_account_count"}
+
+
+def walk_fixed_keys(obj, in_data=False, parent=None, bad=None):
+    if bad is None:
+        bad = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not in_data and isinstance(k, str) \
+                    and k not in ct._ANON_STRUCTURAL_KEYS:
+                bad.append((parent, k))
+            walk_fixed_keys(v, in_data or (k in DATA_KEYED_PARENTS), k, bad)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk_fixed_keys(v, in_data, parent, bad)
+    return bad
+
+
+def test_every_emitted_report_key_is_in_the_structural_set(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The mechanical pin two round-2 reviewers asked for: the structural
+    set's comment claims the fixed field vocabulary of every report
+    anonymize_report traverses, and until now that claim was editorial. This
+    walks the reports the fixtures below actually emit - list, alignment,
+    doctor, and the public converge manifest - and fails on any fixed key
+    the set does not know. Coverage is exactly the shapes these fixtures
+    produce; a field only richer state emits still needs adding by hand."""
+    from test_converge import measured_pair, row_data, t_entries, A1, O1, A2, O2
+    env = mkenv(tmp_path / "reports")
+    # Reachable + duplicate-title pair (doctor's group shapes need real
+    # transcripts), a dead row, a blank row, and an unlisted transcript.
+    write_transcript(env, "C--p", "s-1", t_entries())
+    write_transcript(env, "C--p", "s-2", t_entries())
+    write_transcript(env, "C--p", "s-orphan", t_entries())
+    for n, sid in (("local_1", "s-1"), ("local_2", "s-2")):
+        write_row(env, 0, A1, O1, n,
+                  {"sessionId": n, "cliSessionId": sid, "cwd": "C:\\p",
+                   "title": "Quarterly board report", "lastActivityAt": 9})
+    write_row(env, 0, A2, O2, "local_1",
+              {"sessionId": "local_1", "cliSessionId": "s-2",
+               "cwd": "C:\\p", "title": "Another name", "lastActivityAt": 9})
+    write_row(env, 0, A1, O1, "local_dead",
+              {"sessionId": "local_dead", "cliSessionId": "s-gone",
+               "cwd": "C:\\p", "title": "Dead", "lastActivityAt": 9})
+    write_row(env, 0, A1, O1, "local_blank",
+              {"sessionId": "local_blank", "cwd": "C:\\p",
+               "title": "Blank", "lastActivityAt": 9})
+    bad = walk_fixed_keys(ct.gather_list(env))
+    bad = walk_fixed_keys(ct.gather_alignment(env), bad=bad)
+    bad = walk_fixed_keys(ct.gather_doctor(env), bad=bad)
+    env2 = mkenv(tmp_path / "converge")
+    measured_pair(env2, write_transcript, write_row, third_dest=True)
+    m = ct._public_converge_manifest(env2, ct.plan_converge(env2, ct.ConvergeFlags()))
+    bad = walk_fixed_keys(m, bad=bad)
+    assert bad == []
+
+
 def test_a_transcript_derived_title_survives_nowhere_in_a_hold(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """The full carrier set at once: two untitled conversations whose
