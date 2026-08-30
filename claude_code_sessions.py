@@ -10185,6 +10185,73 @@ def _retitle_command(sid, title):
             '--apply'.format(sid[:8], title))
 
 
+# The generated remedy title's suffix grammar (hold-remedies design, §3).
+# Fixed English month abbreviations, NOT strftime's %b: the suffix-replacement
+# rule below matches this grammar byte-exactly to decide tool provenance, and
+# a locale-dependent rendering would make a title generated on one machine a
+# "lookalike" on the next.
+_LEG_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_LEG_RANGE_PAT = (
+    r"(?:{m} {d}(?:-{d})?"                                # Aug 28 / Aug 24-28
+    r"|{m} {d} - {m} {d}"                                 # Aug 24 - Sep 2
+    r"|\d{{4}}-\d{{2}}-\d{{2}} - \d{{4}}-\d{{2}}-\d{{2}})"  # across years
+).format(m="(?:" + "|".join(_LEG_MONTHS) + ")",
+         d=r"(?:[1-9]|[12]\d|3[01])")
+# The EXACT generated grammar - matching it is treated as tool provenance, so
+# the range (the only part rewritten) is refreshed. A tail that merely
+# resembles it - different wording, spacing or a malformed range - is a
+# human's prose, and rewriting a person's words is not this feature's job.
+_LEG_SUFFIX_RE = re.compile(r" - earlier leg \(" + _LEG_RANGE_PAT + r"\)$")
+_LEG_SUFFIX_LOOSE_RE = re.compile(r"(?i)- ?earlier leg ?\(.*\)\s*$")
+
+
+def _leg_day(ms):
+    """One date as the sidebar convention renders it - 'Aug 28', local time.
+    The dates are a label for a human, not evidence; local time matches every
+    date the person has ever seen in their sidebar."""
+    t = time.localtime(ms / 1000.0)
+    return "{0} {1}".format(_LEG_MONTHS[t.tm_mon - 1], t.tm_mday)
+
+
+def _leg_range(start_ms, end_ms):
+    """The generated title's date range, in exactly four formats (§3):
+    'Aug 28', 'Aug 24-28', 'Aug 24 - Sep 2', '2026-12-30 - 2027-01-02'."""
+    s = time.localtime(start_ms / 1000.0)
+    e = time.localtime(end_ms / 1000.0)
+    if (s.tm_year, s.tm_mon, s.tm_mday) == (e.tm_year, e.tm_mon, e.tm_mday):
+        return _leg_day(start_ms)
+    if s.tm_year != e.tm_year:
+        return "{0:04d}-{1:02d}-{2:02d} - {3:04d}-{4:02d}-{5:02d}".format(
+            s.tm_year, s.tm_mon, s.tm_mday, e.tm_year, e.tm_mon, e.tm_mday)
+    if s.tm_mon == e.tm_mon:
+        return "{0} {1}-{2}".format(_LEG_MONTHS[s.tm_mon - 1], s.tm_mday,
+                                    e.tm_mday)
+    return "{0} - {1}".format(_leg_day(start_ms), _leg_day(end_ms))
+
+
+def _superseded_leg_title(base, rows):
+    """(generated title, None) for a superseded leg, or (None, degrade reason).
+
+    '<base> - earlier leg (<range>)', where the range spans the leg's rows -
+    min(createdAt) to max(lastActivityAt) - because the rows are what the
+    remedy renames and their dates are what the person's sidebar shows. BASE
+    is the colliding title; a base already wearing the exact generated suffix
+    (a second fork of an already-renamed leg) gets its range refreshed, and a
+    lookalike tail degrades instead - see _LEG_SUFFIX_RE. ROWS are the leg's
+    parsed row dicts; callers guarantee usable dates (classification already
+    refused 'row dates unusable' pairs), and the per-pair exception wrap owns
+    whatever slips past that guarantee."""
+    base = base.strip()
+    rng = _leg_range(min(r.get("createdAt") for r in rows),
+                     max(r.get("lastActivityAt") for r in rows))
+    if _LEG_SUFFIX_RE.search(base):
+        base = _LEG_SUFFIX_RE.sub("", base)
+    elif _LEG_SUFFIX_LOOSE_RE.search(base):
+        return None, "title already carries a leg suffix"
+    return "{0} - earlier leg ({1})".format(base, rng), None
+
+
 def _converge_title(recs, facts):
     """(title, title_source, disagreement, holder_titles) for one conversation.
 

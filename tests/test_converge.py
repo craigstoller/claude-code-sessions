@@ -6,6 +6,7 @@ the converge-side tests of docs/specs/2026-08-29-identity-ux-design.md
 corroboration). Every title is from the fake cast (ACME-REVIEW, Northwind,
 "Quarterly board report finalization") - never a real one.
 """
+import datetime
 import json
 import os
 import types
@@ -1413,3 +1414,55 @@ def test_remedy_lines_fall_back_when_emails_collide(
     assert "converge --live {0} --apply".format(A2[:8]) in out
     remedy = [line for line in out.splitlines() if "--live" in line]
     assert remedy and all("@" not in line for line in remedy)
+
+
+# ------------------- 0.14.0: measured hold remedies (hold-remedies design)
+
+def ms_local(y, mo, d, h=12, mi=0):
+    """Epoch ms for a LOCAL-time instant. The generated title's range renders
+    in local time, so fixtures built this way assert exact strings on any
+    runner timezone; noon keeps DST edges out of the arithmetic."""
+    return int(datetime.datetime(y, mo, d, h, mi).timestamp() * 1000)
+
+
+def leg_rows(created, last):
+    return [{"createdAt": created, "lastActivityAt": last}]
+
+
+def test_generated_title_shape():
+    """Spec test 9: the four range grammars, min(createdAt) to
+    max(lastActivityAt) across the leg's rows."""
+    def gen(rows):
+        title, why = ct._superseded_leg_title("ACME-REVIEW session", rows)
+        assert why is None
+        return title
+    base = "ACME-REVIEW session - earlier leg ({0})"
+    assert gen(leg_rows(ms_local(2026, 8, 28), ms_local(2026, 8, 28))) == \
+        base.format("Aug 28")
+    assert gen(leg_rows(ms_local(2026, 8, 24), ms_local(2026, 8, 28))) == \
+        base.format("Aug 24-28")
+    assert gen(leg_rows(ms_local(2026, 8, 24), ms_local(2026, 9, 2))) == \
+        base.format("Aug 24 - Sep 2")
+    assert gen(leg_rows(ms_local(2026, 12, 30), ms_local(2027, 1, 2))) == \
+        base.format("2026-12-30 - 2027-01-02")
+    # The range spans EVERY row of the leg, not whichever came first.
+    assert gen(leg_rows(ms_local(2026, 8, 25), ms_local(2026, 8, 26))
+               + leg_rows(ms_local(2026, 8, 24), ms_local(2026, 8, 28))) == \
+        base.format("Aug 24-28")
+
+
+def test_exact_suffix_is_replaced_lookalike_degrades():
+    """Spec test 10: a byte-exact generated suffix is tool provenance - its
+    range is refreshed; a tail that merely resembles one is a human's prose
+    and degrades rather than being rewritten."""
+    rows = leg_rows(ms_local(2026, 8, 24), ms_local(2026, 8, 28))
+    fresh = "ACME-REVIEW session - earlier leg (Aug 24-28)"
+    assert ct._superseded_leg_title(
+        "ACME-REVIEW session - earlier leg (Aug 1-3)", rows) == (fresh, None)
+    assert ct._superseded_leg_title(
+        "ACME-REVIEW session - earlier leg (2026-12-30 - 2027-01-02)",
+        rows) == (fresh, None)
+    title, why = ct._superseded_leg_title(
+        "ACME-REVIEW session - earlier leg (probably)", rows)
+    assert title is None
+    assert why == "title already carries a leg suffix"
