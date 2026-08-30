@@ -268,6 +268,26 @@ def test_store_guess_is_flagged_in_the_plan(mkenv, tmp_path, write_row):
     assert m["store_is_a_guess"] is True
 
 
+def test_pair_form_resolves_store(mkenv, tmp_path, write_row):
+    """_repoint_store accepts a pair-shaped query - the `acct/org` form every
+    report prints - as two anchored prefixes filtering the same dirs the
+    substring branches filter; the let-the-row-settle-it behavior continues
+    on whatever survives."""
+    env = mkenv(tmp_path)
+    three_accounts(env, write_row)
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW",
+                                             store="aaaaaaaa/bbbbbbbb"))
+    assert len(m["rows"]) == 1
+    assert A1 in m["rows"][0]["dest_path"]
+    assert m["store_is_a_guess"] is False
+    # A pair whose left half sits MID-uuid matches no store and refuses with
+    # the listing - it must never fall back to the path-substring branch,
+    # where '0001/bbbbbbbb' IS a fragment of A1's normalized store path.
+    with pytest.raises(ct.Refusal, match="matched no store"):
+        ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW",
+                                             store="0001/bbbbbbbb"))
+
+
 def test_store_sibling_divergence_warning_iff_siblings_would_differ(
         mkenv, tmp_path, write_row):
     env = mkenv(tmp_path)

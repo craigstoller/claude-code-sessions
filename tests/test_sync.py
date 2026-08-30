@@ -134,6 +134,44 @@ def test_to_refuses_cleanly_when_nothing_matches(two_account_env, tmp_path):
     assert "be more specific" not in str(exc_info.value)
 
 
+def test_pair_form_resolves_sync_to(two_account_env, tmp_path):
+    """The tool labels every account `email (acct/org)`, and 0.12.0 accepted
+    no form of that label back - the '/' matched nothing in any matcher. The
+    pair form is PARSED (two anchored prefixes), never substring-searched."""
+    env, src, dst = two_account_env(tmp_path)
+    os.makedirs(os.path.join(env.store_candidates[0],
+                             "eeeeeeee-0000-0000-0000-000000000005",
+                             "ffffffff-0000-0000-0000-000000000006"))
+    source, dest = ct.resolve_sync_endpoints(env, to="cccccccc/dddddddd")
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+    # The full printed uuids work too.
+    _, dest = ct.resolve_sync_endpoints(
+        env, to="cccccccc-0000-0000-0000-000000000003/"
+                "dddddddd-0000-0000-0000-000000000004")
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+    # A pair whose left half is a MID-uuid fragment is anchored out - and a
+    # pair matching nothing gets the ordinary no-match refusal, never a
+    # silent fall back into substring semantics.
+    with pytest.raises(ct.Refusal, match="matched no other account store"):
+        ct.resolve_sync_endpoints(env, to="0000-0000/dddddddd")
+
+
+def test_to_ambiguity_refusal_offers_the_pair_form(two_account_env, tmp_path):
+    """The 'be more specific' refusal now names the one form every report
+    already prints, so the retry can be a copy-paste of a label."""
+    env, src, dst = two_account_env(tmp_path)
+    second_dst_org = os.path.join(env.store_candidates[0],
+                                  "cccccccc-0000-0000-0000-000000000003",
+                                  "eeeeeeee-0000-0000-0000-000000000007")
+    os.makedirs(second_dst_org)
+    with pytest.raises(ct.Refusal) as exc_info:
+        ct.resolve_sync_endpoints(env, to="cccccccc")
+    assert "printed account form works too" in str(exc_info.value)
+    # ...and the offered form actually settles the ambiguity it appears in.
+    _, dest = ct.resolve_sync_endpoints(env, to="cccccccc/eeeeeeee")
+    assert os.path.normcase(dest.path) == os.path.normcase(second_dst_org)
+
+
 def test_layout_error_on_store_discovery_failure(two_account_env, tmp_path, monkeypatch):
     env, src, dst = two_account_env(tmp_path)
     root = env.store_candidates[0]
@@ -2591,6 +2629,20 @@ class TestLiveOverride:
         assert os.path.normcase(source.path) == os.path.normcase(dst)
         assert os.path.normcase(dest.path) == os.path.normcase(src)
 
+    def test_pair_form_resolves_live(self, two_account_env, tmp_path):
+        """sync --live accepts the printed account form at store scope: the
+        pair is parsed into two anchored prefixes, exactly as --to parses
+        it, and the resolved Account keeps its concrete org and path -
+        sync's source is the resolved STORE, so the org half stays
+        load-bearing there."""
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        source, dest = ct.resolve_sync_endpoints(env,
+                                                 live="cccccccc/dddddddd")
+        assert source.account_uuid == DORMANT
+        assert source.resolved_from == "user"
+        assert os.path.normcase(source.path) == os.path.normcase(dst)
+
     def test_matching_by_recovered_email_works(self, two_account_env, tmp_path):
         env, src, dst = two_account_env(tmp_path)
         self._e4(env)
@@ -2611,6 +2663,7 @@ class TestLiveOverride:
             ct.resolve_sync_endpoints(env, live=DORMANT)
         msg = str(exc.value)
         assert "be more specific" in msg
+        assert "printed account form works too" in msg
         assert "(1 row)" in _line_containing(msg, dst)
         assert "(no listing rows)" in _line_containing(msg, second)
         # ...and an org substring settles it, exactly like --to

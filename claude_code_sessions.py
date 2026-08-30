@@ -4854,6 +4854,53 @@ def _disagreeing_config_path(env, config_uuid):
     return ""
 
 
+_PAIR_CHARS = frozenset("0123456789abcdef-")
+
+
+def _pair_query(q):
+    """(acct_prefix, org_prefix) when Q is the tool's own printed account
+    form - exactly one '/', both halves non-empty and hex-shaped
+    ([0-9a-f-]) after lowercasing - else None.
+
+    Every report labels an account `email (aaaa1111/cccc3333)`, and until
+    0.13.0 no matcher accepted any form of that label back: two sites join
+    their haystack fields with spaces and the third tests fields
+    separately, so the '/' matched nothing anywhere. Nor could substring
+    semantics express the form once added: a mid-uuid fragment like
+    '1111/cccc' would match INSIDE a joined 'aaaa1111/cccc3333', and a
+    legitimate shorter pair like 'aaaa11/cccc33' would fail because its '/'
+    lands at a different index. "Two anchored prefixes" is a structure, so
+    the pair form is PARSED here and matched by _pair_matches, never
+    searched. The hex guard keeps real substrings out of this branch: a
+    cygwin-style path carries more than one '/', and an email never has
+    hex-only halves, so neither can be captured by accident.
+    """
+    if q.count("/") != 1:
+        return None
+    left, right = q.lower().split("/", 1)
+    if not left or not right:
+        return None
+    if not (set(left) <= _PAIR_CHARS and set(right) <= _PAIR_CHARS):
+        return None
+    return left, right
+
+
+def _pair_matches(pair, account_uuid, org_uuid):
+    """Anchored prefix match of a parsed pair against one store's own ids.
+
+    Prefixes are what a human shortening an id actually types, so the
+    printed 8-char form, the full uuids, and any unambiguous prefix pair
+    all resolve. A pair-shaped query that matches nothing gets the caller's
+    ordinary no-match refusal - it must NEVER fall back into substring
+    semantics, which would silently re-admit the over-matching the parsed
+    form exists to remove. Two stores genuinely sharing both prefixes hit
+    the ordinary >1-match refusal, which is the correct outcome.
+    """
+    left, right = pair
+    return (account_uuid.lower().startswith(left)
+            and org_uuid.lower().startswith(right))
+
+
 def _resolve_live_assertion(env, live, dirs):
     """The Account the user certifies as desktop-live via --live (RULING 5).
 
@@ -4876,10 +4923,12 @@ def _resolve_live_assertion(env, live, dirs):
     would have it certify a bit no file corroborates at all.
 
     Matching reuses --to's disambiguation semantics over the two named
-    accounts' on-disk stores, with one addition: an empty or whitespace-only
-    value is refused outright - substring containment would make it match
-    every candidate, which on a one-candidate machine is exactly the bare
-    force flag this design refuses to be.
+    accounts' on-disk stores - a pair-shaped value resolves as the printed
+    account form (_pair_query), anything else as a substring - with one
+    addition: an empty or whitespace-only value is refused outright -
+    substring containment would make it match every candidate, which on a
+    one-candidate machine is exactly the bare force flag this design
+    refuses to be.
     """
     if not live.strip():
         raise Refusal(
@@ -4918,14 +4967,21 @@ def _resolve_live_assertion(env, live, dirs):
         email, src = ((oauth_email, "") if a == oauth_uuid and oauth_email
                       else account_email(env, a))
         cands.append(Account(a, o, email, p, "user", src))
-    matched = [c for c in cands if live.lower() in
-               (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
-                c.path).lower()]
+    pair = _pair_query(live)
+    if pair is not None:
+        matched = [c for c in cands
+                   if _pair_matches(pair, c.account_uuid, c.org_uuid)]
+    else:
+        matched = [c for c in cands if live.lower() in
+                   (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
+                    c.path).lower()]
     if len(matched) > 1:
         listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
                                      for c in matched)
         raise Refusal("--live {0!r} matched {1} stores; be more specific (a longer "
-                      "id, or part of the store path):\n{2}"
+                      "id, or part of the store path):\n"
+                      "the printed account form works too, e.g. "
+                      "'aaaa1111/cccc3333'\n{2}"
                       .format(live, len(matched), listing))
     if not matched:
         listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
@@ -5032,9 +5088,14 @@ def resolve_sync_endpoints(env, to=None, live=None):
         # for both candidates and no --to value could ever tell them apart.
         # The path is the only thing that differs, so it has to be matchable
         # (and, below, printed) or sync is simply unusable on such a machine.
-        matched = [c for c in others if to.lower() in
-                   (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
-                    c.path).lower()]
+        pair = _pair_query(to)
+        if pair is not None:
+            matched = [c for c in others
+                       if _pair_matches(pair, c.account_uuid, c.org_uuid)]
+        else:
+            matched = [c for c in others if to.lower() in
+                       (c.account_uuid + " " + c.org_uuid + " " + c.email +
+                        " " + c.path).lower()]
         if not matched:
             raise Refusal("--to {0!r} matched no other account store".format(to))
         if len(matched) > 1:
@@ -5042,7 +5103,9 @@ def resolve_sync_endpoints(env, to=None, live=None):
                 ((c.account_uuid, c.org_uuid, c.path) for c in matched),
                 _authenticated_org(env, source.account_uuid))
             raise Refusal("--to {0!r} matched {1} accounts; be more specific (a longer "
-                          "id, or part of the store path):\n{2}"
+                          "id, or part of the store path):\n"
+                          "the printed account form works too, e.g. "
+                          "'aaaa1111/cccc3333'\n{2}"
                           .format(to, len(matched), listing))
         return source, matched[0]
     if len(others) > 1:
@@ -8227,29 +8290,38 @@ def _repoint_store(env, flags, what="repoint"):
     """
     dirs = _account_dirs(env)
     if flags.store:
-        # Once, not once per candidate: the same answer for every dir below.
-        # Only in this branch - the --live path resolves its own, and asking
-        # here would be work thrown away.
-        live = live_account(env)
-        want = flags.store.lower()
-        # The path gets its OWN normalized form, and is the only branch that
-        # uses it. Kept separate from `want` so the substring semantics of the
-        # other three branches are untouched: neither a uuid nor an email can
-        # contain a path separator, so folding one in would be a no-op for them
-        # in practice - but a no-op by assumption rather than by construction,
-        # and this is exactly the kind of shared-string reasoning that produced
-        # the mismatch _path_match_key documents.
-        want_path = _path_match_key(flags.store)
-        # Email included on purpose: an account id and an org id BOTH collide
-        # across stores on a real machine (three accounts x three org dirs here),
-        # so the fragments people reach for first are exactly the ones that come
-        # back ambiguous. The email is how a person names an account.
-        # account_email returns (email, provenance) - not a bare string. Taking
-        # it for one raised AttributeError on the first real invocation.
-        hits = [(a, o, p) for a, o, p in dirs
-                if want in a.lower() or want in o.lower()
-                or want in (_email_of(env, a, live) or "").lower()
-                or want_path in _path_match_key(p)]
+        pair = _pair_query(flags.store)
+        if pair is not None:
+            # The printed account form, parsed rather than searched (see
+            # _pair_query). It filters the same dirs the substring branches
+            # filter, and everything downstream - the no-match refusal, the
+            # let-the-row-settle-it multi-hit return - is shared.
+            hits = [(a, o, p) for a, o, p in dirs
+                    if _pair_matches(pair, a, o)]
+        else:
+            # Once, not once per candidate: the same answer for every dir
+            # below. Only in this branch - the --live path resolves its own,
+            # and asking here would be work thrown away.
+            live = live_account(env)
+            want = flags.store.lower()
+            # The path gets its OWN normalized form, and is the only branch that
+            # uses it. Kept separate from `want` so the substring semantics of the
+            # other three branches are untouched: neither a uuid nor an email can
+            # contain a path separator, so folding one in would be a no-op for them
+            # in practice - but a no-op by assumption rather than by construction,
+            # and this is exactly the kind of shared-string reasoning that produced
+            # the mismatch _path_match_key documents.
+            want_path = _path_match_key(flags.store)
+            # Email included on purpose: an account id and an org id BOTH collide
+            # across stores on a real machine (three accounts x three org dirs here),
+            # so the fragments people reach for first are exactly the ones that come
+            # back ambiguous. The email is how a person names an account.
+            # account_email returns (email, provenance) - not a bare string. Taking
+            # it for one raised AttributeError on the first real invocation.
+            hits = [(a, o, p) for a, o, p in dirs
+                    if want in a.lower() or want in o.lower()
+                    or want in (_email_of(env, a, live) or "").lower()
+                    or want_path in _path_match_key(p)]
         if not hits:
             raise Refusal("--store {0!r} matched no store on this machine:\n{1}"
                           .format(flags.store, _candidate_listing(dirs)))
