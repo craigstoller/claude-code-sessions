@@ -2747,6 +2747,25 @@ def _anon_pairs(env):
             # Over-matching corrupts the report; the structured pass below is
             # what actually guarantees coverage.
             seen.setdefault(c, _anon_label("project", c))
+    # Project FOLDER names as they sit on disk, WHOLE entry names only. A
+    # transcript path names its project folder, and the folder is the cwd
+    # wearing the app's encoding ("C--clients-Northwind") - a form neither
+    # the whole-path pairs above nor any title ever matches - so a refusal
+    # that quotes transcript paths (the duplicated-transcript hold's detail,
+    # new-row's version of the same refusal) printed the client's name
+    # verbatim under --anonymize. Listing the real directory names needs no
+    # knowledge of the encoding scheme and cannot drift from it, and covers
+    # a folder whose cwd no row carries - which a duplicate copy's second
+    # folder typically is. An entry name is the whole path encoded, not a
+    # basename, so this stays on the right side of the over-matching
+    # history above.
+    try:
+        for entry in os.listdir(env.projects_root):
+            if len(entry) >= _ANON_MIN and \
+                    os.path.isdir(os.path.join(env.projects_root, entry)):
+                seen.setdefault(entry, _anon_label("project", entry))
+    except OSError:
+        pass
     pairs = sorted(seen.items(), key=lambda kv: -len(kv[0]))
     _ANON_CACHE[key] = pairs
     return pairs

@@ -119,6 +119,49 @@ def test_json_is_covered(mkenv, tmp_path, write_transcript, write_row, capsys):
     assert "<session-" in payload
 
 
+def test_a_duplicated_transcript_hold_does_not_leak_the_project_folder(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The transcript-unusable hold quotes _transcript_facts' refusal, and the
+    duplicate-transcript refusal quotes full transcript paths. A path names its
+    project folder, and the folder is the cwd wearing the app's encoding
+    ("C--clients-Northwind") - a form the substitution table's whole-path and
+    title pairs never match - so the client's name survived both the text
+    scrub and the --json one while everything around it looked anonymised."""
+    from test_converge import A1, A2, O1, O2, S1, S2, cv_ns, row_data, t_entries
+    env = mkenv(tmp_path)
+    # The same conversation in TWO project folders: _transcript_facts refuses,
+    # quoting both paths. The client-naming folder is what must not survive.
+    write_transcript(env, "C--clients-Northwind", S1,
+                     t_entries(cwd="C:\\clients\\Northwind"))
+    write_transcript(env, "C--Users-u-scratch", S1,
+                     t_entries(cwd="C:\\clients\\Northwind"))
+    write_row(env, 0, A1, O1, "local_1",
+              row_data(S1, "ACME-REVIEW handoff", cwd="C:\\clients\\Northwind"))
+    # A2 is a destination via an unrelated, healthy conversation.
+    write_transcript(env, "C--p", S2, t_entries(cwd="C:\\p"))
+    write_row(env, 0, A2, O2, "local_2", row_data(S2, "Padding", cwd="C:\\p"))
+
+    # Sanity, so the assertions below cannot pass vacuously: the raw plan
+    # really does carry the folder name inside a hold detail.
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = [h for h in m["holds"] if h["reason"] == "held_transcript_unusable"]
+    assert held and all("C--clients-Northwind" in h["detail"] for h in held)
+
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "held_transcript_unusable" in out
+    assert "Northwind" not in out
+
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert any(h["reason"] == "held_transcript_unusable"
+               for h in json.loads(payload)["holds"])
+    assert "Northwind" not in payload
+
+
 def test_anonymize_with_verbose_is_refused(mkenv, tmp_path, capsys):
     """--verbose prints the raw line and never reaches redact(), where
     anonymising happens. Accepting both would print real titles under a flag
