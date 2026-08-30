@@ -2752,6 +2752,35 @@ def _anon_pairs(env):
     return pairs
 
 
+def _anon_register_title(env, title):
+    """Teach the substitution table one PLAN-CHOSEN title.
+
+    The table above is built from STORED row titles, but converge names a
+    conversation whose rows carry no usable title at plan time, from the
+    transcript (_new_row_title's customTitle fallback, else the placeholder
+    - which embeds the cwd leaf). That string exists in no row, so without
+    this it rode through --anonymize verbatim everywhere the chosen title is
+    carried: the row listing, a hold's `title` and `detail`, the generated
+    suggestion and the rendered retitle command. Same rules as _anon_pairs,
+    deliberately: whole strings only (the over-matching history above),
+    _ANON_MIN, the stripped base of an exact leg suffix, and the list is
+    re-sorted because anonymize() depends on longest-first. Mutates the
+    cached list in place, so every later anonymize() this process runs sees
+    the pair - harmless, since the string is a real title either way.
+    """
+    t = title.strip() if isinstance(title, str) else ""
+    pairs = _anon_pairs(env)
+    known = {real for real, _label in pairs}
+    added = False
+    for s in (t, _LEG_SUFFIX_RE.sub("", t)):
+        if len(s) >= _ANON_MIN and s not in known:
+            pairs.append((s, _anon_label("session", s)))
+            known.add(s)
+            added = True
+    if added:
+        pairs.sort(key=lambda kv: -len(kv[0]))
+
+
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
                 "suggested_title")
 _ANON_EMAIL_FIELDS = ("label", "email", "account_email")
@@ -11361,6 +11390,24 @@ def _public_converge_manifest(env, m):
                     if k not in ("pre_b64", "post_b64")}
                    for r in m.get("rows", [])]
     if _ANONYMIZE:
+        # The manifest's titles are plan-CHOSEN, not all stored: an
+        # untitled conversation is named from its transcript
+        # (_converge_title's fallback), a string _anon_pairs has never
+        # seen. Register every title this manifest carries before any
+        # substitution runs, so the chosen form is replaced wherever it is
+        # embedded - a hold's detail sentence, the generated suggestion,
+        # the derived command - exactly like a stored one. Read from the
+        # manifest itself, not plan state, so a manifest re-displayed by a
+        # later process is covered the same way. The suggestion is NOT
+        # registered whole: its base is a registered title and its suffix
+        # is tool provenance, the same partial-replacement rendering the
+        # stored-base path already shows.
+        for r in out["rows"]:
+            _anon_register_title(env, r.get("title"))
+        for group in (out.get("holds"), out.get("notes")):
+            for entry in group or []:
+                if isinstance(entry, dict):
+                    _anon_register_title(env, entry.get("title"))
         out = anonymize_report(env, out)
 
         def _scrub(s):

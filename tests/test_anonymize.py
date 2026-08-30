@@ -183,3 +183,110 @@ def test_anonymize_covers_the_rendered_command(
             assert "ACME-REVIEW" not in (h["measured"]["suggested_title"]
                                          or "")
             assert "ACME-REVIEW" not in h["retitle"]
+
+
+# ---------------- plan-chosen titles (the transcript-derived fallback)
+#
+# _anon_pairs is built from STORED row titles, but converge names a
+# conversation whose rows carry no usable title at plan time, from the
+# transcript (_new_row_title's customTitle fallback). That string exists in
+# no row, so the substitution table had never seen it and it rode through
+# --anonymize verbatim in every field and sentence that carries it.
+
+
+def test_a_transcript_derived_row_title_is_anonymized(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """A conversation with untitled rows gets its planned title from the
+    transcript's customTitle; under --anonymize that title must come out as
+    a label in the row listing, text and JSON both."""
+    from test_converge import cv_ns, t_entries, row_data, S1, PAD, A1, O1, A2, O2
+    env = mkenv(tmp_path)
+    private = "ACME-REVIEW offboarding escalation"
+    write_transcript(env, "C--p", S1, t_entries() + [{"customTitle": private}])
+    write_row(env, 0, A1, O1, "local_s1", row_data(S1, ""))
+    write_row(env, 0, A2, O2, "local_pad", row_data(PAD, "Padding"))
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in out
+    assert "<session-" in out
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in payload
+    assert "<session-" in payload
+
+
+def test_a_placeholder_title_does_not_leak_the_cwd_leaf(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The fallback's other arm: no customTitle either, so the plan names the
+    conversation '(untitled - <day>, <n> turns, <leaf>)' - and the leaf can
+    name a client. Whole cwd paths are in the table; a leaf inside a
+    generated title is not, unless the chosen title is registered whole."""
+    from test_converge import cv_ns, t_entries, row_data, S1, PAD, A1, O1, A2, O2
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--clients-Northwind", S1,
+                     t_entries(cwd="C:\\clients\\Northwind"))
+    write_row(env, 0, A1, O1, "local_s1", row_data(S1, ""))
+    write_row(env, 0, A2, O2, "local_pad", row_data(PAD, "Padding"))
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Northwind" not in out
+    assert "<session-" in out
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert "Northwind" not in payload
+
+
+def test_a_transcript_derived_title_survives_nowhere_in_a_hold(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The full carrier set at once: two untitled conversations whose
+    transcripts chose the SAME title converge on a third destination, so the
+    later one holds (shape (b)) and the pair measures as a supersession. The
+    chosen title is the hold's `title`, is embedded in the `detail`
+    sentence, and is the base of `suggested_title` and the rendered retitle
+    command - all four must carry the label, none the real string."""
+    from test_converge import (cv_ns, prose_transcript, turn_labels, row_data,
+                               ms_local, S1, S2, PAD, A1, O1, A2, O2, A3, O3)
+    env = mkenv(tmp_path)
+    private = "ACME-REVIEW session"
+    shared = turn_labels("s", 48)
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + turn_labels("a", 2))
+                     + [{"customTitle": private}])
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + turn_labels("b", 13))
+                     + [{"customTitle": private}])
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, "", createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, "", createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    write_row(env, 0, A3, O3, "local_pad", row_data(PAD, "Padding"))
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in out
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert "ACME-REVIEW" not in payload
+    holds = [h for h in json.loads(payload)["holds"]
+             if h["reason"] == "held_title_collision"]
+    assert len(holds) == 1
+    h = holds[0]
+    label = h["title"]
+    assert label.startswith("<session-")
+    # One string, one stable label - the detail sentence and the generated
+    # suggestion carry the SAME label the title field got.
+    assert label in h["detail"]
+    assert h["measured"]["suggested_title"].startswith(label)
+    assert "earlier leg" in h["measured"]["suggested_title"]
+    assert label in h["retitle"]
+    assert h["measured"]["command_runnable"] is False
