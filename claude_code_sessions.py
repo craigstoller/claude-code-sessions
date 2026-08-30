@@ -4417,11 +4417,17 @@ def _guard_mutation(env, what, whose="another account's store",
     dis = _identity_disagreement(env)
     extra = ""
     if dis:
+        # The desktop-switch caveat is change 4's: config.json has been
+        # measured both tracking a switch (2026-08-02) and keeping the
+        # previous account across one (2026-08-29), so "so the two agree"
+        # must not read as a promise the user can reliably keep.
         extra = (
             "\nAlso: ~/.claude.json ({0}) and config.json ({1}) disagree about the "
             "signed-in account. Re-authenticate the CLI (run 'claude', then /login) "
             "as the account you use, or switch the desktop app to it, so the two "
-            "agree. --live does not lift this guard - close the app."
+            "agree (a desktop switch may not refresh config.json - it has been "
+            "measured both tracking one and keeping the previous account). "
+            "--live does not lift this guard - close the app."
             .format(dis[0][:8], dis[1][:8]))
     if running[0] == _PROC_UNAVAILABLE:
         # "Couldn't look" is never "nothing there" (Task 2), but it is also
@@ -10485,14 +10491,30 @@ def _converge_recheck(env, m):
     # side to protect - but a machine whose identity files disagree is a
     # machine in a state this module never mutates under silently. --live
     # (validated at plan time by _resolve_live_assertion) arbitrates it.
+    # The remedies are ordered by what can actually work (change 4,
+    # 0.13.0): --live works in every disagreement; /login rewrites only
+    # ~/.claude.json, so re-auth clears this only when the CLI side is the
+    # stale one - and the one re-auth that would force "agreement" when
+    # config.json is stuck is signing the CLI into the STALE account, the
+    # false agreement a liveness guard must not invite, which is why the
+    # old "so the two agree" promise is gone. The desktop switch says "may
+    # not", not "cannot": config.json has been measured both ways.
     dis = _identity_disagreement(env)
     if dis and (m.get("live_asserted") or "") not in dis:
         raise Refusal(
             "~/.claude.json ({0}) and config.json ({1}) disagree about the "
-            "signed-in account (RULING 5). Re-authenticate the CLI (run "
-            "'claude', then /login) or switch the desktop app so the two "
-            "agree, or re-plan with --live naming one of the two accounts. "
-            "Nothing was written.".format(dis[0][:8], dis[1][:8]))
+            "signed-in account (RULING 5). The designed remedy is to "
+            "assert which account the desktop app is on and re-plan:\n"
+            "   claude-code-sessions converge --live <email, or acct/org "
+            "as reports print it> --apply\n"
+            "If it is the CLI's record that is stale, re-authenticating "
+            "the CLI as the desktop's account (run 'claude', then /login) "
+            "also clears this. Switching the desktop app may not - "
+            "config.json has been measured both tracking a switch "
+            "(2026-08-02) and keeping the previous account across one "
+            "(2026-08-29) - and re-authenticating never writes it. --live "
+            "exists for exactly that case. Nothing was written."
+            .format(dis[0][:8], dis[1][:8]))
     # The plan's stores are re-discovered and must still resolve to the same
     # populated-one answer - a store that moved since planning is a replan,
     # never a guess.

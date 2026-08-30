@@ -1288,6 +1288,26 @@ def test_account_scope_refuses_across_accounts(mkenv, tmp_path,
                                    account_scope=True)
 
 
+def test_apply_refusal_leads_with_live(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Change 4: the remedies ordered by what can actually work. --live
+    first (it works in every disagreement); re-authentication scoped to
+    the CLI-stale case (/login rewrites only ~/.claude.json); the desktop
+    switch caveated "may not" - config.json has been measured both
+    tracking a switch and keeping the previous account across one."""
+    env = mkenv(tmp_path)
+    one_missing_pair(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_converge(env, m)
+    msg = str(exc.value)
+    assert msg.index("--live") < msg.index("/login")
+    assert "If it is the CLI's record that is stale" in msg
+    assert "Switching the desktop app may not" in msg
+    assert "Nothing was written" in msg
+
+
 # --------------------------------- 0.13.0: corroboration is a note, not an error
 
 def test_corroborated_live_proceeds_with_note(

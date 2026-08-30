@@ -2815,6 +2815,21 @@ class TestLiveOverride:
             ct._guard_mutation(env, "write to")
         assert "--live does not lift this guard" in str(exc.value)
 
+    def test_guard_disagreement_note_caveats_the_desktop_switch(
+            self, two_account_env, tmp_path):
+        """Change 4's one-clause caveat reaches the guard's note too: a
+        desktop switch may not refresh config.json - measured tracking one
+        (E4, 2026-08-02) and keeping the previous account across one
+        (2026-08-29) - so "so the two agree" must not read as a promise."""
+        env, src, dst = two_account_env(tmp_path)
+        self._e4(env)
+        env.process_lister = lambda: [(99999, _DESKTOP_EXE)]
+        with pytest.raises(ct.Refusal) as exc:
+            ct._guard_mutation(env, "write to")
+        msg = str(exc.value)
+        assert "may not refresh config.json" in msg
+        assert "--live does not lift this guard" in msg
+
     def test_disagreement_refusal_advertises_live(self, two_account_env, tmp_path):
         env, src, dst = two_account_env(tmp_path)
         self._e4(env)
