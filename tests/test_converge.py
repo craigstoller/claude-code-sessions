@@ -2065,6 +2065,224 @@ def test_planned_three_way_collision_degrades(
     assert all("already creates" in h["detail"] for h in held)
 
 
+def two_blocked_pairs(env, write_transcript, write_row, s3_turns=40):
+    """Two independent collision pairs whose blockers are COMPLETE (rows in
+    both accounts), so measuring each blocker costs one added read: S1
+    collides with S3 in A2, S2 collides with S4 in A1. No prose is shared,
+    so a measured pair classifies distinct. Returns the blockers' transcript
+    paths."""
+    write_transcript(env, "C--p", S1, prose_transcript(turn_labels("a", 10)))
+    write_transcript(env, "C--p", S2, prose_transcript(turn_labels("b", 10)))
+    p3 = write_transcript(env, "C--p", S3,
+                          prose_transcript(turn_labels("c", s3_turns)))
+    p4 = write_transcript(env, "C--p", S4,
+                          prose_transcript(turn_labels("d", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, "ACME-REVIEW", createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, "Northwind kickoff",
+                       createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    for acct, org, name in ((A1, O1, "local_s3a"), (A2, O2, "local_s3b")):
+        write_row(env, 0, acct, org, name,
+                  row_data(S3, "ACME-REVIEW", createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 29)))
+    for acct, org, name in ((A1, O1, "local_s4a"), (A2, O2, "local_s4b")):
+        write_row(env, 0, acct, org, name,
+                  row_data(S4, "Northwind kickoff",
+                           createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 29)))
+    return p3, p4
+
+
+def pair_holds(m):
+    out = {}
+    for h in collision_holds(m):
+        pair = frozenset((h["measured"]["a"], h["measured"]["b"]))
+        out.setdefault(pair, []).append(h["measured"])
+    return out
+
+
+def test_dead_collision_row_degrades(mkenv, tmp_path, write_transcript,
+                                     write_row):
+    """Spec test 18: the blocking conversation has no transcript - that side
+    is 'no transcript', the numeric trio does not exist, and the plan
+    otherwise proceeds (regression: no Refusal)."""
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, prose_transcript(turn_labels("a", 10)))
+    write_transcript(env, "C--p", S2, prose_transcript(turn_labels("b", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A1, O1, "local_s2",
+              row_data(S2, "Northwind kickoff",
+                       createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_dead", row_data(S3, T_COLL))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 1
+    mm = held[0]["measured"]
+    assert mm["classification"] == "unmeasured"
+    assert mm["reason"] == "no transcript"
+    assert (mm["a"], mm["b"]) == (S1, S3)
+    assert mm["shared"] is None and mm["a_total"] is None \
+        and mm["b_total"] is None
+    assert any(r["session"] == S2 for r in m["rows"])
+
+
+def test_ambiguous_transcript_count_degrades(mkenv, tmp_path,
+                                             write_transcript, write_row):
+    """Spec test 19: one sid in two project dirs - comparing [0] would
+    measure a file we only might have meant, so the pair is unmeasured."""
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, prose_transcript(turn_labels("a", 10)))
+    write_transcript(env, "C--p", S3, prose_transcript(turn_labels("c", 10)))
+    write_transcript(env, "C--q", S3, prose_transcript(turn_labels("c", 10)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s3",
+              row_data(S3, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert held
+    for h in held:
+        assert h["measured"]["reason"] == \
+            "several transcripts carry this id"
+
+
+def test_oversized_transcript_degrades(mkenv, tmp_path, write_transcript,
+                                       write_row, monkeypatch):
+    """Spec test 20: over TRANSCRIPT_COMPARE_MAX_BYTES is 'unreadable or too
+    large', never a wrong number - and the plan completes."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    monkeypatch.setattr(ct, "TRANSCRIPT_COMPARE_MAX_BYTES", 10)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "unreadable or too large")
+
+
+def test_below_sample_floor_degrades(mkenv, tmp_path, write_transcript,
+                                     write_row):
+    """Spec test 21: below OVERLAP_MIN_SAMPLE a percentage would read as
+    precise while meaning nothing - but the counts themselves are honest, so
+    the numeric trio survives."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    shared = turn_labels("s", 4)
+    write_transcript(env, "C--p", S1, prose_transcript(shared))
+    write_transcript(env, "C--p", S2, prose_transcript(shared))
+    held = assert_unmeasured(ct.plan_converge(env, ct.ConvergeFlags()),
+                             "too few prose turns")
+    for h in held:
+        assert h["measured"]["shared"] == 4
+        assert h["measured"]["a_total"] == 4
+        assert h["measured"]["b_total"] == 4
+
+
+def test_budget_exhaustion_degrades_later_pairs(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Spec test 22: the budget covers the first blocker exactly; the first
+    pair measures and the second reports exhaustion instead of reading."""
+    env = mkenv(tmp_path)
+    p3, _p4 = two_blocked_pairs(env, write_transcript, write_row)
+    monkeypatch.setattr(ct, "MEASURE_MAX_TOTAL_BYTES", os.path.getsize(p3))
+    per_pair = pair_holds(ct.plan_converge(env, ct.ConvergeFlags()))
+    assert all(mm["classification"] == "distinct"
+               for mm in per_pair[frozenset((S1, S3))])
+    assert all(mm["reason"] == "measurement budget exhausted"
+               for mm in per_pair[frozenset((S2, S4))])
+
+
+def test_oversized_transcript_charges_no_budget(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Spec test 22b: an over-cap blocker degrades its own pair as oversized
+    while the later, smaller pair still measures - the budget was not
+    consumed by bytes never read."""
+    env = mkenv(tmp_path)
+    p3, p4 = two_blocked_pairs(env, write_transcript, write_row,
+                               s3_turns=2000)
+    assert os.path.getsize(p3) > 50_000 > os.path.getsize(p4)
+    monkeypatch.setattr(ct, "TRANSCRIPT_COMPARE_MAX_BYTES", 50_000)
+    # Room for the SMALL blocker only: had the oversized one been charged,
+    # the second pair would (wrongly) exhaust.
+    monkeypatch.setattr(ct, "MEASURE_MAX_TOTAL_BYTES",
+                        os.path.getsize(p4) + 100)
+    per_pair = pair_holds(ct.plan_converge(env, ct.ConvergeFlags()))
+    assert all(mm["reason"] == "unreadable or too large"
+               for mm in per_pair[frozenset((S1, S3))])
+    assert all(mm["classification"] == "distinct"
+               for mm in per_pair[frozenset((S2, S4))])
+
+
+def test_exception_in_measurement_degrades(mkenv, tmp_path, write_transcript,
+                                           write_row, monkeypatch):
+    """Spec test 23: an exception anywhere in the pipeline degrades that
+    hold and the plan completes. Patched at _measure_load - the measurement
+    path's own read - rather than _message_fingerprints wholesale, which the
+    facts pass legitimately calls for every planned row and whose failure
+    there is _transcript_facts' own held_transcript_unusable story."""
+    env = mkenv(tmp_path)
+    two_blocked_pairs(env, write_transcript, write_row)
+
+    def boom(path):
+        raise ValueError("synthetic")
+    monkeypatch.setattr(ct, "_measure_load", boom)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        assert h["measured"]["reason"] == "measurement failed (ValueError)"
+        assert "<new title>" in h["retitle"]
+    assert m["complete"] == {"now": 2, "of": 4, "after": 2, "held": 2,
+                             "scoped": False}
+
+
+def test_measurement_cache_bounds_added_reads(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Spec test 24: N holds over one pair cost at most two added loads -
+    here exactly ONE, because the held side's fingerprints were computed by
+    the plan's own _transcript_facts pass and reused, and the blocker is
+    read once then cache-hit."""
+    env = mkenv(tmp_path)
+    calls = counting_measure(monkeypatch)
+    p1 = write_transcript(env, "C--p", S1,
+                          prose_transcript(turn_labels("a", 10)))
+    p3 = write_transcript(env, "C--p", S3,
+                          prose_transcript(turn_labels("c", 40)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    for acct, org, name in ((A1, O1, "local_s3a"), (A2, O2, "local_s3b"),
+                            (A3, O3, "local_s3c")):
+        write_row(env, 0, acct, org, name,
+                  row_data(S3, T_COLL, createdAt=ms_local(2026, 8, 24),
+                           lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    assert all(h["measured"]["classification"] == "distinct" for h in held)
+    assert calls["loads"] == [p3]
+    assert p1 not in calls["loads"]
+
+
+def test_holds_free_plan_adds_no_measurement_reads(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Spec test 25: instrumented at the measurement cache layer - not raw
+    _message_fingerprints, which the plan legitimately calls for planned
+    rows - a plan with no collisions performs zero measurement loads."""
+    env = mkenv(tmp_path)
+    calls = counting_measure(monkeypatch)
+    mixed_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert m["rows"] and not m["holds"]
+    assert calls["loads"] == []
+    assert calls["fingerprints"] == []
+
+
 def test_title_validation_is_retitles_own(mkenv, tmp_path, write_transcript,
                                           write_row, monkeypatch):
     """Spec test 15: generation routes through _valid_new_title rather than
