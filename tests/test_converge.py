@@ -1657,3 +1657,189 @@ def test_current_leg_wearing_suffix_gets_the_note(
     assert rc == 0
     assert ("note: the current leg also carries a leg suffix and likely "
             "wants a fresh name") in out
+
+
+def assert_unmeasured(m, reason, count=2):
+    held = collision_holds(m)
+    assert len(held) == count
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "unmeasured"
+        assert mm["reason"] == reason
+        assert mm["suggested_title"] is None
+        assert mm["command_runnable"] is False
+        assert "<new title>" in h["retitle"]
+    return held
+
+
+def test_overlap_and_recency_disagreeing_is_unmeasured(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 5: the contained leg is the NEWER one - the trunk touched
+    after forking. When the two signals point at different legs, the honest
+    output is neither."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row,
+                  early_last=ms_local(2026, 8, 29),
+                  late_last=ms_local(2026, 8, 28))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "overlap and recency disagree")
+
+
+def test_inconclusive_band_is_unmeasured_with_ratios(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 6: overlap 0.5 sits between the bands - hedged output with
+    both ratios, never a confident wrong sentence."""
+    env = mkenv(tmp_path)
+    shared = turn_labels("s", 8)
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + turn_labels("a", 8)))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + turn_labels("b", 8)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = assert_unmeasured(m, "inconclusive overlap")
+    for h in held:
+        assert h["measured"]["shared"] == 8
+        assert h["measured"]["a_total"] == 16
+        assert h["measured"]["b_total"] == 16
+        assert h["measured_line"].count("0.50") == 2
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "not measured: inconclusive overlap" in out
+    assert "0.50" in out
+
+
+def test_band_edges(mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 7: 0.8 exactly is supersession-shaped; 0.2 exactly is
+    distinct."""
+    env = mkenv(tmp_path / "hi")
+    shared = turn_labels("s", 8)
+    # |A| = 10, |B| = 40: a_in_b = 0.8 exactly, and recency corroborates.
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + turn_labels("a", 2)))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + turn_labels("b", 32)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    for h in collision_holds(m):
+        assert h["measured"]["classification"] == "supersession"
+        assert h["measured"]["superseded"] == S1
+
+    env = mkenv(tmp_path / "lo")
+    # |A| = |B| = 40, shared 8: both ratios 0.2 exactly.
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + turn_labels("a", 32)))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + turn_labels("b", 32)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    for h in collision_holds(m):
+        assert h["measured"]["classification"] == "distinct"
+
+
+def test_distinct_wording_claims_no_ancestry(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Spec test 8: near-zero overlap says 'largely distinct', never
+    'branch' - a shared title does not prove shared ancestry, and the
+    output must not claim it."""
+    env = mkenv(tmp_path)
+    shared = turn_labels("s", 2)
+    write_transcript(env, "C--p", S1,
+                     prose_transcript(shared + turn_labels("a", 39)))
+    write_transcript(env, "C--p", S2,
+                     prose_transcript(shared + turn_labels("b", 36)))
+    write_row(env, 0, A1, O1, "local_s1",
+              row_data(S1, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 28)))
+    write_row(env, 0, A2, O2, "local_s2",
+              row_data(S2, T_COLL, createdAt=ms_local(2026, 8, 24),
+                       lastActivityAt=ms_local(2026, 8, 29)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    held = collision_holds(m)
+    assert len(held) == 2
+    for h in held:
+        mm = h["measured"]
+        assert mm["classification"] == "distinct"
+        assert mm["reason"] is None
+        assert mm["shared"] == 2
+        assert {mm["a_total"], mm["b_total"]} == {41, 38}
+        assert "largely distinct" in h["measured_line"]
+        assert "branch" not in h["measured_line"]
+        assert "both need human names" in h["measured_line"]
+        assert mm["suggested_title"] is None
+        assert "<new title>" in h["retitle"]
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "measured: largely distinct conversations" in out
+
+
+def test_missing_row_dates_degrade(mkenv, tmp_path, write_transcript,
+                                   write_row):
+    """Spec test 16: a null lastActivityAt on one row, and an inverted
+    createdAt > lastActivityAt - both 'row dates unusable'."""
+    env = mkenv(tmp_path / "null")
+    measured_pair(env, write_transcript, write_row)
+    p = os.path.join(env.store_candidates[0], A1, O1, "local_s1.json")
+    with open(p, encoding="utf-8") as fh:
+        d = json.load(fh)
+    d["lastActivityAt"] = None
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "row dates unusable")
+
+    env = mkenv(tmp_path / "inv")
+    measured_pair(env, write_transcript, write_row,
+                  early_last=ms_local(2026, 8, 20))  # before its createdAt
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "row dates unusable")
+
+
+def test_recency_tie_is_unmeasured(mkenv, tmp_path, write_transcript,
+                                   write_row):
+    """Spec test 17: equal max(lastActivityAt) in BOTH the symmetric and the
+    asymmetric branch - checked before anything else, so neither branch has
+    an undefined tie state."""
+    tie = ms_local(2026, 8, 28)
+    env = mkenv(tmp_path / "sym")
+    measured_pair(env, write_transcript, write_row,
+                  early=turn_labels("a", 2), late=turn_labels("b", 2),
+                  early_last=tie, late_last=tie)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "legs cannot be ordered")
+
+    env = mkenv(tmp_path / "asym")
+    measured_pair(env, write_transcript, write_row,
+                  early_last=tie, late_last=tie)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "legs cannot be ordered")
+
+
+def test_symmetric_recency_below_margin_is_unmeasured(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Spec test 25c: symmetric ratios with an activity gap under
+    RECENCY_MARGIN_MS - timestamp jitter and touch-updates cannot decide."""
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row,
+                  early=turn_labels("a", 2), late=turn_labels("b", 2),
+                  early_last=ms_local(2026, 8, 28, 12, 0),
+                  late_last=ms_local(2026, 8, 28, 12, 4))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert_unmeasured(m, "legs cannot be ordered")
