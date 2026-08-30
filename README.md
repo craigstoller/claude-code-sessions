@@ -463,9 +463,27 @@ when creating the row would damage the destination sidebar: chiefly when the cho
 already names a *different* conversation there. The comparison is the same trimmed-exact
 comparator `alignment` counts duplicates with, so a converge can never raise that count — and
 there is deliberately no auto-suffix, because a `(2)` is a collision avoided, not a name. Each
-hold prints the colliding row and a pastable fix, and an applied run that ends with holds
-**exits 3**: bulk and unattended is exactly where an exit code gets trusted without reading
-prose. The plan ends with truthful math projected from what will actually be written —
+collision hold **measures the two conversations against each other** — the same prose-turn
+overlap `doctor`'s duplicate report prints — and when the measurement is decisive the pastable
+fix arrives complete, naming the *superseded* leg whichever side of the hold it sits on, with a
+title generated from the store's own convention:
+
+```
+   s-early12 -> alice@example.com (aaaa1111/cccc3333): held_title_collision - 'ACME-REVIEW session' already names a different conversation in that sidebar: row local_….json (opens s-late34)
+      measured: s-early12 is the earlier leg - 52 of its 53 prose turns continue in s-late34, which adds 11 more; last activity Aug 28 vs Aug 29
+      claude-code-sessions retitle --only s-early12 --title "ACME-REVIEW session - earlier leg (Aug 24-28)" --apply
+```
+
+One retitle clears every hold of a two-leg group, and the current leg keeps its name. The
+measurement is advisory by construction: it runs only when holds exist, its added reads are
+bounded by a plan-wide byte budget, and every inconclusive or degraded state — overlap between
+the bands, overlap and recency disagreeing about which leg is older, a generated name that is
+taken or not shell-safe, more than two legs on one name — falls back to exactly the old
+placeholder remedy plus one reason line, so silence is never ambiguous. Two conversations that
+merely share a name are said to be that (`largely distinct … both need human names`); nothing
+is ever renamed automatically. An applied run that ends with holds **exits 3**: bulk and
+unattended is exactly where an exit code gets trusted without reading prose. The plan ends with
+truthful math projected from what will actually be written —
 `complete : 337 of 359 -> 356 of 359 (3 held)` — never a promised full house.
 
 The dry run also discloses the one apply-time refusal that is fully knowable at plan time:
