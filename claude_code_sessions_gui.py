@@ -71,6 +71,239 @@ def short(path, home):
     return path.replace(home, "~") if home and path.startswith(home) else path
 
 
+# ------------------------------------------------------------ Level tab models
+#
+# Pure functions, importable without tkinter (the tkinter import above is
+# guarded), so tests/test_gui_models.py and the tools/check_gui_*.py harness
+# can exercise them headlessly. The row model is the contract the design doc
+# states (docs/specs/2026-08-31-gui-level-design.md, "The holds, as
+# structured rows"): key, title, evidence, target_sid, prefill, editable,
+# ticked, degrade_reason, classification - plus `entry`, the working text the
+# widgets read and write, initialised from prefill.
+
+def _hold_models(manifest):
+    """One row dict per distinct hold identity in a converge manifest.
+
+    `key` is the stable identity - (measured.superseded or the hold's own
+    session id, title_key of the colliding title) - which is what edit-merging
+    across replans keys on. Two holds sharing a key are ONE decision: retitle's
+    default scope is every account, so a single rename clears them all, and
+    rendering them as two ticked rows would make the default state refuse
+    itself on the duplicate-title check. The engine agrees - its
+    measure_suggested census treats the same (sid, title) repeating across a
+    group's holds as one suggestion, not a collision.
+
+    `target_sid` is measured.superseded - THE ENGINE'S VERDICT, never
+    re-derived from the evidence text (the hold's own session id can be either
+    leg of the pair). `command_runnable` is deliberately not consulted: it
+    speaks about the rendered shell command only, and this window applies
+    titles through plan_retitle with no shell involved - a `$` in a title
+    degrades the pasteable command while remaining a valid title.
+
+    Any hold reason this window does not recognise still gets a read-only row
+    carrying the hold's own reason/detail verbatim: the pane must never count
+    holds it cannot show.
+    """
+    models, by_key = [], {}
+    for h in (manifest.get("holds") or []):
+        mm = h.get("measured")
+        title = h.get("title") or ""
+        tkey = ccs.title_key(title)
+        if h.get("reason") == "held_title_collision" and isinstance(mm, dict):
+            cls = mm.get("classification") or "unmeasured"
+            sup = mm.get("superseded")
+            key = (sup or h.get("session") or "", tkey)
+            if cls == "supersession":
+                suggestion = mm.get("suggested_title") or ""
+                model = {"key": key, "title": title,
+                         "evidence": "measured: " + (h.get("measured_line")
+                                                     or ""),
+                         "target_sid": sup, "prefill": suggestion,
+                         "entry": suggestion, "editable": True,
+                         "ticked": bool(suggestion),
+                         "degrade_reason": mm.get("degrade_reason") or "",
+                         "classification": "supersession"}
+            else:
+                line = h.get("measured_line") or mm.get("reason") or ""
+                tag = "not measured: " if cls == "unmeasured" else "measured: "
+                model = {"key": key, "title": title,
+                         "evidence": tag + line,
+                         "target_sid": None, "prefill": "", "entry": "",
+                         "editable": False, "ticked": False,
+                         "degrade_reason": mm.get("degrade_reason") or "",
+                         "classification": cls}
+        else:
+            key = (h.get("session") or "", tkey)
+            model = {"key": key, "title": title,
+                     "evidence": "{0} - {1}".format(h.get("reason") or "?",
+                                                    h.get("detail") or ""),
+                     "target_sid": None, "prefill": "", "entry": "",
+                     "editable": False, "ticked": False, "degrade_reason": "",
+                     "classification": h.get("reason") or "?"}
+        seen = by_key.get(model["key"])
+        if seen is not None:
+            seen["_held_count"] = seen.get("_held_count", 1) + 1
+            continue
+        model["_held_count"] = 1
+        by_key[model["key"]] = model
+        models.append(model)
+    for m in models:
+        n = m.pop("_held_count", 1)
+        if n > 1:
+            m["evidence"] += " - held in {0} accounts".format(n)
+    return models
+
+
+def _merge_hold_models(fresh, previous):
+    """Rebuild rows without silently resetting the user's input.
+
+    Merge by stable key: a row still present keeps the previous entry text and
+    tick; rows that vanished drop (their state goes with them); new rows
+    arrive with their defaults. Only editable rows carry user state, and a row
+    whose classification changed to read-only takes its fresh defaults - the
+    old text belonged to a decision that no longer exists.
+    """
+    prev = {m["key"]: m for m in previous}
+    for m in fresh:
+        old = prev.get(m["key"])
+        if old is not None and m.get("editable") and old.get("editable"):
+            m["entry"] = old.get("entry", m["entry"])
+            m["ticked"] = bool(old.get("ticked"))
+    return fresh
+
+
+def _scoreboard_lines(rep):
+    """The alignment scoreboard, rendered from the report's own fields, never
+    re-derived. Same facts the CLI's `alignment` prints, minus its
+    [observed]/[hypothesis] prefixes - the window has no piped-output
+    convention to honour."""
+    if (rep.get("stores") or {}).get("status") != "found":
+        return ["store: {0} ({1})".format(rep["stores"].get("status"),
+                                          rep["stores"].get("detail"))]
+    lines = ["{0} account(s):".format(len(rep["accounts"]))]
+    for a in rep["accounts"]:
+        lines.append("   {0:<28} {1:>4} rows".format(a["label"], a["rows"]))
+    for e in rep.get("row_errors") or []:
+        lines.append("UNREADABLE ROW (mutations blocked): " + e)
+    r = rep["reachable"]
+    lines.append("reachable       {0} of {1} transcript(s) open from a "
+                 "sidebar; {2} orphaned".format(r["reachable"],
+                                                r["transcripts"],
+                                                r["orphans"]))
+    d = rep["distinguishable"]
+    lines.append("distinguishable {0} title(s) duplicated inside a single "
+                 "sidebar".format(d["duplicate_titles"]))
+    c = rep["consistent"]
+    lines.append("consistent      {0} row file(s) open a different "
+                 "conversation depending on the account"
+                 .format(c["disagreeing_rows"]))
+    if c["disagreeing_rows"]:
+        lines.append("                {0} of those leave a conversation short "
+                     "of at least one sidebar".format(c["leaving_a_gap"]))
+    m = rep["complete"]
+    lines.append("complete        {0} of {1} conversation(s) reachable from "
+                 "all {2} account(s); {3} short"
+                 .format(m["in_all_accounts"], m["conversations"],
+                         len(rep["accounts"]), m["short"]))
+    s = rep["safe"]
+    lines.append("safe            {0} dead, {1} blank, {2} unreadable row(s)"
+                 .format(s["dead_rows"], s["blank_rows"],
+                         s["unreadable_rows"]))
+    return lines
+
+
+def _scoreboard_half(rep):
+    """The completion status line's store half - per-account row counts plus
+    the completeness gap, e.g. 'Level: 379 / 379 / 379 - 0 short.'"""
+    counts = " / ".join(str(a["rows"]) for a in rep.get("accounts") or [])
+    return "Level: {0} - {1} short.".format(
+        counts or "?", (rep.get("complete") or {}).get("short", "?"))
+
+
+def _level_state(rep, manifest, models):
+    """The pane's headline and Apply enablement, per the defined predicate.
+
+    'Nothing to do - the sidebars are level.' requires ALL THREE: the
+    alignment report's `complete` short-count is 0, the plan has no rows, and
+    no holds exist. Rows-empty-but-holds-present keeps Apply enabled (it has
+    renames to run) - unless every hold is read-only, because whenever there
+    is truly nothing to run, Apply is disabled. Rows-empty-holds-empty-but-
+    alignment-short is the one state this tab can do nothing about (a
+    conversation with no transcript for converge to spread), so it points at
+    Health and disables Apply.
+    """
+    rows = manifest.get("rows") or []
+    short_n = (rep.get("complete") or {}).get("short", 0)
+    tickable = any(m.get("editable") for m in models)
+    if rows:
+        n_acct = len({r.get("account") for r in rows})
+        status = "{0} row{1} to create across {2} account{3}".format(
+            len(rows), "" if len(rows) == 1 else "s",
+            n_acct, "" if n_acct == 1 else "s")
+        if models:
+            status += " - {0} naming decision{1} below".format(
+                len(models), "" if len(models) == 1 else "s")
+        return {"kind": "rows", "status": status,
+                "detail": "Nothing is written until you press Apply.",
+                "apply": True}
+    if models:
+        return {"kind": "naming",
+                "status": "Nothing to copy - {0} naming decision{1} below."
+                          .format(len(models),
+                                  "" if len(models) == 1 else "s"),
+                "detail": ("Each ticked rename applies in every account "
+                           "holding that conversation; nothing is written "
+                           "until you press Apply."),
+                "apply": tickable}
+    if short_n:
+        return {"kind": "short",
+                "status": "{0} conversation{1} short of a sidebar, but "
+                          "nothing to copy or rename - see Health."
+                          .format(short_n, "" if short_n == 1 else "s"),
+                "detail": ("Usually a conversation whose transcript is gone, "
+                           "so converge has nothing to spread. This tab "
+                           "cannot fix that state."),
+                "apply": False}
+    return {"kind": "level",
+            "status": "Nothing to do - the sidebars are level.",
+            "detail": "", "apply": False}
+
+
+def _level_steps_stage1(models):
+    """(steps, problems) for stage 1 - the ticked renames, in row order.
+
+    Each step aims plan_retitle at the model's target_sid with the entry's
+    trimmed text. Unticked and read-only rows contribute nothing. Two local
+    refusals run before any engine call - the cheap set-check: a ticked row
+    with an empty entry ('a rename needs a name'), and two ticked rows whose
+    trimmed titles collide ('two renames share a name'). Any problem means NO
+    steps: a partial list would rename some rows under a plan the user was
+    never shown.
+    """
+    steps, problems, seen = [], [], {}
+    for m in models:
+        if not (m.get("editable") and m.get("ticked")):
+            continue
+        text = (m.get("entry") or "").strip()
+        if not text:
+            problems.append("a rename needs a name: the row for {0!r} is "
+                            "ticked with an empty title".format(
+                                m.get("title") or "?"))
+            continue
+        if text in seen:
+            problems.append("two renames share a name: {0!r} is the new "
+                            "title for both {1!r} and {2!r}".format(
+                                text, seen[text], m.get("title") or "?"))
+            continue
+        seen[text] = m.get("title") or "?"
+        steps.append({"key": m["key"], "target_sid": m["target_sid"],
+                      "old_title": m.get("title") or "",
+                      "new_title": text})
+    if problems:
+        return [], problems
+    return steps, []
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
