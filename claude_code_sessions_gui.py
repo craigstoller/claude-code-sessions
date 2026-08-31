@@ -304,6 +304,252 @@ def _level_steps_stage1(models):
     return steps, []
 
 
+def _ordinal(n):
+    words = ("", "first", "second", "third", "fourth", "fifth", "sixth",
+             "seventh", "eighth", "ninth", "tenth")
+    return words[n] if 0 < n < len(words) else "{0}th".format(n)
+
+
+def _stage1_dialog_parts(steps):
+    """(headline, mapping lines, footer) for the stage-1 confirmation.
+
+    Every ticked mapping is listed in full, one line per row - the
+    prefilled-and-ticked default is an opt-out, and this dialog, showing
+    every old->new pair, is the look the opt-out gets. The footer states
+    ONCE that each rename applies in every account holding that conversation
+    (retitle's default scope, said so the bulk list is not blind trust in
+    routing) and that each is individually undoable.
+    """
+    head = "Rename {0} conversation{1}?".format(
+        len(steps), "" if len(steps) == 1 else "s")
+    mappings = ["{0!r}  ->  {1!r}".format(s["old_title"], s["new_title"])
+                for s in steps]
+    footer = ("Each rename applies in every account holding that "
+              "conversation (retitle's default scope), and each is its own "
+              "journalled operation - individually undoable.")
+    return head, mappings, footer
+
+
+def _stage2_question(fresh):
+    """The stage-2 confirmation, describing the FRESH plan's numbers only."""
+    rows = fresh.get("rows") or []
+    holds = fresh.get("holds") or []
+    n_acct = len({r.get("account") for r in rows})
+    q = "Create {0} row{1} across the {2} account{3} named?".format(
+        len(rows), "" if len(rows) == 1 else "s",
+        n_acct, "" if n_acct == 1 else "s")
+    if holds:
+        q += "  ({0} held - they stay held.)".format(len(holds))
+    return (q + "\n\nEach row adds the conversation to that account's "
+                "sidebar; converge never overwrites or deletes. Undo "
+                "removes the created rows again.")
+
+
+# ------------------------------------------------------- the Apply sequence
+#
+# The two-stage Apply, as one linear function driven through a UI adapter so
+# the harness can run it headlessly against a real store. The adapter's
+# contract:
+#
+#   status(text)          - posted BEFORE every engine call (a twenty-rename
+#                           Apply with a frozen status line reads as a hang)
+#   gate()                - the press-time unresolved-op re-scan; None when
+#                           clear, else what blocked (a list of op ids, or a
+#                           sentence when the journal could not be read)
+#   confirm_stage2(fresh) - show the fresh plan's numbers, return bool
+#   truncate_requested()  - True once the user confirmed closing the window;
+#                           checked at operation boundaries only, so the
+#                           in-flight operation always completes
+#   remaining             - attribute this function keeps current: how many
+#                           steps a truncation right now would drop
+#
+# The function NEVER raises - every outcome travels in the result dict, so
+# the worker's finally-refresh cannot be skipped by an exception path.
+
+def _run_level_sequence(env, steps, live, ui):
+    """Stage 1 (each ticked rename, its own journalled op) then stage 2 (a
+    FRESH plan_converge, confirmed as itself, then run_converge on that fresh
+    manifest only). Returns a dict:
+
+      planned   how many renames were asked for
+      landed    how many completed (each individually undoable)
+      rename_refusal  (1-based index, verbatim text) when one stopped the
+                      sequence - remaining renames and stage 2 do not run
+      rename_error    True when the stopper was a bug, not a Refusal
+      stage2    'gate' | 'truncated' | 'plan_failed' | 'empty' | 'cancelled'
+                | 'refused' | 'error' | 'completed' | 'unchanged'
+      plan_problem / converge_problem   ('refusal'|'error', text)
+      fresh     the stage-2 plan manifest, when one was made
+      gate      what the press-time re-scan found, when it aborted the press
+      mutated   True once anything was written
+    """
+    seq = {"planned": len(steps), "landed": 0, "rename_refusal": None,
+           "rename_error": False, "stage2": "not_reached",
+           "plan_problem": None, "converge_problem": None, "fresh": None,
+           "gate": None, "mutated": False}
+    ui.remaining = len(steps) + 1
+    blocked = ui.gate()
+    if blocked:
+        seq["gate"] = blocked
+        seq["stage2"] = "gate"
+        return seq
+    for i, st in enumerate(steps):
+        if ui.truncate_requested():
+            seq["stage2"] = "truncated"
+            return seq
+        ui.remaining = (len(steps) - i - 1) + 1
+        ui.status("Applying rename {0} of {1}...".format(i + 1, len(steps)))
+        try:
+            pm = ccs.plan_retitle(env, ccs.RetitleFlags(
+                only=st["target_sid"], title=st["new_title"]))
+            ccs.run_retitle(env, pm)
+        except ccs.Refusal as exc:
+            seq["rename_refusal"] = (i + 1, str(exc))
+            return seq
+        except Exception:
+            seq["rename_refusal"] = (i + 1, traceback.format_exc())
+            seq["rename_error"] = True
+            return seq
+        seq["landed"] += 1
+        seq["mutated"] = True
+    if ui.truncate_requested():
+        seq["stage2"] = "truncated"
+        return seq
+    ui.remaining = 1
+    ui.status("Planning the copy...")
+    try:
+        fresh = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
+    except ccs.Refusal as exc:
+        seq["stage2"] = "plan_failed"
+        seq["plan_problem"] = ("refusal", str(exc))
+        return seq
+    except Exception:
+        seq["stage2"] = "plan_failed"
+        seq["plan_problem"] = ("error", traceback.format_exc())
+        return seq
+    seq["fresh"] = fresh
+    if not fresh.get("rows"):
+        # A user must never be asked to confirm creating zero rows: no
+        # dialog appears and no converge runs.
+        seq["stage2"] = "empty"
+        return seq
+    blocked = ui.gate()
+    if blocked:
+        seq["gate"] = blocked
+        seq["stage2"] = "gate"
+        return seq
+    if ui.truncate_requested():
+        seq["stage2"] = "truncated"
+        return seq
+    if not ui.confirm_stage2(fresh):
+        seq["stage2"] = "cancelled"
+        return seq
+    ui.status("Creating rows...")
+    try:
+        final = ccs.run_converge(env, fresh)
+    except ccs.Refusal as exc:
+        seq["stage2"] = "refused"
+        seq["converge_problem"] = ("refusal", str(exc))
+        return seq
+    except Exception:
+        seq["stage2"] = "error"
+        seq["converge_problem"] = ("error", traceback.format_exc())
+        return seq
+    ui.remaining = 0
+    seq["stage2"] = final                      # "completed" or "unchanged"
+    if final == "completed":
+        seq["mutated"] = True
+    return seq
+
+
+def _sequence_status(seq, half=""):
+    """One status line for a finished sequence, conditional on what actually
+    ran: a skipped stage 1 must never produce 'renames landed' - the
+    templates take the landed count, and zero renders as no clause at all.
+    The completed line concatenates the journal half and the store half
+    (HALF, from _scoreboard_half), because the ops-created part is what makes
+    the Undo walk-back legible and the scoreboard part is what the tab
+    exists to report."""
+    landed = seq.get("landed") or 0
+    plural = "" if landed == 1 else "s"
+    landed_clause = "{0} rename{1} landed, each undoable".format(landed,
+                                                                 plural)
+    if seq.get("rename_refusal"):
+        idx = seq["rename_refusal"][0]
+        verb = "failed" if seq.get("rename_error") else "was refused"
+        if landed:
+            return "{0}; the {1} {2}.".format(landed_clause, _ordinal(idx),
+                                              verb)
+        return "The rename {0} - nothing was written.".format(verb)
+    s2 = seq.get("stage2")
+    if s2 == "plan_failed":
+        tail = "the copy could not be planned."
+        return (landed_clause + "; " + tail) if landed else tail.capitalize()
+    if s2 == "cancelled":
+        if landed:
+            return landed_clause + "; the copy was not confirmed."
+        return "Nothing was applied - the copy was not confirmed."
+    if s2 in ("refused", "error"):
+        tail = ("nothing was copied - the copy {0}."
+                .format("was refused" if s2 == "refused" else "failed"))
+        return (landed_clause + "; " + tail) if landed else tail.capitalize()
+    if s2 == "empty":
+        if landed:
+            held = len((seq.get("fresh") or {}).get("holds") or [])
+            line = "Applied ({0} rename{1}; nothing to copy)".format(landed,
+                                                                     plural)
+            if held:
+                line += " - {0} held".format(held)
+            return line + " - the rows below are current."
+        return "Nothing to do."
+    if s2 == "unchanged":
+        tail = "the copy's re-check left nothing to write."
+        return (landed_clause + "; " + tail) if landed else tail.capitalize()
+    if s2 == "completed":
+        ops = ("{0} rename{1} + 1 converge".format(landed, plural)
+               if landed else "1 converge")
+        line = "Applied ({0})".format(ops)
+        return (line + " - " + half) if half else line
+    return ""                                   # gate / truncated: no line
+
+
+def _run_level_apply(env, steps, live, ui):
+    """The whole Apply press, worker side: the sequence, then the
+    post-mutation refresh. Returns (seq, refresh).
+
+    The refresh is UNCONDITIONAL for every sequence that got past its gate -
+    a finally, not a success step: whether renames landed and stage 2 was
+    skipped, refused, or completed, the pane's next render comes from
+    gather_alignment plus a fresh plan_converge, never from a manifest that
+    predates the writes (which also reconciles a partial converge honestly).
+    Two exceptions, both stated in the design: a gate abort mutated nothing
+    and must not touch the pane the red line annotates, and a truncated
+    sequence is a window on its way closed.
+
+    The refresh plans with live="" because the sequence has ENDED here -
+    completed, refused, or cancelled alike - and an assertion covers one
+    attempt. If the identity files still disagree, this very replan is what
+    re-raises the banner and asks again.
+
+    REFRESH is ("ok", alignment_report, manifest, running) or
+    ("refusal"|"error", text), or None when skipped.
+    """
+    seq = _run_level_sequence(env, steps, live, ui)
+    if seq["stage2"] in ("gate", "truncated"):
+        return seq, None
+    ui.status("Re-measuring...")
+    try:
+        rep = ccs.gather_alignment(env)
+        man = ccs.plan_converge(env, ccs.ConvergeFlags(live=""))
+        running = ccs.claude_running(env)
+        refresh = ("ok", rep, man, running)
+    except ccs.Refusal as exc:
+        refresh = ("refusal", str(exc))
+    except Exception:
+        refresh = ("error", traceback.format_exc())
+    return seq, refresh
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
