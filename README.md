@@ -785,6 +785,36 @@ window into `journaled`/`completed`/`rolled_back`.
   forgiving where `retitle`'s is all-or-nothing: it removes the rows the op created except one
   that became the conversation's last pointer anywhere, or that someone repointed or retitled
   since — deleting those would destroy work the undo was never asked to touch.
+- **0.13.0 is the identity release: the tool takes its own word for an account.** Four changes
+  from a third real re-levelling pass, all about which account the tool believes it is talking
+  to. The converge dry run now discloses the RULING 5 identity disagreement at plan time, with
+  a pastable per-account remedy; in 0.12.0 the plan could read `0 held` while `--apply` was
+  always going to refuse for a reason fully knowable at plan time, and discovering that cost a
+  close-the-app cycle. The `acct/org` pair form the reports print parses back as two anchored
+  prefixes wherever an account can be named, so a printed label is always a valid input.
+  `--live` resolves at account scope for converge (an email works), and asserting an account
+  the files already agree on is a note, not an error. And the refusal texts now tell the
+  measured truth about their own remedies: switching the desktop app "may not" refresh
+  `config.json`, because it has been measured doing both.
+- **0.14.0 measures the collision holds it already prints.** Every converge pass on a real
+  three-account store has produced title-collision holds, because both routine gestures,
+  resuming a session and rewinding to edit a prompt, fork the conversation and carry the
+  pinned title across. Clearing them by hand took the same steps every time: measure the two
+  legs' shared prose, conclude supersession, retitle the superseded one. The hold now runs
+  that measurement itself (the same prose-turn overlap `doctor`'s duplicate report prints)
+  and, when it is decisive, prints a complete remedy naming the superseded leg with a
+  generated `<base> - earlier leg (<range>)` title, so one paste clears a two-leg group and
+  the current leg keeps its name (three or more legs on one title refuse wholesale). Advisory
+  by construction: bands, not a binary (supersession at 0.8 overlap or above, distinct at 0.2
+  or below, everything between refuses as inconclusive with both ratios printed); the
+  superseded side picked by overlap and corroborated by recency, never by clocks alone; a
+  plan-wide byte budget on measurement-added reads; and every degraded state falls back to
+  exactly the old placeholder remedy plus one reason line. The same release hardens
+  `--anonymize` end to end: plan-chosen titles and the app-encoded project folders join the
+  substitution table, `new-row`, `repoint` and `sync` honour the flag through their own public
+  manifests, manifest schema keys can never be renamed by a terse title, anonymized JSON
+  borrows both machine-layer redactions (the home fold, and 8-character uuid truncation), and
+  the README now says what the flag deliberately does not mask.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
