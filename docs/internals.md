@@ -65,7 +65,7 @@ This is the part that is easy to get wrong, because the two layers behave differ
 
 | Layer | Shared or copied? | Consequence |
 |-------|-------------------|-------------|
-| Transcript (`.jsonl`) | **One genuinely shared file.** Carries no account identifier at all. | Any account whose listing points at it reads and writes the same bytes. Continuing a session from one login and opening it from another login shows the new content immediately. |
+| Transcript (`.jsonl`) | **One genuinely shared file.** Carries no account identifier at all. | Any account whose listing points at it reads and writes the same bytes. Continuing a session from one login and opening it from another login shows the new content immediately — *while both rows still point at the same transcript*; see "The fork mechanic" below for the two ordinary gestures that end that state. |
 | Listing (`local_*.json`) | **Per-account copy.** | Which sessions appear, plus title/timestamp/sort order, is private to each login and frozen at copy time. |
 
 So relocating or copying a session's listing entry is a **snapshot**, not a live sync of the
@@ -132,6 +132,78 @@ Two consequences worth stating plainly:
 The secondary cost is still real and still worth fixing: a stale row keeps an old title and
 sorts by an old `lastActivityAt`, so a session used this week sits weeks down the other
 account's list under a name it has outgrown.
+
+## The fork mechanic — resumes and the rewind button (measured 2026-08-29, app 1.40609.0.0)
+
+The section above says a row "accumulates several transcripts over time" without saying what
+produces them. Two ordinary gestures do, and they are the same mechanism wearing two buttons:
+
+- **Resuming** a session starts a new CLI run — a new `cliSessionId`, a new transcript
+  carrying the displayed history forward (the same fact stated above as "`cliSessionId`
+  changes when a session is resumed as a new CLI run"; this section is about what that does
+  to the rows).
+- **The rewind button** ("rewind to here", used to edit an earlier prompt and resend) does
+  the same thing. It is not an in-place edit: it creates a new conversation holding the
+  history up to the rewind point plus the edited prompt.
+
+In both cases the app then **repoints the live account's existing row** at the fork. Not a
+new row — the same `local_*.json`, keeping its `createdAt` to the millisecond, its title, and
+its `titleSource`; at the fork event, the pointer is what changes. (The app's ordinary row
+drift — `lastActivityAt`, the RULING 8 `held_same` fields — continues afterwards as always;
+this is a claim about the event, not about the row being otherwise frozen.) The original
+conversation keeps its bytes on disk and loses exactly one thing: that account's pointer.
+
+The evidence, scoped to what was actually measured — one rewind-to-edit on a real
+three-account store, plus prose-overlap measurement of three fork pairs from the same week:
+the two transcripts' copies of the edited prompt differed by **exactly the words the edit
+added** (seven, in the measured case), the original leg ends in an interruption marker
+nineteen seconds after the first send, the fork's copy lands thirty seconds later, and
+`isArchived` was `False` on every row involved across all three accounts. No flag the rows
+carry marks the abandoned leg; whether some other mechanism marks it elsewhere was not
+probed — what the census below observed in practice is these legs sitting unreferenced with
+nothing `doctor` recognizes as a marker. The three fork pairs measured **0.98, 0.98 and
+0.80** prose overlap between superseded leg and continuation — high because the fork carries
+the displayed history forward, so near-total overlap is how this gesture *presents*; it is
+the calibration behind the measured hold remedies' supersession band
+(`docs/specs/2026-08-30-hold-remedies-design.md`).
+
+The consequences key on **how many rows still point at the old leg** — rows, not accounts,
+are the unit (the 0.9.13 lesson elsewhere in this file), though in practice the common cases
+line up one per account:
+
+- **Zero surviving rows — the usual single-account outcome — and the old leg is
+  sidebar-unreachable.** The sidebar entry itself survives, title intact, now opening the
+  fork; what a user experiences is not a missing entry but edited history, with the old
+  leg's tail gone. This lineage was the largest class in a machine-wide orphan census here
+  (2026-08-26: 52 of 187 unreferenced transcripts attributed as ancestors of reachable
+  conversations, by prose-overlap against every reachable transcript; `doctor` had counted
+  155 unreferenced on the same store five days earlier — the store grows). `new-row` is the
+  way back **while the transcript survives**: retention (above) deletes unreferenced
+  transcripts on the app's cleanup clock, 30 days by default, so an orphaned leg worth
+  keeping has a deadline, not just a remedy.
+- **Surviving rows elsewhere keep the old leg reachable — and collide.** Rows in other
+  accounts were not repointed, so they still open the original: nothing lost, but both legs
+  now sit under one title, because the repointed row brought its name along. This is the
+  standing producer of `converge`'s title-collision holds (`converge` shipped in 0.12.0;
+  the holds and their measured remedies are in the spec linked above). On this machine,
+  every converge pass since the command existed has carried holds from this mechanism —
+  twelve, then eight, then six — so here they are the expected texture of a pass rather
+  than a sign of damage. (A later `sync --update` would propagate the fork's pointer over a
+  surviving row; RULING 8's `held_orphan` exists for exactly that displacement.)
+
+One field deserves its own sentence: rows carry a `forkedFromSessionId`, and the rewind path
+**leaves it empty** — the repointed row is not new, so no breadcrumb lands. Older rows on
+this machine do carry the field, so some app path that creates fresh rows for forks writes
+it; that path was not the one measured here. The practical consequence stands either way:
+there is no reliable parent edge in metadata (the shared row *filename* across accounts
+hints that two transcripts belong to one lineage, but proves neither direction nor
+parentage), which is why the measured remedies compare transcript content instead of
+reading a field the rewind path never writes.
+
+(The 2026-08-21 orphaning incident under RULING 8 is this same mechanism crossed with an
+account switch: a resume under the wrong login repointed a row in a store that was holding
+the *newer* leg. The gesture is ordinary; the storage model is what makes its cost vary from
+"invisible bookkeeping" to "a conversation no sidebar opens".)
 
 ## The encoding rule
 
