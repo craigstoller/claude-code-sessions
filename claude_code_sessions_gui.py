@@ -805,7 +805,10 @@ class SyncApp:
         # the pane's stated top-to-bottom order.
         self.level_banner = ttk.Frame(lt)
         self.level_banner.pack(fill="x")
-        self.level_text = tk.Text(body, wrap="none", height=11,
+        # 8 lines, scrolling: taller and a high-DPI screen leaves the hold
+        # rows below no room at all - measured at 150% scaling, an 11-line
+        # area consumed the whole tab.
+        self.level_text = tk.Text(body, wrap="none", height=8,
                                   font=("Consolas", 9), state="disabled",
                                   borderwidth=1, relief="solid")
         lsb = ttk.Scrollbar(body, orient="vertical",
@@ -813,6 +816,11 @@ class SyncApp:
         self.level_text.configure(yscrollcommand=lsb.set)
         self.level_text.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
+        # The button bar packs FIRST, pinned to the bottom edge, so a short
+        # window squeezes the hold area (which scrolls) and never the Apply
+        # button; the hold rows then take whatever is left.
+        lbar = ttk.Frame(lt)
+        lbar.pack(side="bottom", fill="x", pady=(6, 0))
         # The hold rows scroll when they overflow - a canvas-hosted frame,
         # the stock tkinter idiom for a scrollable widget stack.
         holds_wrap = ttk.Frame(lt)
@@ -834,8 +842,6 @@ class SyncApp:
                                                      width=e.width))
         self.hold_canvas.pack(side="left", fill="both", expand=True)
         hsb.pack(side="right", fill="y")
-        lbar = ttk.Frame(lt)
-        lbar.pack(fill="x", pady=(6, 0))
         self.level_apply_btn = ttk.Button(lbar, text="Apply",
                                           command=self.on_level_apply,
                                           state="disabled")
