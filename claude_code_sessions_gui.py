@@ -798,10 +798,13 @@ class SyncApp:
             lt, foreground="#a05000", wraplength=880, justify="left",
             text="!! The Claude desktop app is running - Apply will refuse "
                  "until it is closed.")
-        self.level_banner = ttk.Frame(lt)
-        self.level_banner.pack(fill="x")
         body = ttk.Frame(lt)
         body.pack(fill="x", pady=(4, 4))
+        self.level_body = body           # the notice packs before this
+        # The identity banner sits between the plan summary and the holds -
+        # the pane's stated top-to-bottom order.
+        self.level_banner = ttk.Frame(lt)
+        self.level_banner.pack(fill="x")
         self.level_text = tk.Text(body, wrap="none", height=11,
                                   font=("Consolas", 9), state="disabled",
                                   borderwidth=1, relief="solid")
@@ -1938,7 +1941,7 @@ class SyncApp:
         if running:
             if not self.level_notice.winfo_manager():
                 self.level_notice.pack(anchor="w", pady=(0, 2),
-                                       before=self.level_banner)
+                                       before=self.level_body)
         elif self.level_notice.winfo_manager():
             self.level_notice.pack_forget()
         self._render_banner(man)
