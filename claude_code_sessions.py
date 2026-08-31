@@ -2747,6 +2747,39 @@ def _anon_pairs(env):
             # Over-matching corrupts the report; the structured pass below is
             # what actually guarantees coverage.
             seen.setdefault(c, _anon_label("project", c))
+    # Cwds of transcripts NO row points at, read the way gather_list reads
+    # them. The rows above register every cwd a sidebar knows, but `list`
+    # also reports row-less transcripts with first_cwd() - so a
+    # client-naming directory leaked exactly when no account had a row for
+    # it. Same whole-path rule; the head-read is the cost gather_list
+    # already pays for the same set of files.
+    row_sids = {r.cli_session_id for r in rows if r.cli_session_id}
+    for _folder, path in iter_transcripts(env.projects_root):
+        sid = os.path.splitext(os.path.basename(path))[0]
+        if sid in row_sids or not path.endswith(".jsonl"):
+            continue
+        c = (first_cwd(path) or "").strip()
+        if len(c) >= _ANON_MIN:
+            seen.setdefault(c, _anon_label("project", c))
+    # Project FOLDER names as they sit on disk, WHOLE entry names only. A
+    # transcript path names its project folder, and the folder is the cwd
+    # wearing the app's encoding ("C--clients-Northwind") - a form neither
+    # the whole-path pairs above nor any title ever matches - so a refusal
+    # that quotes transcript paths (the duplicated-transcript hold's detail,
+    # new-row's version of the same refusal) printed the client's name
+    # verbatim under --anonymize. Listing the real directory names needs no
+    # knowledge of the encoding scheme and cannot drift from it, and covers
+    # a folder whose cwd no row carries - which a duplicate copy's second
+    # folder typically is. An entry name is the whole path encoded, not a
+    # basename, so this stays on the right side of the over-matching
+    # history above.
+    try:
+        for entry in os.listdir(env.projects_root):
+            if len(entry) >= _ANON_MIN and \
+                    os.path.isdir(os.path.join(env.projects_root, entry)):
+                seen.setdefault(entry, _anon_label("project", entry))
+    except OSError:
+        pass
     pairs = sorted(seen.items(), key=lambda kv: -len(kv[0]))
     _ANON_CACHE[key] = pairs
     return pairs
@@ -2815,9 +2848,19 @@ def _listing_label(s):
 
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
                 "suggested_title")
-_ANON_EMAIL_FIELDS = ("label", "email", "account_email")
+_ANON_EMAIL_FIELDS = ("label", "email", "account_email", "source_email",
+                      "dest_email")
+
+
+def _fold_home(env, text):
+    for h in {env.home, os.path.realpath(env.home)}:
+        text = text.replace(h, "~")
+    return text
+
+
 # The fixed field vocabulary of every report anonymize_report traverses
-# (list items, doctor, alignment, the retitle and converge manifests).
+# (list items, doctor, alignment, and the retitle, converge, new-row,
+# repoint and sync public manifests).
 # Keys in this set are SCHEMA, never data, and must never be renamed: a
 # title in the substitution table that happens to equal one - 'rows' as a
 # terse customTitle is enough - used to rename the key, crashing
@@ -2868,7 +2911,14 @@ def anonymize_report(env, obj):
     apply to the LABEL, so the output stays aligned and nothing survives being
     cut in half.
 
-    This is also what covers `--json`, which no line-level pass ever reaches.
+    This is also what covers `--json`, which no line-level pass ever reaches -
+    which is why every string here ALSO folds the home directory to ~. Plain
+    --json is deliberately unredacted (README) and keeps its full paths; but
+    anonymized output exists to be pasted, --json never meets redact(), and a
+    payload that hides every title while printing the account name in
+    C:\\Users\\<name>\\... is a partial safety that reads as whole. The fold
+    is the one machine-layer redaction this content pass borrows; ids stay
+    full, per the --json rule.
     """
     if isinstance(obj, dict):
         out = {}
@@ -2882,9 +2932,11 @@ def anonymize_report(env, obj):
                 if "@" in k and "." in k:
                     k = _anon_label("account", k)
                 else:
-                    k = anonymize(env, k)
+                    k = _fold_home(env, anonymize(env, k))
             if k in _ANON_FIELDS and isinstance(v, str) and v.strip():
-                out[k] = anonymize(env, v)
+                # anonymize() first: the whole-path pairs match the raw value,
+                # home prefix included; the fold then covers what no pair knew.
+                out[k] = _fold_home(env, anonymize(env, v))
             elif (k in _ANON_EMAIL_FIELDS and isinstance(v, str) and "@" in v):
                 # An account address names a person and an organisation. It is
                 # not a title, so the substitution table never sees it.
@@ -2894,6 +2946,8 @@ def anonymize_report(env, obj):
         return out
     if isinstance(obj, list):
         return [anonymize_report(env, v) for v in obj]
+    if isinstance(obj, str):
+        return _fold_home(env, obj)
     return obj
 
 
@@ -2906,8 +2960,7 @@ def anonymize(env, text):
 
 
 def redact(env, text, keep_ids=False):
-    for h in {env.home, os.path.realpath(env.home)}:
-        text = text.replace(h, "~")
+    text = _fold_home(env, text)
     if not keep_ids:
         text = _UUID_RE.sub(lambda m: m.group(1) + "…", text)
     if _ANONYMIZE:
@@ -3889,7 +3942,7 @@ def build_parser():
                          "(RULING 5), when the identity files disagree")
     rp.add_argument("--apply", action="store_true", help="actually write the row")
     rp.add_argument("--json", action="store_true", help="print the plan as JSON")
-    rp.add_argument("--verbose", action="store_true", help="do not redact paths")
+    common(rp)
 
     nr = sub.add_parser("new-row",
                         help="create a sidebar row for a conversation that has none")
@@ -3909,13 +3962,16 @@ def build_parser():
                          "(RULING 5), when the identity files disagree")
     nr.add_argument("--apply", action="store_true", help="actually create the row")
     nr.add_argument("--json", action="store_true", help="print the plan as JSON")
-    # Not optional decoration. README's redaction section promises that
-    # plain-text output replaces the home directory with `~` and that --verbose
-    # shows paths in full, and it tells users not to paste --json into an issue
-    # BECAUSE that one is unredacted - which reads as a guarantee that the plain
-    # text is safe. This command printed the user's project directory in the
-    # clear and had no --verbose to offer, so `new-row --verbose` exited 2.
-    nr.add_argument("--verbose", action="store_true", help="do not redact paths")
+    # common() is not optional decoration here. README's redaction section
+    # promises that plain-text output replaces the home directory with `~` and
+    # that --verbose shows paths in full, and it tells users not to paste
+    # --json into an issue BECAUSE that one is unredacted - which reads as a
+    # guarantee that the plain text is safe. This command printed the user's
+    # project directory in the clear and had no --verbose to offer, so
+    # `new-row --verbose` exited 2. It then grew its own --verbose without the
+    # common set, so `new-row --anonymize` exited 2 the same way while the
+    # README said the flag was on every command.
+    common(nr)
 
     rt = sub.add_parser(
         "retitle",
@@ -4102,12 +4158,24 @@ def cmd_undo(env, ns):
     # path skips the preview entirely, so the preview line alone would warn
     # only the users who happened to dry-run first.
     live_note = _live_override_note(prior.manifest)
+
+    def _pub_title(t):
+        # Direct label under --anonymize, the public-manifest rule: an op
+        # manifest can carry content the substitution table no longer knows
+        # - a retitle's new_title after a later rename, a new-row title
+        # whose row was deleted since - and the line pass below only
+        # replaces what the table holds. Byte-identical to the table's
+        # label when both know the value (same hash).
+        if _ANONYMIZE and isinstance(t, str) and t.strip():
+            return _anon_label("session", t)
+        return t
+
     if not ns.apply:
         if prior.manifest.get("op_type") == "repoint":
             pm = prior.manifest
             line = ("would undo {0} (repoint: {1!r} goes back to opening {2} instead "
                     "of {3}); pass --apply to execute".format(
-                        pm["op_id"], pm.get("title", ""),
+                        pm["op_id"], _pub_title(pm.get("title", "")),
                         (pm.get("from_session") or "nothing")[:8],
                         (pm.get("to_session") or "")[:8]))
         elif prior.manifest.get("op_type") == "sync":
@@ -4116,20 +4184,24 @@ def cmd_undo(env, ns):
             # actually remove instead: how many rows landed, and where.
             n_written = sum(1 for r in prior.manifest.get("rows", []) if r.get("written"))
             dest = prior.manifest.get("dest_email") or prior.manifest.get("dest_account", "")
+            if _ANONYMIZE and "@" in dest:
+                # An address names a person - the sync-manifest rule.
+                dest = _anon_label("account", dest)
             line = ("would undo {0} (sync: {1} row(s) written to {2}); pass --apply "
                     "to execute".format(prior.manifest["op_id"], n_written, dest))
         elif prior.manifest.get("op_type") == "new-row":
             pm = prior.manifest
             line = ("would undo {0} (new-row: removes the row {1!r}, which opens "
                     "{2}); pass --apply to execute".format(
-                        pm["op_id"], pm.get("title", ""),
+                        pm["op_id"], _pub_title(pm.get("title", "")),
                         (pm.get("to_session") or "")[:8]))
         elif prior.manifest.get("op_type") == "retitle":
             pm = prior.manifest
             n_written = sum(1 for r in pm.get("rows", []) if r.get("written"))
             line = ("would undo {0} (retitle: {1} row(s) get their previous "
                     "titles back, dropping {2!r}); pass --apply to execute"
-                    .format(pm["op_id"], n_written, pm.get("new_title", "")))
+                    .format(pm["op_id"], n_written,
+                            _pub_title(pm.get("new_title", ""))))
         elif prior.manifest.get("op_type") == "converge":
             pm = prior.manifest
             created = [r for r in pm.get("rows", []) if r.get("written")]
@@ -6896,8 +6968,9 @@ def _print_new_row_report(say, m):
     say("today; other accounts are not consulted, and may well have one.")
 
 
-def _public_new_row_manifest(m):
-    """The new-row manifest with the row image removed, for --json.
+def _public_new_row_manifest(env, m):
+    """The new-row manifest with the row image removed, for --json and the
+    printed report.
 
     Same rule as `_public_repoint_manifest` and `_public_manifest`: a listing
     row carries `remoteMcpServersConfig` and permission state, and printing it
@@ -6905,10 +6978,37 @@ def _public_new_row_manifest(m):
     This command's post-image is synthesized rather than copied out of an
     account, which makes it less sensitive and not differently governed - it
     goes through the same filter rather than around it.
+
+    Also where --anonymize is honoured. The planned title is
+    transcript-derived (a customTitle) and the cwd may be a directory no row
+    registers - this command's whole job is conversations without rows - so
+    the substitution table cannot be trusted to know either. They are
+    labelled directly from the RAW value: for a value the table does know,
+    that is byte-identical to the table's label (same hash), and for one it
+    does not, it is the label the table would have produced.
     """
     out = {k: v for k, v in m.items() if k != "rows"}
     out["rows"] = [{k: v for k, v in r.items() if k not in ("pre_b64", "post_b64")}
                    for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        out = anonymize_report(env, out)
+        for key, kind in (("title", "session"),
+                          ("title_collision", "session"),
+                          ("cwd", "project")):
+            if isinstance(m.get(key), str) and m[key].strip():
+                out[key] = _anon_label(kind, m[key])
+        for pub_r, r in zip(out["rows"], m.get("rows", [])):
+            if isinstance(r.get("title"), str) and r["title"].strip():
+                pub_r["title"] = _anon_label("session", r["title"])
+        # anonymize_report knows "label"; the manifest-level store label is
+        # not one of its field names - the retitle rule.
+        if isinstance(out.get("store_label"), str) and "@" in out["store_label"]:
+            out["store_label"] = _anon_label("account", out["store_label"])
+        # The transcript path embeds the encoded project folder, which the
+        # table lists straight from disk; anonymize_report already folded the
+        # home prefix, this adds the folder's label.
+        if isinstance(out.get("transcript"), str):
+            out["transcript"] = anonymize(env, out["transcript"])
     return out
 
 
@@ -6957,7 +7057,7 @@ def cmd_new_row(env, ns):
     # reported a plan, exited 0, and wrote nothing, which automation reads as a
     # completed operation.
     if not ns.json:
-        _print_new_row_report(say, m)
+        _print_new_row_report(say, _public_new_row_manifest(env, m))
         if ns.apply:
             say("")
     # A guessed store may PLAN but never WRITE. Printing the guess and then
@@ -6972,7 +7072,7 @@ def cmd_new_row(env, ns):
             .format(m["store_why"], m["store_path"]))
     final = run_new_row(env, m) if ns.apply else None
     if ns.json:
-        pub = _public_new_row_manifest(m)
+        pub = _public_new_row_manifest(env, m)
         if final is not None:
             pub["result"] = final
         print(json.dumps(pub, indent=1))
@@ -8871,8 +8971,9 @@ def _print_repoint_report(say, m):
     say("this decides which one that sidebar entry opens.")
 
 
-def _public_repoint_manifest(m):
-    """The repoint manifest with both row images removed, for --json.
+def _public_repoint_manifest(env, m):
+    """The repoint manifest with both row images removed, for --json and the
+    printed report.
 
     `pre_b64` and `post_b64` are the destination row VERBATIM - the same bytes
     `_public_manifest` scrubs out of `sync --json`, and for the same reason:
@@ -8881,10 +8982,30 @@ def _public_repoint_manifest(m):
     connector configuration. This route had the identical exposure and no
     scrub, which is worse than sync's was, because a repoint's post-image is a
     copy of the row it is about to write rather than a stripped transform.
+
+    Also where --anonymize is honoured. The title is a stored row's, so the
+    substitution table normally knows it - but the table is built by a scan
+    that degrades to empty when a store cannot be read, and a partial
+    anonymisation that reads as safe is the worse failure. Label directly
+    from the RAW value, byte-identical to the table's label when both know
+    it (same hash).
     """
     out = {k: v for k, v in m.items() if k != "rows"}
     out["rows"] = [{k: v for k, v in r.items() if k not in ("pre_b64", "post_b64")}
                    for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        out = anonymize_report(env, out)
+        if isinstance(m.get("title"), str) and m["title"].strip():
+            out["title"] = _anon_label("session", m["title"])
+        for pub_r, r in zip(out["rows"], m.get("rows", [])):
+            if isinstance(r.get("title"), str) and r["title"].strip():
+                pub_r["title"] = _anon_label("session", r["title"])
+        # anonymize_report knows "label"; the manifest-level store label is
+        # not one of its field names - the retitle rule.
+        if isinstance(out.get("store_label"), str) and "@" in out["store_label"]:
+            out["store_label"] = _anon_label("account", out["store_label"])
+        if isinstance(out.get("transcript"), str):
+            out["transcript"] = anonymize(env, out["transcript"])
     return out
 
 
@@ -8892,22 +9013,36 @@ def cmd_repoint(env, ns):
     flags = RepointFlags(only=ns.only, to_session=ns.to_session,
                          store=ns.store, live=ns.live)
     m = plan_repoint(env, flags)
+
+    def say(line):
+        """cmd_new_row's wrapper, for the same two reasons: the report prints
+        a title (arbitrary text), and piped Windows stdout is the console
+        codepage. This command was handing _print_repoint_report a bare
+        print, so the default mode showed full session ids while its own
+        --verbose help promised redaction was the default."""
+        text = line if getattr(ns, "verbose", False) else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
     # --apply runs BEFORE --json prints, the way cmd_sync does it. Printing and
     # returning first meant `repoint --apply --json` reported a plan, exited 0,
     # and wrote nothing - automation would read that as a completed repoint.
     final = run_repoint(env, m) if ns.apply else None
     if ns.json:
-        pub = _public_repoint_manifest(m)
+        pub = _public_repoint_manifest(env, m)
         if final is not None:
             pub["result"] = final
         print(json.dumps(pub, indent=1))
         return 0
-    _print_repoint_report(print, m)
+    _print_repoint_report(say, _public_repoint_manifest(env, m))
     if final is None:
-        print("\ndry run - pass --apply to repoint")
+        say("\ndry run - pass --apply to repoint")
         return 0
-    print("\nresult  : {0}".format(final))
-    print("Reopen the app and check the session - 'undo' puts the old pointer back.")
+    say("\nresult  : {0}".format(final))
+    say("Reopen the app and check the session - 'undo' puts the old pointer back.")
     return 0
 
 
@@ -9848,8 +9983,9 @@ def cmd_retitle(env, ns):
     return 1
 
 
-def _public_manifest(m):
-    """The manifest with refresh pre-images removed, for --json.
+def _public_manifest(env, m):
+    """The sync manifest with refresh pre-images removed, for --json and the
+    printed report.
 
     `pre_b64` is the destination row VERBATIM - including the
     `remoteMcpServersConfig` and permission state the default transform strips
@@ -9857,10 +9993,33 @@ def _public_manifest(m):
     which is what undo restores from; printing it to stdout would let ordinary
     automation log another account's connector configuration without anyone
     asking for --verbatim.
+
+    Also where --anonymize is honoured - sync was the one emitter with no
+    anonymize pass at all. Its content comes in three shapes: the two
+    account addresses (never substitution pairs - an address names a person,
+    and the text report prints it too), titles in rows[].title and in the
+    tally's lists, and the row IMAGES, which are dropped outright under the
+    flag: a base64 blob embeds every title and cwd it carries, cannot be
+    eyeballed in a paste, and anonymized output is a display artifact
+    (--anonymize --apply is refused globally), so nothing legitimate reads
+    them from it. rows[].title takes the direct label from the raw value,
+    the repoint rule; the tally lists mix titles with filenames, so they go
+    through anonymize() instead, where only registered values match.
     """
     out = dict(m)
-    out["rows"] = [{k: v for k, v in r.items() if k != "pre_b64"}
+    strip = ("pre_b64", "post_b64") if _ANONYMIZE else ("pre_b64",)
+    out["rows"] = [{k: v for k, v in r.items() if k not in strip}
                    for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        if isinstance(out.get("tally"), dict):
+            out["tally"] = {k: ([anonymize(env, x) if isinstance(x, str)
+                                 else x for x in v]
+                                if isinstance(v, list) else v)
+                            for k, v in out["tally"].items()}
+        out = anonymize_report(env, out)
+        for pub_r, r in zip(out["rows"], m.get("rows", [])):
+            if isinstance(r.get("title"), str) and r["title"].strip():
+                pub_r["title"] = _anon_label("session", r["title"])
     return out
 
 
@@ -9883,7 +10042,7 @@ def cmd_sync(env, ns):
     # the combination automation would use - must report what actually
     # happened, not the plan it would have run.
     if not ns.json:
-        _print_sync_report(say, manifest)
+        _print_sync_report(say, _public_manifest(env, manifest))
     elif "live_override" in manifest:
         # --json prints no report and (with --apply) executes first, so the
         # override would otherwise mutate with no pre-mutation notice at
@@ -9901,7 +10060,7 @@ def cmd_sync(env, ns):
     if ns.json:
         if final is not None:
             manifest["result"] = final
-        print(json.dumps(_public_manifest(manifest), indent=1))
+        print(json.dumps(_public_manifest(env, manifest), indent=1))
         return 0 if final in (None, "completed") else 1
 
     if not manifest["rows"]:

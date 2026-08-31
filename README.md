@@ -640,7 +640,12 @@ to share.
 `sync --json` is the one place this discloses **a second account's** identifiers: unlike every
 other command, its output carries the destination account's account/org uuids and full store path
 in the clear, regardless of `--verbose`, because those are what the plan is *about*. The
-plain-text report redacts them like everything else; the JSON does not.
+plain-text report redacts them like everything else; the JSON does not. `--anonymize` is the
+exception, because pasteability is its whole point: both account addresses become labels, titles
+are labelled in the rows and the tally alike, the home directory folds to `~`, and the row
+images (`post_b64`, plus `pre_b64` on refreshes) are dropped from the JSON outright — a base64
+blob embeds every title it carries and cannot be eyeballed in a paste. The uuids stay, as ids
+always do.
 
 **`--anonymize` hides the *content*, which redaction never did.** The redaction above covers
 the **machine** — your home directory and uuid-shaped ids. It has never touched **titles**, and a
@@ -663,7 +668,13 @@ back later is indistinguishable from a real one, and that confusion is the origi
 are stable (a hash of the value), so two pasted listings can still be compared to each other, and
 session ids are left alone because they are random and are what makes the output useful.
 
-It covers `--json` too, which no amount of care with plain-text output would have.
+It covers `--json` too, which no amount of care with plain-text output would have. Under the
+flag — and only under it — `--json` also folds your home directory to `~`: anonymized output
+exists to be pasted, `--json` never passes through the plain-text redaction, and a payload that
+hides every title while printing your account name inside `C:\Users\<name>\...` would read as
+safe without being safe. That is the one machine-layer redaction `--anonymize` borrows; ids
+stay full, and plain `--json` without the flag is unchanged — still deliberately unredacted, as
+above.
 
 Two combinations are refused rather than half-honoured:
 
