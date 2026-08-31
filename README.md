@@ -640,7 +640,12 @@ to share.
 `sync --json` is the one place this discloses **a second account's** identifiers: unlike every
 other command, its output carries the destination account's account/org uuids and full store path
 in the clear, regardless of `--verbose`, because those are what the plan is *about*. The
-plain-text report redacts them like everything else; the JSON does not.
+plain-text report redacts them like everything else; the JSON does not. `--anonymize` is the
+exception, because pasteability is its whole point: both account addresses become labels, titles
+are labelled in the rows and the tally alike, the home directory folds to `~`, and the row
+images (`post_b64`, plus `pre_b64` on refreshes) are dropped from the JSON outright — a base64
+blob embeds every title it carries and cannot be eyeballed in a paste. The uuids stay, as ids
+always do.
 
 **`--anonymize` hides the *content*, which redaction never did.** The redaction above covers
 the **machine** — your home directory and uuid-shaped ids. It has never touched **titles**, and a

@@ -2787,7 +2787,8 @@ def _anon_pairs(env):
 
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
                 "suggested_title")
-_ANON_EMAIL_FIELDS = ("label", "email", "account_email")
+_ANON_EMAIL_FIELDS = ("label", "email", "account_email", "source_email",
+                      "dest_email")
 
 
 def _fold_home(env, text):
@@ -4053,12 +4054,24 @@ def cmd_undo(env, ns):
     # path skips the preview entirely, so the preview line alone would warn
     # only the users who happened to dry-run first.
     live_note = _live_override_note(prior.manifest)
+
+    def _pub_title(t):
+        # Direct label under --anonymize, the public-manifest rule: an op
+        # manifest can carry content the substitution table no longer knows
+        # - a retitle's new_title after a later rename, a new-row title
+        # whose row was deleted since - and the line pass below only
+        # replaces what the table holds. Byte-identical to the table's
+        # label when both know the value (same hash).
+        if _ANONYMIZE and isinstance(t, str) and t.strip():
+            return _anon_label("session", t)
+        return t
+
     if not ns.apply:
         if prior.manifest.get("op_type") == "repoint":
             pm = prior.manifest
             line = ("would undo {0} (repoint: {1!r} goes back to opening {2} instead "
                     "of {3}); pass --apply to execute".format(
-                        pm["op_id"], pm.get("title", ""),
+                        pm["op_id"], _pub_title(pm.get("title", "")),
                         (pm.get("from_session") or "nothing")[:8],
                         (pm.get("to_session") or "")[:8]))
         elif prior.manifest.get("op_type") == "sync":
@@ -4067,20 +4080,24 @@ def cmd_undo(env, ns):
             # actually remove instead: how many rows landed, and where.
             n_written = sum(1 for r in prior.manifest.get("rows", []) if r.get("written"))
             dest = prior.manifest.get("dest_email") or prior.manifest.get("dest_account", "")
+            if _ANONYMIZE and "@" in dest:
+                # An address names a person - the sync-manifest rule.
+                dest = _anon_label("account", dest)
             line = ("would undo {0} (sync: {1} row(s) written to {2}); pass --apply "
                     "to execute".format(prior.manifest["op_id"], n_written, dest))
         elif prior.manifest.get("op_type") == "new-row":
             pm = prior.manifest
             line = ("would undo {0} (new-row: removes the row {1!r}, which opens "
                     "{2}); pass --apply to execute".format(
-                        pm["op_id"], pm.get("title", ""),
+                        pm["op_id"], _pub_title(pm.get("title", "")),
                         (pm.get("to_session") or "")[:8]))
         elif prior.manifest.get("op_type") == "retitle":
             pm = prior.manifest
             n_written = sum(1 for r in pm.get("rows", []) if r.get("written"))
             line = ("would undo {0} (retitle: {1} row(s) get their previous "
                     "titles back, dropping {2!r}); pass --apply to execute"
-                    .format(pm["op_id"], n_written, pm.get("new_title", "")))
+                    .format(pm["op_id"], n_written,
+                            _pub_title(pm.get("new_title", ""))))
         elif prior.manifest.get("op_type") == "converge":
             pm = prior.manifest
             created = [r for r in pm.get("rows", []) if r.get("written")]
@@ -9858,8 +9875,9 @@ def cmd_retitle(env, ns):
     return 1
 
 
-def _public_manifest(m):
-    """The manifest with refresh pre-images removed, for --json.
+def _public_manifest(env, m):
+    """The sync manifest with refresh pre-images removed, for --json and the
+    printed report.
 
     `pre_b64` is the destination row VERBATIM - including the
     `remoteMcpServersConfig` and permission state the default transform strips
@@ -9867,10 +9885,33 @@ def _public_manifest(m):
     which is what undo restores from; printing it to stdout would let ordinary
     automation log another account's connector configuration without anyone
     asking for --verbatim.
+
+    Also where --anonymize is honoured - sync was the one emitter with no
+    anonymize pass at all. Its content comes in three shapes: the two
+    account addresses (never substitution pairs - an address names a person,
+    and the text report prints it too), titles in rows[].title and in the
+    tally's lists, and the row IMAGES, which are dropped outright under the
+    flag: a base64 blob embeds every title and cwd it carries, cannot be
+    eyeballed in a paste, and anonymized output is a display artifact
+    (--anonymize --apply is refused globally), so nothing legitimate reads
+    them from it. rows[].title takes the direct label from the raw value,
+    the repoint rule; the tally lists mix titles with filenames, so they go
+    through anonymize() instead, where only registered values match.
     """
     out = dict(m)
-    out["rows"] = [{k: v for k, v in r.items() if k != "pre_b64"}
+    strip = ("pre_b64", "post_b64") if _ANONYMIZE else ("pre_b64",)
+    out["rows"] = [{k: v for k, v in r.items() if k not in strip}
                    for r in m.get("rows", [])]
+    if _ANONYMIZE:
+        if isinstance(out.get("tally"), dict):
+            out["tally"] = {k: ([anonymize(env, x) if isinstance(x, str)
+                                 else x for x in v]
+                                if isinstance(v, list) else v)
+                            for k, v in out["tally"].items()}
+        out = anonymize_report(env, out)
+        for pub_r, r in zip(out["rows"], m.get("rows", [])):
+            if isinstance(r.get("title"), str) and r["title"].strip():
+                pub_r["title"] = _anon_label("session", r["title"])
     return out
 
 
@@ -9893,7 +9934,7 @@ def cmd_sync(env, ns):
     # the combination automation would use - must report what actually
     # happened, not the plan it would have run.
     if not ns.json:
-        _print_sync_report(say, manifest)
+        _print_sync_report(say, _public_manifest(env, manifest))
     elif "live_override" in manifest:
         # --json prints no report and (with --apply) executes first, so the
         # override would otherwise mutate with no pre-mutation notice at
@@ -9911,7 +9952,7 @@ def cmd_sync(env, ns):
     if ns.json:
         if final is not None:
             manifest["result"] = final
-        print(json.dumps(_public_manifest(manifest), indent=1))
+        print(json.dumps(_public_manifest(env, manifest), indent=1))
         return 0 if final in (None, "completed") else 1
 
     if not manifest["rows"]:

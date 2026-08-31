@@ -5,6 +5,7 @@ the same shape - output that LOOKED anonymised while still carrying the private
 string - which is worse than no feature at all, because it invites the paste.
 """
 import json
+import os
 import types
 
 import pytest
@@ -194,7 +195,6 @@ O1 = "bbbbbbbb-0000-0000-0000-000000000002"
 
 
 def _signed_in(env):
-    import os
     with open(os.path.join(env.home, ".claude.json"), "w",
               encoding="utf-8") as fh:
         json.dump({"oauthAccount": {"accountUuid": A1,
@@ -341,6 +341,91 @@ def test_anonymize_json_folds_the_home_directory(
     assert rc == 0
     assert not any(env.home in s for s in _strings(pub))
     assert pub["transcript"].startswith("~")
+
+
+def test_sync_anonymize_covers_addresses_titles_and_images(
+        two_account_env, tmp_path, write_transcript, capsys):
+    """sync was the one --json emitter with no anonymize pass at all: the two
+    account addresses printed in the clear (text mode too - an address is
+    never a substitution pair), row titles sat in rows[].title AND in the
+    tally's title lists, and the row images (post_b64, pre_b64 on refreshes)
+    are base64 blobs embedding every title they carry - unreadable in a
+    paste, so they are dropped outright under the flag."""
+    env, src, dst = two_account_env(tmp_path)
+    sid = "abcdef01-9abc-def0-1234-56789abcdef0"
+    write_transcript(env, "C--p", sid, [{"cwd": "C:\\p"}])
+    with open(os.path.join(src, "local_1.json"), "w", encoding="utf-8") as fh:
+        json.dump({"sessionId": "local_1", "cliSessionId": sid,
+                   "title": "ACME-REVIEW matter", "lastActivityAt": 9}, fh)
+    # A row already in the destination: its title lands in tally["present"].
+    for d in (src, dst):
+        with open(os.path.join(d, "local_2.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"sessionId": "local_2", "cliSessionId": sid,
+                       "title": "ACME-REVIEW parked", "lastActivityAt": 9}, fh)
+
+    def sy(**kw):
+        return ns(to="", only="", update=False, newer_only=False,
+                  allow_orphan=False, include_deleted=(), verbatim=False,
+                  live="", apply=False, **kw)
+
+    # Sanity: the raw JSON carries all three shapes, per its documented
+    # unredacted contract.
+    ct.cmd_sync(env, sy(json=True))
+    raw = json.loads(capsys.readouterr().out)
+    assert raw["source_email"] == "me@example.com"
+    assert any("ACME-REVIEW" in s for s in _strings(raw))
+    assert any("post_b64" in r for r in raw["rows"])
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    rc = ct.cmd_sync(env, sy())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "me@example.com" not in out and "<account-" in out
+    assert "ACME-REVIEW" not in out
+    rc = ct.cmd_sync(env, sy(json=True))
+    pub = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert not any("me@example.com" in s for s in _strings(pub))
+    assert not any("ACME-REVIEW" in s for s in _strings(pub))
+    assert not any("pre_b64" in r or "post_b64" in r for r in pub["rows"])
+    assert "<session-" in json.dumps(pub) and pub["source_email"].startswith(
+        "<account-")
+
+
+def test_undo_preview_anonymizes_manifest_titles_and_addresses(
+        mkenv, tmp_path, capsys):
+    """undo previews print op-manifest values through the line pass only, and
+    an op manifest can carry content the substitution table cannot know: a
+    retitle's new_title after a later rename, a sync destination's address.
+    Direct labels, byte-identical to the table's when both know the value."""
+    env = mkenv(tmp_path)
+    op1 = ct.new_op(env, {"op_type": "retitle", "new_title": "SECRET rename",
+                          "rows": [{"written": True}]})
+    ct.set_status(op1, "completed")
+    op2 = ct.new_op(env, {"op_type": "sync",
+                          "dest_email": "alice@example.com",
+                          "dest_account": "cccccccc-0000-0000-0000-000000000003",
+                          "rows": []})
+    ct.set_status(op2, "completed")
+
+    def undo_ns(op):
+        return ns(apply=False, show=False, op_id=op.manifest["op_id"])
+
+    ct.cmd_undo(env, undo_ns(op1))
+    assert "SECRET rename" in capsys.readouterr().out
+
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    rc = ct.cmd_undo(env, undo_ns(op1))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SECRET rename" not in out and "<session-" in out
+    rc = ct.cmd_undo(env, undo_ns(op2))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "alice@example.com" not in out and "<account-" in out
 
 
 def test_anonymize_with_verbose_is_refused(mkenv, tmp_path, capsys):
