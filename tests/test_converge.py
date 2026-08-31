@@ -1109,8 +1109,10 @@ def test_json_manifest_carries_identity_disagreement(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """--json is the machine caller's warning: the field is the signal (the
     dry run still exits 0), present with both ids under a disagreement,
-    absent otherwise, and --anonymize must keep its structure - the values
-    are machine ids, not content."""
+    absent otherwise. --anonymize keeps its structure but truncates the ids
+    to their 8-character prefixes - the same form the text warning has
+    always printed, still distinct, and anonymized output is a paste
+    artifact, not a machine surface (machine callers use plain --json)."""
     env = mkenv(tmp_path)
     one_missing_pair(env, write_transcript, write_row)
     identity_files(env, A1, A2)
@@ -1131,7 +1133,8 @@ def test_json_manifest_carries_identity_disagreement(
         rc = ct.cmd_converge(env, cv_ns(anonymize=True, json=True))
         payload = json.loads(capsys.readouterr().out)
         assert rc == 0
-        assert payload["identity_disagreement"] == {"oauth": A1, "config": A2}
+        assert payload["identity_disagreement"] == \
+            {"oauth": A1[:8] + "…", "config": A2[:8] + "…"}
     finally:
         ct._ANONYMIZE = False
         ct._ANON_CACHE.clear()

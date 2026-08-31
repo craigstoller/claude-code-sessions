@@ -883,3 +883,38 @@ def test_a_transcript_derived_title_survives_nowhere_in_a_hold(
     assert "earlier leg" in h["measured"]["suggested_title"]
     assert label in h["retitle"]
     assert h["measured"]["command_runnable"] is False
+
+
+def test_anonymized_json_truncates_uuid_shaped_ids(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Anonymized JSON borrows redact's OTHER machine-layer rule too:
+    uuid-shaped ids - session, account and org, standalone or inside store
+    paths - truncate to their 8-character prefix, exactly as every anonymized
+    plain-text line always has. Anonymized output exists to be pasted, and a
+    full account uuid outlives the paste. Plain --json without the flag stays
+    deliberately unredacted."""
+    from test_converge import A1, S1, cv_ns, measured_pair
+    env = mkenv(tmp_path)
+    measured_pair(env, write_transcript, write_row)
+    # Sanity, so the truncation assertions cannot pass vacuously: the
+    # unanonymized JSON really does carry the full ids.
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert S1 in payload and A1 in payload
+
+    ct._ANONYMIZE = True
+    rc = ct.cmd_converge(env, cv_ns(json=True, anonymize=True))
+    payload = capsys.readouterr().out
+    assert rc == 0
+    assert S1 not in payload and A1 not in payload
+    assert ct._UUID_RE.search(payload) is None
+    assert S1[:8] in payload and A1[:8] in payload
+
+    # And `list`, the other everyday paste surface.
+    seed(env, write_transcript, write_row)
+    ct._ANON_CACHE.clear()
+    ct.cmd_list(env, ns(anonymize=True, json=True))
+    payload = capsys.readouterr().out
+    assert S1 not in payload
+    assert ct._UUID_RE.search(payload) is None

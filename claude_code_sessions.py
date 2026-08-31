@@ -2687,6 +2687,13 @@ _UUID_RE = re.compile(r"\b([0-9a-f]{8})-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
 # compared to each other.
 _ANONYMIZE = False
 _ANON_CACHE = {}
+# Below this length a string never enters the substitution table, and that is
+# a DOCUMENTED residual, not an oversight: a 1-3 character fragment
+# substring-matches everywhere, and the over-matching history in _anon_pairs
+# says a partial replacement that corrupts surrounding output is worse than
+# none. So a very short title survives --anonymize verbatim - the README's
+# "what --anonymize deliberately does not mask" paragraph tells the paste
+# review to look for exactly that.
 _ANON_MIN = 4
 
 
@@ -2858,6 +2865,15 @@ def _fold_home(env, text):
     return text
 
 
+def _short_ids(text):
+    """Uuid-shaped ids to their 8-character prefix - the same machine-layer
+    rule redact() applies to every plain-text line. anonymize_report composes
+    it into anonymized output (JSON included) so the two surfaces agree;
+    kept separate from _fold_home because redact() needs the fold without
+    the truncation when --verbose/keep_ids asks for full ids."""
+    return _UUID_RE.sub(lambda m: m.group(1) + "…", text)
+
+
 # The fixed field vocabulary of every report anonymize_report traverses
 # (list items, doctor, alignment, and the retitle, converge, new-row,
 # repoint and sync public manifests).
@@ -2926,13 +2942,15 @@ def anonymize_report(env, obj):
     cut in half.
 
     This is also what covers `--json`, which no line-level pass ever reaches -
-    which is why every string here ALSO folds the home directory to ~. Plain
-    --json is deliberately unredacted (README) and keeps its full paths; but
-    anonymized output exists to be pasted, --json never meets redact(), and a
-    payload that hides every title while printing the account name in
-    C:\\Users\\<name>\\... is a partial safety that reads as whole. The fold
-    is the one machine-layer redaction this content pass borrows; ids stay
-    full, per the --json rule.
+    which is why every string here ALSO borrows redact()'s two machine-layer
+    rules: the home directory folds to ~, and uuid-shaped ids truncate to
+    their 8-character prefix. Plain --json is deliberately unredacted
+    (README) and keeps its full paths and ids; but anonymized output exists
+    to be pasted, --json never meets redact(), and a payload that hides
+    every title while printing the account name in C:\\Users\\<name>\\...
+    - or the full, globally-unique account uuid - is a partial safety that
+    reads as whole. Truncated ids stay distinct and stable, so pasted
+    reports remain comparable; only the tail that outlives the paste goes.
     """
     if isinstance(obj, dict):
         out = {}
@@ -2946,11 +2964,11 @@ def anonymize_report(env, obj):
                 if "@" in k and "." in k:
                     k = _anon_label("account", k)
                 else:
-                    k = _fold_home(env, anonymize(env, k))
+                    k = _short_ids(_fold_home(env, anonymize(env, k)))
             if k in _ANON_FIELDS and isinstance(v, str) and v.strip():
                 # anonymize() first: the whole-path pairs match the raw value,
                 # home prefix included; the fold then covers what no pair knew.
-                out[k] = _fold_home(env, anonymize(env, v))
+                out[k] = _short_ids(_fold_home(env, anonymize(env, v)))
             elif (k in _ANON_EMAIL_FIELDS and isinstance(v, str) and "@" in v):
                 # An account address names a person and an organisation. It is
                 # not a title, so the substitution table never sees it.
@@ -2961,7 +2979,7 @@ def anonymize_report(env, obj):
     if isinstance(obj, list):
         return [anonymize_report(env, v) for v in obj]
     if isinstance(obj, str):
-        return _fold_home(env, obj)
+        return _short_ids(_fold_home(env, obj))
     return obj
 
 

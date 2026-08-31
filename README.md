@@ -642,10 +642,11 @@ other command, its output carries the destination account's account/org uuids an
 in the clear, regardless of `--verbose`, because those are what the plan is *about*. The
 plain-text report redacts them like everything else; the JSON does not. `--anonymize` is the
 exception, because pasteability is its whole point: both account addresses become labels, titles
-are labelled in the rows and the tally alike, the home directory folds to `~`, and the row
+are labelled in the rows and the tally alike, the home directory folds to `~`, the row
 images (`post_b64`, plus `pre_b64` on refreshes) are dropped from the JSON outright — a base64
-blob embeds every title it carries and cannot be eyeballed in a paste. The uuids stay, as ids
-always do.
+blob embeds every title it carries and cannot be eyeballed in a paste — and every uuid, the
+destination's included, truncates to its 8-character prefix, exactly as the plain-text report
+prints them.
 
 **`--anonymize` hides the *content*, which redaction never did.** The redaction above covers
 the **machine** — your home directory and uuid-shaped ids. It has never touched **titles**, and a
@@ -666,15 +667,29 @@ e82cfaac…  <session-9c06>       <project-1a20>
 The labels are deliberately unreadable rather than plausible fake titles — a convincing fake read
 back later is indistinguishable from a real one, and that confusion is the original problem. They
 are stable (a hash of the value), so two pasted listings can still be compared to each other, and
-session ids are left alone because they are random and are what makes the output useful.
+ids are never labelled — they are random, and, truncated to their 8-character prefixes, they are
+what makes the output useful.
 
 It covers `--json` too, which no amount of care with plain-text output would have. Under the
-flag — and only under it — `--json` also folds your home directory to `~`: anonymized output
-exists to be pasted, `--json` never passes through the plain-text redaction, and a payload that
-hides every title while printing your account name inside `C:\Users\<name>\...` would read as
-safe without being safe. That is the one machine-layer redaction `--anonymize` borrows; ids
-stay full, and plain `--json` without the flag is unchanged — still deliberately unredacted, as
+flag — and only under it — `--json` borrows both of the plain-text redaction's machine-layer
+rules: your home directory folds to `~`, and every uuid-shaped id — session, account and org,
+standalone or inside a store path — truncates to the same 8-character prefix the text report
+has always printed. Anonymized output exists to be pasted, `--json` never passes through the
+plain-text redaction, and a payload that hides every title while printing your account name
+inside `C:\Users\<name>\...` — or your full, globally-unique account uuid — would read as safe
+without being safe. Truncated ids stay distinct and stable, so a pasted report is still
+debuggable; plain `--json` without the flag is unchanged — still deliberately unredacted, as
 above.
+
+**What `--anonymize` deliberately does not mask**, so the paste review knows where to look:
+strings shorter than 4 characters never enter the substitution table — a 1–3 character
+fragment substring-matches everywhere, and the over-matching history above says a partial
+replacement that corrupts surrounding output is worse than none — so a very short title
+survives verbatim. Dates and counts pass through too: activity dates, prose-turn tallies, and
+the date range inside a generated `… - earlier leg (Aug 24-28)` title are labels and
+quantities, not identity, and masking them would anonymize the report into uselessness. Both
+are accepted residuals, not gaps: eyeball a paste before publishing it, especially one whose
+titles were very short.
 
 Two combinations are refused rather than half-honoured:
 
