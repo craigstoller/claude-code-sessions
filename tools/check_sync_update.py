@@ -176,7 +176,7 @@ d["remoteMcpServersConfig"] = {"secret-endpoint": "https://internal.example/mcp"
 json.dump(d, open(dest_row, "w", encoding="utf-8"))
 m = ccs.plan_sync(env, ccs.SyncFlags(update=True))
 check("the pre-image is journaled", bool(m["rows"][0].get("pre_b64")))
-pub = json.dumps(ccs._public_manifest(m))
+pub = json.dumps(ccs._public_manifest(env, m))
 check("  but --json omits it", "pre_b64" not in pub)
 check("  so the destination's config never reaches stdout",
       "secret-endpoint" not in pub)

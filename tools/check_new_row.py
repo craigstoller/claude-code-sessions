@@ -985,7 +985,7 @@ check("  and says the row is new rather than moved",
 check("  without claiming nothing else points at the conversation",
       "nothing pointing at it" not in joined, joined[:200])
 
-pub = ccs._public_new_row_manifest(m)
+pub = ccs._public_new_row_manifest(env, m)
 blob = json.dumps(pub)
 check("--json carries no row image", "post_b64" not in blob)
 check("  nor a pre-image key", "pre_b64" not in blob)

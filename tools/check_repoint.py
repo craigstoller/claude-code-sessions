@@ -94,7 +94,7 @@ def sid_of(path):
 
 # ---------------------------------------------------------------- planning
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 check("plans against the live store by default", m["op_type"] == "repoint")
 check("  naming the row it found", m["name"] == "local_slot0.json", m["name"])
 check("  the pointer it would replace", m["from_session"] == OLD)
@@ -108,11 +108,11 @@ check("  the post-image differs ONLY in cliSessionId",
 
 # ---------------------------------------------------------------- refusals
 for flags, want, why in (
-        (ccs.RepointFlags(only="KRIS"), "--to is required", "no target"),
+        (ccs.RepointFlags(only="ACME"), "--to is required", "no target"),
         (ccs.RepointFlags(to_session=NEW), "--only is required", "no row named"),
-        (ccs.RepointFlags(only="KRIS", to_session="%032d" % 99),
+        (ccs.RepointFlags(only="ACME", to_session="%032d" % 99),
          "no transcript on disk", "target does not exist"),
-        (ccs.RepointFlags(only="KRIS", to_session=OLD),
+        (ccs.RepointFlags(only="ACME", to_session=OLD),
          "already opens", "already pointing there"),
         (ccs.RepointFlags(only="nothing-matches-this", to_session=NEW),
          "no row matching", "row not found")):
@@ -126,7 +126,7 @@ shutil.rmtree(root, ignore_errors=True)
 # an ambiguous --only must name the candidates rather than pick one
 root, env, row = build(rows=(("ACME-REVIEW session", OLD), ("ACME-REVIEW again", OLD)))
 try:
-    ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
     check("refuses: two rows match --only", False, "it picked one")
 except ccs.Refusal as exc:
     check("refuses: two rows match --only", "matches 2 rows" in str(exc), str(exc)[:60])
@@ -136,7 +136,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # ---------------------------------------------------------------- apply + undo
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 check("apply repoints the row", ccs.run_repoint(env, m) == "completed")
 check("  the row now opens the other conversation", sid_of(row) == NEW, sid_of(row))
 op = [o for o in ccs.list_ops(env) if o.manifest["op_id"] == m["op_id"]][0]
@@ -147,7 +147,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # the app rewriting the row after the repoint blocks undo, as with sync
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 ccs.run_repoint(env, m)
 d = json.load(open(row, encoding="utf-8"))
 d["title"] = "the app touched this"
@@ -167,7 +167,7 @@ shutil.rmtree(root, ignore_errors=True)
 root, env, row = build()
 env.process_lister = lambda: [(1, r"c:\program files\windowsapps"
                                   r"\claude_1.0_x64__pzs8sxrjxfjjc\app\claude.exe")]
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 try:
     ccs.run_repoint(env, m)
     check("apply refuses while the desktop app is running", False, "it wrote!")
@@ -179,7 +179,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # a repoint is undoable through the ordinary `undo` candidate filter
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 ccs.run_repoint(env, m)
 cands = [o for o in ccs.list_ops(env)
          if o.manifest.get("status") == "completed"
@@ -284,7 +284,7 @@ root, env, row = build()
 
 
 class NSJ:
-    only = "KRIS"
+    only = "ACME"
     to_session = NEW
     store = ""
     live = ""
@@ -306,7 +306,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # the target vanishing between plan and apply must refuse, not write a dangler
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 os.remove(os.path.join(env.projects_root, "proj", NEW + ".jsonl"))
 try:
     ccs.run_repoint(env, m)
@@ -319,7 +319,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # an interrupted repoint must be finishable rather than jamming the journal
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 op = ccs.new_op(env, m)
 ccs.set_status(op, "journaled")
 ccs.set_status(op, "writing")                       # died between the two
@@ -330,7 +330,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # recover must refuse cleanly on a repoint, not traceback on move-shaped keys
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 op = ccs.new_op(env, m)
 ccs.set_status(op, "journaled")
 ccs.set_status(op, "writing")
@@ -351,13 +351,13 @@ with open(os.path.join(env.home, ".claude.json"), "w") as fh:
     json.dump({"oauthAccount": {"accountUuid": DORM, "organizationUuid": ORG_D,
                                 "emailAddress": "dorm@example.com"}}, fh)
 try:
-    ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
     check("with the identity files disagreeing, the default store is refused",
           False, "it planned anyway")
 except ccs.Refusal as exc:
     check("with the identity files disagreeing, the default store is refused",
           "cannot identify" in str(exc) or "--live" in str(exc), str(exc)[:60])
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW, live=LIVE))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW, live=LIVE))
 check("  and --live resolves it instead of being ignored",
       m["store_path"].endswith(os.path.join(LIVE, ORG_L)), m["store_path"][-40:])
 shutil.rmtree(root, ignore_errors=True)
@@ -427,7 +427,7 @@ except ccs.Refusal as exc:
 
 # The same lookup labels the plan, so gap 1 also printed eight hex characters
 # for the store the user is looking at.
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 check("the plan names the live store by email rather than a hex prefix",
       m["store_label"].startswith("live@example.com"), m["store_label"])
 shutil.rmtree(root, ignore_errors=True)
@@ -449,7 +449,7 @@ DESKTOP = (1, r"c:\program files\windowsapps"
 def torn(landed=True, drift=False):
     """A repoint left non-terminal, as a crash between write and marker does."""
     root, env, row = build()
-    m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
     op = ccs.new_op(env, m)
     ccs.set_status(op, "journaled")
     if landed:
@@ -607,10 +607,10 @@ shutil.rmtree(root, ignore_errors=True)
 print("\n--- back does not reverse a later completed repoint ---")
 
 root, env, row = build()
-m1 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m1 = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 op1 = ccs.new_op(env, m1)
 ccs.set_status(op1, "journaled")                  # stalls, never writes
-m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 check("the re-run completes", ccs.run_repoint(env, m2) == "completed")
 check("  and the row opens the new conversation", sid_of(row) == NEW, sid_of(row))
 
@@ -656,7 +656,7 @@ shutil.rmtree(root, ignore_errors=True)
 
 # ...and with no later claimant, back still reverses normally.
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 op = ccs.new_op(env, m)
 ccs.set_status(op, "journaled")
 ccs.atomic_write(m["rows"][0]["dest_path"], ccs.unb64(m["rows"][0]["post_b64"]))
@@ -681,7 +681,7 @@ for label, wreck in (("no rows key", lambda mm: mm.pop("rows")),
                      ("post_b64 missing",
                       lambda mm: mm["rows"][0].pop("post_b64"))):
     root, env, row = build()
-    m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+    m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
     op = ccs.new_op(env, m)
     ccs.set_status(op, "journaled")
     wreck(op.manifest)
@@ -708,12 +708,12 @@ for label, wreck in (("no rows key", lambda mm: mm.pop("rows")),
 
 # one damaged op must not take the whole listing down with it
 root, env, row = build()
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 bad_op = ccs.new_op(env, m)
 ccs.set_status(bad_op, "journaled")
 bad_op.manifest.pop("rows")
 ccs.save_manifest(bad_op)
-m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m2 = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 good = ccs.new_op(env, m2)
 ccs.set_status(good, "journaled")
 try:
@@ -733,7 +733,7 @@ d = json.load(open(row, encoding="utf-8"))
 del d["cliSessionId"]
 with open(row, "w") as fh:
     json.dump(d, fh)
-m = ccs.plan_repoint(env, ccs.RepointFlags(only="KRIS", to_session=NEW))
+m = ccs.plan_repoint(env, ccs.RepointFlags(only="ACME", to_session=NEW))
 check("planning against a row that opens nothing works",
       (m.get("from_session") or None) is None, str(m.get("from_session")))
 op = ccs.new_op(env, m)
