@@ -485,6 +485,13 @@ def _run_level_sequence(env, steps, live, ui):
     if not ui.confirm_stage2(fresh):
         seq["stage2"] = "cancelled"
         return seq
+    if ui.truncate_requested():
+        # The close prompt can be confirmed WHILE the stage-2 dialog sits
+        # open ("the 1 remaining step(s) will NOT run"); an OK on that
+        # dialog afterwards must not run the step the close just promised
+        # away.
+        seq["stage2"] = "truncated"
+        return seq
     ui.status("Creating rows...")
     try:
         final = ccs.run_converge(env, fresh)
@@ -551,7 +558,11 @@ def _sequence_status(seq, half=""):
                if landed else "1 converge")
         line = "Applied ({0})".format(ops)
         return (line + " - " + half) if half else line
-    return ""                                   # gate / truncated: no line
+    if s2 == "gate" and landed:
+        # The mid-sequence gate hit: renames stand, the copy never ran.
+        return (landed_clause + "; the copy did not run - interrupted "
+                "operation(s) need attention (see Health).")
+    return ""                                   # press-abort / truncated
 
 
 def _run_level_apply(env, steps, live, ui):
@@ -576,7 +587,13 @@ def _run_level_apply(env, steps, live, ui):
     ("refusal"|"error", text), or None when skipped.
     """
     seq = _run_level_sequence(env, steps, live, ui)
-    if seq["stage2"] in ("gate", "truncated"):
+    if seq["stage2"] == "truncated" or (seq["stage2"] == "gate"
+                                        and not seq["mutated"]):
+        # A truncated sequence is a window on its way closed. A gate abort
+        # skips the refresh only while it is still a pure press abort - a
+        # gate hit BETWEEN the stages, with renames already landed, must
+        # refresh like any other end, or the pane keeps rendering
+        # pre-rename rows under a status that denies the writes.
         return seq, None
     ui.status("Re-measuring...")
     try:
@@ -661,7 +678,10 @@ def _interrupted_lines(entries, now_s):
 class _MutationMarker(object):
     """The close handler's view of a single-operation worker (sync apply,
     undo): nothing remains after the in-flight op, and truncation is simply
-    'close once it lands'."""
+    'close once it lands'. `truncate` is accepted-and-ignored on purpose -
+    these workers run exactly one operation and never consult the flag; the
+    close-at-the-boundary semantics live entirely in _close_after_worker
+    plus _mutation_over."""
     def __init__(self):
         self.remaining = 0
         self.truncate = False
@@ -741,7 +761,6 @@ class SyncApp:
         self.level_live = ""
         self.level_gen = 0
         self.level_manifest = None
-        self.level_rep = None
         self.hold_models = []
         self._level_apply_ok = False
         self._sync_apply_ok = False
@@ -992,23 +1011,27 @@ class SyncApp:
         self.refresh_level()
 
     # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _set_text(widget, lines, append=False):
+        """The one enable/edit/disable dance for every read-only Text pane -
+        a fix to it (scroll preservation, a missed re-disable) must not need
+        finding in four copies."""
+        widget.configure(state="normal")
+        if append:
+            widget.insert("end", "\n" + "\n".join(lines))
+        else:
+            widget.delete("1.0", "end")
+            widget.insert("1.0", "\n".join(lines))
+        widget.configure(state="disabled")
+
     def show(self, lines):
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", "\n".join(lines))
-        self.text.configure(state="disabled")
+        self._set_text(self.text, lines)
 
     def show_level(self, lines):
-        self.level_text.configure(state="normal")
-        self.level_text.delete("1.0", "end")
-        self.level_text.insert("1.0", "\n".join(lines))
-        self.level_text.configure(state="disabled")
+        self._set_text(self.level_text, lines)
 
     def show_health(self, lines):
-        self.health_text.configure(state="normal")
-        self.health_text.delete("1.0", "end")
-        self.health_text.insert("1.0", "\n".join(lines))
-        self.health_text.configure(state="disabled")
+        self._set_text(self.health_text, lines)
 
     def busy(self, on):
         """Disable EVERY action while a worker runs - not a selected few.
@@ -1043,11 +1066,15 @@ class SyncApp:
         # newer_chk qualifies update_chk, so re-releasing everything must not
         # leave it live while the box it qualifies is unticked - it would read
         # as a control that does nothing.
-        if not self._busy_count:
-            if not self.update_var.get():
-                self.newer_chk.configure(state="disabled")
-                self.orphan_chk.configure(state="disabled")
-            self._apply_gate_to_buttons()
+        if not self._busy_count and not self.update_var.get():
+            self.newer_chk.configure(state="disabled")
+            self.orphan_chk.configure(state="disabled")
+        # BOTH transitions recompute the Apply/Undo verdicts, so a worker
+        # starting anywhere (the Health check included, which is not a
+        # mutation but reads state a concurrent apply would be tearing)
+        # takes every Apply button down with it, and no done-callback needs
+        # its own configure calls that could disagree with the recompute.
+        self._apply_gate_to_buttons()
 
     # ---------------------------------------------------------------- planning
     def refresh(self, reset_live=False):
@@ -1108,9 +1135,15 @@ class SyncApp:
                             ("error", traceback.format_exc()))
 
     def _plan_done(self, gen, only, manifest, problem):
+        # The decrement comes BEFORE the staleness check: every worker owned
+        # exactly one busy(True), and a superseded callback that returned
+        # without paying it back would strand the counted busy state above
+        # zero - every control in the window disabled forever. (The old
+        # boolean busy() made the early return harmless; the counter does
+        # not.)
+        self.busy(False)
         if gen != self.generation:
             return                       # superseded by a newer plan
-        self.busy(False)
         if problem:
             kind, msg = problem
             self.manifest = None
@@ -1606,21 +1639,29 @@ class SyncApp:
         threading.Thread(target=self._doctor_worker, daemon=True).start()
 
     def _doctor_worker(self):
+        # The scan fails closed independently of the doctor gather: a
+        # doctor that errors must not leave the gate wherever the last
+        # successful scan put it - this Refresh is the designed way back
+        # after `ccs recover`, and it has to report the journal it could
+        # not read as exactly that.
+        try:
+            entries = _scan_interrupted(self.env)
+        except Exception:
+            entries = None
         try:
             rep = ccs.gather_doctor(self.env)
-            entries = _scan_interrupted(self.env)
             self.root.after(0, self._doctor_done, rep, entries, None)
         except Exception:
-            self.root.after(0, self._doctor_done, None, None,
+            self.root.after(0, self._doctor_done, None, entries,
                             traceback.format_exc())
 
     def _doctor_done(self, rep, entries, err):
         self.busy(False)
+        self._set_gate(entries, error=entries is None)
         if err:
             self.health_status.set("Health check failed")
             self.show_health([err])
             return
-        self._set_gate(entries)
         lines = []
         if entries:
             lines += _interrupted_lines(entries, self.env.now()) + [""]
@@ -1759,9 +1800,17 @@ class SyncApp:
             prompt += "\n\n" + t["live_note"]
         if not messagebox.askokcancel(title, prompt):
             return
+        # An undo changes the store underneath BOTH panes' plans, so both
+        # Apply verdicts are void until each pane replans - the Level pane
+        # replans automatically below; the sync pane waits for its own
+        # Refresh, exactly as it did when its Apply survived only its own
+        # operations. (Leaving _sync_apply_ok standing let the recompute
+        # re-arm Apply over a manifest planned before the undo - the
+        # "Apply would copy something other than what was shown" state the
+        # generation discipline exists to prevent.)
+        self._sync_apply_ok = False
+        self._level_apply_ok = False
         self.busy(True)
-        self.apply_btn.configure(state="disabled")
-        self.level_apply_btn.configure(state="disabled")
         self.undo_btn.configure(state="disabled")
         self.status.set("Undoing...")
         self.level_status.set("Undoing...")
@@ -1801,8 +1850,7 @@ class SyncApp:
     def _undo_done(self, kind, result, report, problem):
         if self._mutation_over():
             return                       # the window was closing; it may now
-        self.busy(False)
-        self.undo_btn.configure(state="normal")
+        self.busy(False)                 # the recompute re-arms Undo itself
         if problem:
             kind_p, msg = problem
             # NOT "nothing was removed": a refusal can follow some rows having
@@ -1829,15 +1877,24 @@ class SyncApp:
             self.show([])
             note = "Undone - the copied rows were removed."
         elif kind == "retitle":
+            # The sync tab said "Undoing..." at press time; every kind has
+            # to land that line somewhere, or a finished undo reads as
+            # in-flight forever on the one tab that was not watching.
+            self.status.set("Undone")
+            self.detail.set("The store changed underneath this tab's plan - "
+                            "press Refresh to replan.")
             note = "Undone - the previous titles are back."
         else:
+            self.status.set("Undone")
+            self.detail.set("The store changed underneath this tab's plan - "
+                            "press Refresh to replan.")
             # Converge's undo is FORGIVING - it deletes what is still
             # redundant and skips what became load-bearing - so a bare
             # "undone" would hide exactly the rows it deliberately left.
             rep = report or {}
             note = "Undone - removed {0} row(s); {1} already gone{2}.".format(
                 rep.get("deleted", 0), rep.get("already_gone", 0),
-                "; {0} kept (see Health/CLI report)".format(
+                "; {0} kept (see the CLI's undo report)".format(
                     len(rep.get("skipped") or []))
                 if rep.get("skipped") else "")
         self._update_undo_button()
@@ -1896,27 +1953,37 @@ class SyncApp:
                          args=(gen, self.level_live), daemon=True).start()
 
     def _level_plan_worker(self, gen, live):
+        # The gate scan gets its own try, OUTSIDE the read block, and its
+        # result survives a read failure: an early version passed a bare []
+        # through the except path, so a Refresh whose gather/plan refused
+        # ERASED a standing red line - "couldn't look" (or "looked, then the
+        # read failed") rendered as "nothing there", lifting the mutation
+        # gate on the strength of a scan whose findings were discarded.
+        try:
+            entries = _scan_interrupted(self.env)
+        except Exception:
+            entries = None               # gates closed until Health can look
         try:
             running = ccs.claude_running(self.env)
-            try:
-                entries = _scan_interrupted(self.env)
-            except Exception:
-                entries = None           # gates closed until Health can look
             rep = ccs.gather_alignment(self.env)
             man = ccs.plan_converge(self.env, ccs.ConvergeFlags(live=live))
-            self.root.after(0, self._level_plan_done, gen, rep, man, running,
-                            entries, None)
+            problem = None
         except ccs.Refusal as exc:
-            self.root.after(0, self._level_plan_done, gen, None, None, [],
-                            [], ("refusal", str(exc)))
+            rep = man = None
+            running = []
+            problem = ("refusal", str(exc))
         except Exception:
-            self.root.after(0, self._level_plan_done, gen, None, None, [],
-                            [], ("error", traceback.format_exc()))
+            rep = man = None
+            running = []
+            problem = ("error", traceback.format_exc())
+        self.root.after(0, self._level_plan_done, gen, rep, man, running,
+                        entries, problem)
 
     def _level_plan_done(self, gen, rep, man, running, entries, problem):
+        # Decrement before the staleness check - see _plan_done.
+        self.busy(False)
         if gen != self.level_gen:
             return                       # superseded by a newer plan
-        self.busy(False)
         self._set_gate(entries, error=entries is None)
         if entries:
             self._render_health_entries(entries)
@@ -1941,7 +2008,7 @@ class SyncApp:
         """The pane, top to bottom, from post-read state only: notice,
         banner, scoreboard + plan summary, hold rows (merged by key so a
         replan never silently resets the user's edits), footer."""
-        self.level_rep, self.level_manifest = rep, man
+        self.level_manifest = man
         self.hold_models = _merge_hold_models(_hold_models(man),
                                               self._current_models())
         if running:
@@ -2057,7 +2124,11 @@ class SyncApp:
                           wraplength=780, justify="left").grid(row=2,
                                                                column=1,
                                                                sticky="w")
-                if m["degrade_reason"]:
+                if m["degrade_reason"] and not m["prefill"]:
+                    # Only when no suggestion survived: the shell-unsafe
+                    # degrade keeps its suggested_title (the GUI path is not
+                    # the shell path), and labeling a filled, ticked entry
+                    # "no suggestion" would deny the very text above it.
                     ttk.Label(row, text="no suggestion: " + m["degrade_reason"],
                               foreground="#a05000").grid(row=3, column=1,
                                                          sticky="w")
@@ -2180,15 +2251,20 @@ class SyncApp:
                                    "\n\n".join(problems))
             return
         if not steps and not (self.level_manifest.get("rows") or []):
+            # Everything unticked and nothing to copy: an enabled button
+            # whose press does nothing at all reads as a broken button.
+            self.level_status.set("Nothing is ticked - tick a rename, or "
+                                  "press Refresh.")
             return
         if steps and not self._confirm_stage1(steps):
             return
         self.level_gen += 1              # this press owns the pane now
         gen = self.level_gen
-        self.busy(True)
         self._level_apply_ok = False
-        self.level_apply_btn.configure(state="disabled")
-        self.apply_btn.configure(state="disabled")
+        # The converge writes into the same stores the sync plan measured,
+        # so that verdict is void too until the sync pane replans.
+        self._sync_apply_ok = False
+        self.busy(True)
         self.level_status.set("Applying...")
         self.level_detail.set("")
         ui = _TkLevelUI(self)
@@ -2242,21 +2318,28 @@ class SyncApp:
         if gen != self.level_gen:
             return
         if seq.get("gate") is not None:
-            # The press aborted before writing anything; the pane still
-            # describes the store, and nothing consumed the live assertion.
+            # Render the red line first - the pane below must never look
+            # more willing than the gate.
             if isinstance(seq["gate"], str):
                 self._set_gate(None, error=True)
             else:
                 self._press_gate()       # re-render the line + the listing
-            self.level_status.set("Nothing was written - resolve the "
-                                  "interrupted operation(s) first.")
-            return
+            if not seq.get("mutated"):
+                # A pure press abort: nothing was written, the pane still
+                # describes the store, and nothing consumed the live
+                # assertion.
+                self.level_status.set("Nothing was written - resolve the "
+                                      "interrupted operation(s) first.")
+                return
+            # A gate hit BETWEEN the stages: renames landed. Fall through -
+            # the refresh ran, and the status below names the landed count.
         # The sequence has ended - completed, refused, or cancelled alike -
         # so the assertion it carried is spent. The refresh below already
         # planned without it; if the files still disagree, that replan is
         # what re-raises the banner.
         self.level_live = ""
         half = ""
+        keep_stale_status = False
         if refresh is not None and refresh[0] == "ok":
             _kind, rep, man, running = refresh
             self._render_level(rep, man, running)
@@ -2279,6 +2362,7 @@ class SyncApp:
                                       "shown from BEFORE the apply.")
                 self._append_level(["", "!! shown from before the apply - "
                                         "press Refresh"])
+                keep_stale_status = True
             else:
                 problem = (seq.get("plan_problem")
                            or (refresh if refresh is not None else None))
@@ -2288,8 +2372,7 @@ class SyncApp:
                                       "Refresh retries.")
             self._update_undo_button()
         status = _sequence_status(seq, half)
-        if status and not (refresh is not None and refresh[0] != "ok"
-                           and seq.get("stage2") == "completed"):
+        if status and not keep_stale_status:
             self.level_status.set(status)
         # Modal AFTER the pane settles, mirroring _apply_done: a refusal
         # after pressing Apply is the one message that must not be missable.
@@ -2302,9 +2385,7 @@ class SyncApp:
                                    seq["converge_problem"][1])
 
     def _append_level(self, lines):
-        self.level_text.configure(state="normal")
-        self.level_text.insert("end", "\n" + "\n".join(lines))
-        self.level_text.configure(state="disabled")
+        self._set_text(self.level_text, lines, append=True)
 
     # ------------------------------------------------------- window lifecycle
     def _on_close(self):
@@ -2409,9 +2490,11 @@ class SyncApp:
         if not messagebox.askokcancel(
                 "Copy sessions?", "{0}\n\n{1} Undo reverses it.".format(what, does)):
             return
-        self.busy(True)
         self._sync_apply_ok = False
-        self.apply_btn.configure(state="disabled")
+        # And the Level pane's verdict: this copy changes the store its plan
+        # measured. It replans after the apply lands (_apply_done).
+        self._level_apply_ok = False
+        self.busy(True)
         self.status.set("Copying...")
         self._mutation_ui = _MutationMarker()
         threading.Thread(target=self._apply_worker, args=(self.manifest,),
@@ -2471,6 +2554,9 @@ class SyncApp:
         self.manifest = None
         self._update_undo_button()
         self._sync_live_button()
+        # The copy changed the store the Level pane measured; re-measure so
+        # its scoreboard and Apply verdict describe the store as it now is.
+        self.refresh_level()
 
 
 # ------------------------------------------------------------------- shortcuts

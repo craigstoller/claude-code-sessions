@@ -139,6 +139,7 @@ class FakeUI(object):
         self.statuses = []
         self.confirmed_with = []
         self.remaining = 0
+        self.truncate = False
         self._confirm = confirm
         self._gate = gate or (lambda: None)
         self._on_confirm = on_confirm
@@ -150,7 +151,7 @@ class FakeUI(object):
         return self._gate()
 
     def truncate_requested(self):
-        return False
+        return self.truncate
 
     def confirm_stage2(self, fresh):
         self.confirmed_with.append(fresh)
@@ -305,6 +306,48 @@ check("  the renames stand - a complete, valid store state",
           env.store_candidates[0], A1, O1, n), encoding="utf-8"))
           .get("title") or "")
           for n in os.listdir(os.path.join(env.store_candidates[0], A1, O1))))
+
+# ---------- the mid-sequence gate: renames stand, and the pane says so
+env, root = build_env()
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+gate_state = {"hits": 0}
+
+
+def gate_after_stage1():
+    gate_state["hits"] += 1
+    return ["20990101T000009Z-feedcc"] if gate_state["hits"] > 1 else None
+
+
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True, gate=gate_after_stage1)
+    seq, refresh = gp._run_level_apply(env, steps, "", ui)
+check("a gate hit between the stages stops the copy",
+      seq["stage2"] == "gate" and seq["landed"] == 1 and len(spy.runs) == 0)
+check("  but the landed rename still gets its refresh",
+      refresh is not None and refresh[0] == "ok")
+check("  and the status names what landed, never 'nothing was written'",
+      gp._sequence_status(seq)
+      == "1 rename landed, each undoable; the copy did not run - "
+         "interrupted operation(s) need attention (see Health).",
+      gp._sequence_status(seq))
+
+# ---------- close confirmed while the stage-2 dialog is open
+env, root = build_env()
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True)
+
+    def confirm_then_close():
+        ui.truncate = True               # the close prompt was confirmed
+    ui._on_confirm = confirm_then_close
+    seq, refresh = gp._run_level_apply(env, steps, "", ui)
+check("an OK on the stage-2 dialog after a confirmed close runs nothing",
+      seq["stage2"] == "truncated" and len(spy.runs) == 0
+      and refresh is None)
 
 # ------------------------------------------------- 13. RULING 4 up front
 env, root = build_env()
@@ -549,6 +592,20 @@ check("Undo points at the converge",
       str(app.undo_target))
 check("no refusal modal on the happy path",
       not modals.of("showwarning"))
+check("the sync tab's Apply is void until IT replans - the converge wrote "
+      "into its destination",
+      str(app.apply_btn.cget("state")) == "disabled")
+app.refresh()
+settle()
+check("  and its own Refresh re-arms it against a fresh plan",
+      str(app.apply_btn.cget("state")) == "normal"
+      or not (app.manifest or {}).get("rows"))
+# A stale-generation callback must still pay back its busy(True): the
+# counted busy state deadlocks the whole window otherwise.
+app.busy(True)
+app._level_plan_done(-1, None, None, [], [], ("refusal", "stale"))
+check("a superseded worker callback still releases the busy counter",
+      str(app.level_refresh_btn.cget("state")) == "normal")
 tkroot.destroy()
 
 # ------------------- 14. banner buttons; typed text survives the replan
@@ -702,6 +759,22 @@ check("  and Refresh stays enabled as the retry",
 app.refresh_level()
 settle()
 check("  a later Refresh recovers", app.level_manifest is not None)
+# A read failure must not erase a standing gate: the scan's findings
+# survive the gather/plan raising.
+plant_op(env, "20260831T000005Z-eeeeee")
+ccs.gather_alignment = broken
+try:
+    app.on_doctor()                      # raises the gate first
+    settle()
+    app.refresh_level()                  # then the failing read
+    settle()
+finally:
+    ccs.gather_alignment = _real_gather
+check("a failing Refresh keeps the standing red line",
+      "1 interrupted operation(s)" in app.gate_var.get(),
+      app.gate_var.get())
+check("  and the gate stays down on Undo",
+      str(app.undo_btn.cget("state")) == "disabled")
 tkroot.destroy()
 
 # ------------------- 19. press-time gate re-scan, every mutation press
