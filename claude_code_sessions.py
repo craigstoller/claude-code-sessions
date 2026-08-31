@@ -2783,6 +2783,36 @@ def _anon_register_title(env, title):
         pairs.sort(key=lambda kv: -len(kv[0]))
 
 
+# Refusals print through redact(), whose anonymize pass substitutes WHOLE
+# registered strings - so refusal prose that embeds a substring, a
+# truncated title, or an email needs its components handled at
+# composition, not after. These three cover the carriers refusals
+# actually use; a new refusal that embeds one of them goes through these.
+def _only_display(value):
+    """A --only value as refusal text shows it. The value is a user-typed
+    TITLE SUBSTRING, and a substring matches no whole registered title, so
+    the substitution table structurally cannot cover it - under --anonymize
+    it becomes the same fixed marker the converge manifest uses."""
+    return "<only-filter>" if _ANONYMIZE and value else value
+
+
+def _listing_title(env, title):
+    """A stored title as a refusal LISTING shows it: anonymized BEFORE the
+    caller truncates, because a whole-title pair cannot match a title cut
+    to a column width - the structured pass's own lesson, applied to the
+    one path that still truncated first."""
+    shown = title or "(untitled)"
+    return anonymize(env, shown) if _ANONYMIZE else shown
+
+
+def _listing_label(s):
+    """A holder label in refusal prose - the account email scrubbed under
+    --anonymize exactly as the manifest's label fields are."""
+    if _ANONYMIZE and isinstance(s, str) and "@" in s:
+        return _anon_label("account", s)
+    return s
+
+
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
                 "suggested_title")
 _ANON_EMAIL_FIELDS = ("label", "email", "account_email")
@@ -8676,12 +8706,15 @@ def plan_repoint(env, flags):
     if not hits:
         where = ", ".join(sorted({"{0}".format(a[:8]) for a, _o, _p in candidates}))
         raise Refusal("no row matching --only {0!r} in any store for {1}"
-                      .format(flags.only, where))
+                      .format(_only_display(flags.only), where))
     if len(hits) > 1:
-        listing = "\n".join("   {0}   {1}   [{2}]".format(n, (t or "(untitled)")[:52], lb)
+        listing = "\n".join("   {0}   {1}   [{2}]".format(
+                                n, _listing_title(env, t)[:52],
+                                _listing_label(lb))
                             for _s, lb, n, _p, _d, t in hits[:10])
         raise Refusal("--only {0!r} matches {1} rows; name one exactly (a local id is "
-                      "unambiguous):\n{2}".format(flags.only, len(hits), listing))
+                      "unambiguous):\n{2}".format(_only_display(flags.only),
+                                                  len(hits), listing))
     store, label, name, path, data, title = hits[0]
     current = data.get("cliSessionId")
     if current == flags.to_session:
@@ -9003,7 +9036,7 @@ def _retitle_scan(env, live=_LIVE_UNRESOLVED, store_path="",
     return out
 
 
-def _retitle_candidate_listing(conversations):
+def _retitle_candidate_listing(env, conversations):
     """One line per candidate conversation: id, title, accounts, last activity.
 
     This listing is the WORKFLOW, not a dead end: a colliding title matches
@@ -9021,9 +9054,10 @@ def _retitle_candidate_listing(conversations):
                     if ms else "unknown")
         except (OverflowError, OSError, ValueError):
             when = "unknown"
-        labels = sorted({rec.label for rec in recs})
+        labels = sorted({_listing_label(rec.label) for rec in recs})
         lines.append("   {0}   {1:<52}  {2} account(s): {3}   last activity {4}"
-                     .format(cid[:8], (newest.data.get("title") or "(untitled)")[:52],
+                     .format(cid[:8],
+                             _listing_title(env, newest.data.get("title"))[:52],
                              len(labels), ", ".join(labels), when))
     return "\n".join(lines)
 
@@ -9083,15 +9117,15 @@ def plan_retitle(env, flags):
             "a cliSessionId prefix). If the conversation exists on disk but no "
             "account has a row for it, renaming is not the gap - creating a row "
             "is 'new-row's job: claude-code-sessions new-row --to <cliSessionId>."
-            .format(flags.only))
+            .format(_only_display(flags.only)))
     if len(conversations) > 1:
         raise Refusal(
             "--only {0!r} matches {1} conversations - expected when resolving a "
             "colliding title, since a colliding title names several by "
             "construction. Re-run with the session id of the one you mean (a "
             "prefix is enough):\n{2}".format(
-                flags.only, len(conversations),
-                _retitle_candidate_listing(conversations)))
+                _only_display(flags.only), len(conversations),
+                _retitle_candidate_listing(env, conversations)))
     sid = next(iter(conversations))
 
     # The target set is re-collected from the FULL scan, not from the rows that
@@ -10808,14 +10842,14 @@ def plan_converge(env, flags):
                 "substring, or a cliSessionId prefix). A transcript no account "
                 "points at is not converge's gap - first rows are 'new-row's "
                 "job: claude-code-sessions new-row --to <cliSessionId>."
-                .format(flags.only))
+                .format(_only_display(flags.only)))
         if len(matches) > 1:
             raise Refusal(
                 "--only {0!r} matches {1} conversations - expected when the "
                 "title itself collides. Re-run with the session id of the one "
                 "you mean (a prefix is enough):\n{2}".format(
-                    flags.only, len(matches),
-                    _retitle_candidate_listing(matches)))
+                    _only_display(flags.only), len(matches),
+                    _retitle_candidate_listing(env, matches)))
         only_sid = next(iter(matches))
         if only_sid not in tids:
             raise Refusal(

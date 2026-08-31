@@ -355,6 +355,83 @@ def test_the_only_filter_is_not_echoed_into_anonymized_output(
     assert payload["complete"]["scoped"] is True
 
 
+# Both >52 characters, so the refusal listings' truncation bites: a
+# whole-title pair cannot match a title cut at 52, the first bug's exact
+# mechanism resurfacing on the stderr path.
+LONG_A = ("ACME-REVIEW quarterly offboarding retrospective for the "
+          "northern division")
+LONG_B = ("ACME-REVIEW quarterly offboarding retrospective for the "
+          "southern division")
+
+
+def test_a_refusal_does_not_echo_the_only_filter(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Round-3 catch: --anonymize never reached REFUSAL output. The
+    zero-match refusals of converge and retitle embedded the user-typed
+    --only substring verbatim - a substring no whole-title pair can cover -
+    so it becomes the manifest's own <only-filter> marker at composition."""
+    from test_converge import t_entries, row_data, S1, A1, O1
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", S1, t_entries())
+    write_row(env, 0, A1, O1, "local_s1", row_data(S1, "ACME-REVIEW plan"))
+    ct._ANONYMIZE = True
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_converge(env, ct.ConvergeFlags(only="zz-off-record"))
+    assert "zz-off-record" not in str(exc.value)
+    assert "<only-filter>" in str(exc.value)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_retitle(env, ct.RetitleFlags(only="zz-off-record",
+                                             title="New name"))
+    assert "zz-off-record" not in str(exc.value)
+    assert "<only-filter>" in str(exc.value)
+
+
+def test_a_refusal_listing_shows_labels_not_truncated_titles(
+        mkenv, tmp_path, write_row):
+    """The ambiguous-match refusal lists candidates with titles cut to 52
+    characters BEFORE any redaction ran, so a longer stored title leaked
+    its prefix - anonymize-then-truncate, the structured pass's own
+    lesson, applied to the listing."""
+    from test_converge import row_data, S1, S2, A1, O1
+    env = mkenv(tmp_path)
+    write_row(env, 0, A1, O1, "local_s1", row_data(S1, LONG_A))
+    write_row(env, 0, A1, O1, "local_s2", row_data(S2, LONG_B))
+    ct._ANONYMIZE = True
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_converge(env, ct.ConvergeFlags(only="offboarding"))
+    text = str(exc.value)
+    assert "ACME-REVIEW" not in text
+    assert "<session-" in text
+    assert "<only-filter>" in text
+
+
+def test_a_repoint_refusal_listing_is_covered_too(
+        two_account_env, tmp_path, write_row):
+    """repoint composes its own inline candidate listing with the same
+    52-character cut - the same treatment applies."""
+    from test_converge import row_data, S1, S2, S3, A1, O1
+    env, _src, _dst = two_account_env(tmp_path)
+    write_row(env, 0, A1, O1, "local_a", row_data(S1, LONG_A))
+    write_row(env, 0, A1, O1, "local_b", row_data(S2, LONG_B))
+    ct._ANONYMIZE = True
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_repoint(env, ct.RepointFlags(only="offboarding",
+                                             to_session=S3))
+    text = str(exc.value)
+    assert "ACME-REVIEW" not in text
+    assert "<only-filter>" in text
+
+
+def test_listing_labels_scrub_the_account_email():
+    """Holder labels in refusal listings carry the account email; under
+    --anonymize they get the same account label the manifest fields do."""
+    ct._ANONYMIZE = True
+    assert ct._listing_label(
+        "alice@example.com (aaaaaaaa/bbbbbbbb)").startswith("<account-")
+    ct._ANONYMIZE = False
+    assert ct._listing_label("alice@example.com (x)") == "alice@example.com (x)"
+
+
 # The dict keys under these names are DATA (titles, account labels or uuids,
 # stringified counts), not schema - the walker below skips membership checks
 # for their whole subtree, mirroring anonymize_report's own key handling.
@@ -370,7 +447,13 @@ def walk_fixed_keys(obj, in_data=False, parent=None, bad=None):
             if not in_data and isinstance(k, str) \
                     and k not in ct._ANON_STRUCTURAL_KEYS:
                 bad.append((parent, k))
-            walk_fixed_keys(v, in_data or (k in DATA_KEYED_PARENTS), k, bad)
+            # Stickiness applies to dict-valued children only: alignment's
+            # `accounts` is a LIST of structural entries while doctor
+            # reuses the same name for a dict keyed by account uuid, and
+            # blanket stickiness left the list's fixed keys unpinned.
+            walk_fixed_keys(v, in_data or (isinstance(v, dict)
+                                           and k in DATA_KEYED_PARENTS),
+                            k, bad)
     elif isinstance(obj, list):
         for v in obj:
             walk_fixed_keys(v, in_data, parent, bad)
@@ -383,9 +466,10 @@ def test_every_emitted_report_key_is_in_the_structural_set(
     set's comment claims the fixed field vocabulary of every report
     anonymize_report traverses, and until now that claim was editorial. This
     walks the reports the fixtures below actually emit - list, alignment,
-    doctor, and the public converge manifest - and fails on any fixed key
-    the set does not know. Coverage is exactly the shapes these fixtures
-    produce; a field only richer state emits still needs adding by hand."""
+    doctor, and the public converge and retitle manifests, the full set the
+    structural-keys comment names - and fails on any fixed key the set does
+    not know. Coverage is exactly the shapes these fixtures produce; a
+    field only richer state emits still needs adding by hand."""
     from test_converge import measured_pair, row_data, t_entries, A1, O1, A2, O2
     env = mkenv(tmp_path / "reports")
     # Reachable + duplicate-title pair (doctor's group shapes need real
@@ -409,6 +493,9 @@ def test_every_emitted_report_key_is_in_the_structural_set(
     bad = walk_fixed_keys(ct.gather_list(env))
     bad = walk_fixed_keys(ct.gather_alignment(env), bad=bad)
     bad = walk_fixed_keys(ct.gather_doctor(env), bad=bad)
+    mr = ct.plan_retitle(env, ct.RetitleFlags(only="s-1",
+                                              title="Renamed by the pin"))
+    bad = walk_fixed_keys(ct._public_retitle_manifest(env, mr), bad=bad)
     env2 = mkenv(tmp_path / "converge")
     measured_pair(env2, write_transcript, write_row, third_dest=True)
     m = ct._public_converge_manifest(env2, ct.plan_converge(env2, ct.ConvergeFlags()))
