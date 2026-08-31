@@ -112,6 +112,85 @@ if target:
     check("no undo offered once it is undone",
           gp.SyncApp._find_undoable_sync(app) is None)
 
+# ---------------------------------------------------------------------
+# GUI 2.0 (harness item 15): the button generalizes to _find_undoable_op -
+# sync, retitle and converge are offered, each labeled by what it reverses;
+# a CLI-only op on top means NO button rather than reaching past it. The
+# unresolved-op gate itself (Undo and Apply disabled everywhere until a
+# refresh finds none) is pinned window-level in check_gui_level.py.
+import json as _json  # noqa: E402
+import time as _time  # noqa: E402
+
+pm = ccs.plan_retitle(env, ccs.RetitleFlags(only="0" * 31 + "1",
+                                            title="Northwind renamed one"))
+ccs.run_retitle(env, pm)
+t = gp.SyncApp._find_undoable_op(app)
+check("latest = retitle -> offered", t is not None and t["type"] == "retitle",
+      str(t and t["type"]))
+if t:
+    check("  labeled as the rename it reverses", t["label"] == "Undo last rename")
+    check("  and the sync-shaped wrapper stays quiet",
+          gp.SyncApp._find_undoable_sync(app) is None)
+
+# A padding row makes the dormant account a converge destination again
+# (the populated-one rule), so the two sessions spread there: 2 rows. The
+# fixture's one-line transcripts cannot populate a row (_transcript_facts
+# needs a cwd, timestamps and a model), so give the two sessions real ones.
+with open(os.path.join(dorm_dir, "local_pad.json"), "w") as fh:
+    _json.dump({"sessionId": "local-pad", "cliSessionId": "f" * 32,
+                "title": "Padding", "lastActivityAt": 1}, fh)
+for i in (1, 2):
+    sid = "%032d" % i
+    with open(os.path.join(projects, sid + ".jsonl"), "w") as fh:
+        fh.write(_json.dumps(
+            {"cwd": projects, "timestamp": "2026-08-01T00:00:00.000Z",
+             "type": "user",
+             "message": {"role": "user", "content": "hello"}}) + "\n")
+        fh.write(_json.dumps(
+            {"timestamp": "2026-08-01T00:10:00.000Z", "type": "assistant",
+             "message": {"role": "assistant", "model": "claude-opus-5",
+                         "content": [{"type": "text", "text": "hi"}]}})
+            + "\n")
+cm = ccs.plan_converge(env, ccs.ConvergeFlags())
+check("converge plans the spread", len(cm["rows"]) == 2, str(len(cm["rows"])))
+final = ccs.run_converge(env, cm)
+check("  and applies", final == "completed", str(final))
+t = gp.SyncApp._find_undoable_op(app)
+check("latest = converge -> offered with the row count",
+      t is not None and t["type"] == "converge"
+      and t["label"] == "Undo last converge (2 rows)", str(t))
+
+# A completed CLI new-row lands on top: this window does not undo those,
+# and quietly reaching past it to the converge would undo something other
+# than what the user last did.
+newrow_dir = os.path.join(env.ops_dir, "20990101T000000Z-feedaa")
+os.makedirs(newrow_dir)
+with open(os.path.join(newrow_dir, "manifest.json"), "w") as fh:
+    _json.dump({"op_id": "20990101T000000Z-feedaa", "status": "completed",
+                "op_type": "new-row", "rows": [{"written": True}],
+                "history": [{"status": "journaled",
+                             "at": _time.time() + 9999}]}, fh)
+check("latest = CLI new-row -> no button",
+      gp.SyncApp._find_undoable_op(app) is None)
+
+# An unresolved op is what the window-level gate scans for - pin that the
+# shared selection helper sees exactly what cmd_recover would.
+stuck_dir = os.path.join(env.ops_dir, "20990101T000001Z-feedbb")
+os.makedirs(stuck_dir)
+with open(os.path.join(stuck_dir, "manifest.json"), "w") as fh:
+    _json.dump({"op_id": "20990101T000001Z-feedbb", "status": "writing",
+                "op_type": "repoint",
+                "history": [{"status": "journaled",
+                             "at": _time.time() + 10000}]}, fh)
+entries = gp._scan_interrupted(env)
+check("the unresolved op is detected by the shared scan",
+      len(entries) == 1
+      and entries[0][0]["op_id"] == "20990101T000001Z-feedbb")
+listing = gp._interrupted_lines(entries, _time.time() + 10001)
+check("  and the listing marks it and carries the copyable command",
+      any("listed first" in line for line in listing)
+      and any("claude-code-sessions recover" in line for line in listing))
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()

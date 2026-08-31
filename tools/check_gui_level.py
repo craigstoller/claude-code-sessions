@@ -26,6 +26,8 @@ sys.path.insert(0, GUIDIR)
 import gp  # noqa: E402
 
 ok = []
+# Captured before Part B patches ccs.default_env for the real-window runs.
+REAL_DEFAULT_ENV = ccs.default_env
 
 
 def check(name, cond, extra=""):
@@ -91,7 +93,7 @@ def build_env(collide=True, disagree=False):
     home = os.path.join(root, "home")
     store = os.path.join(root, "Claude", "claude-code-sessions")
     os.makedirs(home)
-    env = ccs.default_env()
+    env = REAL_DEFAULT_ENV()
     env.home = home
     env.projects_root = os.path.join(home, ".claude", "projects")
     env.store_candidates = [store]
@@ -422,6 +424,322 @@ check("converge completed but the refresh failed",
       and refresh[0] == "error")
 check("  applied-but-unverified is distinct from not-applied",
       seq["mutated"] is True and len(spy.runs) == 1)
+
+# =====================================================================
+# Part B - the window itself, instantiated for real (root withdrawn),
+# workers inlined so the harness pumps deterministically with no sleeps.
+# The same trick check_gui_live_and_newer.py established.
+import threading as _real_threading  # noqa: E402
+import tkinter as tk  # noqa: E402
+
+
+class _Inline(object):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+
+    def start(self):
+        self._t(*self._a, **self._k)
+
+
+class _FakeThreading(object):
+    Thread = _Inline
+    # The Level UI bridge asks which thread it is on; inline workers run on
+    # the main thread, so the bridge calls its dialogs directly.
+    current_thread = staticmethod(_real_threading.current_thread)
+    main_thread = staticmethod(_real_threading.main_thread)
+    Event = _real_threading.Event
+
+
+gp.threading = _FakeThreading
+gp.load_pref = lambda: ""
+gp.save_pref = lambda _v: None
+
+_CURRENT = {"env": None}
+gp.ccs.default_env = lambda: _CURRENT["env"]
+
+
+class Modals(object):
+    """Every messagebox call recorded; answers scripted per title."""
+
+    def __init__(self):
+        self.calls = []
+        self.answers = {}
+        self.default = True
+
+    def askokcancel(self, title, message, **kw):
+        self.calls.append(("askokcancel", title, message))
+        return self.answers.get(title, self.default)
+
+    def showwarning(self, title, message, **kw):
+        self.calls.append(("showwarning", title, message))
+
+    def showerror(self, title, message, **kw):
+        self.calls.append(("showerror", title, message))
+
+    def of(self, kind, title=None):
+        return [c for c in self.calls
+                if c[0] == kind and (title is None or c[1] == title)]
+
+
+def open_app(env, stage1=True):
+    """A real SyncApp over ENV, withdrawn, stage-1 dialog scripted (a
+    Toplevel needs a display pump this harness does not want mid-check)."""
+    _CURRENT["env"] = env
+    modals = Modals()
+    gp.messagebox = modals
+    tkroot = tk.Tk()
+    tkroot.withdraw()
+    stage1_calls = []
+
+    def fake_stage1(self, steps):
+        stage1_calls.append(list(steps))
+        return stage1
+    gp.SyncApp._confirm_stage1 = fake_stage1
+    app = gp.SyncApp(tkroot)
+    app._stage1_calls = stage1_calls
+
+    def settle():
+        for _ in range(30):
+            tkroot.update()
+    return app, tkroot, modals, settle
+
+
+def plant_op(env, op_id, status="writing", op_type="repoint", at=None):
+    d = os.path.join(env.ops_dir, op_id)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({"op_id": op_id, "status": status, "op_type": op_type,
+                   "history": [{"status": "journaled",
+                                "at": at or (1_800_000_000.0)}]}, fh)
+
+
+# ---------------------- 13 (render) + full Apply through the real window
+env, root = build_env()
+roots.append(root)
+env.process_lister = lambda: DESKTOP
+app, tkroot, modals, settle = open_app(env)
+settle()
+check("the passive notice renders while the app is up",
+      bool(app.level_notice.winfo_manager()))
+env.process_lister = lambda: []
+app.refresh_level()
+settle()
+check("  and clears once it is closed - weather, not a gate",
+      not app.level_notice.winfo_manager())
+check("the hold row rendered as widgets",
+      len(app.hold_models) == 1 and len(app._hold_widgets) == 2)
+check("Apply is enabled in the naming-only state",
+      str(app.level_apply_btn.cget("state")) == "normal")
+app.on_level_apply()
+settle()
+check("stage-1 dialog saw the steps", len(app._stage1_calls) == 1
+      and app._stage1_calls[0][0]["new_title"] == SUGGESTED)
+check("stage-2 dialog described the fresh plan",
+      any("Create 2 rows across the 2 accounts named?" in c[2]
+          for c in modals.of("askokcancel", "Create the rows?")),
+      str(modals.of("askokcancel")))
+check("the completion status carries both halves",
+      app.level_status.get()
+      == "Applied (1 rename + 1 converge) - Level: 2 / 2 - 0 short.",
+      app.level_status.get())
+check("the post-apply pane shows no holds", app.hold_models == [])
+check("Undo points at the converge",
+      app.undo_target is not None and app.undo_target["type"] == "converge"
+      and app.undo_target["label"] == "Undo last converge (2 rows)",
+      str(app.undo_target))
+check("no refusal modal on the happy path",
+      not modals.of("showwarning"))
+tkroot.destroy()
+
+# ------------------- 14. banner buttons; typed text survives the replan
+env, root = build_env(disagree=True)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+check("the identity banner renders one button per disagreeing store",
+      len(app._banner_widgets) == 2, str(len(app._banner_widgets)))
+check("  labeled by email where known",
+      any("alice@example.com" in b.cget("text")
+          for b in app._banner_widgets))
+mine = "ACME-REVIEW session - my own words"
+app.hold_models[0]["_entry_var"].set(mine)
+app.hold_models[0]["_tick_var"].set(False)
+app._banner_widgets[0].invoke()
+settle()
+check("choosing an account replans with the assertion held",
+      app.level_live and app.level_manifest is not None)
+check("  the banner now shows the in-force line instead of the pickers",
+      len(app._banner_widgets) == 1)
+check("  and the typed entry text and tick survived that replan",
+      app.hold_models and app.hold_models[0]["_entry_var"].get() == mine
+      and app.hold_models[0]["_tick_var"].get() is False)
+tkroot.destroy()
+
+# ------------- 16. two unresolved ops: red line, listing, copy, refresh
+env, root = build_env()
+roots.append(root)
+plant_op(env, "20260831T000001Z-aaaaaa")
+plant_op(env, "20260831T000002Z-bbbbbb", at=1_800_000_100.0)
+app, tkroot, modals, settle = open_app(env)
+settle()
+check("the plural red line renders",
+      app.gate_var.get()
+      == "!! 2 interrupted operation(s) need attention - see Health.",
+      app.gate_var.get())
+check("  on every tab", all(lbl.winfo_manager()
+                            for lbl, _a in app._gate_labels))
+check("  Apply and Undo are gated",
+      str(app.level_apply_btn.cget("state")) == "disabled"
+      and str(app.apply_btn.cget("state")) == "disabled"
+      and str(app.undo_btn.cget("state")) == "disabled")
+health = app.health_text.get("1.0", "end")
+check("both ops are listed",
+      "20260831T000001Z-aaaaaa" in health
+      and "20260831T000002Z-bbbbbb" in health)
+check("  the bare-recover target is marked, once",
+      health.count("listed first by a bare 'recover'") == 1
+      and health.index("listed first") > health.index("aaaaaa"))
+check("  the Copy button is offered, and no resolution buttons exist",
+      bool(app.copy_btn.winfo_manager()))
+check("  the copyable command is the CLI hand-off",
+      "claude-code-sessions recover" in health)
+for op_id in ("20260831T000001Z-aaaaaa", "20260831T000002Z-bbbbbb"):
+    mp = os.path.join(env.ops_dir, op_id, "manifest.json")
+    with open(mp, encoding="utf-8") as fh:
+        m = json.load(fh)
+    m["status"] = "rolled_back"          # resolved fixture-side, as recover would
+    with open(mp, "w", encoding="utf-8") as fh:
+        json.dump(m, fh)
+app.on_doctor()
+settle()
+check("a Refresh that finds nothing unresolved clears the banner",
+      app.gate_var.get() == "" and not any(lbl.winfo_manager()
+                                           for lbl, _a in app._gate_labels))
+check("  and lifts the gate",
+      str(app.level_apply_btn.cget("state")) == "normal")
+tkroot.destroy()
+
+# ---------------------- 17. window close during a two-rename sequence
+env, root = build_env(collide=False)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+app.hold_models = [
+    {"key": (S1, "a"), "title": T_COLL + " one", "evidence": "x",
+     "target_sid": S1, "prefill": "", "entry": "ACME-REVIEW leg one",
+     "editable": True, "ticked": True, "degrade_reason": "",
+     "classification": "supersession"},
+    {"key": (S2, "b"), "title": T_COLL + " two", "evidence": "x",
+     "target_sid": S2, "prefill": "", "entry": "ACME-REVIEW leg two",
+     "editable": True, "ticked": True, "degrade_reason": "",
+     "classification": "supersession"},
+]
+calls = {"retitle": 0}
+_real_run_retitle = ccs.run_retitle
+
+
+def closing_run_retitle(env_, manifest):
+    final = _real_run_retitle(env_, manifest)
+    calls["retitle"] += 1
+    if calls["retitle"] == 1:
+        app._on_close()                  # the user clicks X mid-operation
+    return final
+
+
+ccs.run_retitle = closing_run_retitle
+modals.answers["Close during an operation?"] = True
+with PlanSpy() as spy:
+    app.on_level_apply()
+    try:
+        settle()
+    except tk.TclError:
+        pass                             # the root died at the boundary - expected
+ccs.run_retitle = _real_run_retitle
+closes = modals.of("askokcancel", "Close during an operation?")
+check("the close prompt stated the remaining-step count",
+      len(closes) == 1 and "2 remaining step(s) will NOT run" in closes[0][2],
+      closes[0][2] if closes else "-")
+check("the in-flight rename completed; the remainder was truncated",
+      calls["retitle"] == 1)
+check("  no further engine calls - no plan, no converge",
+      len(spy.plans) == 0 and len(spy.runs) == 0)
+try:
+    gone = not tkroot.winfo_exists()
+except tk.TclError:
+    gone = True                          # the application object itself died
+check("  the window closed at the boundary", gone)
+renamed = [json.load(open(os.path.join(env.store_candidates[0], A1, O1, n),
+                          encoding="utf-8")).get("title")
+           for n in os.listdir(os.path.join(env.store_candidates[0], A1, O1))]
+check("  the landed rename is in the store, journalled",
+      "ACME-REVIEW leg one" in renamed, str(renamed))
+
+# --------------------------- 18. read failure on open: in-pane, no modal
+env, root = build_env()
+roots.append(root)
+_real_gather = ccs.gather_alignment
+
+
+def broken(_env):
+    raise RuntimeError("simulated unreadable store")
+
+
+ccs.gather_alignment = broken
+try:
+    app, tkroot, modals, settle = open_app(env)
+    settle()
+finally:
+    ccs.gather_alignment = _real_gather
+check("a read failure on open renders in the pane",
+      "simulated unreadable store" in app.level_text.get("1.0", "end"))
+check("  with the status line set",
+      app.level_status.get() == "Something went wrong",
+      app.level_status.get())
+check("  never as a modal", not modals.of("showwarning")
+      and not modals.of("showerror"))
+check("  and Refresh stays enabled as the retry",
+      str(app.level_refresh_btn.cget("state")) == "normal")
+app.refresh_level()
+settle()
+check("  a later Refresh recovers", app.level_manifest is not None)
+tkroot.destroy()
+
+# ------------------- 19. press-time gate re-scan, every mutation press
+env, root = build_env()
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+# A completed sync op so the Undo button is offered, THEN an unresolved op
+# planted after the pane rendered - the scan at open is stale now.
+plant_op(env, "20260831T000003Z-cccccc", status="completed", op_type="sync",
+         at=1_800_000_000.0)
+mp = os.path.join(env.ops_dir, "20260831T000003Z-cccccc", "manifest.json")
+with open(mp, encoding="utf-8") as fh:
+    m = json.load(fh)
+m["rows"] = [{"written": True}]
+m["dest_email"] = "dorm@example.com"
+with open(mp, "w", encoding="utf-8") as fh:
+    json.dump(m, fh)
+app._update_undo_button()
+check("undo is offered before the plant", app.undo_target is not None)
+plant_op(env, "20260831T000004Z-dddddd", at=1_800_000_200.0)
+with PlanSpy() as spy:
+    app.on_level_apply()
+    settle()
+check("the next Apply press aborts with the red line",
+      "interrupted operation" in app.gate_var.get()
+      and len(app._stage1_calls) == 0)
+check("  no engine mutation call was made",
+      len(spy.plans) == 0 and len(spy.runs) == 0)
+app.manifest = {"rows": [], "tally": {}, "dest_account": "x" * 32}
+before = len(modals.calls)
+app.on_apply()
+check("the sync tab's Apply press aborts the same way",
+      len(modals.calls) == before)
+app.on_undo()
+check("and the Undo press too - no confirmation was even asked",
+      len(modals.calls) == before)
+tkroot.destroy()
 
 for r in roots:
     shutil.rmtree(r, ignore_errors=True)
