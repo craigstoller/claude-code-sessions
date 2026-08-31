@@ -52,20 +52,40 @@ ccs-gui                     open it
 ccs-gui --install-shortcut  add a Desktop + Start Menu shortcut (Windows)
 ```
 
-It plans a sync, shows which account copies into which, the destination store and what
-would be copied - and **writes nothing until you press Apply**. It also carries Undo, a
-title filter (`sync --only`), and a health check (`doctor`, findings first).
+The window is called **"Claude sessions"** and has three tabs:
 
-It is a thin shell over the same planning and execution the CLI uses, not a
-reimplementation, so every guard, refusal, and journal entry behaves identically - and a
-refusal is shown **verbatim** rather than summarised into something friendlier. Two things
-it deliberately does not offer, because the friction is the safeguard: `--verbatim` (which
-copies permission grants across an account boundary) and `--include-deleted` (which brings
-back a session you deleted). `move` is CLI-only for now.
+- **Level** - the home tab. It measures how close the accounts are to holding one shared
+  history (`alignment`'s five numbers), previews what `converge` would create, and renders
+  each title-collision hold as a rename row prefilled from the measured suggestion - tick,
+  edit, or ignore each one. Apply confirms in two stages, each describing exactly what runs
+  next: first every rename as an `old -> new` list (each lands as its own journalled,
+  individually undoable operation), then a fresh converge plan's own numbers. After any
+  apply the pane re-measures and re-renders from the store as it now is.
+- **Copy & refresh** - the original sync pane, unchanged: destination choice, a title
+  filter (`sync --only`), the refresh checkboxes, and the same confirmations. Still the
+  only tab that can overwrite a row; converge is additive and never refreshes.
+- **Health** - `doctor`'s report (findings first), plus interrupted-operation detection.
+  While an unresolved operation sits in the journal, Apply and Undo are disabled on every
+  tab and the tab shows each stuck operation with a Copy button for the `recover` command -
+  resolving is a directional judgment the CLI walks you through, so execution stays there.
+
+One Undo button below the tabs reverses the most recent operation the window can reverse
+(a copy, a rename, or a converge), exactly the one `ccs undo` would pick; pressing it
+repeatedly walks the journal back one operation at a time.
+
+Everything **writes nothing until you press Apply**. It is a thin shell over the same
+planning and execution the CLI uses, not a reimplementation, so every guard, refusal, and
+journal entry behaves identically - and a refusal is shown **verbatim** rather than
+summarised into something friendlier. Some things it deliberately does not offer, because
+the friction is the safeguard: `--verbatim` (which copies permission grants across an
+account boundary), `--include-deleted` (which brings back a session you deleted), and
+`recover` execution. `move`, `repoint`, and `new-row` are CLI-only for now.
 
 Registered as a GUI script, so nothing flashes a console window. It needs `tkinter` - part
 of the standard library, but packaged separately on some Linux distributions
-(`apt install python3-tk`).
+(`apt install python3-tk`). Upgrading from an earlier version? `--install-shortcut`
+replaces the old "Claude session sync" shortcut with the new name; a taskbar pin to the
+old name is yours to re-pin.
 
 ## Optional: let Chrome stay open
 
