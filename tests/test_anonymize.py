@@ -770,15 +770,16 @@ def walk_fixed_keys(obj, in_data=False, parent=None, bad=None):
 
 
 def test_every_emitted_report_key_is_in_the_structural_set(
-        mkenv, tmp_path, write_transcript, write_row):
+        mkenv, two_account_env, tmp_path, write_transcript, write_row):
     """The mechanical pin two round-2 reviewers asked for: the structural
     set's comment claims the fixed field vocabulary of every report
     anonymize_report traverses, and until now that claim was editorial. This
     walks the reports the fixtures below actually emit - list, alignment,
-    doctor, and the public converge and retitle manifests, the full set the
-    structural-keys comment names - and fails on any fixed key the set does
-    not know. Coverage is exactly the shapes these fixtures produce; a
-    field only richer state emits still needs adding by hand."""
+    doctor, and the public converge, retitle, new-row, repoint and sync
+    manifests, the full set the structural-keys comment names - and fails
+    on any fixed key the set does not know. Coverage is exactly the shapes
+    these fixtures produce; a field only richer state emits still needs
+    adding by hand."""
     from test_converge import measured_pair, row_data, t_entries, A1, O1, A2, O2
     env = mkenv(tmp_path / "reports")
     # Reachable + duplicate-title pair (doctor's group shapes need real
@@ -809,6 +810,28 @@ def test_every_emitted_report_key_is_in_the_structural_set(
     measured_pair(env2, write_transcript, write_row, third_dest=True)
     m = ct._public_converge_manifest(env2, ct.plan_converge(env2, ct.ConvergeFlags()))
     bad = walk_fixed_keys(m, bad=bad)
+    env3 = mkenv(tmp_path / "manifests")
+    sid = "abcdef01-9abc-def0-1234-56789abcdef0"
+    write_transcript(env3, "C--p", sid, t_entries(cwd="C:\\p"))
+    write_row(env3, 0, A1, O1, "local_p",
+              {"sessionId": "local_p", "cliSessionId": "other-conversation",
+               "title": "Padding", "lastActivityAt": 9})
+    _signed_in(env3)
+    mn = ct.plan_new_row(env3, ct.NewRowFlags(to_session=sid))
+    bad = walk_fixed_keys(ct._public_new_row_manifest(env3, mn), bad=bad)
+    mp = ct.plan_repoint(env3, ct.RepointFlags(only="Padding",
+                                               to_session=sid))
+    bad = walk_fixed_keys(ct._public_repoint_manifest(env3, mp), bad=bad)
+    env4, _src, _dst = two_account_env(tmp_path / "sync")
+    write_transcript(env4, "C--p", sid, t_entries(cwd="C:\\p"))
+    write_row(env4, 0, A1, O1, "local_1",
+              {"sessionId": "local_1", "cliSessionId": sid,
+               "title": "Quarterly board report", "lastActivityAt": 9})
+    write_row(env4, 0, A2, O2, "local_2",
+              {"sessionId": "local_2", "cliSessionId": sid,
+               "title": "Parked", "lastActivityAt": 9})
+    ms = ct.plan_sync(env4, ct.SyncFlags())
+    bad = walk_fixed_keys(ct._public_manifest(env4, ms), bad=bad)
     assert bad == []
 
 
