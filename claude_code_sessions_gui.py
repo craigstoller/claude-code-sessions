@@ -1,18 +1,32 @@
-"""Windowed front end for `ccs sync` - no terminal, nothing to remember.
+"""Windowed front end for the maintenance routine - no terminal, nothing to
+remember.
 
     ccs-gui                     open the window
-    ccs-gui --install-shortcut  put "Claude session sync" on the Desktop + Start Menu
+    ccs-gui --install-shortcut  put "Claude sessions" on the Desktop + Start Menu
     ccs-gui --remove-shortcut   take them away again
+
+Three tabs (docs/specs/2026-08-31-gui-level-design.md):
+  Level           the home - the alignment scoreboard, the converge plan, and
+                  the title-collision holds as prefilled rename rows; Apply
+                  runs the renames then a fresh converge, two confirmations,
+                  each describing exactly what runs next.
+  Copy & refresh  the original sync pane, moved intact - still the only tab
+                  that can OVERWRITE a row (converge is additive and
+                  deliberately never refreshes).
+  Health          the doctor report plus interrupted-operation detection;
+                  while an unresolved operation exists, Apply and Undo are
+                  disabled on every tab and `recover` runs in the terminal.
 
 Installed as a GUI script (pyproject's [project.gui-scripts]), so the launcher
 runs under pythonw and no console window ever appears - the console-script
 equivalent would flash one on every double-click.
 
 Deliberately a THIN SHELL over the library, not a reimplementation: it calls
-plan_sync() and run_sync() exactly as the CLI does, so every refusal, guard, and
-safety property (RULING 4's running-app guard, RULING 5's --live certification,
-RULING 6's helper exclusion, tombstone skipping, dry-run-then-apply) behaves
-identically here. It adds no path of its own into the store.
+the same gather_*/plan_*/run_* functions the CLI does, so every refusal,
+guard, and safety property (RULING 4's running-app guard, RULING 5's --live
+certification, RULING 6's helper exclusion, tombstone skipping,
+dry-run-then-apply) behaves identically here. It adds no path of its own into
+the store.
 
 Two rules it holds to:
   - Nothing is written until you press Apply. Opening the window plans only.
@@ -26,6 +40,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import traceback
 
 import claude_code_sessions as ccs
@@ -170,6 +185,32 @@ def _merge_hold_models(fresh, previous):
             m["entry"] = old.get("entry", m["entry"])
             m["ticked"] = bool(old.get("ticked"))
     return fresh
+
+
+def _plan_summary_lines(m):
+    """The converge plan summary: the manifest's completeness line and
+    per-destination row counts - the same facts `_print_converge_report`
+    prints, condensed for a pane that renders holds as widgets below."""
+    lines = []
+    c = m.get("complete") or {}
+    lines.append("complete{0} : {1} of {2}  ->  {3} of {2}   ({4} held)".format(
+        " (scoped)" if c.get("scoped") else "", c.get("now"), c.get("of"),
+        c.get("after"), c.get("held")))
+    rows = m.get("rows") or []
+    for d in m.get("destinations") or []:
+        mine = [r for r in rows if r.get("account") == d.get("account")]
+        if mine:
+            lines.append("-> {0}: {1} row{2} to create".format(
+                d.get("label", ""), len(mine), "" if len(mine) == 1 else "s"))
+    for nd in m.get("non_destinations") or []:
+        lines.append("   {0}: NOT a destination - every org directory under "
+                     "it is empty, so there is no evidence which one is real"
+                     .format(nd.get("label", "")))
+    if m.get("dead_excluded"):
+        lines.append("({0} dead conversation(s) excluded from the count - "
+                     "rows exist but the transcript is gone; 'doctor' "
+                     "reports them)".format(m["dead_excluded"]))
+    return lines
 
 
 def _scoreboard_lines(rep):
@@ -550,6 +591,133 @@ def _run_level_apply(env, steps, live, ui):
     return seq, refresh
 
 
+# --------------------------------------------- interrupted-operation detection
+
+# The hand-off, not an executor: `recover` is a directional judgment whose
+# CLI prose walks the user through the evidence, so this window copies the
+# command instead of duplicating that surface.
+RECOVER_COMMAND = "claude-code-sessions recover"
+
+
+def _scan_interrupted(env):
+    """[(manifest, classification note)] per unresolved journal op - the
+    same selection `cmd_recover` makes (ccs.nonterminal_ops), in the same
+    journal order it lists them. Raises when the journal cannot be read:
+    'couldn't look' is never 'nothing there', and the caller gates mutations
+    on the failure rather than treating it as a clean scan."""
+    entries = []
+    for op in ccs.nonterminal_ops(env):
+        try:
+            note = ccs.classify_op(env, op).get("note") or ""
+        except Exception:
+            note = ""                    # classify_op never raises, per its
+        entries.append((op.manifest, note))  # contract - belt and braces
+    return entries
+
+
+def _age_text(seconds):
+    s = max(0, int(seconds))
+    if s < 120:
+        return "{0}s ago".format(s)
+    if s < 7200:
+        return "{0} min ago".format(s // 60)
+    if s < 172800:
+        return "{0} h ago".format(s // 3600)
+    return "{0} days ago".format(s // 86400)
+
+
+def _interrupted_lines(entries, now_s):
+    """The Health listing: id, type, age and what each op was doing, the
+    first one marked (a bare `recover` lists them in this same order, so it
+    is the one that listing leads with), the copyable command, and the
+    rationale for keeping execution in the CLI."""
+    lines = ["!! {0} interrupted operation(s) need attention"
+             .format(len(entries)), ""]
+    for i, (m, note) in enumerate(entries):
+        at = (m.get("history") or [{}])[0].get("at") or now_s
+        lines.append("{0}  {1:<10} {2:<12} {3}{4}".format(
+            m.get("op_id", "?"), m.get("op_type", "move"),
+            _age_text(now_s - at), m.get("status", "?"),
+            "   <- listed first by a bare 'recover'" if i == 0 else ""))
+        if note:
+            lines.append("      " + note)
+    lines += [
+        "",
+        "Resolve in a terminal - the Copy button has the command:",
+        "   " + RECOVER_COMMAND,
+        "",
+        "Execution stays in the CLI deliberately: recover is a directional",
+        "judgment (--back removes what landed, --forward re-evaluates the",
+        "remainder), and its report walks you through the evidence this",
+        "window would have to duplicate to be safe. A hard kill",
+        "mid-operation lands here too - this listing is the net.",
+        "Press Refresh here once recover finishes: a scan that finds",
+        "nothing unresolved clears the banner and lifts the Apply/Undo",
+        "gate on every tab.",
+    ]
+    return lines
+
+
+class _MutationMarker(object):
+    """The close handler's view of a single-operation worker (sync apply,
+    undo): nothing remains after the in-flight op, and truncation is simply
+    'close once it lands'."""
+    def __init__(self):
+        self.remaining = 0
+        self.truncate = False
+
+
+class _TkLevelUI(object):
+    """The Apply sequence's bridge back onto the Tk thread.
+
+    status() posts and never waits; confirm_stage2() marshals the dialog to
+    the UI thread and blocks the worker on the answer - or calls it directly
+    when already on that thread, which is how the inline-thread harness
+    drives the same code path without deadlocking on itself. gate() is the
+    press-time unresolved-op re-scan. `truncate` is set by the close handler
+    (UI thread) and read by the sequence at operation boundaries only, so
+    the in-flight operation always completes - a plain attribute is enough
+    under the GIL for a set-once flag.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.remaining = 0
+        self.truncate = False
+
+    def status(self, text):
+        self.app.root.after(0, self.app.level_status.set, text)
+
+    def gate(self):
+        try:
+            ops = ccs.nonterminal_ops(self.app.env)
+        except Exception:
+            return "the journal could not be read"
+        return [o.manifest.get("op_id") for o in ops] or None
+
+    def truncate_requested(self):
+        return self.truncate
+
+    def confirm_stage2(self, fresh):
+        return bool(self._on_ui(lambda: messagebox.askokcancel(
+            "Create the rows?", _stage2_question(fresh))))
+
+    def _on_ui(self, fn):
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        evt = threading.Event()
+        box = []
+
+        def run():
+            try:
+                box.append(fn())
+            finally:
+                evt.set()
+        self.app.root.after(0, run)
+        evt.wait()
+        return box[0] if box else None
+
+
 class SyncApp:
     def __init__(self, root):
         self.root = root
@@ -563,26 +731,140 @@ class SyncApp:
         # Bumped on every plan; a callback whose generation is stale is dropped
         # rather than allowed to install a superseded manifest.
         self.generation = 0
-        root.title("Claude session sync")
-        root.geometry("880x580")
-        root.minsize(700, 460)
+        # The Level tab's own state, deliberately separate from the sync
+        # pane's: level_live is the same RULING 5 fact the sync pane can hold
+        # in live_choice, but its lifetime differs (it clears when the Apply
+        # SEQUENCE ends, not when a sync lands), and sharing one variable
+        # would let a Level apply silently consume an assertion the user gave
+        # the sync pane - a behavior change the moved pane's contract forbids.
+        # In-memory only, never written to disk; shown while in force.
+        self.level_live = ""
+        self.level_gen = 0
+        self.level_manifest = None
+        self.level_rep = None
+        self.hold_models = []
+        self._level_apply_ok = False
+        self._sync_apply_ok = False
+        self._level_note = ""
+        # The mutation gate (unresolved journal ops) and the worker plumbing.
+        self.gate_text = ""
+        self._busy_count = 0
+        self._banner_widgets = []        # rebuilt with the identity banner
+        self._hold_widgets = []          # rebuilt with the hold rows
+        self._mutation_ui = None
+        self._close_after_worker = False
+        root.title("Claude sessions")
+        root.geometry("940x640")
+        root.minsize(760, 520)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         outer = ttk.Frame(root, padding=PAD)
         outer.pack(fill="both", expand=True)
+        self.nb = ttk.Notebook(outer)
+        self.nb.pack(fill="both", expand=True)
+        self.level_tab = ttk.Frame(self.nb, padding=PAD)
+        self.sync_tab = ttk.Frame(self.nb, padding=PAD)
+        self.health_tab = ttk.Frame(self.nb, padding=PAD)
+        self.nb.add(self.level_tab, text="Level")
+        self.nb.add(self.sync_tab, text="Copy & refresh")
+        self.nb.add(self.health_tab, text="Health")
 
+        # One window-level bar outside the notebook: Close, and the SHARED
+        # Undo button - there is one journal, so there is one "last
+        # operation", and a per-tab button would let two tabs disagree about
+        # which op that is. It replaces the sync pane's own undo button.
+        winbar = ttk.Frame(outer)
+        winbar.pack(fill="x", pady=(PAD, 0))
+        ttk.Button(winbar, text="Close", command=self._on_close).pack(
+            side="left")
+        self.undo_btn = ttk.Button(winbar, text="Undo", command=self.on_undo)
+        self.undo_target = None          # the _find_undoable_op descriptor
+
+        # ------------------------------------------------- Tab 1: Level
+        lt = self.level_tab
+        self.level_status = tk.StringVar(value="Measuring...")
+        lb_status = ttk.Label(lt, textvariable=self.level_status,
+                              font=("Segoe UI", 11, "bold"), wraplength=880,
+                              justify="left")
+        lb_status.pack(anchor="w")
+        self.level_detail = tk.StringVar(value="")
+        ttk.Label(lt, textvariable=self.level_detail, wraplength=880,
+                  justify="left", foreground="#555").pack(anchor="w",
+                                                         pady=(4, 2))
+        # The passive environment notice - weather, not a gate: the guard
+        # stays in the engine at mutation time; this line exists so nobody
+        # types five titles first and learns about RULING 4 second.
+        self.level_notice = ttk.Label(
+            lt, foreground="#a05000", wraplength=880, justify="left",
+            text="!! The Claude desktop app is running - Apply will refuse "
+                 "until it is closed.")
+        self.level_banner = ttk.Frame(lt)
+        self.level_banner.pack(fill="x")
+        body = ttk.Frame(lt)
+        body.pack(fill="x", pady=(4, 4))
+        self.level_text = tk.Text(body, wrap="none", height=11,
+                                  font=("Consolas", 9), state="disabled",
+                                  borderwidth=1, relief="solid")
+        lsb = ttk.Scrollbar(body, orient="vertical",
+                            command=self.level_text.yview)
+        self.level_text.configure(yscrollcommand=lsb.set)
+        self.level_text.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+        # The hold rows scroll when they overflow - a canvas-hosted frame,
+        # the stock tkinter idiom for a scrollable widget stack.
+        holds_wrap = ttk.Frame(lt)
+        holds_wrap.pack(fill="both", expand=True)
+        self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0)
+        hsb = ttk.Scrollbar(holds_wrap, orient="vertical",
+                            command=self.hold_canvas.yview)
+        self.hold_canvas.configure(yscrollcommand=hsb.set)
+        self.hold_frame = ttk.Frame(self.hold_canvas)
+        self._hold_window = self.hold_canvas.create_window(
+            (0, 0), window=self.hold_frame, anchor="nw")
+        self.hold_frame.bind(
+            "<Configure>",
+            lambda _e: self.hold_canvas.configure(
+                scrollregion=self.hold_canvas.bbox("all")))
+        self.hold_canvas.bind(
+            "<Configure>",
+            lambda e: self.hold_canvas.itemconfigure(self._hold_window,
+                                                     width=e.width))
+        self.hold_canvas.pack(side="left", fill="both", expand=True)
+        hsb.pack(side="right", fill="y")
+        lbar = ttk.Frame(lt)
+        lbar.pack(fill="x", pady=(6, 0))
+        self.level_apply_btn = ttk.Button(lbar, text="Apply",
+                                          command=self.on_level_apply,
+                                          state="disabled")
+        self.level_apply_btn.pack(side="right")
+        self.level_refresh_btn = ttk.Button(lbar, text="Refresh",
+                                            command=self.refresh_level)
+        self.level_refresh_btn.pack(side="right", padx=(0, 6))
+        # The footer says when the snapshot was taken; converge's own
+        # apply-time re-checks are the guard against drift between the two
+        # reads, not this label.
+        self.level_footer = tk.StringVar(value="")
+        ttk.Label(lbar, textvariable=self.level_footer,
+                  foreground="#555").pack(side="left")
+
+        # ---------------------------------------- Tab 2: Copy & refresh
+        st = self.sync_tab
         self.status = tk.StringVar(value="Planning...")
-        ttk.Label(outer, textvariable=self.status, font=("Segoe UI", 11, "bold"),
-                  wraplength=840, justify="left").pack(anchor="w")
+        sb_status = ttk.Label(st, textvariable=self.status,
+                              font=("Segoe UI", 11, "bold"), wraplength=880,
+                              justify="left")
+        sb_status.pack(anchor="w")
 
         self.detail = tk.StringVar(value="")
-        ttk.Label(outer, textvariable=self.detail, wraplength=840, justify="left",
-                  foreground="#555").pack(anchor="w", pady=(4, 6))
+        ttk.Label(st, textvariable=self.detail, wraplength=880,
+                  justify="left", foreground="#555").pack(anchor="w",
+                                                          pady=(4, 6))
 
         # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
         # rather than per-row checkboxes: checkboxes would mean assembling a
         # subset here and handing plan_sync a selection it did not make, i.e. a
         # second route into the store. This stays one route.
-        filt = ttk.Frame(outer)
+        filt = ttk.Frame(st)
         filt.pack(fill="x", pady=(0, PAD))
         ttk.Label(filt, text="Only sessions whose title contains:").pack(side="left")
         self.only_var = tk.StringVar(value="")
@@ -625,7 +907,7 @@ class SyncApp:
             command=self.refresh, state="disabled")
         self.orphan_chk.pack(side="left", padx=(6, 0))
 
-        body = ttk.Frame(outer)
+        body = ttk.Frame(st)
         body.pack(fill="both", expand=True)
         self.text = tk.Text(body, wrap="none", height=18, font=("Consolas", 9),
                             state="disabled", borderwidth=1, relief="solid")
@@ -634,23 +916,18 @@ class SyncApp:
         self.text.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        bar = ttk.Frame(outer)
+        bar = ttk.Frame(st)
         bar.pack(fill="x", pady=(PAD, 0))
         self.apply_btn = ttk.Button(bar, text="Apply", command=self.on_apply,
                                     state="disabled")
         self.apply_btn.pack(side="right")
-        self.undo_btn = ttk.Button(bar, text="Undo last copy", command=self.on_undo)
-        self.undo_target = None          # (op_id, rows_written, destination label)
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
         self.refresh_btn.pack(side="right", padx=(0, 6))
-        ttk.Button(bar, text="Close", command=root.destroy).pack(side="left")
-        self.doctor_btn = ttk.Button(bar, text="Health check", command=self.on_doctor)
-        self.doctor_btn.pack(side="left", padx=(6, 0))
         self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
         self.trust_chk = ttk.Checkbutton(
             bar, text="Let Chrome stay open", variable=self.trust_var,
             command=self.on_toggle_trust)
-        self.trust_chk.pack(side="left", padx=(12, 0))
+        self.trust_chk.pack(side="left")
         self.forget_btn = ttk.Button(bar, text="Change destination",
                                      command=self.forget_destination)
         if self.dest_choice:
@@ -662,7 +939,48 @@ class SyncApp:
         self.live_btn = ttk.Button(bar, text="Change signed-in account",
                                    command=self.forget_live)
 
+        # ------------------------------------------------ Tab 3: Health
+        ht = self.health_tab
+        self.health_status = tk.StringVar(
+            value="Press Refresh for the full health check.")
+        hb_status = ttk.Label(ht, textvariable=self.health_status,
+                              font=("Segoe UI", 11, "bold"), wraplength=880,
+                              justify="left")
+        hb_status.pack(anchor="w")
+        hbody = ttk.Frame(ht)
+        hbody.pack(fill="both", expand=True, pady=(6, 0))
+        self.health_text = tk.Text(hbody, wrap="none", height=18,
+                                   font=("Consolas", 9), state="disabled",
+                                   borderwidth=1, relief="solid")
+        hsb2 = ttk.Scrollbar(hbody, orient="vertical",
+                             command=self.health_text.yview)
+        self.health_text.configure(yscrollcommand=hsb2.set)
+        self.health_text.pack(side="left", fill="both", expand=True)
+        hsb2.pack(side="right", fill="y")
+        hbar = ttk.Frame(ht)
+        hbar.pack(fill="x", pady=(PAD, 0))
+        self.doctor_btn = ttk.Button(hbar, text="Refresh",
+                                     command=self.on_doctor)
+        self.doctor_btn.pack(side="right")
+        # Execution stays in the CLI, deliberately - recover is a directional
+        # judgment whose CLI prose walks the user through the evidence. This
+        # button hands over the command, nothing more.
+        self.copy_btn = ttk.Button(hbar, text="Copy the recover command",
+                                   command=self.on_copy_recover)
+
+        # The mutation-gate red line, one per tab (the text carries its own
+        # !! prefix - never color alone). One StringVar backs all three.
+        self.gate_var = tk.StringVar(value="")
+        self._gate_labels = []
+        for tab, anchor in ((lt, lb_status), (st, sb_status),
+                            (ht, hb_status)):
+            lbl = ttk.Label(tab, textvariable=self.gate_var,
+                            foreground="#a00000", wraplength=880,
+                            justify="left")
+            self._gate_labels.append((lbl, anchor))
+
         self.refresh()
+        self.refresh_level()
 
     # ---------------------------------------------------------------- helpers
     def show(self, lines):
@@ -671,28 +989,56 @@ class SyncApp:
         self.text.insert("1.0", "\n".join(lines))
         self.text.configure(state="disabled")
 
+    def show_level(self, lines):
+        self.level_text.configure(state="normal")
+        self.level_text.delete("1.0", "end")
+        self.level_text.insert("1.0", "\n".join(lines))
+        self.level_text.configure(state="disabled")
+
+    def show_health(self, lines):
+        self.health_text.configure(state="normal")
+        self.health_text.delete("1.0", "end")
+        self.health_text.insert("1.0", "\n".join(lines))
+        self.health_text.configure(state="disabled")
+
     def busy(self, on):
         """Disable EVERY action while a worker runs - not a selected few.
 
         Each control left live is a competing worker: mutation locks produce
         spurious refusals, an unlocked plan can read a half-undone destination,
         and callbacks overwrite each other's UI state. The health check was the
-        sharpest case - it clears self.manifest, so finishing mid-copy made the
-        apply callback fault on a manifest that had become None *after the rows
-        were already written*.
+        sharpest historical case - it used to clear self.manifest, so
+        finishing mid-copy made the apply callback fault on a manifest that
+        had become None *after the rows were already written*.
+
+        Counted, not boolean, because the window now runs one reader per tab
+        at open: two concurrent read-only workers each call busy(True) and the
+        controls stay down until the LAST one releases. The Apply buttons are
+        deliberately not in the list - their enablement is each pane's own
+        verdict (rows to copy, renames to run, the mutation gate), recomputed
+        by _apply_gate_to_buttons on release.
         """
-        state = "disabled" if on else "normal"
-        for w in (self.refresh_btn, self.undo_btn, self.doctor_btn,
-                  self.only_entry, self.filter_btn, self.clear_btn,
-                  self.trust_chk, self.update_chk, self.newer_chk,
-                  self.orphan_chk, self.live_btn, self.forget_btn):
-            w.configure(state=state)
+        self._busy_count = max(0, self._busy_count + (1 if on else -1))
+        state = "disabled" if self._busy_count else "normal"
+        for w in ((self.refresh_btn, self.undo_btn, self.doctor_btn,
+                   self.only_entry, self.filter_btn, self.clear_btn,
+                   self.trust_chk, self.update_chk, self.newer_chk,
+                   self.orphan_chk, self.live_btn, self.forget_btn,
+                   self.level_refresh_btn, self.copy_btn)
+                  + tuple(self._banner_widgets)
+                  + tuple(self._hold_widgets)):
+            try:
+                w.configure(state=state)
+            except tk.TclError:
+                pass                    # a rebuilt hold row already destroyed it
         # newer_chk qualifies update_chk, so re-releasing everything must not
         # leave it live while the box it qualifies is unticked - it would read
         # as a control that does nothing.
-        if not on and not self.update_var.get():
-            self.newer_chk.configure(state="disabled")
-            self.orphan_chk.configure(state="disabled")
+        if not self._busy_count:
+            if not self.update_var.get():
+                self.newer_chk.configure(state="disabled")
+                self.orphan_chk.configure(state="disabled")
+            self._apply_gate_to_buttons()
 
     # ---------------------------------------------------------------- planning
     def refresh(self, reset_live=False):
@@ -727,6 +1073,7 @@ class SyncApp:
         gen = self.generation
         only = self.only_var.get().strip()
         self.busy(True)
+        self._sync_apply_ok = False
         self.apply_btn.configure(state="disabled")
         self.status.set("Planning...")
         self.detail.set("")
@@ -938,7 +1285,7 @@ class SyncApp:
         # Offered on every plan, not only right after an apply: "I synced
         # yesterday and want it back" is the same need, and the CLI was the
         # only answer to it before.
-        self._sync_undo_button()
+        self._update_undo_button()
         self._sync_live_button()
         # A filter that hides candidates must say so on the status line, not only
         # in the tally: "nothing to copy" reads as "you are up to date", which is
@@ -949,7 +1296,10 @@ class SyncApp:
                 len(rows), "" if len(rows) == 1 else "s", suffix))
             self.detail.set("Nothing is written until you press Apply. The Claude "
                             "desktop app must be closed for that step.")
-            self.apply_btn.configure(state="normal")
+            # Carve-out 1 of the moved pane's "unchanged" contract: the
+            # mutation gate can hold this button down even with rows ready.
+            self._sync_apply_ok = True
+            self._apply_gate_to_buttons()
         elif only:
             # NOT "no titles match": a title can match and still not be copyable
             # - already present, transcript gone, tombstoned. The tally above
@@ -1238,51 +1588,67 @@ class SyncApp:
         return out
 
     def on_doctor(self):
+        """The Health tab's Refresh: the doctor report plus the
+        interrupted-operation scan. A successful scan that finds nothing
+        unresolved clears the red line and lifts the mutation gate on every
+        tab - this button is the designed way back after `ccs recover`."""
         self.busy(True)
-        self.apply_btn.configure(state="disabled")
-        self.status.set("Checking...")
-        self.detail.set("")
+        self.health_status.set("Checking...")
         threading.Thread(target=self._doctor_worker, daemon=True).start()
 
     def _doctor_worker(self):
         try:
             rep = ccs.gather_doctor(self.env)
-            self.root.after(0, self._doctor_done, rep, None)
+            entries = _scan_interrupted(self.env)
+            self.root.after(0, self._doctor_done, rep, entries, None)
         except Exception:
-            self.root.after(0, self._doctor_done, None, traceback.format_exc())
+            self.root.after(0, self._doctor_done, None, None,
+                            traceback.format_exc())
 
-    def _doctor_done(self, rep, err):
+    def _doctor_done(self, rep, entries, err):
         self.busy(False)
         if err:
-            self.status.set("Health check failed")
-            self.detail.set("")
-            self.show([err])
+            self.health_status.set("Health check failed")
+            self.show_health([err])
             return
-        lines = self.doctor_lines(rep, self.env.home)
-        blocking = lines and lines[0] == "NEEDS ATTENTION"
-        self.status.set("Health check: needs attention" if blocking
-                        else "Health check: nothing blocking a sync")
-        self.detail.set("Read-only - this changed nothing. Press Refresh to plan a sync.")
-        self.show(lines)
-        self.manifest = None      # the text area no longer shows a plan
+        self._set_gate(entries)
+        lines = []
+        if entries:
+            lines += _interrupted_lines(entries, self.env.now()) + [""]
+        lines += self.doctor_lines(rep, self.env.home)
+        blocking = entries or (lines and "NEEDS ATTENTION" in lines)
+        self.health_status.set("Health check: needs attention" if blocking
+                               else "Health check: nothing blocking a "
+                                    "mutation")
+        self.show_health(lines)
 
     # ------------------------------------------------------------------- undo
-    def _find_undoable_sync(self):
-        """(op_id, rows, dest) for the most recent completed op IF it is a sync.
+    def _find_undoable_op(self):
+        """The most recent completed op, described, IF its type is one this
+        window reverses - sync, retitle or converge. None otherwise.
 
         Deliberately only the MOST RECENT completed op `ccs undo` would pick -
-        so the button and the CLI can never disagree about which operation "the
-        last one" is. If that op is anything this window does not do (a move,
-        a repoint, a new-row - all CLI-only), no undo is offered here, because
-        quietly reaching past it to an older sync would undo something other
-        than what the user last did.
+        so the button and the CLI can never disagree about which operation
+        "the last one" is. If that op is anything this window does not do (a
+        move, a repoint, a new-row - all CLI-only), no undo is offered here,
+        because quietly reaching past it to an older op would undo something
+        other than what the user last did.
 
-        THE FILTER HAS TO MATCH `cmd_undo`'s CANDIDATE TUPLE, or this docstring
-        is a lie. It read ("move", "sync") while cmd_undo grew "repoint" and
-        then "new-row": with a completed new-row as the most recent operation,
-        this skipped straight past it to an older sync and offered to undo THAT,
-        while `ccs undo` would have reversed the new-row. "retitle" joined the
-        tuple in 0.11.0 for the same reason, and "converge" in 0.12.0.
+        THE FILTER HAS TO MATCH `cmd_undo`'s CANDIDATE TUPLE, or this
+        docstring is a lie. It read ("move", "sync") while cmd_undo grew
+        "repoint" and then "new-row": with a completed new-row as the most
+        recent operation, this skipped straight past it to an older sync and
+        offered to undo THAT, while `ccs undo` would have reversed the
+        new-row. "retitle" joined the tuple in 0.11.0 for the same reason,
+        and "converge" in 0.12.0; both are now also types this window itself
+        creates (the Level tab), so they are offered rather than parked.
+
+        The descriptor carries what the confirmation needs: op_id, type, the
+        written-row count, a button label naming what it reverses, and the
+        RULING 5 live-override note (sync ops only - retitle and converge
+        record no assertion the undo path would need to disclose... converge
+        records live_asserted, but its undo deletes rows this op minted, a
+        target no identity file arbitrates).
         """
         try:
             ops = [o for o in ccs.list_ops(self.env)
@@ -1293,56 +1659,116 @@ class SyncApp:
                                                              "converge")]
         except Exception:
             return None
-        if not ops or ops[-1].manifest.get("op_type") != "sync":
+        if not ops:
             return None
         m = ops[-1].manifest
+        kind = m.get("op_type")
         rows = sum(1 for r in m.get("rows", []) if r.get("written"))
-        if not rows:
+        if kind not in ("sync", "retitle", "converge") or not rows:
             return None
-        return (m["op_id"], rows,
-                m.get("dest_email") or (m.get("dest_account", "")[:8] + "…"),
-                ccs._live_override_note(m))
+        t = {"op_id": m["op_id"], "type": kind, "rows": rows,
+             "live_note": ccs._live_override_note(m)}
+        if kind == "sync":
+            t["dest"] = (m.get("dest_email")
+                         or (m.get("dest_account", "")[:8] + "…"))
+            t["label"] = "Undo last copy ({0} session{1})".format(
+                rows, "" if rows == 1 else "s")
+        elif kind == "retitle":
+            t["new_title"] = m.get("new_title", "")
+            t["label"] = "Undo last rename"
+        else:
+            t["accounts"] = len({r.get("account")
+                                 for r in m.get("rows", [])
+                                 if r.get("written")})
+            t["label"] = "Undo last converge ({0} row{1})".format(
+                rows, "" if rows == 1 else "s")
+        return t
 
-    def _sync_undo_button(self):
-        self.undo_target = self._find_undoable_sync()
+    def _find_undoable_sync(self):
+        """The old sync-only tuple - (op_id, rows, dest, live_note) when the
+        undoable op is a sync, else None. Kept as a wrapper over
+        _find_undoable_op because the check harness pins this exact contract;
+        the selection rule (and its cmd_undo-mirroring obligation) lives in
+        _find_undoable_op now. Dispatched through the class, not self: the
+        harness calls this unbound, on a stand-in object that has only
+        .env."""
+        t = SyncApp._find_undoable_op(self)
+        if not t or t["type"] != "sync":
+            return None
+        return (t["op_id"], t["rows"], t["dest"], t["live_note"])
+
+    def _update_undo_button(self):
+        self.undo_target = self._find_undoable_op()
         if self.undo_target:
-            self.undo_btn.configure(text="Undo last copy ({0} session{1})".format(
-                self.undo_target[1], "" if self.undo_target[1] == 1 else "s"))
-            self.undo_btn.pack(side="left", padx=(6, 0))
+            self.undo_btn.configure(text=self.undo_target["label"])
+            if not self.undo_btn.winfo_manager():
+                self.undo_btn.pack(side="left", padx=(6, 0))
         else:
             self.undo_btn.pack_forget()
+
+    def _undo_prompt(self, t):
+        """The confirmation, carrying the op's own semantics in the CLI's
+        wording - converge-undo's skip rules included."""
+        if t["type"] == "sync":
+            return ("Undo the last copy?",
+                    "Remove the {0} listing row{1} copied into {2}?\n\nThis "
+                    "deletes only rows this tool wrote, and only while they "
+                    "still match what was written - if that account has since "
+                    "opened one, it refuses rather than discard the change. "
+                    "Conversations are never touched.".format(
+                        t["rows"], "" if t["rows"] == 1 else "s", t["dest"]))
+        if t["type"] == "retitle":
+            return ("Undo the last rename?",
+                    "{0} row{1} get their previous titles back, dropping "
+                    "{2!r} - all of them or none of them, and the operation "
+                    "is then consumed. A row that changed since the rename "
+                    "refuses rather than overwrite the change.".format(
+                        t["rows"], "" if t["rows"] == 1 else "s",
+                        t.get("new_title", "")))
+        return ("Undo the last converge?",
+                "Remove the {0} row{1} it created across {2} account{3}, "
+                "skipping any that is now load-bearing - a row that became "
+                "the only pointer to its conversation, or one that account "
+                "has since repointed or retitled, is kept and named in the "
+                "report. Conversations are never touched.".format(
+                    t["rows"], "" if t["rows"] == 1 else "s",
+                    t.get("accounts", 1),
+                    "" if t.get("accounts", 1) == 1 else "s"))
 
     def on_undo(self):
         if not self.undo_target:
             return
-        op_id, rows, dest, live_note = self.undo_target
-        prompt = ("Remove the {0} listing row{1} copied into {2}?\n\nThis deletes only "
-                  "rows this tool wrote, and only while they still match what was "
-                  "written - if that account has since opened one, it refuses rather "
-                  "than discard the change. Conversations are never touched.".format(
-                      rows, "" if rows == 1 else "s", dest))
-        if live_note:
-            # RULING 5: every route that can mutate under a --live certification
-            # discloses it BEFORE mutating. The CLI prints this; a generic
-            # confirmation here would hide the premise the deletion rests on.
-            prompt += "\n\n" + live_note
-        if not messagebox.askokcancel("Undo the last copy?", prompt):
+        if self._press_gate():
+            return                       # the red line is the explanation
+        t = self.undo_target
+        title, prompt = self._undo_prompt(t)
+        if t.get("live_note"):
+            # RULING 5: every route that can mutate under a --live
+            # certification discloses it BEFORE mutating. The CLI prints
+            # this; a generic confirmation here would hide the premise the
+            # deletion rests on.
+            prompt += "\n\n" + t["live_note"]
+        if not messagebox.askokcancel(title, prompt):
             return
         self.busy(True)
         self.apply_btn.configure(state="disabled")
+        self.level_apply_btn.configure(state="disabled")
         self.undo_btn.configure(state="disabled")
         self.status.set("Undoing...")
-        threading.Thread(target=self._undo_worker, args=(op_id,), daemon=True).start()
+        self.level_status.set("Undoing...")
+        self._mutation_ui = _MutationMarker()
+        threading.Thread(target=self._undo_worker,
+                         args=(t["op_id"], t["type"]), daemon=True).start()
 
-    def _undo_worker(self, op_id):
+    def _undo_worker(self, op_id, kind):
         try:
             # Re-check that this is STILL the latest eligible operation, not just
             # that it exists. Another CLI move or sync can complete between the
             # button being drawn and the confirmation being accepted; undoing the
             # captured id then reaches behind a newer operation and disagrees with
             # what `ccs undo` would pick.
-            current = self._find_undoable_sync()
-            if not current or current[0] != op_id:
+            current = self._find_undoable_op()
+            if not current or current["op_id"] != op_id:
                 raise ccs.Refusal(
                     "another operation completed since this window last looked, so "
                     "{0} is no longer the most recent one to undo. Nothing was "
@@ -1351,40 +1777,66 @@ class SyncApp:
                    if o.manifest.get("op_id") == op_id]
             if not ops:
                 raise ccs.Refusal("operation {0} is no longer in the journal".format(op_id))
-            result = ccs.undo_sync(self.env, ops[0])
-            self.root.after(0, self._undo_done, result, None)
+            undo = {"sync": ccs.undo_sync, "retitle": ccs.undo_retitle,
+                    "converge": ccs.undo_converge}[kind]
+            result = undo(self.env, ops[0])
+            report = ops[0].manifest.get("undo_report")
+            self.root.after(0, self._undo_done, kind, result, report, None)
         except ccs.Refusal as exc:
-            self.root.after(0, self._undo_done, None, ("refusal", str(exc)))
+            self.root.after(0, self._undo_done, kind, None, None,
+                            ("refusal", str(exc)))
         except Exception:
-            self.root.after(0, self._undo_done, None, ("error", traceback.format_exc()))
+            self.root.after(0, self._undo_done, kind, None, None,
+                            ("error", traceback.format_exc()))
 
-    def _undo_done(self, result, problem):
+    def _undo_done(self, kind, result, report, problem):
+        if self._mutation_over():
+            return                       # the window was closing; it may now
         self.busy(False)
         self.undo_btn.configure(state="normal")
         if problem:
-            kind, msg = problem
-            # NOT "nothing was removed": _sync_unlink_all attempts every unlink
-            # and only raises after collecting failures, so a refusal can follow
-            # some rows having already been deleted. Claiming otherwise could
-            # leave a half-undone destination looking untouched.
-            self.status.set("Undo did not complete" if kind == "refusal"
+            kind_p, msg = problem
+            # NOT "nothing was removed": a refusal can follow some rows having
+            # already been deleted or restored - undo_sync collects unlink
+            # failures, undo_retitle stops mid-restore. Claiming otherwise
+            # could leave a half-undone destination looking untouched.
+            self.status.set("Undo did not complete" if kind_p == "refusal"
                             else "Something went wrong")
             self.detail.set(
                 "The tool's own explanation is below. Press Refresh to see the "
                 "destination's current state before deciding what to do - a refusal "
                 "that names specific rows may have removed others first."
-                if kind == "refusal" else "")
+                if kind_p == "refusal" else "")
             self.show([msg])
             messagebox.showwarning("Undo did not complete", msg)   # see _apply_done
-            self._sync_undo_button()
+            self._update_undo_button()
             self._sync_live_button()
+            self.refresh_level()
             return
-        self.status.set("Undone - the copied rows were removed")
-        self.detail.set("The other account's sidebar is back to how it was. "
-                        "Press Refresh to plan again.")
-        self.show([])
-        self._sync_undo_button()
+        if kind == "sync":
+            self.status.set("Undone - the copied rows were removed")
+            self.detail.set("The other account's sidebar is back to how it was. "
+                            "Press Refresh to plan again.")
+            self.show([])
+            note = "Undone - the copied rows were removed."
+        elif kind == "retitle":
+            note = "Undone - the previous titles are back."
+        else:
+            # Converge's undo is FORGIVING - it deletes what is still
+            # redundant and skips what became load-bearing - so a bare
+            # "undone" would hide exactly the rows it deliberately left.
+            rep = report or {}
+            note = "Undone - removed {0} row(s); {1} already gone{2}.".format(
+                rep.get("deleted", 0), rep.get("already_gone", 0),
+                "; {0} kept (see Health/CLI report)".format(
+                    len(rep.get("skipped") or []))
+                if rep.get("skipped") else "")
+        self._update_undo_button()
         self._sync_live_button()
+        # Undo after any step triggers the same fresh replan/re-render as
+        # Apply does - the Level pane must never keep describing rows an undo
+        # just removed.
+        self.refresh_level(note=note)
 
     def forget_destination(self):
         self.dest_choice = ""
@@ -1416,9 +1868,478 @@ class SyncApp:
         elif self.live_btn.winfo_manager():
             self.live_btn.pack_forget()
 
+    # ----------------------------------------------------------- the Level tab
+    def refresh_level(self, note=""):
+        """One worker, two read-only calls - gather_alignment then
+        plan_converge - plus the environment weather (claude_running,
+        read-only) and the unresolved-op scan. NOTE, when given, survives
+        into the next render's detail line so an undo's outcome is not
+        instantly overwritten by the replan it triggers."""
+        if note:
+            self._level_note = note
+        self.level_gen += 1
+        gen = self.level_gen
+        self.busy(True)
+        self._level_apply_ok = False
+        self.level_apply_btn.configure(state="disabled")
+        self.level_status.set("Measuring...")
+        threading.Thread(target=self._level_plan_worker,
+                         args=(gen, self.level_live), daemon=True).start()
+
+    def _level_plan_worker(self, gen, live):
+        try:
+            running = ccs.claude_running(self.env)
+            try:
+                entries = _scan_interrupted(self.env)
+            except Exception:
+                entries = None           # gates closed until Health can look
+            rep = ccs.gather_alignment(self.env)
+            man = ccs.plan_converge(self.env, ccs.ConvergeFlags(live=live))
+            self.root.after(0, self._level_plan_done, gen, rep, man, running,
+                            entries, None)
+        except ccs.Refusal as exc:
+            self.root.after(0, self._level_plan_done, gen, None, None, [],
+                            [], ("refusal", str(exc)))
+        except Exception:
+            self.root.after(0, self._level_plan_done, gen, None, None, [],
+                            [], ("error", traceback.format_exc()))
+
+    def _level_plan_done(self, gen, rep, man, running, entries, problem):
+        if gen != self.level_gen:
+            return                       # superseded by a newer plan
+        self.busy(False)
+        self._set_gate(entries, error=entries is None)
+        if entries:
+            self._render_health_entries(entries)
+        if problem:
+            # A read-side failure is NOT a refusal-after-Apply: it renders in
+            # the pane with the status line set, never as a modal, and
+            # Refresh stays enabled as the retry.
+            kind, msg = problem
+            self.level_status.set("Refused" if kind == "refusal"
+                                  else "Something went wrong")
+            self.level_detail.set(
+                "Nothing was written; Refresh retries. The tool's own "
+                "explanation:" if kind == "refusal" else
+                "This is a bug in the launcher, not a refusal.")
+            self.show_level([msg])
+            self.level_footer.set("")
+            self._apply_gate_to_buttons()
+            return
+        self._render_level(rep, man, running)
+
+    def _render_level(self, rep, man, running):
+        """The pane, top to bottom, from post-read state only: notice,
+        banner, scoreboard + plan summary, hold rows (merged by key so a
+        replan never silently resets the user's edits), footer."""
+        self.level_rep, self.level_manifest = rep, man
+        self.hold_models = _merge_hold_models(_hold_models(man),
+                                              self._current_models())
+        if running:
+            if not self.level_notice.winfo_manager():
+                self.level_notice.pack(anchor="w", pady=(0, 2),
+                                       before=self.level_banner)
+        elif self.level_notice.winfo_manager():
+            self.level_notice.pack_forget()
+        self._render_banner(man)
+        self.show_level(_scoreboard_lines(rep) + [""]
+                        + _plan_summary_lines(man))
+        self._render_holds()
+        state = _level_state(rep, man, self.hold_models)
+        self.level_status.set(state["status"])
+        detail = state["detail"]
+        if self._level_note:
+            detail = (self._level_note + "  " + detail).strip()
+            self._level_note = ""
+        self.level_detail.set(detail)
+        self._level_apply_ok = state["apply"]
+        self._apply_gate_to_buttons()
+        self._update_undo_button()
+        self.level_footer.set("Measured at " + time.strftime("%H:%M:%S"))
+
+    def _render_banner(self, man):
+        """The 0.13.0 identity warning, when the manifest carries one - the
+        existing live-picker pattern inline: one button per disagreeing
+        STORE (an account can own several org directories, the sync picker's
+        hard-won lesson), labeled by email where known, setting the
+        assertion and replanning."""
+        for w in self.level_banner.winfo_children():
+            w.destroy()
+        self._banner_widgets = []
+        if self.level_live:
+            row = ttk.Frame(self.level_banner)
+            row.pack(fill="x", pady=(0, 4))
+            ttk.Label(row, foreground="#a00000", wraplength=680,
+                      justify="left",
+                      text="!! --live assertion in force for the next Apply "
+                           "- cleared when its sequence ends; never saved."
+                      ).pack(side="left")
+            b = ttk.Button(row, text="Change signed-in account",
+                           command=self.forget_level_live)
+            b.pack(side="left", padx=(6, 0))
+            self._banner_widgets.append(b)
+            return
+        dis = (man or {}).get("identity_disagreement")
+        if not isinstance(dis, dict):
+            return
+        oauth, config = dis.get("oauth") or "", dis.get("config") or ""
+        ttk.Label(self.level_banner, foreground="#a00000", wraplength=880,
+                  justify="left",
+                  text="!! ~/.claude.json ({0}) and config.json ({1}) "
+                       "disagree about which account is signed in, and "
+                       "either record can be the stale one. The copy stage "
+                       "will refuse (RULING 5) until you say which account "
+                       "the DESKTOP APP is on right now - the answer covers "
+                       "one Apply and is never written to disk.".format(
+                           oauth[:8], config[:8])).pack(anchor="w",
+                                                        pady=(0, 2))
+        try:
+            stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env)
+                      if a in (oauth, config)]
+        except Exception:
+            stores = []
+        for a, o, p in stores:
+            rows = ccs._listing_row_count(p)
+            count = ("{0} rows".format(rows) if rows
+                     else "no listing rows" if rows == 0
+                     else "row count unreadable")
+
+            def pick(path=p):
+                self.level_live = path   # a full path matches exactly one store
+                self.refresh_level()
+            b = ttk.Button(self.level_banner, command=pick,
+                           text="Signed in as  {0}   org {1}…   ({2})".format(
+                               self._account_label(a), o[:8], count))
+            b.pack(fill="x", pady=2)
+            self._banner_widgets.append(b)
+
+    def forget_level_live(self):
+        """Drop the Level tab's --live assertion and re-ask - the same
+        deliberate re-look the sync pane's forget_live provides."""
+        self.level_live = ""
+        self.refresh_level()
+
+    def _render_holds(self):
+        for w in self.hold_frame.winfo_children():
+            w.destroy()
+        self._hold_widgets = []
+        if not self.hold_models:
+            return
+        ttk.Label(self.hold_frame,
+                  text="Naming decisions - each ticked row becomes one "
+                       "rename on Apply:",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(2, 4))
+        for m in self.hold_models:
+            row = ttk.Frame(self.hold_frame)
+            row.pack(fill="x", pady=(0, 6), anchor="w")
+            if m["editable"]:
+                m["_tick_var"] = tk.BooleanVar(value=bool(m["ticked"]))
+                m["_entry_var"] = tk.StringVar(value=m["entry"])
+                chk = ttk.Checkbutton(row, text="Rename",
+                                      variable=m["_tick_var"])
+                chk.grid(row=0, column=0, sticky="nw", padx=(0, 6))
+                ttk.Label(row, text=m["title"],
+                          font=("Segoe UI", 9, "bold")).grid(row=0, column=1,
+                                                             sticky="w")
+                entry = ttk.Entry(row, textvariable=m["_entry_var"],
+                                  width=86)
+                entry.grid(row=1, column=1, sticky="we", pady=(2, 0))
+                ttk.Label(row, text=m["evidence"], foreground="#555",
+                          wraplength=780, justify="left").grid(row=2,
+                                                               column=1,
+                                                               sticky="w")
+                if m["degrade_reason"]:
+                    ttk.Label(row, text="no suggestion: " + m["degrade_reason"],
+                              foreground="#a05000").grid(row=3, column=1,
+                                                         sticky="w")
+                row.columnconfigure(1, weight=1)
+                self._hold_widgets += [chk, entry]
+            else:
+                ttk.Label(row, text="held: " + (m["title"]
+                                                or m["classification"]),
+                          font=("Segoe UI", 9, "bold")).pack(anchor="w")
+                ttk.Label(row, text=m["evidence"], foreground="#555",
+                          wraplength=820, justify="left").pack(anchor="w")
+
+    def _current_models(self):
+        """The hold models with the widgets' CURRENT text and ticks read
+        back in - the tkinter variables stripped, so the result is the pure
+        shape _level_steps_stage1 and _merge_hold_models take."""
+        out = []
+        for m in self.hold_models:
+            clean = {k: v for k, v in m.items() if not k.startswith("_")}
+            tick, entry = m.get("_tick_var"), m.get("_entry_var")
+            if tick is not None:
+                try:
+                    clean["ticked"] = bool(tick.get())
+                    clean["entry"] = entry.get()
+                except tk.TclError:
+                    pass                 # widget already destroyed: keep stored
+            out.append(clean)
+        return out
+
+    # ------------------------------------------------------ the mutation gate
+    def _set_gate(self, entries, error=False):
+        """Render (or clear) the red line on every tab and gate Apply/Undo.
+
+        The line carries its own !! prefix - never color alone. A scan that
+        FAILED gates too: 'couldn't look' is never 'nothing there'.
+        """
+        if error:
+            self.gate_text = ("!! the journal could not be read - Apply and "
+                              "Undo are disabled until Health can scan it.")
+        elif entries:
+            self.gate_text = ("!! {0} interrupted operation(s) need "
+                              "attention - see Health.".format(len(entries)))
+        else:
+            self.gate_text = ""
+        self.gate_var.set(self.gate_text)
+        for lbl, anchor in self._gate_labels:
+            if self.gate_text:
+                if not lbl.winfo_manager():
+                    lbl.pack(anchor="w", after=anchor)
+            elif lbl.winfo_manager():
+                lbl.pack_forget()
+        if self.gate_text and not error:
+            if not self.copy_btn.winfo_manager():
+                self.copy_btn.pack(side="left")
+        elif self.copy_btn.winfo_manager():
+            self.copy_btn.pack_forget()
+        self._apply_gate_to_buttons()
+
+    def _apply_gate_to_buttons(self):
+        """Apply enablement is three verdicts ANDed: the pane's own (rows to
+        copy / renames to run), no worker running, and no unresolved journal
+        op. The gate covers the sync tab too - carve-out 1 of its "unchanged"
+        contract - and Undo shares it, because a mutation launched over an
+        unresolved op would change the state `recover` is about to reason
+        over."""
+        gated = bool(self.gate_text)
+        busy = self._busy_count > 0
+        self.apply_btn.configure(
+            state="normal" if (self._sync_apply_ok and not gated
+                               and not busy) else "disabled")
+        self.level_apply_btn.configure(
+            state="normal" if (self._level_apply_ok and not gated
+                               and not busy) else "disabled")
+        if gated:
+            self.undo_btn.configure(state="disabled")
+        elif not busy:
+            self.undo_btn.configure(state="normal")
+
+    def _press_gate(self):
+        """The press-time re-scan, run before EVERY mutation - stage 1's
+        confirm, stage 2's confirm (inside the worker), sync's Apply, Undo.
+        A scan at window-open goes stale the moment another process dies
+        mid-write; an op found here renders the red line and aborts the
+        press. True when the press must abort."""
+        try:
+            entries = _scan_interrupted(self.env)
+        except Exception:
+            self._set_gate(None, error=True)
+            return True
+        self._set_gate(entries)
+        if entries:
+            self._render_health_entries(entries)
+            return True
+        return False
+
+    def _render_health_entries(self, entries):
+        self.show_health(_interrupted_lines(entries, self.env.now())
+                         + ["", "Press Refresh here for the full health "
+                                "check."])
+        self.health_status.set("{0} interrupted operation(s) need attention"
+                               .format(len(entries)))
+
+    def on_copy_recover(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(RECOVER_COMMAND)
+        self.health_status.set("Copied. Run it in a terminal, then press "
+                               "Refresh here.")
+
+    # ------------------------------------------------------- the Level apply
+    def on_level_apply(self):
+        if self.level_manifest is None:
+            return
+        if self._press_gate():
+            return                       # the red line is the explanation
+        models = self._current_models()
+        steps, problems = _level_steps_stage1(models)
+        if problems:
+            # The cheap local set-check, before any engine call.
+            messagebox.showwarning("These renames refuse locally",
+                                   "\n\n".join(problems))
+            return
+        if not steps and not (self.level_manifest.get("rows") or []):
+            return
+        if steps and not self._confirm_stage1(steps):
+            return
+        self.level_gen += 1              # this press owns the pane now
+        gen = self.level_gen
+        self.busy(True)
+        self._level_apply_ok = False
+        self.level_apply_btn.configure(state="disabled")
+        self.apply_btn.configure(state="disabled")
+        self.level_status.set("Applying...")
+        self.level_detail.set("")
+        ui = _TkLevelUI(self)
+        self._mutation_ui = ui
+        threading.Thread(target=self._level_apply_worker,
+                         args=(gen, steps, self.level_live, ui),
+                         daemon=True).start()
+
+    def _confirm_stage1(self, steps):
+        """Stage 1's dialog: a scrollable Toplevel, not a stock messagebox -
+        thirty mapping lines would push a messagebox's buttons off screen.
+        The mapping list scrolls; the confirm/cancel row does not move."""
+        head, mappings, footer = _stage1_dialog_parts(steps)
+        win = tk.Toplevel(self.root)
+        win.title(head)
+        win.transient(self.root)
+        result = {"ok": False}
+        ttk.Label(win, padding=PAD, justify="left", wraplength=680,
+                  text=footer).pack(anchor="w")
+        bar = ttk.Frame(win)
+        bar.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
+
+        def go():
+            result["ok"] = True
+            win.destroy()
+        ttk.Button(bar, text="Rename", command=go).pack(side="right")
+        ttk.Button(bar, text="Cancel",
+                   command=win.destroy).pack(side="right", padx=(0, 6))
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=PAD)
+        txt = tk.Text(body, wrap="none", height=min(len(mappings), 14),
+                      width=100, font=("Consolas", 9))
+        tsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=tsb.set)
+        txt.insert("1.0", "\n".join(mappings))
+        txt.configure(state="disabled")
+        txt.pack(side="left", fill="both", expand=True)
+        tsb.pack(side="right", fill="y")
+        win.grab_set()
+        self.root.wait_window(win)
+        return result["ok"]
+
+    def _level_apply_worker(self, gen, steps, live, ui):
+        seq, refresh = _run_level_apply(self.env, steps, live, ui)
+        self.root.after(0, self._level_apply_done, gen, seq, refresh)
+
+    def _level_apply_done(self, gen, seq, refresh):
+        if self._mutation_over():
+            return                       # truncated: closed at the boundary
+        self.busy(False)
+        if gen != self.level_gen:
+            return
+        if seq.get("gate") is not None:
+            # The press aborted before writing anything; the pane still
+            # describes the store, and nothing consumed the live assertion.
+            if isinstance(seq["gate"], str):
+                self._set_gate(None, error=True)
+            else:
+                self._press_gate()       # re-render the line + the listing
+            self.level_status.set("Nothing was written - resolve the "
+                                  "interrupted operation(s) first.")
+            return
+        # The sequence has ended - completed, refused, or cancelled alike -
+        # so the assertion it carried is spent. The refresh below already
+        # planned without it; if the files still disagree, that replan is
+        # what re-raises the banner.
+        self.level_live = ""
+        half = ""
+        if refresh is not None and refresh[0] == "ok":
+            _kind, rep, man, running = refresh
+            self._render_level(rep, man, running)
+            half = _scoreboard_half(rep)
+            if seq.get("plan_problem"):
+                # Stage 2's plan failed but the refresh's succeeded - a
+                # transient. The failure still renders in-pane, under the
+                # fresh render.
+                self._append_level(["", "!! the copy stage could not plan:",
+                                    seq["plan_problem"][1]])
+        else:
+            if seq.get("stage2") == "completed":
+                # Applied-but-unverified is distinct from not-applied, and
+                # must look it: keep the last rendered content, visibly
+                # flagged stale, rather than going blank.
+                self.level_status.set("Applied - could not re-measure; "
+                                      "press Refresh.")
+                self.level_detail.set("The operations landed and are "
+                                      "journalled; everything below is "
+                                      "shown from BEFORE the apply.")
+                self._append_level(["", "!! shown from before the apply - "
+                                        "press Refresh"])
+            else:
+                problem = (seq.get("plan_problem")
+                           or (refresh if refresh is not None else None))
+                if problem is not None:
+                    self.show_level([problem[1]])
+                self.level_detail.set("The pane could not be re-measured; "
+                                      "Refresh retries.")
+            self._update_undo_button()
+        status = _sequence_status(seq, half)
+        if status and not (refresh is not None and refresh[0] != "ok"
+                           and seq.get("stage2") == "completed"):
+            self.level_status.set(status)
+        # Modal AFTER the pane settles, mirroring _apply_done: a refusal
+        # after pressing Apply is the one message that must not be missable.
+        if seq.get("rename_refusal"):
+            messagebox.showwarning(
+                "Nothing more was renamed" if seq.get("landed")
+                else "Nothing was renamed", seq["rename_refusal"][1])
+        elif seq.get("converge_problem"):
+            messagebox.showwarning("Nothing was copied",
+                                   seq["converge_problem"][1])
+
+    def _append_level(self, lines):
+        self.level_text.configure(state="normal")
+        self.level_text.insert("end", "\n" + "\n".join(lines))
+        self.level_text.configure(state="disabled")
+
+    # ------------------------------------------------------- window lifecycle
+    def _on_close(self):
+        """Intercept the WM close (and the Close button) while a mutation
+        worker runs: state the remaining-step count up front, finish the
+        in-flight operation, truncate the remainder, close at that boundary.
+        Landed operations are in the journal exactly as if the user had
+        stopped there deliberately. (A hard kill mid-operation lands in the
+        journal as an interrupted op; Health's detection is the net.)"""
+        ui = self._mutation_ui
+        if ui is None:
+            self.root.destroy()
+            return
+        n = getattr(ui, "remaining", 0)
+        if n:
+            msg = ("The current operation will finish, and the {0} "
+                   "remaining step(s) will NOT run. Close?".format(n))
+        else:
+            msg = ("The operation in progress will finish first, then the "
+                   "window closes. Close?")
+        if not messagebox.askokcancel("Close during an operation?", msg):
+            return
+        ui.truncate = True
+        self._close_after_worker = True
+
+    def _mutation_over(self):
+        """True when the window was closing behind this worker - the
+        callback must stop rendering into a window about to be destroyed."""
+        self._mutation_ui = None
+        if self._close_after_worker:
+            self.root.destroy()
+            return True
+        return False
+
     # ---------------------------------------------------------------- applying
     def on_apply(self):
         if not self.manifest:
+            return
+        # Carve-out 1 of this pane's "unchanged" contract: the press-time
+        # unresolved-op re-scan. A scan at window-open goes stale the moment
+        # another process dies mid-write; a mutation launched over an
+        # unresolved journal op would change the state `recover` is about to
+        # reason over, so the window refuses to be the second writer.
+        if self._press_gate():
             return
         n = len(self.manifest.get("rows") or [])
         dst = self.manifest.get("dest_email") or self.manifest["dest_account"][:8]
@@ -1480,8 +2401,10 @@ class SyncApp:
                 "Copy sessions?", "{0}\n\n{1} Undo reverses it.".format(what, does)):
             return
         self.busy(True)
+        self._sync_apply_ok = False
         self.apply_btn.configure(state="disabled")
         self.status.set("Copying...")
+        self._mutation_ui = _MutationMarker()
         threading.Thread(target=self._apply_worker, args=(self.manifest,),
                          daemon=True).start()
 
@@ -1499,6 +2422,8 @@ class SyncApp:
                             ("error", traceback.format_exc()))
 
     def _apply_done(self, manifest, result, problem):
+        if self._mutation_over():
+            return                       # the window was closing; it may now
         self.busy(False)
         if problem:
             kind, msg = problem
@@ -1535,13 +2460,18 @@ class SyncApp:
                         "Changed your mind? Undo is the button below - a GUI should not "
                         "send you to a terminal to reverse what it just did.")
         self.manifest = None
-        self._sync_undo_button()
+        self._update_undo_button()
         self._sync_live_button()
 
 
 # ------------------------------------------------------------------- shortcuts
 
-SHORTCUT_NAME = "Claude session sync.lnk"
+SHORTCUT_NAME = "Claude sessions.lnk"
+# The pre-0.15 name. --install-shortcut deletes it so a rename does not leave
+# two icons pointing at one window; --remove-shortcut removes both names. A
+# taskbar pin to the old name is the user's to re-pin - pins are per-user
+# shell state this tool does not touch.
+OLD_SHORTCUT_NAME = "Claude session sync.lnk"
 
 
 def _psq(s):
@@ -1552,11 +2482,11 @@ def _psq(s):
     return "'" + s.replace("'", "''") + "'"
 
 
-def _shortcut_paths():
+def _shortcut_paths(name=SHORTCUT_NAME):
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     start = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
                          "Start Menu", "Programs")
-    return [os.path.join(d, SHORTCUT_NAME) for d in (desktop, start)
+    return [os.path.join(d, name) for d in (desktop, start)
             if d and os.path.isdir(d)]
 
 
@@ -1583,6 +2513,14 @@ def manage_shortcut(remove=False):
         return 2
     target, arg = _launcher()
     done = []
+    # The old-name links go on BOTH routes: install replaces them (two icons
+    # for one window is the migration bug), remove means remove.
+    for link in _shortcut_paths(OLD_SHORTCUT_NAME):
+        try:
+            os.remove(link)
+            done.append("removed " + link)
+        except OSError:
+            pass
     for link in _shortcut_paths():
         if remove:
             try:
@@ -1603,7 +2541,7 @@ def manage_shortcut(remove=False):
               "$s.Arguments = {2};"
               "$s.WorkingDirectory = {3};"
               "$s.IconLocation = {1};"
-              "$s.Description = 'Copy Claude sessions to your other account';"
+              "$s.Description = 'Keep your Claude account sidebars level';"
               "$s.Save()"
               ).format(_psq(link), _psq(target), _psq(quoted_arg),
                        _psq(os.path.dirname(target)))
@@ -1616,8 +2554,8 @@ def manage_shortcut(remove=False):
     for line in done:
         print(line)
     if not remove and done:
-        print('\nDouble-click "Claude session sync" to plan a sync. Nothing is '
-              "written until you press Apply.")
+        print('\nDouble-click "Claude sessions" to see how level the '
+              "sidebars are. Nothing is written until you press Apply.")
     return 0
 
 
@@ -1626,9 +2564,11 @@ def main(argv=None):
         prog="ccs-gui", description="Windowed front end for claude-code-sessions sync.")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--install-shortcut", action="store_true",
-                   help="add Desktop + Start Menu shortcuts (Windows)")
+                   help='add Desktop + Start Menu shortcuts (Windows); an '
+                        'existing "Claude session sync" shortcut from before '
+                        '0.15.0 is deleted, not kept alongside')
     g.add_argument("--remove-shortcut", action="store_true",
-                   help="remove those shortcuts")
+                   help="remove those shortcuts (the pre-0.15.0 name too)")
     ns = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     if ns.install_shortcut or ns.remove_shortcut:
@@ -1653,7 +2593,7 @@ def main(argv=None):
     try:
         SyncApp(root)
     except Exception:
-        messagebox.showerror("Claude session sync", traceback.format_exc())
+        messagebox.showerror("Claude sessions", traceback.format_exc())
         return 1
     root.mainloop()
     return 0
