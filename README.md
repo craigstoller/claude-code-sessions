@@ -835,6 +835,32 @@ window into `journaled`/`completed`/`rolled_back`.
   manifests, manifest schema keys can never be renamed by a terse title, anonymized JSON
   borrows both machine-layer redactions (the home fold, and 8-character uuid truncation), and
   the README now says what the flag deliberately does not mask.
+- **0.15.0 rebuilds the window around the routine that actually runs.** The window had been
+  `ccs sync` with buttons - two of the tool's twelve commands - while the maintenance routine
+  a multi-account store needs (plan, name the title-collision holds, converge, confirm)
+  stayed CLI-only. 0.14.0 made its one interactive step one-click-shaped: holds
+  arrive measured, with a suggested title and a named target, fields designed with this
+  window as their intended second consumer. This release is that consumer, and the order was
+  deliberate - a window built before the measurements would have been a data-entry form
+  built twice. Three tabs now. **Level** is the home: `alignment`'s five numbers, the
+  converge preview, and each hold as a rename row prefilled from the measured suggestion -
+  tick, edit, or ignore. Apply confirms in two stages, each describing exactly and only what
+  runs next: first every `old -> new` mapping (each rename lands as its own journalled,
+  individually undoable operation), then a **fresh** converge plan's numbers - never the
+  preview's, which the renames just made stale. Every Apply ends in a re-measure, so the
+  pane describes the store as it now is, not as it was planned to be. **Copy & refresh** is
+  the sync pane moved intact - still the only tab that can overwrite a row, because converge
+  is additive and deliberately never refreshes. **Health** keeps `doctor`'s report and adds
+  the interrupted-operation net a 2026-08-08 review asked for: an unresolved journal
+  operation disables Apply and Undo on every tab, re-checked at every press because a scan
+  at window-open goes stale the moment another process dies mid-write - and the tab hands
+  over the `recover` command with a Copy button rather than running it, since recover is a
+  directional judgment whose CLI report walks you through the evidence a window would have
+  to duplicate to be safe. One Undo button under the tabs walks the journal back one
+  operation at a time, exactly as `ccs undo` would; there is deliberately no one-click "undo
+  the whole apply" - the journal's unit is the operation, so the completion status names
+  what was created instead. The window becomes **"Claude sessions"**, because the old name
+  described one tab of three; installing the shortcut replaces the old one.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
