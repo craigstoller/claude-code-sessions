@@ -1687,7 +1687,7 @@ class SyncApp:
             blocking.append("{0} unrecognised item(s) in the store layout. The tool "
                             "fails closed on these.".format(len(rep["unknown_layout"])))
         # Both of these make `ccs doctor` exit 1, and this window reported
-        # "Nothing is blocking a sync" over the top of them. They go in the
+        # "Nothing is blocking a mutation" over the top of them. They go in the
         # blocking list rather than the inventory below because neither is
         # routine and neither is numerous - which is the line the ordering rule
         # in this docstring actually draws. Aged-out transcripts and legacy
@@ -1728,7 +1728,9 @@ class SyncApp:
             out += ["  - " + b for b in blocking]
             out.append("")
         else:
-            out += ["Nothing is blocking a sync.", ""]
+            # "a mutation", not "a sync": since 0.15.0 the same gate holds
+            # renames and converges too, and the tab title already says so.
+            out += ["Nothing is blocking a mutation.", ""]
         out.append("Inventory")
         out += ["  " + n for n in notes]
         out += ["", "These counts are observations, not errors - see `ccs doctor` for the "

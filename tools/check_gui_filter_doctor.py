@@ -87,6 +87,10 @@ clean = {"stores": {"status": "found", "roots": ["/x"]}, "row_count": 10,
 lines = gp.SyncApp.doctor_lines(clean)
 check("a clean report leads with 'nothing blocking'",
       lines[0].startswith("Nothing is blocking"), lines[0])
+# 0.15.1 (C): the window gates every MUTATION now - renames and converges
+# too - so the sync-era body line has to say what the tab title says.
+check("  and names a mutation, not a sync - the tab title's own word",
+      lines[0] == "Nothing is blocking a mutation.", lines[0])
 check("  and does not shout NEEDS ATTENTION", "NEEDS ATTENTION" not in "\n".join(lines))
 
 # routine-but-numerous findings must NOT be treated as blocking
