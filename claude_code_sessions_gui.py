@@ -988,6 +988,26 @@ class SyncApp:
         ttk.Label(st, textvariable=self.detail, wraplength=880,
                   justify="left", foreground="#555").pack(anchor="w",
                                                           pady=(4, 6))
+        # What this tab is FOR, said before the plan (0.15.1, finding E).
+        # Measured on a freshly levelled store: this tab offered 78 rows
+        # into one account, 77 of them for conversations that sidebar could
+        # already open under a different row file, 78 carrying a title
+        # already naming a row there. Sync counts ROW FILES the destination
+        # lacks; converge counts CONVERSATIONS it cannot open; a multi-
+        # account store accumulates different row filenames for the same
+        # conversations - so the two tabs can disagree about counts, and
+        # bulk-applying this one would have driven `distinguishable` from 0
+        # to ~78. The guidance is static because the hazard is structural,
+        # not a property of any one plan.
+        self.sync_guidance = ttk.Label(
+            st, wraplength=880, justify="left", foreground="#555",
+            text="Level (the first tab) is the routine. This tab copies "
+                 "ROW FILES: it can add rows for conversations the "
+                 "destination already opens under another row file, and "
+                 "duplicate their titles in that sidebar. It is meant for "
+                 "one session at a time - type its title in the filter "
+                 "below, with \"only where mine is newer\" ticked.")
+        self.sync_guidance.pack(anchor="w", pady=(0, 6))
 
         # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
         # rather than per-row checkboxes: checkboxes would mean assembling a

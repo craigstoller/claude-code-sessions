@@ -680,6 +680,12 @@ settle()
 check("the header names the hold as suggested",
       app.level_status.get() == "Nothing to copy - 1 held: 1 suggested.",
       app.level_status.get())
+# E part 1 (0.15.1): the Copy & refresh tab says what it is for.
+guidance = app.sync_guidance.cget("text")
+check("the Copy & refresh tab carries the guidance line",
+      "Level" in guidance and "one session at a time" in guidance
+      and "only where mine is newer" in guidance, guidance[:80])
+check("  packed above the plan", bool(app.sync_guidance.winfo_manager()))
 app.on_level_apply()
 settle()
 check("stage-1 dialog saw the steps", len(app._stage1_calls) == 1
