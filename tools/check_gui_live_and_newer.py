@@ -73,6 +73,7 @@ gp2.save_pref = lambda _v: None
 
 # Record what the planner is asked for, and never touch a real store.
 calls = []
+FAKE_ROWS, FAKE_TALLY = [], {}        # what the next fake plan carries
 
 
 def fake_plan(env, flags):
@@ -82,7 +83,7 @@ def fake_plan(env, flags):
             "dest_account": B, "dest_org": ORG, "dest_email": "dorm@example.com",
             "dest_email_source": "", "dest_path": store, "verbatim": False,
             "update": flags.update, "newer_only": flags.newer_only,
-            "rows": [], "tally": {}}
+            "rows": [dict(r) for r in FAKE_ROWS], "tally": dict(FAKE_TALLY)}
 
 
 gp2.ccs.plan_sync = fake_plan
@@ -201,6 +202,46 @@ app.busy(False)
 check("releasing the controls leaves it disabled when unticked",
       str(app.newer_chk.cget("state")) == "disabled",
       str(app.newer_chk.cget("state")))
+
+# ------------------------- 0.15.1 (E, part 2). the duplicate-title warning
+# plan_sync annotates each add with dup_conversation / dup_title (the
+# destination already opens that conversation under another row file / already
+# has a row under that title); the pane must say so ABOVE Apply, in numbers.
+FAKE_ROWS[:] = [
+    {"name": "local_%d.json" % i, "title": t, "is_update": False,
+     "session_id": "s%d" % i, "dup_conversation": dc, "dup_title": dt,
+     "pre_b64": None, "post_b64": "e30=", "written": False}
+    for i, (t, dc, dt) in enumerate([("ACME-REVIEW session", True, True),
+                                     ("Northwind backtest", True, False),
+                                     ("Quarterly board report", False, False)])]
+FAKE_TALLY.update({"dup_conversation": ["ACME-REVIEW session",
+                                        "Northwind backtest"],
+                   "dup_title": ["ACME-REVIEW session"]})
+app.refresh()
+settle()
+warn = app.sync_warning.cget("text")
+check("the warning counts the rows that would duplicate a title",
+      mapped(app.sync_warning)
+      and "1 of 3 rows would duplicate a title already in that sidebar" in warn,
+      warn)
+check("  and points back at Level as the routine", "Level" in warn)
+slaves = app.sync_tab.pack_slaves()
+check("  it sits above the Apply bar",
+      slaves.index(app.sync_warning) < slaves.index(app.sync_bar),
+      str([str(w) for w in slaves]))
+pane_lines = app.text.get("1.0", "end").splitlines()
+check("the tally lines count both kinds",
+      any(l.startswith("already open there under another row file")
+          and l.rstrip().endswith(": 2") for l in pane_lines),
+      "\n".join(pane_lines[:12]))
+check("  and the duplicate-title count",
+      any(l.startswith("would duplicate a title already there")
+          and l.rstrip().endswith(": 1") for l in pane_lines))
+FAKE_ROWS[:] = [dict(FAKE_ROWS[2])]
+FAKE_TALLY.clear()
+app.refresh()
+settle()
+check("no duplicate titles, no warning", not mapped(app.sync_warning))
 
 tkroot.destroy()
 shutil.rmtree(root_dir, ignore_errors=True)

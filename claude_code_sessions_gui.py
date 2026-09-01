@@ -401,6 +401,23 @@ def _level_state(rep, manifest, models):
             "detail": "", "apply": False}
 
 
+def _sync_dup_warning(rows):
+    """The Copy & refresh tab's warning above Apply, or '' (0.15.1, E part
+    2): how many of the rows it would ADD already name a row in that sidebar,
+    from plan_sync's per-row `dup_title` (computed with the engine's own
+    title_key). Adds only - a refresh duplicates its own conversation by
+    definition. A manifest from an engine without the flag warns nothing."""
+    adds = [r for r in rows if not r.get("is_update")]
+    dup = [r for r in adds if r.get("dup_title")]
+    if not dup:
+        return ""
+    return ("!! {0} of {1} row{2} would duplicate a title already in that "
+            "sidebar - alignment's `distinguishable` would move off zero. "
+            "Level (the first tab) is the routine; this tab is for one "
+            "session at a time.".format(len(dup), len(adds),
+                                        "" if len(adds) == 1 else "s"))
+
+
 def _level_steps_stage1(models):
     """(steps, problems) for stage 1 - the ticked renames, in row order.
 
@@ -1065,8 +1082,15 @@ class SyncApp:
         self.text.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
+        # The duplicate-title warning, packed above the Apply bar only when
+        # the plan's adds would duplicate a title already in that sidebar
+        # (0.15.1, E part 2) - the number the bulk apply would move
+        # `distinguishable` by, said before the button that would do it.
+        self.sync_warning = ttk.Label(st, foreground="#a05000",
+                                      wraplength=880, justify="left")
         bar = ttk.Frame(st)
         bar.pack(fill="x", pady=(PAD, 0))
+        self.sync_bar = bar
         self.apply_btn = ttk.Button(bar, text="Apply", command=self.on_apply,
                                     state="disabled")
         self.apply_btn.pack(side="right")
@@ -1240,6 +1264,7 @@ class SyncApp:
         self.status.set("Planning...")
         self.detail.set("")
         self.show([])
+        self._show_sync_warning("")
         threading.Thread(
             target=self._plan_worker,
             args=(gen, only, self.update_var.get(), self.newer_var.get(),
@@ -1342,6 +1367,11 @@ class SyncApp:
                            ("held_orphan", "held back - would HIDE a conversation"),
                            ("swapping", "change WHICH conversation opens"),
                            ("held_unknown", "held back - could not tell which is newer"),
+                           # 0.15.1: adds the destination can already open
+                           # under another row file, and adds that would
+                           # duplicate a title there - reported, never held
+                           ("dup_conversation", "already open there under another row file"),
+                           ("dup_title", "would duplicate a title already there"),
                            ("resurrected", "!! RESURRECTED (deletion overridden)")):
             val = tally.get(key)
             count = len(val) if isinstance(val, (list, tuple, set)) else val
@@ -1450,6 +1480,7 @@ class SyncApp:
             lines = ["!! --live certification in effect", ""] + lines
 
         self.show(lines)
+        self._show_sync_warning(_sync_dup_warning(rows))
         # Offered on every plan, not only right after an apply: "I synced
         # yesterday and want it back" is the same need, and the CLI was the
         # only answer to it before.
@@ -1478,6 +1509,17 @@ class SyncApp:
         else:
             self.status.set("Nothing to copy - the other account is up to date")
             self.detail.set("")
+
+    def _show_sync_warning(self, text):
+        """Pack the duplicate-title warning above the Apply bar, or take it
+        away - the text carries its own !! prefix, never color alone."""
+        self.sync_warning.configure(text=text)
+        if text:
+            if not self.sync_warning.winfo_manager():
+                self.sync_warning.pack(anchor="w", pady=(6, 0),
+                                       before=self.sync_bar)
+        elif self.sync_warning.winfo_manager():
+            self.sync_warning.pack_forget()
 
     @staticmethod
     def _candidates(msg):

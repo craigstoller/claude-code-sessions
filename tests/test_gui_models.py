@@ -469,3 +469,29 @@ def test_row_merge_preserves_edits():
     assert merged[1]["ticked"] is False
     # ...and the vanished row's state went with it (nothing resurrects it).
     assert all(m["key"] != ("gone" + "0" * 28, "x") for m in merged)
+
+
+# -------------------------------------------------- the sync pane's warning
+
+def test_sync_dup_warning_counts_adds_that_duplicate_a_title():
+    """0.15.1 (E, part 2): the Copy & refresh tab warns ABOVE Apply, in
+    numbers, when rows it would add already name a row in that sidebar -
+    computed from plan_sync's per-row dup_title flag over the adds only
+    (a refresh duplicates its own conversation by definition and is not
+    counted either way)."""
+    def add(title, dup_title, dup_conversation=False, is_update=False):
+        return {"name": "local_x.json", "title": title, "is_update": is_update,
+                "dup_title": dup_title, "dup_conversation": dup_conversation}
+    rows = [add("ACME-REVIEW session", True, True),
+            add("Northwind backtest", False, True),
+            add("Quarterly board report", False),
+            add("a refresh", True, True, is_update=True)]
+    text = gui._sync_dup_warning(rows)
+    assert text.startswith("!! ")
+    assert "1 of 3 rows would duplicate a title already in that sidebar" in text
+    assert "Level" in text
+    assert gui._sync_dup_warning([add("Quarterly board report", False)]) == ""
+    assert gui._sync_dup_warning([]) == ""
+    # A manifest from an older engine carries no flags: no warning, no crash.
+    assert gui._sync_dup_warning([{"name": "local_y.json", "title": "x",
+                                   "is_update": False}]) == ""
