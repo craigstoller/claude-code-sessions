@@ -7,9 +7,11 @@ remember.
 
 Three tabs (docs/specs/2026-08-31-gui-level-design.md):
   Level           the home - the alignment scoreboard, the converge plan, and
-                  the title-collision holds as prefilled rename rows; Apply
-                  runs the renames then a fresh converge, two confirmations,
-                  each describing exactly what runs next.
+                  the title-collision holds as rename rows (prefilled where
+                  the measurement suggested a name, empty where it declined -
+                  a human can still name those); "Level the sidebars" runs
+                  the renames then a fresh converge, two confirmations, each
+                  describing exactly what runs next.
   Copy & refresh  the original sync pane, moved intact - still the only tab
                   that can OVERWRITE a row (converge is additive and
                   deliberately never refreshes).
@@ -29,7 +31,9 @@ dry-run-then-apply) behaves identically here. It adds no path of its own into
 the store.
 
 Two rules it holds to:
-  - Nothing is written until you press Apply. Opening the window plans only.
+  - Nothing is written until you press a tab's action button ("Level the
+    sidebars", or the Copy & refresh tab's "Apply"). Opening the window
+    plans only.
   - A refusal is shown verbatim, never summarised into something friendlier.
     The refusals in this tool carry the reason and the fix, and softening them
     would be the one place a GUI could do real harm.
@@ -261,6 +265,11 @@ def _scoreboard_half(rep):
         counts or "?", (rep.get("complete") or {}).get("short", "?"))
 
 
+# The Level tab's action button, by its own spec's name for the flow - not
+# "Apply", which is the Copy & refresh tab's button, and two tabs sharing one
+# label read as one action (0.15.1, finding D).
+LEVEL_BUTTON = "Level the sidebars"
+
 def _level_state(rep, manifest, models):
     """The pane's headline and Apply enablement, per the defined predicate.
 
@@ -285,7 +294,8 @@ def _level_state(rep, manifest, models):
             status += " - {0} naming decision{1} below".format(
                 len(models), "" if len(models) == 1 else "s")
         return {"kind": "rows", "status": status,
-                "detail": "Nothing is written until you press Apply.",
+                "detail": "Nothing is written until you press {0}."
+                          .format(LEVEL_BUTTON),
                 "apply": True}
     if models:
         return {"kind": "naming",
@@ -294,7 +304,7 @@ def _level_state(rep, manifest, models):
                                   "" if len(models) == 1 else "s"),
                 "detail": ("Each ticked rename applies in every account "
                            "holding that conversation; nothing is written "
-                           "until you press Apply."),
+                           "until you press {0}.".format(LEVEL_BUTTON)),
                 "apply": tickable}
     if short_n:
         return {"kind": "short",
@@ -815,8 +825,8 @@ class SyncApp:
         # types five titles first and learns about RULING 4 second.
         self.level_notice = ttk.Label(
             lt, foreground="#a05000", wraplength=880, justify="left",
-            text="!! The Claude desktop app is running - Apply will refuse "
-                 "until it is closed.")
+            text="!! The Claude desktop app is running - {0} will refuse "
+                 "until it is closed.".format(LEVEL_BUTTON))
         body = ttk.Frame(lt)
         body.pack(fill="x", pady=(4, 4))
         self.level_body = body           # the notice packs before this
@@ -861,7 +871,9 @@ class SyncApp:
                                                      width=e.width))
         self.hold_canvas.pack(side="left", fill="both", expand=True)
         hsb.pack(side="right", fill="y")
-        self.level_apply_btn = ttk.Button(lbar, text="Apply",
+        # Its own label, not "Apply": the Copy & refresh tab's button is
+        # "Apply", and two tabs sharing one label read as one action.
+        self.level_apply_btn = ttk.Button(lbar, text=LEVEL_BUTTON,
                                           command=self.on_level_apply,
                                           state="disabled")
         self.level_apply_btn.pack(side="right")
@@ -2047,8 +2059,9 @@ class SyncApp:
             row.pack(fill="x", pady=(0, 4))
             ttk.Label(row, foreground="#a00000", wraplength=680,
                       justify="left",
-                      text="!! --live assertion in force for the next Apply "
-                           "- cleared when its sequence ends; never saved."
+                      text="!! --live assertion in force for the next press "
+                           "of {0} - cleared when its sequence ends; never "
+                           "saved.".format(LEVEL_BUTTON)
                       ).pack(side="left")
             b = ttk.Button(row, text="Change signed-in account",
                            command=self.forget_level_live)
@@ -2066,9 +2079,9 @@ class SyncApp:
                        "either record can be the stale one. The copy stage "
                        "will refuse (RULING 5) until you say which account "
                        "the DESKTOP APP is on right now - the answer covers "
-                       "one Apply and is never written to disk.".format(
-                           oauth[:8], config[:8])).pack(anchor="w",
-                                                        pady=(0, 2))
+                       "one press of {2} and is never written to disk."
+                       .format(oauth[:8], config[:8],
+                               LEVEL_BUTTON)).pack(anchor="w", pady=(0, 2))
         try:
             stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env)
                       if a in (oauth, config)]
@@ -2650,7 +2663,8 @@ def manage_shortcut(remove=False):
         print(line)
     if not remove and done:
         print('\nDouble-click "Claude sessions" to see how level the '
-              "sidebars are. Nothing is written until you press Apply.")
+              "sidebars are. Nothing is written until you press "
+              '"{0}".'.format(LEVEL_BUTTON))
     return 0
 
 

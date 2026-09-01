@@ -573,6 +573,17 @@ check("the hold row rendered as widgets",
       len(app.hold_models) == 1 and len(app._hold_widgets) == 2)
 check("Apply is enabled in the naming-only state",
       str(app.level_apply_btn.cget("state")) == "normal")
+# D (0.15.1): two tabs, two labels - Level's button is its spec's name for
+# the flow; the Copy & refresh tab keeps "Apply".
+check("the Level button is labeled 'Level the sidebars'",
+      app.level_apply_btn.cget("text") == "Level the sidebars",
+      app.level_apply_btn.cget("text"))
+check("  and the Copy & refresh tab's stays 'Apply'",
+      app.apply_btn.cget("text") == "Apply", app.apply_btn.cget("text"))
+check("  the detail line names the button, not 'Apply'",
+      "Level the sidebars" in app.level_detail.get()
+      and "press Apply" not in app.level_detail.get(),
+      app.level_detail.get())
 app.on_level_apply()
 settle()
 check("stage-1 dialog saw the steps", len(app._stage1_calls) == 1
