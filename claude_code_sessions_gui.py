@@ -112,12 +112,26 @@ def _hold_models(manifest):
     measure_suggested census treats the same (sid, title) repeating across a
     group's holds as one suggestion, not a collision.
 
-    `target_sid` is measured.superseded - THE ENGINE'S VERDICT, never
-    re-derived from the evidence text (the hold's own session id can be either
-    leg of the pair). `command_runnable` is deliberately not consulted: it
-    speaks about the rendered shell command only, and this window applies
-    titles through plan_retitle with no shell involved - a `$` in a title
-    degrades the pasteable command while remaining a valid title.
+    `target_sid` on a supersession is measured.superseded - THE ENGINE'S
+    VERDICT, never re-derived from the evidence text (the hold's own session
+    id can be either leg of the pair). `command_runnable` is deliberately not
+    consulted: it speaks about the rendered shell command only, and this
+    window applies titles through plan_retitle with no shell involved - a `$`
+    in a title degrades the pasteable command while remaining a valid title.
+
+    A DISTINCT or UNMEASURED hold is editable too - empty, unticked, the
+    degraded-supersession treatment - with the measurement's own line kept
+    above the entry as context (0.15.1, finding F). The 0.15.0 design
+    conflated "the measurement made no suggestion" with "this leg should not
+    be named"; a human always knows more than the measurement, which is the
+    whole reason the measurement is allowed to decline. Such a row renames
+    ITS OWN held conversation - the hold's session (measured.superseded is
+    null here, so that is also the key sid): a row is ABOUT conversation X,
+    a user typing a name expects to name X, and renaming either leg of a
+    collision clears it. (The CLI's remedy line targets the BLOCKING side
+    instead; that convention stays in the CLI.) The evidence therefore says
+    what the leg collides with - the other sid's prefix and the account(s) -
+    so the user knows they are naming one of two.
 
     Any hold reason this window does not recognise still gets a read-only row
     carrying the hold's own reason/detail verbatim: the pane must never count
@@ -128,10 +142,11 @@ def _hold_models(manifest):
         mm = h.get("measured")
         title = h.get("title") or ""
         tkey = ccs.title_key(title)
+        sess = h.get("session") or ""
         if h.get("reason") == "held_title_collision" and isinstance(mm, dict):
             cls = mm.get("classification") or "unmeasured"
             sup = mm.get("superseded")
-            key = (sup or h.get("session") or "", tkey)
+            key = (sup or sess, tkey)
             if cls == "supersession":
                 suggestion = mm.get("suggested_title") or ""
                 model = {"key": key, "title": title,
@@ -145,30 +160,55 @@ def _hold_models(manifest):
             else:
                 line = h.get("measured_line") or mm.get("reason") or ""
                 tag = "not measured: " if cls == "unmeasured" else "measured: "
+                # The other leg, from the measured object's own sids (§4:
+                # a/b are present once a pair exists) - never parsed out of
+                # the detail text.
+                others = [s for s in (mm.get("a"), mm.get("b"))
+                          if s and s != sess]
                 model = {"key": key, "title": title,
                          "evidence": tag + line,
-                         "target_sid": None, "prefill": "", "entry": "",
-                         "editable": False, "ticked": False,
+                         "target_sid": sess or None, "prefill": "",
+                         "entry": "", "editable": bool(sess),
+                         "ticked": False,
                          "degrade_reason": mm.get("degrade_reason") or "",
-                         "classification": cls}
+                         "classification": cls,
+                         "_others": others}
         else:
-            key = (h.get("session") or "", tkey)
+            key = (sess, tkey)
             model = {"key": key, "title": title,
                      "evidence": "{0} - {1}".format(h.get("reason") or "?",
                                                     h.get("detail") or ""),
                      "target_sid": None, "prefill": "", "entry": "",
                      "editable": False, "ticked": False, "degrade_reason": "",
                      "classification": h.get("reason") or "?"}
+        label = h.get("label") or (h.get("account") or "?")[:8]
         seen = by_key.get(model["key"])
         if seen is not None:
             seen["_held_count"] = seen.get("_held_count", 1) + 1
+            if label not in seen["_labels"]:
+                seen["_labels"].append(label)
+            for s in model.pop("_others", ()):
+                if s not in seen.get("_others", ()):
+                    seen.setdefault("_others", []).append(s)
             continue
         model["_held_count"] = 1
+        model["_labels"] = [label]
         by_key[model["key"]] = model
         models.append(model)
     for m in models:
         n = m.pop("_held_count", 1)
-        if n > 1:
+        labels = m.pop("_labels", [])
+        others = m.pop("_others", None)
+        if others is not None:
+            # A nameable-but-unsuggested row: say which leg it collides with
+            # and in whose sidebar, so "name this one" is an informed act.
+            m["evidence"] += " - collides with {0}{1}; naming either leg " \
+                             "clears it".format(
+                                 ", ".join(s[:8] for s in others) or "the "
+                                 "other leg",
+                                 " in " + " and ".join(labels) if labels
+                                 else "")
+        elif n > 1:
             m["evidence"] += " - held in {0} accounts".format(n)
     return models
 

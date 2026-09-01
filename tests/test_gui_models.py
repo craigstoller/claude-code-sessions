@@ -127,16 +127,23 @@ def test_hold_models_degraded_supersession_is_empty_editable():
 
 
 def test_hold_models_distinct_unmeasured_and_unknown_reasons():
+    """0.15.1 (finding F): a hold the measurement declined to name is still
+    a hold a HUMAN can name. Distinct and unmeasured rows are editable,
+    empty and unticked - the degraded-supersession treatment - and each
+    renames ITS OWN held conversation (the hold's session; measured.superseded
+    is null here). Only the unknown-reason fallback stays read-only."""
     distinct = hold(measured=measured(
         classification="distinct", superseded=None, current=None,
         suggested_title=None, command_runnable=False),
         measured_line="largely distinct conversations - they share 2 of 50 "
                       "and 2 of 61 prose turns; both need human names")
-    unmeasured = hold(session="eeee5555" + "0" * 24,
+    SID_E = "eeee5555" + "0" * 24
+    unmeasured = hold(session=SID_E,
                       title="Northwind backtest",
                       measured=measured(
                           classification="unmeasured", reason="no transcript",
                           superseded=None, current=None, shared=None,
+                          a=SID_E, b=SID_B,
                           a_total=None, b_total=None, suggested_title=None,
                           command_runnable=False),
                       measured_line="no transcript")
@@ -149,16 +156,79 @@ def test_hold_models_distinct_unmeasured_and_unknown_reasons():
     # The pane must never count holds it cannot show.
     assert len(models) == 3
     d, u, f = models
-    for m in (d, u, f):
-        assert m["editable"] is False
+    for m in (d, u):
+        assert m["editable"] is True
         assert m["ticked"] is False
-        assert m["target_sid"] is None
         assert m["prefill"] == ""
-    assert "largely distinct" in d["evidence"]
+        assert m["entry"] == ""
+    # The row is ABOUT its own conversation - typing a name names that one.
+    assert d["target_sid"] == SID_B
+    assert d["key"] == (SID_B, TITLE)
+    assert u["target_sid"] == SID_E
+    # The measurement's own line stays above the entry as context...
+    assert d["evidence"].startswith("measured: largely distinct")
     assert u["evidence"].startswith("not measured: no transcript")
-    # The fallback row carries the hold's own reason/detail verbatim.
+    # ...and says what the leg collides with - the other sid's prefix and
+    # the account - so the user knows they are naming one of two.
+    assert "aaaa1111" in d["evidence"]
+    assert "bbbb2222" in u["evidence"]
+    assert "alice@example.com" in d["evidence"]
+    assert "alice@example.com" in u["evidence"]
+    # The fallback row carries the hold's own reason/detail verbatim, and
+    # stays read-only: no measured object, no verdict, nothing to aim at.
+    assert f["editable"] is False
+    assert f["ticked"] is False
+    assert f["target_sid"] is None
+    assert f["prefill"] == ""
     assert f["classification"] == "held_future_reason"
     assert "the engine grew a hold this window predates" in f["evidence"]
+
+
+def test_hold_models_unmeasured_pair_is_two_rows_each_naming_its_own_leg():
+    """The two directions of an unmeasured collision do NOT share a key
+    (no superseded sid to merge on), so they render as two rows - one per
+    leg - and naming either one clears the pair. A supersession pair still
+    merges into one row keyed on the superseded leg."""
+    reason = "overlap and recency disagree"
+    a = hold(session=SID_A, label="bob@example.com",
+             measured=measured(classification="unmeasured", reason=reason,
+                               superseded=None, current=None,
+                               a=SID_A, b=SID_B, shared=48,
+                               suggested_title=None, command_runnable=False),
+             measured_line=reason)
+    b = hold(session=SID_B, label="alice@example.com",
+             measured=measured(classification="unmeasured", reason=reason,
+                               superseded=None, current=None,
+                               a=SID_B, b=SID_A, shared=48,
+                               suggested_title=None, command_runnable=False),
+             measured_line=reason)
+    models = gui._hold_models(manifest(holds=[a, b]))
+    assert [m["target_sid"] for m in models] == [SID_A, SID_B]
+    assert all(m["editable"] and not m["ticked"] for m in models)
+    assert "bbbb2222" in models[0]["evidence"]
+    assert "bob@example.com" in models[0]["evidence"]
+    assert "aaaa1111" in models[1]["evidence"]
+    assert "alice@example.com" in models[1]["evidence"]
+
+
+def test_hold_models_unmeasured_row_held_in_two_accounts_lists_both():
+    """The same conversation held under one title in two destination
+    sidebars is ONE decision (retitle's scope is every account), so the
+    rows merge by key - and the evidence names both accounts."""
+    reason = "no transcript"
+    one = hold(session=SID_B, label="alice@example.com",
+               measured=measured(classification="unmeasured", reason=reason,
+                                 superseded=None, current=None,
+                                 a=SID_B, b=SID_A, shared=None,
+                                 a_total=None, b_total=None,
+                                 suggested_title=None, command_runnable=False),
+               measured_line=reason)
+    two = dict(one, account="e" * 32, label="carol@example.com")
+    models = gui._hold_models(manifest(holds=[one, two]))
+    assert len(models) == 1
+    ev = models[0]["evidence"]
+    assert "alice@example.com" in ev and "carol@example.com" in ev
+    assert models[0]["target_sid"] == SID_B
 
 
 # --------------------------------------------------------------- scoreboard
@@ -198,11 +268,11 @@ def test_level_predicate_states():
                           models)
     assert st["status"] == "Nothing to copy - 1 naming decision below."
     assert st["apply"] is True
-
-    # Naming-only but every hold read-only: nothing ticked-able, Apply off.
-    ro = hold(measured=measured(classification="distinct", superseded=None,
-                                current=None, suggested_title=None,
-                                command_runnable=False))
+    # Naming-only but every hold read-only (an unknown-reason fallback):
+    # nothing ticked-able, Apply off, and the count says read-only.
+    ro = {"session": "ffff6666" + "0" * 24, "account": ACCT,
+          "label": "alice@example.com", "title": "",
+          "reason": "held_future_reason", "detail": "unknown", "retitle": ""}
     ro_models = gui._hold_models(manifest(holds=[ro]))
     st = gui._level_state(alignment(short=0), manifest(holds=[ro]), ro_models)
     assert st["apply"] is False
@@ -238,13 +308,20 @@ def test_level_steps_stage1():
                                     suggested_title="Northwind backtest - "
                                                     "earlier leg (Aug 27)"))
     b = gui._hold_models(manifest(holds=[b_hold]))[0]
-    ro = gui._hold_models(manifest(holds=[hold(
+    # A distinct row arrives editable but UNTICKED (0.15.1, F), so it
+    # contributes nothing until someone ticks it and types a name.
+    distinct = gui._hold_models(manifest(holds=[hold(
         measured=measured(classification="distinct", superseded=None,
                           current=None, suggested_title=None,
                           command_runnable=False))]))[0]
+    ro = gui._hold_models(manifest(holds=[{
+        "session": "ffff6666" + "0" * 24, "account": ACCT,
+        "label": "alice@example.com", "title": "",
+        "reason": "held_future_reason", "detail": "unknown", "retitle": ""}]
+    ))[0]
     unticked = dict(a, ticked=False)
 
-    steps, problems = gui._level_steps_stage1([a, b, ro])
+    steps, problems = gui._level_steps_stage1([a, b, distinct, ro])
     assert problems == []
     # Ticked renames in row order, aimed at measured.superseded.
     assert [s["target_sid"] for s in steps] == [SID_A, "eeee5555" + "0" * 24]
@@ -252,7 +329,7 @@ def test_level_steps_stage1():
     assert steps[0]["old_title"] == TITLE
 
     # Unticked and read-only rows contribute nothing.
-    steps, problems = gui._level_steps_stage1([unticked, ro])
+    steps, problems = gui._level_steps_stage1([unticked, distinct, ro])
     assert steps == [] and problems == []
 
     # A ticked row with an empty entry refuses locally - no steps at all.
@@ -266,6 +343,45 @@ def test_level_steps_stage1():
     steps, problems = gui._level_steps_stage1([a, twin])
     assert steps == []
     assert any("share a name" in p for p in problems)
+
+
+def test_level_steps_stage1_renames_a_ticked_unmeasured_row():
+    """0.15.1 (F): a ticked unmeasured row with a typed title becomes one
+    rename aimed at ITS OWN held conversation - the hold's session, which
+    the model carries as target_sid. The CLI's remedy line targets the
+    blocking side; that convention stays in the CLI."""
+    SID_E = "eeee5555" + "0" * 24
+    h = hold(session=SID_E, title="Northwind backtest",
+             measured=measured(classification="unmeasured",
+                               reason="overlap and recency disagree",
+                               superseded=None, current=None,
+                               a=SID_E, b=SID_B, suggested_title=None,
+                               command_runnable=False),
+             measured_line="overlap and recency disagree")
+    m = gui._hold_models(manifest(holds=[h]))[0]
+    typed = dict(m, ticked=True, entry="Northwind backtest - the Aug 27 leg ")
+    steps, problems = gui._level_steps_stage1([typed])
+    assert problems == []
+    assert steps == [{"key": (SID_E, "Northwind backtest"),
+                      "target_sid": SID_E,
+                      "old_title": "Northwind backtest",
+                      "new_title": "Northwind backtest - the Aug 27 leg"}]
+    # Both legs of an unmeasured pair named at once: two renames, and the
+    # local duplicate-title check still stands between them.
+    other = hold(session=SID_B, title="Northwind backtest",
+                 measured=measured(classification="unmeasured",
+                                   reason="overlap and recency disagree",
+                                   superseded=None, current=None,
+                                   a=SID_B, b=SID_E, suggested_title=None,
+                                   command_runnable=False),
+                 measured_line="overlap and recency disagree")
+    m2 = gui._hold_models(manifest(holds=[other]))[0]
+    both = [typed, dict(m2, ticked=True, entry="Northwind backtest - Aug 30")]
+    steps, problems = gui._level_steps_stage1(both)
+    assert [s["target_sid"] for s in steps] == [SID_E, SID_B]
+    clash = [typed, dict(m2, ticked=True, entry=typed["entry"].strip())]
+    steps, problems = gui._level_steps_stage1(clash)
+    assert steps == [] and any("share a name" in p for p in problems)
 
 
 # ------------------------------------------------------------------- merges

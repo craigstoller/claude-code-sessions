@@ -83,12 +83,16 @@ def write_transcript(env, sid, labels):
             fh.write(json.dumps(e) + "\n")
 
 
-def build_env(collide=True, disagree=False):
+def build_env(collide=True, disagree=False, recency_disagree=False):
     """A two-account store. COLLIDE builds the measured-supersession shape:
     S1 (A1 only) and S2 (A2 only) under one title, 48 shared prose turns, so
     each is held in the other sidebar and measured.superseded == S1 with the
     suggested title prefillable. collide=False leaves both conversations
-    everywhere - a level store."""
+    everywhere - a level store. RECENCY_DISAGREE gives the smaller leg (S1)
+    the NEWER lastActivityAt, so overlap says S1 is contained in S2 while
+    recency says S1 is the live one: the pair measures as unmeasured,
+    'overlap and recency disagree' - a hold with no suggestion, which the
+    window must still let a human name (0.15.1, F)."""
     root = tempfile.mkdtemp(prefix="leveltest-")
     home = os.path.join(root, "home")
     store = os.path.join(root, "Claude", "claude-code-sessions")
@@ -106,7 +110,8 @@ def build_env(collide=True, disagree=False):
     write_json(os.path.join(store, A1, O1, "local_s1.json"),
                {"sessionId": "local-1", "cliSessionId": S1, "title": T_COLL,
                 "createdAt": ms_local(2026, 8, 24),
-                "lastActivityAt": ms_local(2026, 8, 28)})
+                "lastActivityAt": ms_local(2026, 8, 30 if recency_disagree
+                                           else 28)})
     write_json(os.path.join(store, A2, O2, "local_s2.json"),
                {"sessionId": "local-2", "cliSessionId": S2, "title": T_COLL,
                 "createdAt": ms_local(2026, 8, 24),
@@ -242,6 +247,53 @@ check("completion status carries both halves",
 post_models = gp._merge_hold_models(gp._hold_models(refresh[2]), models)
 check("the post-apply rows come from the third, post-write plan",
       post_models == [], str(post_models))
+
+# ----------------- F (0.15.1). an unmeasured pair is nameable from the window
+env, root = build_env(recency_disagree=True)
+roots.append(root)
+preview = ccs.plan_converge(env, ccs.ConvergeFlags())
+verdicts = [h.get("measured") or {} for h in preview["holds"]]
+check("the fixture measures as 'overlap and recency disagree'",
+      len(verdicts) == 2 and all(
+          v.get("classification") == "unmeasured"
+          and v.get("reason") == "overlap and recency disagree"
+          for v in verdicts),
+      "; ".join("%s/%s" % (v.get("classification"), v.get("reason"))
+                for v in verdicts))
+models = gp._hold_models(preview)
+check("both legs render as rows - editable, empty, unticked",
+      len(models) == 2 and all(m["editable"] and not m["ticked"]
+                               and m["entry"] == "" and m["prefill"] == ""
+                               for m in models),
+      str([(m["editable"], m["ticked"], m["entry"]) for m in models]))
+check("  each aimed at its OWN held conversation",
+      sorted(m["target_sid"] for m in models) == sorted([S1, S2]),
+      str([m["target_sid"] for m in models]))
+by_target = {m["target_sid"]: m for m in models}
+check("  the evidence names the other leg and the account it collides in",
+      S2[:8] in by_target.get(S1, {}).get("evidence", "")
+      and S1[:8] in by_target.get(S2, {}).get("evidence", "")
+      and "alice@example.com" in by_target.get(S2, {}).get("evidence", ""),
+      by_target.get(S1, {}).get("evidence", "-"))
+named = [dict(m) for m in models]
+named[0]["ticked"] = True
+named[0]["entry"] = "ACME-REVIEW session - the other leg"
+steps, problems = gp._level_steps_stage1(named)
+check("one ticked unmeasured row is one rename, aimed at that row's leg",
+      problems == [] and len(steps) == 1
+      and steps[0]["target_sid"] == models[0]["target_sid"],
+      str(problems or steps))
+with PlanSpy() as spy:
+    seq, refresh = gp._run_level_apply(env, steps, "", FakeUI(confirm=True))
+check("the rename landed and the copy completed",
+      seq["landed"] == 1 and seq["stage2"] == "completed",
+      "landed=%s stage2=%s" % (seq["landed"], seq["stage2"]))
+check("  naming ONE leg cleared the collision - the fresh plan holds nothing",
+      refresh is not None and refresh[0] == "ok"
+      and not refresh[2]["holds"] and not refresh[2]["rows"])
+check("  and the sidebars are level",
+      refresh[1]["complete"]["short"] == 0
+      and gp._scoreboard_half(refresh[1]) == "Level: 2 / 2 - 0 short.")
 
 # ------------------------------- 11. retitle refusal stops the sequence
 env, root = build_env()
@@ -617,6 +669,42 @@ app.busy(True)
 app._level_plan_done(-1, None, None, [], [], ("refusal", "stale"))
 check("a superseded worker callback still releases the busy counter",
       str(app.level_refresh_btn.cget("state")) == "normal")
+tkroot.destroy()
+
+# ------------ F (0.15.1). the window names an unmeasured leg end to end
+env, root = build_env(recency_disagree=True)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+check("two unmeasured legs render as two editable rows",
+      len(app.hold_models) == 2 and len(app._hold_widgets) == 4
+      and all(m["editable"] and not m["_tick_var"].get()
+              for m in app.hold_models),
+      "%d models, %d widgets" % (len(app.hold_models),
+                                 len(app._hold_widgets)))
+check("  the button is enabled - there are rows a human can tick",
+      str(app.level_apply_btn.cget("state")) == "normal")
+app.on_level_apply()
+settle()
+check("pressing it with nothing ticked runs nothing and says so",
+      len(app._stage1_calls) == 0
+      and app.level_status.get().startswith("Nothing is ticked"),
+      app.level_status.get())
+leg = app.hold_models[0]
+leg["_tick_var"].set(True)
+leg["_entry_var"].set("ACME-REVIEW session - the other leg")
+settle()
+app.on_level_apply()
+settle()
+check("the stage-1 dialog saw one rename aimed at that row's own leg",
+      len(app._stage1_calls) == 1 and len(app._stage1_calls[0]) == 1
+      and app._stage1_calls[0][0]["target_sid"] == leg["target_sid"],
+      str(app._stage1_calls))
+check("  the copy ran and the sidebars are level",
+      app.level_status.get()
+      == "Applied (1 rename + 1 converge) - Level: 2 / 2 - 0 short.",
+      app.level_status.get())
+check("  the post-apply pane shows no holds", app.hold_models == [])
 tkroot.destroy()
 
 # ------------------- 14. banner buttons; typed text survives the replan
