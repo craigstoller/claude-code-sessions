@@ -2898,6 +2898,7 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "dest_path", "dest_reset", "destinations", "detail",
     "disagreeing_rows", "displaced_orphan", "displaced_overlap",
     "displaced_session", "displaced_turns", "distinguishable",
+    "dup_conversation", "dup_title",
     "duplicate_titles", "encoding", "encoding_recent", "exit_code",
     "filtered", "from_session", "held", "held_older", "held_orphan",
     "held_orphan_detail", "held_same", "held_unknown", "holder_titles",
@@ -5723,7 +5724,13 @@ def select_sync_rows(env, source, dest, flags):
              # refreshes that change WHICH conversation the row opens, and the
              # subset of those held back because the displaced conversation
              # would be left unreachable from every account
-             "swapping": [], "held_orphan": [], "held_orphan_detail": []}
+             "swapping": [], "held_orphan": [], "held_orphan_detail": [],
+             # adds the destination can already OPEN under another row file,
+             # and adds whose title already names a row there - filled in by
+             # plan_sync (0.15.1). Reporting only: sync counts row files the
+             # destination lacks, converge counts conversations it cannot
+             # open, and the difference is exactly these rows.
+             "dup_conversation": [], "dup_title": []}
     have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
@@ -5960,6 +5967,38 @@ def _other_pointers(env, dest_path, doomed_rows=()):
                 if isinstance(sid, str) and sid:
                     out.setdefault(sid, []).append(label)
     return out
+
+
+def _destination_census(dest_path):
+    """({cliSessionId}, {title_key}) over the destination's readable rows -
+    what that sidebar can already open, and what it already calls things.
+
+    Advisory by construction (it only ever annotates a plan), so an
+    unreadable row is simply not in the census rather than a refusal: the
+    decisions that must fail closed - presence, tombstones, orphaning - are
+    made elsewhere, and this read exists to warn about duplicates, not to
+    permit or forbid anything."""
+    sids, keys = set(), set()
+    try:
+        names = _listdir_retrying(dest_path)
+    except OSError:
+        return sids, keys
+    for name in names:
+        if not (name.startswith("local_") and name.endswith(".json")):
+            continue
+        try:
+            d = read_json(os.path.join(dest_path, name))
+        except (LayoutError, OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        sid = d.get("cliSessionId")
+        if isinstance(sid, str) and sid:
+            sids.add(sid)
+        k = title_key(d.get("title"))
+        if k:
+            keys.add(k)
+    return sids, keys
 
 
 # Bounds on the transcript comparison below. Transcripts reach tens of MB, so
@@ -7510,6 +7549,30 @@ def plan_sync(env, flags):
                 continue
             kept.append(r)
         rows = kept
+    # What the destination already holds, against every ADD (0.15.1, E).
+    # Presence above is keyed on FILENAME, so a row for a conversation the
+    # destination opens under a different local id is "absent" and copied -
+    # and a multi-account store accumulates exactly such rows, because each
+    # account mints its own row file for the same transcript. Measured on a
+    # freshly levelled store: 78 rows offered, 77 opening conversations the
+    # sidebar already opened, 78 under titles already naming a row there;
+    # applying would have driven alignment's `distinguishable` from 0 to
+    # ~78. This annotates, and the tally counts; nothing about what is
+    # written or refused changes. Refresh rows are not assessed - a refresh
+    # duplicates its own conversation by definition. One read of the
+    # destination, and only when there is an add to assess.
+    adds = [r for r in rows if not r.get("is_update")]
+    if adds:
+        dest_sids, dest_keys = _destination_census(dest.path)
+        for r in adds:
+            sid = r.get("session_id") or ""
+            k = title_key(r.get("title"))
+            r["dup_conversation"] = bool(sid) and sid in dest_sids
+            r["dup_title"] = bool(k) and k in dest_keys
+            if r["dup_conversation"]:
+                tally["dup_conversation"].append(r["title"])
+            if r["dup_title"]:
+                tally["dup_title"].append(r["title"])
     out = {"op_type": "sync",
            "source_account": source.account_uuid, "source_org": source.org_uuid,
            "source_email": source.email, "source_path": source.path,
@@ -10257,7 +10320,12 @@ def _print_sync_report(say, manifest):
               ("held_same", "held back, same age - nothing newer to send"),
               ("held_orphan", "held back, would HIDE a conversation"),
               ("swapping", "refreshes that change WHICH conversation opens"),
-              ("held_unknown", "held back, could not tell which is newer")]
+              ("held_unknown", "held back, could not tell which is newer"),
+              # 0.15.1: adds the destination can already open under another
+              # row file, and adds that would duplicate a title there -
+              # reported, never held; `converge` is the routine for levelling
+              ("dup_conversation", "already open there under another row file"),
+              ("dup_title", "would DUPLICATE a title already there")]
     for key, label in LABELS:
         items = tally.get(key) or []
         if items:

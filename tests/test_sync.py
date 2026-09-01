@@ -3194,3 +3194,80 @@ class TestLiveOverride:
             with pytest.raises(SystemExit):
                 p.parse_args(argv)
         capsys.readouterr()          # swallow argparse usage noise
+
+
+# ------------------------------------------------ 0.15.1 (E, part 2): dup reporting
+
+def test_plan_sync_annotates_rows_the_destination_already_opens_or_names(
+        two_account_env, tmp_path):
+    """Sync counts ROW FILES the destination lacks; converge counts
+    CONVERSATIONS it cannot open. A multi-account store accumulates different
+    row filenames for the same conversation, so a "to copy" row can add a
+    second row for a conversation that sidebar already opens - and a second
+    row under a title already naming one there. Additive reporting only:
+    each add carries `dup_conversation` (the destination has a row opening
+    the same cliSessionId) and `dup_title` (a destination row's title_key
+    matches), and the tally lists both, so the window can warn before the
+    bulk apply that drove `distinguishable` from 0 to ~78 on a real store.
+    Nothing about what sync writes or refuses changes."""
+    env, src, dst = two_account_env(tmp_path)
+    # Alpha: the destination opens the SAME conversation under another
+    # row file (a different local id) - and under a different title.
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(dst, "local_a2.json", "sid-a", "Alpha (their name for it)")
+    # Bravo: the destination already has a row NAMED Bravo - trimmed exact,
+    # title_key's comparator - for a different conversation.
+    _row(src, "local_b.json", "sid-b", "Bravo"); _transcript(env, "sid-b")
+    _row(dst, "local_other.json", "sid-z", "  Bravo ")
+    # Charlie: genuinely new to that sidebar.
+    _row(src, "local_c.json", "sid-c", "Charlie"); _transcript(env, "sid-c")
+    # A case-different title is NOT a duplicate by title_key.
+    _row(src, "local_d.json", "sid-d", "Delta"); _transcript(env, "sid-d")
+    _row(dst, "local_dd.json", "sid-y", "delta")
+
+    m = ct.plan_sync(env, ct.SyncFlags())
+    by = {r["title"]: r for r in m["rows"]}
+    assert set(by) == {"Alpha", "Bravo", "Charlie", "Delta"}
+    assert by["Alpha"]["dup_conversation"] is True
+    assert by["Alpha"]["dup_title"] is False
+    assert by["Bravo"]["dup_conversation"] is False
+    assert by["Bravo"]["dup_title"] is True
+    assert by["Charlie"]["dup_conversation"] is False
+    assert by["Charlie"]["dup_title"] is False
+    assert by["Delta"]["dup_conversation"] is False
+    assert by["Delta"]["dup_title"] is False
+    assert m["tally"]["dup_conversation"] == ["Alpha"]
+    assert m["tally"]["dup_title"] == ["Bravo"]
+    # The plan still copies every one of them - reporting, not refusal.
+    assert all(not r["is_update"] for r in m["rows"])
+
+
+def test_plan_sync_dup_flags_are_reporting_only(two_account_env, tmp_path):
+    """The flags change nothing about what sync writes: the same rows land,
+    with the same bytes, and an unreadable destination row is skipped by
+    the census rather than failing the plan. Refresh rows (--update) are
+    not assessed - a refresh duplicates its own conversation by definition
+    - so they carry neither key."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(dst, "local_a2.json", "sid-a", "Alpha")          # both flags
+    _row(src, "local_b.json", "sid-b", "Bravo"); _transcript(env, "sid-b")
+    _row(dst, "local_b.json", "sid-b", "Bravo", {"lastActivityAt": 0})
+    with open(os.path.join(dst, "local_junk.json"), "w") as fh:
+        fh.write("{not json")
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    by = {r["title"]: r for r in m["rows"]}
+    assert by["Alpha"]["dup_conversation"] is True
+    assert by["Alpha"]["dup_title"] is True
+    assert by["Bravo"]["is_update"] is True
+    assert "dup_conversation" not in by["Bravo"]
+    assert "dup_title" not in by["Bravo"]
+    assert m["tally"]["dup_conversation"] == ["Alpha"]
+    assert m["tally"]["dup_title"] == ["Alpha"]
+    assert ct.run_sync(env, m) == "completed"
+    assert sorted(f for f in os.listdir(dst) if f.startswith("local_")) == [
+        "local_a.json", "local_a2.json", "local_b.json", "local_junk.json"]
+    # The two flags are schema, never data, for the anonymizer - a title
+    # equal to one must not rename the key.
+    assert "dup_conversation" in ct._ANON_STRUCTURAL_KEYS
+    assert "dup_title" in ct._ANON_STRUCTURAL_KEYS
