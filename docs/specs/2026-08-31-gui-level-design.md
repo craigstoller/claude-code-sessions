@@ -99,6 +99,20 @@ evidence text**), `prefill` (`measured.suggested_title` or empty), `editable` (b
   locally ("a rename needs a name"); two ticked rows with the same trimmed title refuse
   locally too ("two renames share a name") — the cheap set-check before any engine call.
 - **Distinct / unmeasured**: the measured or `not measured: <reason>` line, read-only.
+  **Revised in 0.15.1 (2026-09-01, finding F of the first real use):** these rows are
+  *editable, empty, unticked* - the degraded-supersession treatment - with the measured
+  line kept above the entry as context. The 0.15.0 text conflated "the measurement made
+  no suggestion" with "this leg should not be named"; a human always knows more than the
+  measurement, which is the whole reason the measurement is allowed to decline, and the
+  tab was showing holds it offered no way to clear. Such a row renames **its own held
+  conversation** - the hold's `session`, which is also the key sid since
+  `measured.superseded` is null - because a row is *about* conversation X, a user typing
+  a name expects to name X, and renaming either leg of a collision clears it. (The CLI's
+  remedy line targets the *blocking* side; that convention stays in the CLI.) The
+  evidence line therefore names what the leg collides with - the other sid's prefix, from
+  `measured.a`/`b`, and the account(s) - so the user knows they are naming one of two.
+  The `target_sid` contract above reads: `measured.superseded` on a supersession, the
+  hold's `session` otherwise. The unknown-reason fallback row below stays read-only.
 - **Any other hold reason** (future engine versions): a read-only fallback row carrying
   the hold's own `reason`/`detail` verbatim — the pane must never count holds it cannot
   show.
