@@ -136,15 +136,24 @@ account's list under a name it has outgrown.
 ## The fork mechanic — resumes and the rewind button (measured 2026-08-29, app 1.40609.0.0)
 
 The section above says a row "accumulates several transcripts over time" without saying what
-produces them. Two ordinary gestures do, and they are the same mechanism wearing two buttons:
+produces them. Three ordinary gestures do, and they share one mechanism — a new
+`cliSessionId`, and the live account's row repointed at it. **They differ in how much of the
+old conversation the new transcript actually contains, and that difference matters to every
+tool that compares the two:**
 
-- **Resuming** a session starts a new CLI run — a new `cliSessionId`, a new transcript
-  carrying the displayed history forward (the same fact stated above as "`cliSessionId`
-  changes when a session is resumed as a new CLI run"; this section is about what that does
-  to the rows).
-- **The rewind button** ("rewind to here", used to edit an earlier prompt and resend) does
-  the same thing. It is not an in-place edit: it creates a new conversation holding the
-  history up to the rewind point plus the edited prompt.
+- **Resuming** a session starts a new CLI run whose transcript carries the displayed history
+  forward (the same fact stated above as "`cliSessionId` changes when a session is resumed
+  as a new CLI run"; this section is about what that does to the rows).
+- **The rewind button** ("rewind to here", used to edit an earlier prompt and resend) is not
+  an in-place edit: it creates a new conversation holding the history up to the rewind point
+  plus the edited prompt.
+- **Compaction** — a long session running out of context — also forks, but the new leg
+  begins with a *summary* of what came before rather than the turns themselves. **So the
+  continuation can be far smaller than its parent**, which is the opposite of the other two
+  gestures and is the case that breaks naive "which leg is superseded" reasoning. Measured
+  2026-09-01 on a compaction pair: parent 429 prose turns / 8.8 MB, continuation 128 turns /
+  4.8 MB, 84 shared — the *continuation* was 0.66 contained in the parent while the parent
+  was only 0.20 contained in it. Read carelessly, the live leg looks like the redundant one.
 
 In both cases the app then **repoints the live account's existing row** at the fork. Not a
 new row — the same `local_*.json`, keeping its `createdAt` to the millisecond, its title, and
@@ -162,10 +171,21 @@ nineteen seconds after the first send, the fork's copy lands thirty seconds late
 carry marks the abandoned leg; whether some other mechanism marks it elsewhere was not
 probed — what the census below observed in practice is these legs sitting unreferenced with
 nothing `doctor` recognizes as a marker. The three fork pairs measured **0.98, 0.98 and
-0.80** prose overlap between superseded leg and continuation — high because the fork carries
-the displayed history forward, so near-total overlap is how this gesture *presents*; it is
-the calibration behind the measured hold remedies' supersession band
+0.80** prose overlap between superseded leg and continuation — high because a *rewind*
+carries the prefix forward, so near-total overlap is how that gesture presents; those three
+are the calibration behind the measured hold remedies' supersession band
 (`docs/specs/2026-08-30-hold-remedies-design.md`).
+
+**That calibration does not generalise to compaction forks, and 2026-09-01 proved it.** An
+earlier version of this section said the fork "shares its entire prefix by construction",
+citing the rewind pairs as though they characterised forking in general. A compaction pair
+measured the same week landed at 0.66 / 0.20 — inside the band's inconclusive zone, with the
+higher containment on the *live* leg. The band's design is what saved the outcome: overlap
+nominated the live session as superseded, recency contradicted it, and the two-signal
+agreement rule refused rather than renaming the conversation the operator was typing in
+(reason `overlap and recency disagree`). **The lesson for anyone extending this: overlap
+alone cannot order two legs, because which leg is larger depends on which gesture forked
+them.** Recency is the corroborating signal precisely because it is independent of that.
 
 The consequences key on **how many rows still point at the old leg** — rows, not accounts,
 are the unit (the 0.9.13 lesson elsewhere in this file), though in practice the common cases
