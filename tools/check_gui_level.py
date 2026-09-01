@@ -275,6 +275,10 @@ check("  the evidence names the other leg and the account it collides in",
       and S1[:8] in by_target.get(S2, {}).get("evidence", "")
       and "alice@example.com" in by_target.get(S2, {}).get("evidence", ""),
       by_target.get(S1, {}).get("evidence", "-"))
+check("  the header counts them as needing a name",
+      gp._level_state(ccs.gather_alignment(env), preview, models)["status"]
+      == "Nothing to copy - 2 held: 2 need a name.",
+      gp._level_state(ccs.gather_alignment(env), preview, models)["status"])
 named = [dict(m) for m in models]
 named[0]["ticked"] = True
 named[0]["entry"] = "ACME-REVIEW session - the other leg"
@@ -636,6 +640,21 @@ check("  the detail line names the button, not 'Apply'",
       "Level the sidebars" in app.level_detail.get()
       and "press Apply" not in app.level_detail.get(),
       app.level_detail.get())
+# B (0.15.1): the section label counts what is ticked NOW, from the models.
+check("the section label says 1 of 1 ticked over a prefilled row",
+      app.holds_heading.get().startswith("Naming decisions - 1 of 1 ticked"),
+      app.holds_heading.get())
+app.hold_models[0]["_tick_var"].set(False)
+settle()
+check("  and follows the tick live - none ticked, no 'each ticked row'",
+      app.holds_heading.get().startswith("Naming decisions - none ticked")
+      and "each ticked row" not in app.holds_heading.get(),
+      app.holds_heading.get())
+app.hold_models[0]["_tick_var"].set(True)
+settle()
+check("the header names the hold as suggested",
+      app.level_status.get() == "Nothing to copy - 1 held: 1 suggested.",
+      app.level_status.get())
 app.on_level_apply()
 settle()
 check("stage-1 dialog saw the steps", len(app._stage1_calls) == 1
@@ -682,6 +701,12 @@ check("two unmeasured legs render as two editable rows",
               for m in app.hold_models),
       "%d models, %d widgets" % (len(app.hold_models),
                                  len(app._hold_widgets)))
+check("  the header counts them as needing a name",
+      app.level_status.get() == "Nothing to copy - 2 held: 2 need a name.",
+      app.level_status.get())
+check("  the section label claims nothing ticked",
+      app.holds_heading.get().startswith("Naming decisions - none ticked"),
+      app.holds_heading.get())
 check("  the button is enabled - there are rows a human can tick",
       str(app.level_apply_btn.cget("state")) == "normal")
 app.on_level_apply()
@@ -694,6 +719,9 @@ leg = app.hold_models[0]
 leg["_tick_var"].set(True)
 leg["_entry_var"].set("ACME-REVIEW session - the other leg")
 settle()
+check("  ticking one updates the label live",
+      app.holds_heading.get().startswith("Naming decisions - 1 of 2 ticked"),
+      app.holds_heading.get())
 app.on_level_apply()
 settle()
 check("the stage-1 dialog saw one rename aimed at that row's own leg",

@@ -310,6 +310,43 @@ def _scoreboard_half(rep):
 # label read as one action (0.15.1, finding D).
 LEVEL_BUTTON = "Level the sidebars"
 
+def _holds_clause(models):
+    """'2 held: 1 suggested, 1 needs a name' - the honest count (0.15.1, B).
+
+    A hold with a suggestion is a decision already drafted; a hold needing a
+    name is one the human must draft; a read-only row is one this window can
+    only show. Every number comes from the models, never from the manifest's
+    hold count, so the header can never promise a decision the rows do not
+    offer."""
+    suggested = sum(1 for m in models if m.get("editable") and m.get("prefill"))
+    unnamed = sum(1 for m in models
+                  if m.get("editable") and not m.get("prefill"))
+    ro = sum(1 for m in models if not m.get("editable"))
+    parts = []
+    if suggested:
+        parts.append("{0} suggested".format(suggested))
+    if unnamed:
+        parts.append("{0} need{1} a name".format(unnamed,
+                                                 "s" if unnamed == 1 else ""))
+    if ro:
+        parts.append("{0} read-only".format(ro))
+    return "{0} held: {1}".format(len(models), ", ".join(parts))
+
+
+def _holds_heading(models):
+    """The section label above the rows, counting what is ticked NOW - it
+    must never say 'each ticked row becomes one rename' over a list where
+    nothing is ticked (0.15.1, B)."""
+    ticked = sum(1 for m in models if m.get("editable") and m.get("ticked"))
+    if ticked:
+        return ("Naming decisions - {0} of {1} ticked; each ticked row "
+                "becomes one rename when you press {2}:".format(
+                    ticked, len(models), LEVEL_BUTTON))
+    return ("Naming decisions - none ticked; tick a row and give it a name "
+            "to rename that conversation when you press {0}:"
+            .format(LEVEL_BUTTON))
+
+
 def _level_state(rep, manifest, models):
     """The pane's headline and Apply enablement, per the defined predicate.
 
@@ -331,17 +368,15 @@ def _level_state(rep, manifest, models):
             len(rows), "" if len(rows) == 1 else "s",
             n_acct, "" if n_acct == 1 else "s")
         if models:
-            status += " - {0} naming decision{1} below".format(
-                len(models), "" if len(models) == 1 else "s")
+            status += " - " + _holds_clause(models)
         return {"kind": "rows", "status": status,
                 "detail": "Nothing is written until you press {0}."
                           .format(LEVEL_BUTTON),
                 "apply": True}
     if models:
         return {"kind": "naming",
-                "status": "Nothing to copy - {0} naming decision{1} below."
-                          .format(len(models),
-                                  "" if len(models) == 1 else "s"),
+                "status": "Nothing to copy - {0}.".format(
+                    _holds_clause(models)),
                 "detail": ("Each ticked rename applies in every account "
                            "holding that conversation; nothing is written "
                            "until you press {0}.".format(LEVEL_BUTTON)),
@@ -899,6 +934,7 @@ class SyncApp:
                             command=self.hold_canvas.yview)
         self.hold_canvas.configure(yscrollcommand=hsb.set)
         self.hold_frame = ttk.Frame(self.hold_canvas)
+        self.holds_heading = tk.StringVar(value="")
         self._hold_window = self.hold_canvas.create_window(
             (0, 0), window=self.hold_frame, anchor="nw")
         self.hold_frame.bind(
@@ -2152,11 +2188,15 @@ class SyncApp:
         for w in self.hold_frame.winfo_children():
             w.destroy()
         self._hold_widgets = []
+        self.holds_heading.set("")
         if not self.hold_models:
             return
-        ttk.Label(self.hold_frame,
-                  text="Naming decisions - each ticked row becomes one "
-                       "rename on Apply:",
+        # The label counts what is ticked NOW and follows every tick: it
+        # must never promise "each ticked row becomes one rename" over a
+        # list where nothing is ticked (0.15.1, B).
+        self.holds_heading.set(_holds_heading(self.hold_models))
+        ttk.Label(self.hold_frame, textvariable=self.holds_heading,
+                  wraplength=860, justify="left",
                   font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(2, 4))
         for m in self.hold_models:
             row = ttk.Frame(self.hold_frame)
@@ -2164,6 +2204,8 @@ class SyncApp:
             if m["editable"]:
                 m["_tick_var"] = tk.BooleanVar(value=bool(m["ticked"]))
                 m["_entry_var"] = tk.StringVar(value=m["entry"])
+                m["_tick_var"].trace_add(
+                    "write", lambda *_a: self._update_holds_heading())
                 chk = ttk.Checkbutton(row, text="Rename",
                                       variable=m["_tick_var"])
                 chk.grid(row=0, column=0, sticky="nw", padx=(0, 6))
@@ -2193,6 +2235,12 @@ class SyncApp:
                           font=("Segoe UI", 9, "bold")).pack(anchor="w")
                 ttk.Label(row, text=m["evidence"], foreground="#555",
                           wraplength=820, justify="left").pack(anchor="w")
+
+    def _update_holds_heading(self):
+        try:
+            self.holds_heading.set(_holds_heading(self._current_models()))
+        except tk.TclError:
+            pass                         # a row mid-destruction: next render
 
     def _current_models(self):
         """The hold models with the widgets' CURRENT text and ticks read

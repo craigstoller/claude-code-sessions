@@ -260,14 +260,40 @@ def test_level_predicate_states():
     assert st["apply"] is False
 
     # Naming-only: rows 0, holds N - Apply stays enabled (renames to run).
+    # The header counts honestly (0.15.1, B): holds WITH a suggestion apart
+    # from holds needing a human name, numbers from the models.
     models = gui._hold_models(manifest(holds=[hold()]))
     st = gui._level_state(alignment(short=0),
                           manifest(holds=[hold()],
                                    complete={"now": 2, "of": 3, "after": 2,
                                              "held": 1, "scoped": False}),
                           models)
-    assert st["status"] == "Nothing to copy - 1 naming decision below."
+    assert st["status"] == "Nothing to copy - 1 held: 1 suggested."
     assert st["apply"] is True
+    assert "Level the sidebars" in st["detail"]
+
+    # A suggested supersession beside an unmeasured leg: "2 held - 1
+    # suggested, 1 needs a name", and Apply is live (one rename is ticked).
+    unm = hold(session="eeee5555" + "0" * 24, title="Northwind backtest",
+               measured=measured(classification="unmeasured",
+                                 reason="no transcript", superseded=None,
+                                 current=None, a="eeee5555" + "0" * 24,
+                                 b=SID_B, suggested_title=None,
+                                 command_runnable=False),
+               measured_line="no transcript")
+    mixed = gui._hold_models(manifest(holds=[hold(), unm]))
+    st = gui._level_state(alignment(short=0), manifest(holds=[hold(), unm]),
+                          mixed)
+    assert st["status"] == ("Nothing to copy - 2 held: 1 suggested, "
+                            "1 needs a name.")
+    assert st["apply"] is True
+    # Two unmeasured legs: plural.
+    unm2 = dict(unm, session=SID_B, measured=dict(unm["measured"],
+                                                   a=SID_B, b="e" * 32))
+    st = gui._level_state(alignment(short=0), manifest(holds=[unm, unm2]),
+                          gui._hold_models(manifest(holds=[unm, unm2])))
+    assert st["status"] == "Nothing to copy - 2 held: 2 need a name."
+
     # Naming-only but every hold read-only (an unknown-reason fallback):
     # nothing ticked-able, Apply off, and the count says read-only.
     ro = {"session": "ffff6666" + "0" * 24, "account": ACCT,
@@ -276,6 +302,7 @@ def test_level_predicate_states():
     ro_models = gui._hold_models(manifest(holds=[ro]))
     st = gui._level_state(alignment(short=0), manifest(holds=[ro]), ro_models)
     assert st["apply"] is False
+    assert st["status"] == "Nothing to copy - 1 held: 1 read-only."
 
     # Short-but-empty-plan: alignment says short, the plan has nothing - the
     # tab has nothing it can do about that state, so Apply is disabled and
@@ -294,6 +321,36 @@ def test_level_predicate_states():
     st = gui._level_state(alignment(short=1), manifest(rows=[row]), [])
     assert st["apply"] is True
     assert "1 row" in st["status"]
+    assert "held" not in st["status"]
+    # Rows AND holds: the same honest clause after the row count.
+    st = gui._level_state(alignment(short=1), manifest(rows=[row]), mixed)
+    assert st["status"] == ("1 row to create across 1 account - 2 held: "
+                            "1 suggested, 1 needs a name")
+    assert "Level the sidebars" in st["detail"]
+
+
+def test_holds_heading_never_claims_ticked_rows_that_are_not():
+    """0.15.1 (B): the section label above the rows counts what is ticked
+    NOW, from the models - it must not promise 'each ticked row becomes one
+    rename' over a list where nothing is ticked."""
+    unm = hold(session="eeee5555" + "0" * 24, title="Northwind backtest",
+               measured=measured(classification="unmeasured",
+                                 reason="no transcript", superseded=None,
+                                 current=None, a="eeee5555" + "0" * 24,
+                                 b=SID_B, suggested_title=None,
+                                 command_runnable=False),
+               measured_line="no transcript")
+    models = gui._hold_models(manifest(holds=[hold(), unm]))
+    assert gui._holds_heading(models).startswith(
+        "Naming decisions - 1 of 2 ticked")
+    assert "Level the sidebars" in gui._holds_heading(models)
+    none = [dict(m, ticked=False) for m in models]
+    heading = gui._holds_heading(none)
+    assert heading.startswith("Naming decisions - none ticked")
+    assert "each ticked row" not in heading
+    both = [dict(m, ticked=True) for m in models]
+    assert gui._holds_heading(both).startswith(
+        "Naming decisions - 2 of 2 ticked")
 
 
 # ------------------------------------------------------------------- stage 1
