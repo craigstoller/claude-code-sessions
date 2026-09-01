@@ -640,6 +640,31 @@ check("  the detail line names the button, not 'Apply'",
       "Level the sidebars" in app.level_detail.get()
       and "press Apply" not in app.level_detail.get(),
       app.level_detail.get())
+# A (0.15.1): the scoreboard box is sized to its content - the completeness
+# line, the tab's headline number, must not sit below an inner scrollbar
+# while the holds pane below gets twenty lines for two rows.
+shown = app.level_text.get("1.0", "end-1c").split("\n")
+check("the scoreboard box holds every line it shows (%d)" % len(shown),
+      int(app.level_text.cget("height")) >= len(shown),
+      "height=%s" % app.level_text.cget("height"))
+check("  so the 'complete' line is inside the box, not under a scrollbar",
+      any(line.startswith("complete") for line in shown)
+      and len(shown) <= int(app.level_text.cget("height")))
+check("  capped at 16 lines - a traceback still scrolls",
+      (app.show_level(["x"] * 40) or True)
+      and int(app.level_text.cget("height")) == 16)
+app.show_level(shown)
+# The a32798b geometry contract, pinned now that the box can grow: the
+# button bar packs FIRST against the bottom edge, before the holds area,
+# so a short window squeezes the area that scrolls and never the button.
+slaves = app.level_tab.pack_slaves()
+check("the button bar is bottom-pinned before the holds area",
+      app.level_bar.pack_info()["side"] == "bottom"
+      and slaves.index(app.level_bar) < slaves.index(app.holds_wrap),
+      str([str(w) for w in slaves]))
+check("  and the holds area is the one that expands",
+      app.holds_wrap.pack_info()["expand"] in (1, True, "1")
+      and app.level_body.pack_info()["fill"] == "x")
 # B (0.15.1): the section label counts what is ticked NOW, from the models.
 check("the section label says 1 of 1 ticked over a prefilled row",
       app.holds_heading.get().startswith("Naming decisions - 1 of 1 ticked"),

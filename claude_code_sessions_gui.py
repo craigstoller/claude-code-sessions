@@ -310,6 +310,12 @@ def _scoreboard_half(rep):
 # label read as one action (0.15.1, finding D).
 LEVEL_BUTTON = "Level the sidebars"
 
+# The scoreboard box grows to its content up to this many lines, then
+# scrolls: enough for a three-account store's ~13-line summary, small enough
+# that a traceback never eats the holds pane (0.15.1, finding A).
+LEVEL_TEXT_MAX_LINES = 16
+
+
 def _holds_clause(models):
     """'2 held: 1 suggested, 1 needs a name' - the honest count (0.15.1, B).
 
@@ -909,9 +915,14 @@ class SyncApp:
         # the pane's stated top-to-bottom order.
         self.level_banner = ttk.Frame(lt)
         self.level_banner.pack(fill="x")
-        # 8 lines, scrolling: taller and a high-DPI screen leaves the hold
-        # rows below no room at all - measured at 150% scaling, an 11-line
-        # area consumed the whole tab.
+        # Sized to its content by show_level (capped at LEVEL_TEXT_MAX_LINES,
+        # then scrolling). A fixed 8 lines clipped the tab's own headline:
+        # the summary runs ~13 lines (three account lines, the five
+        # properties, the completeness line, one per destination), and
+        # `complete ... N short` sat below an inner scrollbar while the holds
+        # pane got twenty lines for two rows (0.15.1, finding A). The holds
+        # area takes whatever height is left, with its own scrollbar; the
+        # button bar is bottom-pinned so it is never what gets squeezed.
         self.level_text = tk.Text(body, wrap="none", height=8,
                                   font=("Consolas", 9), state="disabled",
                                   borderwidth=1, relief="solid")
@@ -925,10 +936,12 @@ class SyncApp:
         # button; the hold rows then take whatever is left.
         lbar = ttk.Frame(lt)
         lbar.pack(side="bottom", fill="x", pady=(6, 0))
+        self.level_bar = lbar
         # The hold rows scroll when they overflow - a canvas-hosted frame,
         # the stock tkinter idiom for a scrollable widget stack.
         holds_wrap = ttk.Frame(lt)
         holds_wrap.pack(fill="both", expand=True)
+        self.holds_wrap = holds_wrap
         self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0)
         hsb = ttk.Scrollbar(holds_wrap, orient="vertical",
                             command=self.hold_canvas.yview)
@@ -1116,6 +1129,11 @@ class SyncApp:
         self._set_text(self.text, lines)
 
     def show_level(self, lines):
+        # Sized to its content, capped: the completeness line is the tab's
+        # headline number and must never sit below an inner scrollbar; a
+        # 40-line traceback still scrolls rather than eating the holds pane.
+        self.level_text.configure(
+            height=max(2, min(len(lines), LEVEL_TEXT_MAX_LINES)))
         self._set_text(self.level_text, lines)
 
     def show_health(self, lines):
