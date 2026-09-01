@@ -866,6 +866,29 @@ window into `journaled`/`completed`/`rolled_back`.
   the whole apply" - the journal's unit is the operation, so the completion status names
   what was created instead. The window becomes **"Claude sessions"**, because the old name
   described one tab of three; installing the shortcut replaces the old one.
+- **0.15.1 is the window's first-use patch.** Six findings from GUI 2.0's first real run, on
+  2026-09-01, and the one that mattered was a hold the window could show but not clear. A
+  collision the measurement declines to classify - distinct legs, or an unmeasured pair
+  because overlap and recency disagree - rendered as a read-only line, and clearing it meant
+  `ccs retitle` in a terminal, the exact step the tab exists to absorb. The 0.15.0 design had
+  conflated "the measurement made no suggestion" with "this leg should not be named", and a
+  human always knows more than the measurement; that is the whole reason the measurement is
+  allowed to decline. Those rows are now editable, empty and unticked. Each renames its own
+  held conversation, keeps the measured line as context, and names the other leg's id and the
+  sidebar it collides in, so you know you are naming one of two. The smaller findings: the
+  scoreboard box sizes to its content, so `complete ... N short`, the tab's headline number,
+  no longer sits below an inner scrollbar; the header counts what the rows offer ("2 held: 1
+  suggested, 1 needs a name") and the section label follows the ticks; Level's button is
+  **Level the sidebars**, because two tabs sharing "Apply" read as one action; and Health's
+  body says "mutation" like its title. The last finding is about the other tab. Measured on
+  a freshly levelled store, **Copy & refresh** offered 78 rows into one account: 76 of them
+  for conversations that sidebar already opened under another row file, 77 under a title
+  already naming a row there. Sync counts row files the destination lacks, converge counts
+  conversations it cannot open, and a multi-account store accumulates different row
+  filenames for the same conversation, so the two tabs count different things and one press
+  would have taken `distinguishable` from 0 to the seventies. The sync plan now reports both
+  counts, per row and in its tally, the tab warns above Apply with the number, and a
+  guidance line says what the tab is for: one session at a time, through the title filter.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
