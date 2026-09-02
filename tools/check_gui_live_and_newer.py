@@ -136,6 +136,35 @@ class _FakeThreading:
 
 gp2.threading = _FakeThreading
 
+# A completed sync op in the journal BEFORE the window opens: the Undo
+# button's state at open must come from the Level render, since the sync
+# pane no longer plans at open (GUI polish, Change 2 item 3).
+_op_dir = os.path.join(root_dir, "journal", "ops", "20260901T000000Z-abcdef")
+os.makedirs(_op_dir)
+with open(os.path.join(_op_dir, "manifest.json"), "w", encoding="utf-8") as fh:
+    json.dump({"op_id": "20260901T000000Z-abcdef", "status": "completed",
+               "op_type": "sync", "dest_email": "dorm@example.com",
+               "rows": [{"written": True}],
+               "history": [{"status": "journaled", "at": 1_800_000_000.0}]},
+              fh)
+
+# The doctor, stubbed to a clean report, counted: Health runs it on its
+# first selection (GUI polish, Change 6) through the same deferral the sync
+# plan uses.
+doctor_runs = []
+CLEAN = {"stores": {"status": "found", "roots": ["/x"]}, "row_count": 2,
+         "row_errors": [], "blank_rows": [], "dead_rows": [],
+         "legacy_folders": [], "unlisted_transcripts": [],
+         "nonterminal_ops": [], "stale_lock": False, "unknown_layout": []}
+
+
+def fake_doctor(env):
+    doctor_runs.append(1)
+    return dict(CLEAN)
+
+
+gp2.ccs.gather_doctor = fake_doctor
+
 tkroot = tk.Tk()
 tkroot.withdraw()
 app = gp2.SyncApp(tkroot)
@@ -164,10 +193,34 @@ def above(a, b):
 
 
 settle()
-check("the window planned on open", len(calls) >= 1)
+# ------------------- GUI polish (Change 2 item 3). the sync pane plans lazily
+check("the window did NOT plan the sync pane at open", len(calls) == 0,
+      str(len(calls)))
+check("  nor run the doctor", len(doctor_runs) == 0)
+# An unmapped notebook reports no selection until it is displayed; either
+# answer is the home tab.
+check("  Level is the selected tab",
+      app.nb.select() in ("", str(app.level_tab)), repr(app.nb.select()))
+check("  and the Undo button's state is right at open, before any tab is "
+      "visited - it comes from the Level render",
+      app.undo_target is not None and mapped(app.undo_btn)
+      and app.undo_target["op_id"] == "20260901T000000Z-abcdef",
+      str(app.undo_target))
 check("  and the controls were released again",
       str(app.refresh_btn.cget("state")) == "normal",
       str(app.refresh_btn.cget("state")))
+app.nb.select(app.sync_tab)
+settle()
+check("the first selection of One session plans it", len(calls) == 1,
+      str(len(calls)))
+app.nb.select(app.level_tab)
+settle()
+app.nb.select(app.sync_tab)
+settle()
+check("  and a later visit does not plan again - Refresh does",
+      len(calls) == 1, str(len(calls)))
+check("  the doctor has still not run - Health was never selected",
+      len(doctor_runs) == 0)
 
 # ------------------------------------------------------- 1. the assertion sticks
 app.live_choice = "/some/store/path"
@@ -286,8 +339,6 @@ check("the tabs read Level | Health | One session",
       tabs == ["Level", "Health", "One session"], str(tabs))
 check("  the exception tab is third and named 'One session'",
       app.nb.tabs()[2] == str(app.sync_tab))
-check("  Level is the selected tab at open",
-      app.nb.select() == str(app.level_tab))
 roles = [(app.level_role, app.level_tab, "The routine."),
          (app.health_role, app.health_tab, "Diagnostic."),
          (app.sync_role, app.sync_tab, "The exception.")]
@@ -374,3 +425,80 @@ shutil.rmtree(root_dir, ignore_errors=True)
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
 sys.exit(0 if all(ok) else 1)
+
+
+# ---------------- GUI polish (Change 2 item 3). one deferral mechanism, two tabs
+# A fresh window per scenario: the first-visit flags are per window.
+
+
+def fresh_window():
+    calls[:] = []
+    doctor_runs[:] = []
+    r = tk.Tk()
+    r.withdraw()
+    a = gp2.SyncApp(r)
+
+    def pump():
+        for _ in range(20):
+            r.update()
+    pump()
+    return a, r, pump
+
+
+# 1. A first visit while a worker runs defers, and dispatches only if the
+#    tab is still selected when the busy count reaches zero.
+app, tkroot, settle = fresh_window()
+app.busy(True)                        # a read in flight
+app.nb.select(app.sync_tab)
+settle()
+check("a first visit while busy starts no worker", len(calls) == 0,
+      str(len(calls)))
+app.nb.select(app.level_tab)          # the user clicks away
+settle()
+app.busy(False)
+settle()
+check("  and when the busy count reaches zero with another tab selected, "
+      "nothing dispatches", len(calls) == 0, str(len(calls)))
+app.nb.select(app.sync_tab)           # the next visit gets the plan
+settle()
+check("  the next visit plans it", len(calls) == 1, str(len(calls)))
+tkroot.destroy()
+
+# 2. Clicking through Level -> Health -> One session during a read dispatches
+#    at most one deferred worker: the tab selected when the count hits zero.
+app, tkroot, settle = fresh_window()
+app.busy(True)
+app.nb.select(app.health_tab)
+settle()
+app.nb.select(app.sync_tab)
+settle()
+check("two first visits during a read start nothing", len(calls) == 0
+      and len(doctor_runs) == 0)
+app.busy(False)
+settle()
+check("  the busy count reaching zero dispatches ONE worker - the selected "
+      "tab's", len(calls) == 1 and len(doctor_runs) == 0,
+      "plans=%d doctor=%d" % (len(calls), len(doctor_runs)))
+app.nb.select(app.health_tab)
+settle()
+check("  and Health's pending run waits for its next visit",
+      len(doctor_runs) == 1 and len(calls) == 1,
+      "plans=%d doctor=%d" % (len(calls), len(doctor_runs)))
+check("  its report rendered without a press",
+      app.health_text.get("1.0", "end").startswith("Nothing is blocking"),
+      app.health_text.get("1.0", "end")[:40])
+tkroot.destroy()
+
+# 3. A pending run is dropped, not dispatched, when the window is closing.
+app, tkroot, settle = fresh_window()
+app.busy(True)
+app.nb.select(app.sync_tab)
+settle()
+app._close_after_worker = True        # a close confirmed behind the worker
+app.busy(False)
+settle()
+check("a pending run is dropped when the window is closing", len(calls) == 0,
+      str(len(calls)))
+check("  and the flag does not survive to dispatch later",
+      not any(app._pending.values()), str(app._pending))
+tkroot.destroy()

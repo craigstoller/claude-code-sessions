@@ -1361,8 +1361,11 @@ class SyncApp:
                                      justify="left")
         self.health_role.pack(anchor="w", pady=(0, 4))
         self._wrap_to(self.health_role, ht)
+        # The doctor runs on this tab's first selection (GUI polish,
+        # Change 6) - a read - so the blank "Press Refresh" pane, the
+        # window's only empty state, lasts only until then.
         self.health_status = tk.StringVar(
-            value="Press Refresh for the full health check.")
+            value="The health check runs when this tab is first opened.")
         hb_status = ttk.Label(ht, textvariable=self.health_status,
                               font=("Segoe UI", 11, "bold"), justify="left")
         hb_status.pack(anchor="w")
@@ -1400,8 +1403,70 @@ class SyncApp:
             self._wrap_to(lbl, parent)
             self._gate_labels.append((lbl, place))
 
-        self.refresh()
+        # Only the home tab plans at open (GUI polish, Change 2 item 3). The
+        # One-session plan and Health's doctor run on the FIRST SELECTION of
+        # their tab, through one deferral mechanism: a per-tab "planned"
+        # flag checked on every tab-change event (never a one-shot unbind,
+        # which would fire once during a busy period and leave the tab
+        # blank for good), and a per-tab "first visit pending" flag for a
+        # visit that arrives while a worker runs - when the busy count
+        # reaches zero only the SELECTED tab's pending run dispatches, every
+        # other pending flag waits for its next visit, and a pending flag is
+        # dropped if the window is closing. So clicking through
+        # Level -> Health -> One session during a read starts at most one
+        # deferred worker, for the tab the user ended on. Effect: no
+        # question at open unless the home tab has one, one engine read
+        # fewer, and the Undo button's state at open comes from the Level
+        # render.
+        self._planned = {"sync": False, "health": False}
+        self._pending = {"sync": False, "health": False}
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
         self.refresh_level()
+
+    # ------------------------------------------------- first-visit dispatch
+    def _visit_key(self):
+        """'sync' or 'health' when that tab is selected, else None. An
+        unmapped notebook reports no selection: that is the home tab."""
+        try:
+            sel = self.nb.select()
+        except tk.TclError:
+            return None
+        if sel == str(self.sync_tab):
+            return "sync"
+        if sel == str(self.health_tab):
+            return "health"
+        return None
+
+    def _on_tab_changed(self):
+        key = self._visit_key()
+        if key is None or self._planned[key]:
+            return
+        if self._busy_count:
+            self._pending[key] = True    # dispatched when the read ends,
+            return                       # if this tab is still selected
+        self._first_visit(key)
+
+    def _first_visit(self, key):
+        self._planned[key] = True
+        self._pending[key] = False
+        if key == "sync":
+            self.refresh()
+        else:
+            self.on_doctor()
+
+    def _dispatch_pending(self):
+        """The busy count reached zero: run the selected tab's pending
+        first visit, if any. Scheduled through after(0) so the callback that
+        released the count finishes first."""
+        if self._close_after_worker:
+            for k in self._pending:
+                self._pending[k] = False
+            return
+        if self._busy_count:
+            return                       # another worker started meanwhile
+        key = self._visit_key()
+        if key is not None and self._pending[key] and not self._planned[key]:
+            self._first_visit(key)
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -1567,6 +1632,13 @@ class SyncApp:
         # takes every Apply button down with it, and no done-callback needs
         # its own configure calls that could disagree with the recompute.
         self._apply_gate_to_buttons()
+        if not self._busy_count:
+            # A first visit that arrived during the read dispatches now -
+            # after this callback returns, and only for the selected tab.
+            try:
+                self.root.after(0, self._dispatch_pending)
+            except tk.TclError:
+                pass                     # the window is already gone
 
     # ---------------------------------------------------------------- planning
     def refresh(self, reset_live=False):
@@ -2176,10 +2248,14 @@ class SyncApp:
         return out
 
     def on_doctor(self):
-        """The Health tab's Refresh: the doctor report plus the
-        interrupted-operation scan. A successful scan that finds nothing
-        unresolved clears the red line and lifts the mutation gate on every
-        tab - this button is the designed way back after `ccs recover`."""
+        """The Health tab's Refresh, and its first-selection run: the
+        doctor report plus the interrupted-operation scan. A successful
+        scan that finds nothing unresolved clears the red line and lifts the
+        mutation gate on every tab - this button is the designed way back
+        after `ccs recover`. Cost, said out loud: the counted busy() lock
+        dips every action button for the length of the scan, and disables
+        the hold rows' entries too (typed text is kept - they are disabled,
+        not rebuilt); on the first visit that happens once per window."""
         self.busy(True)
         self.health_status.set("Checking...")
         threading.Thread(target=self._doctor_worker, daemon=True).start()
@@ -2547,6 +2623,9 @@ class SyncApp:
             self.show_level([msg])
             self.level_footer.set("")
             self._apply_gate_to_buttons()
+            # The Undo button's state at open comes from this render, so a
+            # failed read must still derive it.
+            self._update_undo_button()
             return
         self._render_level(rep, man, running)
 

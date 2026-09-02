@@ -152,6 +152,57 @@ check("  the warning text survives onto the button",
 check("  the footnote never becomes a button",
       not any("<account>" in c[1] for c in cands))
 
+# ------------------ GUI polish (Change 6). Health runs on its first selection
+# The window for real (root withdrawn, workers inline) over this store:
+# selecting Health runs the doctor without a press; the report's first line
+# is the one pinned above.
+import threading as _real_threading  # noqa: E402
+import tkinter as tk  # noqa: E402
+
+
+class _Inline(object):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+
+    def start(self):
+        self._t(*self._a, **self._k)
+
+
+class _FakeThreading(object):
+    Thread = _Inline
+    current_thread = staticmethod(_real_threading.current_thread)
+    main_thread = staticmethod(_real_threading.main_thread)
+    Event = _real_threading.Event
+
+
+gp.threading = _FakeThreading
+gp.load_pref = lambda: ""
+gp.save_pref = lambda _v: None
+gp.ccs.default_env = lambda: env
+tkroot = tk.Tk()
+tkroot.withdraw()
+app = gp.SyncApp(tkroot)
+
+
+def settle():
+    for _ in range(30):
+        tkroot.update()
+
+
+settle()
+check("Health has not run the doctor at open",
+      not app.health_text.get("1.0", "end").strip()
+      or "Nothing is blocking" not in app.health_text.get("1.0", "end"))
+app.nb.select(app.health_tab)
+settle()
+first = app.health_text.get("1.0", "end").splitlines()[0]
+check("selecting Health runs the doctor without a press",
+      first == "Nothing is blocking a mutation.", first)
+check("  and the status line says so",
+      app.health_status.get() == "Health check: nothing blocking a mutation",
+      app.health_status.get())
+tkroot.destroy()
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()
