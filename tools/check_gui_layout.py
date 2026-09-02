@@ -590,6 +590,95 @@ check("  a re-enlargement restores the dragged offset", pw.sashpos(0) == dragged
       str(pw.sashpos(0)))
 tkroot.destroy()
 
+# ------------------- 16b (GUI polish, Change 6). every _dialog Toplevel
+# The three Toplevels of the window's own - the stage-1 dialog, the
+# destination picker, the stage-2 identity picker - open centred over the
+# root, hold the grab, close on Escape as Cancel, start with focus on
+# Cancel, and put the headline first in the body in the bold status font;
+# a WM close arriving while one is open cancels it and shows no prompt.
+# Measured here because only a mapped root has geometry and records focus.
+WORK["area"] = (1536, 912)
+app, tkroot, settle = open_app()
+app.nb.select(app.level_tab)
+settle()
+
+
+def walk(w):
+    out = []
+    for c in w.winfo_children():
+        out.append(c)
+        out += walk(c)
+    return out
+
+
+seen = []
+
+
+def inspecting_wait(win):
+    """Stands in for wait_window: inspect the open dialog, then deliver a
+    WM close to the window while the dialog holds the grab."""
+    settle()
+    labels = [w for w in walk(win) if isinstance(w, gp.ttk.Label)]
+    cancel = [w for w in walk(win) if isinstance(w, gp.ttk.Button)
+              and w.cget("text") == "Cancel"]
+    rec = {
+        "centred": abs((win.winfo_rootx() + win.winfo_width() / 2.0)
+                       - (tkroot.winfo_rootx() + tkroot.winfo_width() / 2.0))
+        <= 3
+        and abs((win.winfo_rooty() + win.winfo_height() / 2.0)
+                - (tkroot.winfo_rooty() + tkroot.winfo_height() / 2.0)) <= 3,
+        "grab": win.grab_status(),
+        "escape": any(seq in win.bind() for seq in ("<Escape>", "<Key-Escape>")),
+        "focus_on_cancel": bool(cancel) and win.focus_lastfor() is cancel[0],
+        # captured now: the X below destroys the widgets
+        "head_text": str(labels[0].cget("text")) if labels else None,
+        "head_font": str(labels[0].cget("font")) if labels else "",
+        "registered": app._open_dialog is not None
+        and app._open_dialog[0] is win,
+    }
+    before = len(gp.messagebox.calls)
+    app._on_close()                      # the X while the dialog is up
+    settle()
+    rec["closed_by_x"] = not win.winfo_exists()
+    rec["no_prompt"] = len(gp.messagebox.calls) == before
+    seen.append(rec)
+
+
+tkroot.wait_window = inspecting_wait
+
+
+def pin_dialog(name, headline):
+    rec = seen[-1]
+    check("the %s opens centred over the root" % name, rec["centred"])
+    check("  holds the grab", rec["grab"] == "local", rec["grab"])
+    check("  binds Escape", rec["escape"])
+    check("  starts with focus on Cancel", rec["focus_on_cancel"])
+    check("  leads with its headline in the bold status font",
+          rec["head_text"] == headline and "bold" in rec["head_font"],
+          "%s / %s" % (rec["head_text"], rec["head_font"]))
+    check("  is registered as the open dialog", rec["registered"])
+    check("  and a WM close while it is open cancels it, with no prompt",
+          rec["closed_by_x"] and rec["no_prompt"])
+
+
+steps = [{"key": ("k", "t"), "target_sid": SID_A, "old_title": T_COLL,
+          "new_title": SUGGESTED}]
+result = app._confirm_stage1(steps)
+check("the stage-1 dialog cancelled by the X answers False", result is False
+      or result is None)
+pin_dialog("stage-1 dialog", "Rename 1 conversation?")
+listing = ccs._candidate_listing(STORES[1:], live_org=None)
+app._offer_destination_picker(listing)
+pin_dialog("destination picker",
+           "More than one other account store on this machine.")
+app._ask_live_dialog(converge_manifest())
+pin_dialog("stage-2 identity picker",
+           "Which account is the desktop app signed into?")
+check("  no picker left an answer behind", app.live_choice == "")
+check("  and no dialog is registered once they are gone",
+      app._open_dialog is None)
+tkroot.destroy()
+
 shutil.rmtree(root_dir, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()

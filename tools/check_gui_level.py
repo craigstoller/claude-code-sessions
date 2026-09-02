@@ -224,8 +224,9 @@ check("  prefilled from the measured suggestion",
 check("  aimed at measured.superseded", m0.get("target_sid") == S1)
 steps, problems = gp._level_steps_stage1(models)
 head, mappings, footer = gp._stage1_dialog_parts(steps)
-check("stage-1 dialog text carries the full old->new mapping",
-      any(repr(T_COLL) in line and repr(SUGGESTED) in line
+check("stage-1 dialog text carries the full old->new mapping, in "
+      "straight double quotes",
+      any(line == '"%s"  ->  "%s"' % (T_COLL, SUGGESTED)
           for line in mappings), "; ".join(mappings))
 check("  and the every-account-scope sentence",
       "every account" in footer)
@@ -255,6 +256,11 @@ check("per-step progress statuses, in order",
       ui.statuses == ["Applying rename 1 of 1...", "Planning the copy...",
                       "Creating rows...", "Re-measuring..."],
       str(ui.statuses))
+q2 = gp._stage2_question(ui.confirmed_with[0])
+check("the stage-2 question names every destination by its label",
+      all("into " + d["label"] in q2
+          for d in ui.confirmed_with[0]["destinations"])
+      and q2.startswith("Create 2 rows across 2 accounts:"), q2)
 check("completion status carries both halves",
       gp._sequence_status(seq, gp._scoreboard_half(refresh[1]))
       == "Applied (1 rename + 1 converge) - Level: 2 / 2 - 0 short.",
@@ -895,10 +901,14 @@ app.on_level_apply()
 settle()
 check("stage-1 dialog saw the steps", len(app._stage1_calls) == 1
       and app._stage1_calls[0][0]["new_title"] == SUGGESTED)
-check("stage-2 dialog described the fresh plan",
-      any("Create 2 rows across the 2 accounts named?" in c[2]
+check("stage-2 dialog described the fresh plan, naming the destinations",
+      any(c[2].startswith("Create 2 rows across 2 accounts:")
+          and c[2].count(" into ") == 2
           for c in modals.of("askokcancel", "Create the rows?")),
       str(modals.of("askokcancel")))
+check("  with the default on Cancel (GUI polish, Change 6)",
+      all(c[3].get("default") == "cancel"
+          for c in modals.of("askokcancel", "Create the rows?")))
 check("the completion status carries both halves",
       app.level_status.get()
       == "Applied (1 rename + 1 converge) - Level: 2 / 2 - 0 short.",
@@ -908,6 +918,13 @@ check("Undo points at the converge",
       app.undo_target is not None and app.undo_target["type"] == "converge"
       and app.undo_target["label"] == "Undo last converge (2 rows)",
       str(app.undo_target))
+modals.answers["Undo the last converge?"] = False
+app.on_undo()
+settle()
+undo_boxes = modals.of("askokcancel", "Undo the last converge?")
+check("the undo confirmation defaults to Cancel",
+      len(undo_boxes) == 1 and undo_boxes[0][3].get("default") == "cancel",
+      str(undo_boxes[-1][3] if undo_boxes else "-"))
 check("no refusal modal on the happy path",
       not modals.of("showwarning"))
 check("the sync tab's Apply is void until IT replans - the converge wrote "

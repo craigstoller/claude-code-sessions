@@ -450,6 +450,24 @@ check("an apply clears the tick",
       "ticked=%s" % app.consent_var.get())
 check("  (the fake apply ran to completion)",
       app.status.get().startswith("Copied"), app.status.get())
+# GUI polish (Change 6): the two boxes default to Cancel, and the second
+# box's title follows its body.
+boxes = [c for c in modals.calls if c[0] == "askokcancel"]
+check("sync's two confirmation boxes default to Cancel",
+      len(boxes) >= 2 and all(c[3].get("default") == "cancel" for c in boxes[-2:]),
+      str([(c[1], c[3]) for c in boxes[-2:]]))
+check("  a mixed plan's second box is titled for what it does",
+      boxes and boxes[-1][1] == "Add and refresh rows?", boxes[-1][1])
+FAKE_ROWS[:] = [row(9, is_update=True)]
+app.update_var.set(True)
+app._on_update_toggle()
+settle()
+modals.calls[:] = []
+app.on_apply()
+settle()
+titles = [c[1] for c in modals.calls if c[0] == "askokcancel"]
+check("  a pure refresh's second box is 'Refresh rows?'",
+      titles == ["Overwrite existing rows?", "Refresh rows?"], str(titles))
 
 tkroot.destroy()
 shutil.rmtree(root_dir, ignore_errors=True)

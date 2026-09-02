@@ -537,6 +537,15 @@ def _sync_dup_warning(rows):
                                         "" if len(adds) == 1 else "s"))
 
 
+def _q(text):
+    """One quoting style for every dialog and local refusal: straight
+    double quotes around the text as it is (GUI polish, Change 6). Python's
+    repr rendered a title with an apostrophe in double quotes beside a
+    neighbour in single quotes, and doubled a backslash - repr is not a
+    quoting style for a dialog."""
+    return '"' + str(text) + '"'
+
+
 def _level_steps_stage1(models):
     """(steps, problems) for stage 1 - the ticked renames, in row order.
 
@@ -554,14 +563,15 @@ def _level_steps_stage1(models):
             continue
         text = (m.get("entry") or "").strip()
         if not text:
-            problems.append("a rename needs a name: the row for {0!r} is "
+            problems.append("a rename needs a name: the row for {0} is "
                             "ticked with an empty title".format(
-                                m.get("title") or "?"))
+                                _q(m.get("title") or "?")))
             continue
         if text in seen:
-            problems.append("two renames share a name: {0!r} is the new "
-                            "title for both {1!r} and {2!r}".format(
-                                text, seen[text], m.get("title") or "?"))
+            problems.append("two renames share a name: {0} is the new "
+                            "title for both {1} and {2}".format(
+                                _q(text), _q(seen[text]),
+                                _q(m.get("title") or "?")))
             continue
         seen[text] = m.get("title") or "?"
         steps.append({"key": m["key"], "target_sid": m["target_sid"],
@@ -626,7 +636,7 @@ def _stage1_dialog_parts(steps, note="", assertion=""):
     """
     head = "Rename {0} conversation{1}?".format(
         len(steps), "" if len(steps) == 1 else "s")
-    mappings = ["{0!r}  ->  {1!r}".format(s["old_title"], s["new_title"])
+    mappings = ["{0}  ->  {1}".format(_q(s["old_title"]), _q(s["new_title"]))
                 for s in steps]
     footer = ("Each rename applies in every account holding that "
               "conversation (retitle's default scope), and each is its own "
@@ -639,22 +649,47 @@ def _stage1_dialog_parts(steps, note="", assertion=""):
 
 
 def _stage2_question(fresh, assertion=""):
-    """The stage-2 confirmation, describing the FRESH plan's numbers only,
-    plus the held answer's line when the copy runs under one."""
+    """The stage-2 confirmation, describing the FRESH plan's numbers only
+    - per destination, by the manifest's own label (GUI polish, Change 6:
+    "across the accounts named?" named no account) - plus the held
+    answer's line when the copy runs under one."""
     rows = fresh.get("rows") or []
     holds = fresh.get("holds") or []
-    n_acct = len({r.get("account") for r in rows})
-    q = "Create {0} row{1} across the {2} account{3} named?".format(
+    by_acct = {}
+    for r in rows:
+        by_acct[r.get("account")] = by_acct.get(r.get("account"), 0) + 1
+    n_acct = len(by_acct)
+    q = "Create {0} row{1} across {2} account{3}:".format(
         len(rows), "" if len(rows) == 1 else "s",
         n_acct, "" if n_acct == 1 else "s")
+    named = set()
+    for d in fresh.get("destinations") or []:
+        n = by_acct.get(d.get("account"), 0)
+        if n:
+            named.add(d.get("account"))
+            q += "\n   {0} into {1}".format(
+                n, d.get("label") or (d.get("account") or "?")[:8])
+    for a, n in by_acct.items():
+        if a not in named:               # a row whose destination is unlisted
+            q += "\n   {0} into {1}".format(n, (a or "?")[:8])
     if holds:
-        q += "  ({0} held - they stay held.)".format(len(holds))
+        q += "\n\n({0} held - they stay held.)".format(len(holds))
     q += ("\n\nEach row adds the conversation to that account's "
           "sidebar; converge never overwrites or deletes. Undo "
           "removes the created rows again.")
     if assertion:
         q += "\n\n" + assertion
     return q
+
+
+def _sync_box_title(n_add, n_upd):
+    """The sync second box's title follows its body (Change 6): a pure
+    refresh is not "Copy sessions?" over "It adds nothing"."""
+    if n_add and n_upd:
+        return "Add and refresh rows?"
+    if n_upd:
+        return "Refresh rows?"
+    return "Copy sessions?"
 
 
 # ------------------------------------------------- the identity answer
@@ -1165,7 +1200,8 @@ class _TkLevelUI(object):
     def confirm_stage2(self, fresh):
         return bool(self._on_ui(lambda: messagebox.askokcancel(
             "Create the rows?",
-            _stage2_question(fresh, self.app._assertion_text()))))
+            _stage2_question(fresh, self.app._assertion_text()),
+            default="cancel")))
 
     def ask_live(self, fresh):
         """The stage-2 identity question, marshalled like confirm_stage2.
@@ -1193,6 +1229,84 @@ class _TkLevelUI(object):
         self.app.root.after(0, run)
         evt.wait()
         return box[0] if box else None
+
+
+class _Dialog(object):
+    """One helper for every Toplevel of the window's own - the stage-1
+    dialog, the destination picker, the stage-2 identity picker (GUI
+    polish, Change 6). Measured, a bare transient Toplevel opened at the
+    screen corner, took no grab, had no Escape and no focus, and put its
+    question in the title bar. This one opens centred over the root, holds
+    the grab, closes on Escape as Cancel, starts with focus on Cancel (so
+    Return on a dialog whose list is the safeguard activates Cancel, and
+    the confirming button takes a click or a Tab), and puts the headline
+    first in the body in the bold status font. While it runs it is the
+    window's registered open dialog, so a WM close cancels it and does
+    nothing else - one modal at a time.
+
+    Build the body into `body` and any confirming button into `bar` (Cancel
+    is already at its right); `finish(value)` closes with VALUE as the
+    result, `run()` shows the dialog and returns it - None on Cancel.
+    """
+
+    def __init__(self, app, title, headline, wrap=640):
+        self.app = app
+        self.result = None
+        win = tk.Toplevel(app.root)
+        win.title(title)
+        win.transient(app.root)
+        self.win = win
+        ttk.Label(win, text=headline, font=("Segoe UI", 11, "bold"),
+                  justify="left", wraplength=wrap,
+                  padding=(PAD, PAD, PAD, 4)).pack(anchor="w")
+        self.bar = ttk.Frame(win)
+        self.bar.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
+        self.body = ttk.Frame(win)
+        self.body.pack(fill="both", expand=True)
+        self.cancel_btn = ttk.Button(self.bar, text="Cancel",
+                                     command=self.cancel)
+        self.cancel_btn.pack(side="right")
+        win.bind("<Escape>", lambda _e: self.cancel())
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+
+    def finish(self, value):
+        self.result = value
+        for step in (self.win.grab_release, self.win.destroy):
+            try:
+                step()
+            except tk.TclError:
+                pass
+
+    def cancel(self):
+        self.finish(None)
+
+    def run(self):
+        app, win = self.app, self.win
+        win.update_idletasks()
+        root = app.root
+        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - win.winfo_reqheight()) // 2
+        win.geometry("+{0}+{1}".format(x, y))
+        try:
+            win.update()                 # mapped: the frame's offset is known
+            dx = win.winfo_rootx() - win.winfo_x()
+            dy = win.winfo_rooty() - win.winfo_y()
+            if (dx, dy) != (0, 0):       # centre the CLIENT, not the frame
+                win.geometry("+{0}+{1}".format(x - dx, y - dy))
+        except tk.TclError:
+            pass
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass                         # not viewable: no grab, still modal
+        self.cancel_btn.focus_set()
+        app._open_dialog = (win, self.cancel)
+        try:
+            root.wait_window(win)
+        finally:
+            if app._open_dialog is not None and app._open_dialog[0] is win:
+                app._open_dialog = None
+        return self.result
 
 
 class SyncApp:
@@ -2067,11 +2181,10 @@ class SyncApp:
         choices = self._identity_choices(pair)
         if not choices:
             return None
-        win = tk.Toplevel(self.root)
-        win.title("Which account is the desktop app signed into?")
-        win.transient(self.root)
-        result = {"path": None}
-        ttk.Label(win, padding=PAD, justify="left", wraplength=560,
+        dlg = _Dialog(self, "Which account is signed in?",
+                      "Which account is the desktop app signed into?")
+        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
+                  wraplength=600,
                   text=IDENTITY_QUESTION.format(pair[0][:8], pair[1][:8])
                   ).pack(anchor="w")
         for a, _o, p, text in choices:
@@ -2079,16 +2192,13 @@ class SyncApp:
                 self._apply_live("answered", {
                     "path": path, "pair": pair,
                     "label": self._account_email(acct)})
-                result["path"] = path
-                win.destroy()
-            ttk.Button(win, text=text, command=pick).pack(fill="x", padx=PAD,
-                                                          pady=3)
-        ttk.Label(win, padding=(PAD, 4), foreground="#555", wraplength=520,
-                  justify="left", text=IDENTITY_CANCEL).pack(anchor="w")
-        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
-        win.grab_set()
-        self.root.wait_window(win)
-        return result["path"]
+                dlg.finish(path)
+            ttk.Button(dlg.body, text=text, command=pick).pack(
+                fill="x", padx=PAD, pady=3)
+        ttk.Label(dlg.body, padding=(PAD, 4), foreground="#555",
+                  wraplength=560, justify="left",
+                  text=IDENTITY_CANCEL).pack(anchor="w")
+        return dlg.run()
 
     def _plan_worker(self, gen, only, live, update, newer_only, allow_orphan):
         try:
@@ -2436,31 +2546,31 @@ class SyncApp:
         cands = self._candidates(msg)
         if not cands:
             return                      # unrecognised shape: leave the raw refusal
-        win = tk.Toplevel(self.root)
-        win.title("Choose a destination")
-        win.transient(self.root)
-        header = ("More than one other account store on this machine.\n"
-                  "Pick the one whose sidebar should get these sessions.")
+        dlg = _Dialog(self, "Choose a destination",
+                      "More than one other account store on this machine.")
+        text = "Pick the one whose sidebar should get these sessions."
         # Every candidate empty is the just-created-an-account case, where the row
         # count cannot help at all. Say the one thing that reliably settles it
         # rather than leaving the user to read uuids out of paths.
         if all("(no listing rows)" in line for _t, line, _n in cands):
-            header += ("\n\nAll of them are empty, so row counts cannot tell them apart. "
-                       "The reliable way:\nsend one message in the new account, close the "
-                       "app, then press Refresh - the store\nthat gained a row is the "
-                       "right one.")
-        ttk.Label(win, padding=PAD, justify="left", wraplength=620,
-                  text=header).pack(anchor="w")
+            text += ("\n\nAll of them are empty, so row counts cannot tell them "
+                     "apart. The reliable way:\nsend one message in the new "
+                     "account, close the app, then press Refresh - the store\n"
+                     "that gained a row is the right one.")
+        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
+                  wraplength=620, text=text).pack(anchor="w")
         for pair, line, note in cands:
-            text = line if not note else line + "\n     ⚠ " + note
+            label = line if not note else line + "\n     \u26a0 " + note
+
             def pick(p=pair):
                 # Save the resolved PATH, not the id fragment shown on the button.
                 self.dest_choice = self._resolve_pair(p) or p
                 save_pref(self.dest_choice)
-                win.destroy()
-                self.refresh()
-            ttk.Button(win, text=text, command=pick).pack(fill="x", padx=PAD, pady=2)
-        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
+                dlg.finish(p)
+            ttk.Button(dlg.body, text=label, command=pick).pack(
+                fill="x", padx=PAD, pady=2)
+        if dlg.run():
+            self.refresh()
 
     def _account_label(self, uuid):
         """email (id) when the email can be recovered, else just the id."""
@@ -2488,7 +2598,7 @@ class SyncApp:
         """
         want = self.trust_var.get()
         if want and not messagebox.askokcancel(
-                "Let Chrome stay open?",
+                "Let Chrome stay open?", default="cancel", message=
                 "The desktop app's Chrome helper normally blocks writes unless it is "
                 "the exact build this tool measured - and it auto-updates every few "
                 "days, which is why Chrome keeps having to be closed.\n\n"
@@ -2752,11 +2862,11 @@ class SyncApp:
         if t["type"] == "retitle":
             return ("Undo the last rename?",
                     "{0} row{1} get their previous titles back, dropping "
-                    "{2!r} - all of them or none of them, and the operation "
+                    "{2} - all of them or none of them, and the operation "
                     "is then consumed. A row that changed since the rename "
                     "refuses rather than overwrite the change.".format(
                         t["rows"], "" if t["rows"] == 1 else "s",
-                        t.get("new_title", "")))
+                        _q(t.get("new_title", ""))))
         return ("Undo the last converge?",
                 "Remove the {0} row{1} it created across {2} account{3}, "
                 "skipping any that is now load-bearing - a row that became "
@@ -2780,7 +2890,7 @@ class SyncApp:
             # this; a generic confirmation here would hide the premise the
             # deletion rests on.
             prompt += "\n\n" + t["live_note"]
-        if not messagebox.askokcancel(title, prompt):
+        if not messagebox.askokcancel(title, prompt, default="cancel"):
             return
         # An undo changes the store underneath BOTH panes' plans, so both
         # Apply verdicts are void until each pane replans - the Level pane
@@ -3249,22 +3359,13 @@ class SyncApp:
         The mapping list scrolls; the confirm/cancel row does not move."""
         head, mappings, footer = _stage1_dialog_parts(
             steps, note, self._assertion_text())
-        win = tk.Toplevel(self.root)
-        win.title(head)
-        win.transient(self.root)
-        result = {"ok": False}
-        ttk.Label(win, padding=PAD, justify="left", wraplength=680,
-                  text=footer).pack(anchor="w")
-        bar = ttk.Frame(win)
-        bar.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
-
-        def go():
-            result["ok"] = True
-            win.destroy()
-        ttk.Button(bar, text="Rename", command=go).pack(side="right")
-        ttk.Button(bar, text="Cancel",
-                   command=win.destroy).pack(side="right", padx=(0, 6))
-        body = ttk.Frame(win)
+        dlg = _Dialog(self, head, head)
+        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
+                  wraplength=680, text=footer).pack(anchor="w")
+        ttk.Button(dlg.bar, text="Rename",
+                   command=lambda: dlg.finish(True)).pack(side="right",
+                                                          padx=(0, 6))
+        body = ttk.Frame(dlg.body)
         body.pack(fill="both", expand=True, padx=PAD)
         txt = tk.Text(body, wrap="none", height=min(len(mappings), 14),
                       width=100, font=("Consolas", 9))
@@ -3274,9 +3375,7 @@ class SyncApp:
         txt.configure(state="disabled")
         txt.pack(side="left", fill="both", expand=True)
         tsb.pack(side="right", fill="y")
-        win.grab_set()
-        self.root.wait_window(win)
-        return result["ok"]
+        return bool(dlg.run())
 
     def _level_apply_worker(self, gen, steps, live, pair, ui):
         seq, refresh = _run_level_apply(self.env, steps, live, ui, pair=pair)
@@ -3488,7 +3587,7 @@ class SyncApp:
                 "for as long as the operation stays in the journal (the ten most "
                 "recent are kept). A row that account has changed since this plan "
                 "was made is refused rather than overwritten.\n\nContinue?".format(
-                    n_upd, n, dst, back_note)):
+                    n_upd, n, dst, back_note), default="cancel"):
             return
         # Split adds from refreshes. The old text said "This adds listing rows"
         # unconditionally, so a pure-refresh run told the user it was adding
@@ -3513,8 +3612,10 @@ class SyncApp:
             does = ("It adds listing rows to that account's sidebar. It never "
                     "deletes anything.")
         if not messagebox.askokcancel(
-                "Copy sessions?", "{0}\n\n{1} Undo reverses it.{2}".format(
-                    what, does, ("\n\n" + assertion) if assertion else "")):
+                _sync_box_title(n_add, n_upd),
+                "{0}\n\n{1} Undo reverses it.{2}".format(
+                    what, does, ("\n\n" + assertion) if assertion else ""),
+                default="cancel"):
             return
         self._sync_apply_ok = False
         # And the Level pane's verdict: this copy changes the store its plan

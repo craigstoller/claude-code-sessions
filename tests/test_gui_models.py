@@ -667,3 +667,64 @@ def test_dirty_holds_counts_edited_rows():
     assert gui._unapplied_clause(0) == ""
     assert gui._unapplied_clause(1) == "; 1 unapplied naming change will be lost"
     assert gui._unapplied_clause(3) == "; 3 unapplied naming changes will be lost"
+
+
+# ------------------------------------------------------- dialog quoting
+
+def test_dialog_quoting_is_not_repr():
+    """GUI polish, Change 6: one quoting style - straight double quotes -
+    in every dialog. Python's repr rendered a title with an apostrophe in
+    double quotes beside a neighbour in single quotes, and doubled a
+    backslash."""
+    steps = [{"key": ("a", "x"), "target_sid": SID_A,
+              "old_title": "Northwind's plan", "new_title": "Northwind plan"},
+             {"key": ("b", "y"), "target_sid": SID_B,
+              "old_title": "C:\\Users\\craig",
+              "new_title": "Users folder"}]
+    _head, mappings, _footer = gui._stage1_dialog_parts(steps)
+    assert mappings[0] == '"Northwind\'s plan"  ->  "Northwind plan"'
+    assert mappings[1] == '"C:\\Users\\craig"  ->  "Users folder"'
+    assert all(m.startswith('"') for m in mappings)
+    assert "\\\\" not in mappings[1]              # no doubled backslash
+    assert gui._q("it's") == '"it\'s"'
+    # The local refusals and the undo prompt use the same style.
+    empty = {"key": ("a", "x"), "target_sid": SID_A, "title": "Bob's leg",
+             "editable": True, "ticked": True, "entry": " ", "prefill": ""}
+    _steps, problems = gui._level_steps_stage1([empty])
+    assert problems and '"Bob\'s leg"' in problems[0]
+    assert "'Bob" not in problems[0]
+    _title, prompt = gui.SyncApp._undo_prompt(None, {
+        "type": "retitle", "rows": 2, "new_title": "Alice's leg"})
+    assert '"Alice\'s leg"' in prompt
+
+
+def test_stage2_question_names_the_destinations():
+    """Change 6: the stage-2 dialog lists the fresh manifest's destination
+    labels - nothing in that dialog named an account before."""
+    rows = [{"account": ACCT, "name": "a"}, {"account": ACCT, "name": "b"},
+            {"account": "e" * 32, "name": "c"}]
+    fresh = manifest(rows=rows, holds=[hold()])
+    fresh["destinations"].append({"account": "e" * 32, "org": "d" * 32,
+                                  "path": "/y",
+                                  "label": "bob@example.com (bbbb2222/dddd4444)",
+                                  "rows": 5})
+    q = gui._stage2_question(fresh)
+    assert q.startswith("Create 3 rows across 2 accounts:")
+    assert "   2 into alice@example.com" in q
+    assert "   1 into bob@example.com (bbbb2222/dddd4444)" in q
+    assert "(1 held - they stay held.)" in q
+    assert "converge never overwrites or deletes" in q
+    assert "under your assertion" not in q
+    q2 = gui._stage2_question(fresh, gui._assertion_line("alice@example.com"))
+    assert q2.endswith("under your assertion: the desktop app is on "
+                       "alice@example.com")
+    one = gui._stage2_question(manifest(rows=rows[:1]))
+    assert one.startswith("Create 1 row across 1 account:")
+
+
+def test_sync_second_box_title_follows_its_body():
+    """Change 6: the sync second box's title follows its body - 'Refresh
+    rows?' for a pure refresh, not 'Copy sessions?' over 'It adds nothing'."""
+    assert gui._sync_box_title(n_add=3, n_upd=0) == "Copy sessions?"
+    assert gui._sync_box_title(n_add=0, n_upd=2) == "Refresh rows?"
+    assert gui._sync_box_title(n_add=1, n_upd=2) == "Add and refresh rows?"
