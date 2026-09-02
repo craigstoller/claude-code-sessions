@@ -575,3 +575,45 @@ def test_sync_apply_gate():
     assert gui._sync_apply_allowed([a, b], stale) is False
     assert gui._consent_label(3) == "copy every row this plan lists (3)"
     assert gui._consent_label(78) == "copy every row this plan lists (78)"
+
+
+# ---------------------------------------------- the identity answer's life
+
+def test_live_answer_reducer():
+    """GUI polish, Change 2 item 5, as a pure reducer over events: the
+    answer is bound to the (oauth, config) pair it was given for and drops
+    on a run of the mutation path, on a fresh read that no longer returns
+    that pair, or on an explicit change; everything else keeps it."""
+    A, B, C = "aaaa1111" + "0" * 24, "bbbb2222" + "0" * 24, "eeee5555" + "0" * 24
+    held = {"path": "/x/" + A, "pair": (A, B), "label": "alice@example.com"}
+    nxt = gui._live_answer_next
+    assert nxt(None, "answered", held) == held
+    # (a) the mutation path ran under it - a sync apply that wrote, or a
+    # converge ending completed or unchanged.
+    assert nxt(held, "mutation_ran", "completed") is None
+    assert nxt(held, "mutation_ran", "unchanged") is None
+    # (c) the user changes it.
+    assert nxt(held, "explicit_change") is None
+    # (b) a fresh read of the files no longer returns that pair.
+    assert nxt(held, "files_read", None) is None
+    assert nxt(held, "files_read", (A, C)) is None
+    assert nxt(held, "files_read", (B, A)) is None       # roles swapped
+    assert nxt(held, "files_read", (A, B)) == held       # the same pair keeps
+    assert nxt(held, "files_read", [A, B]) == held       # list or tuple alike
+    # Nothing else clears it: the zero-rows empty outcome is pinned apart
+    # from unchanged - the seam a reviewer found.
+    for ev in ("refused", "cancelled", "empty", "truncated", "tab_switched"):
+        assert nxt(held, ev) == held, ev
+    assert nxt(None, "files_read", (A, B)) is None
+    assert nxt(None, "refused") is None
+    # The sequence's endings map onto those events.
+    assert gui._live_event_for("completed") == "mutation_ran"
+    assert gui._live_event_for("unchanged") == "mutation_ran"
+    assert gui._live_event_for("empty") == "empty"
+    assert gui._live_event_for("cancelled") == "cancelled"
+    assert gui._live_event_for("truncated") == "truncated"
+    for s2 in ("refused", "error", "plan_failed", "gate", "not_reached"):
+        assert gui._live_event_for(s2) == "refused", s2
+    # The line every confirmation prints while an answer is held.
+    assert (gui._assertion_line("alice@example.com")
+            == "under your assertion: the desktop app is on alice@example.com")

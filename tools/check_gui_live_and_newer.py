@@ -48,6 +48,11 @@ os.makedirs(os.path.join(home, ".claude", "projects"))
 with open(os.path.join(home, ".claude.json"), "w") as fh:
     json.dump({"oauthAccount": {"accountUuid": A, "organizationUuid": ORG,
                                 "emailAddress": "live@example.com"}}, fh)
+# The identity files DISAGREE here: an answer is bound to the pair it was
+# given for and drops the moment a plan reads files that no longer show it
+# (GUI polish, Change 2 item 5, rule (b)).
+with open(os.path.join(root_dir, "Claude", "config.json"), "w") as fh:
+    json.dump({"lastKnownAccountUuid": B}, fh)
 
 
 # Captured BEFORE patching: gp2.ccs is the same module object as ccs, so
@@ -183,6 +188,16 @@ def mapped(w):
     return bool(w.winfo_manager())
 
 
+def walk(w):
+    """W's descendants, depth first - the banner builder nests its line and
+    buttons in a row frame."""
+    out = []
+    for c in w.winfo_children():
+        out.append(c)
+        out += walk(c)
+    return out
+
+
 def above(a, b):
     """A is placed above B in their common parent - by grid row where both
     are gridded, else by pack order."""
@@ -223,7 +238,8 @@ check("  the doctor has still not run - Health was never selected",
       len(doctor_runs) == 0)
 
 # ------------------------------------------------------- 1. the assertion sticks
-app.live_choice = "/some/store/path"
+app._apply_live("answered", {"path": "/some/store/path", "pair": (A, B),
+                             "label": "live@example.com"})
 before = len(calls)
 app.refresh()
 settle()
@@ -245,15 +261,30 @@ settle()
 check("only an explicit change clears it", app.live_choice == "")
 check("  and the planner is told nothing", calls[-1].live == "")
 
-# the button that does that is only offered while an assertion is held
-app.live_choice = "/some/store/path"
-app._sync_live_button()
+# the button that does that is only offered while an assertion is held -
+# on the in-force line of the One-session banner, the same line Level shows
+app._apply_live("answered", {"path": "/some/store/path", "pair": (A, B),
+                             "label": "live@example.com"})
+app._render_sync_banner()
+
+
+def change_button():
+    return [w for w in walk(app.sync_banner)
+            if isinstance(w, gp2.ttk.Button)
+            and w.cget("text") == "Change signed-in account"]
+
+
 check("'Change signed-in account' appears while asserted",
-      mapped(app.live_btn))
-app.live_choice = ""
-app._sync_live_button()
+      len(change_button()) == 1)
+check("  under the in-force line that names the answer",
+      any(isinstance(w, gp2.ttk.Label)
+          and "under your assertion" in str(w.cget("text"))
+          and "live@example.com" in str(w.cget("text"))
+          for w in walk(app.sync_banner)))
+app._apply_live("explicit_change")
+app._render_sync_banner()
 check("  and goes away when there is nothing to change",
-      not mapped(app.live_btn))
+      not change_button() and not app.sync_banner.winfo_children())
 
 # ------------------------------------------------------- 2. the newer-only box
 check("'only where mine is newer' defaults ON", app.newer_var.get() is True)

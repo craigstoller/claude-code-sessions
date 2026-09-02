@@ -125,6 +125,93 @@ try:
 except ccs.Refusal:
     check("a third account is refused", True)
 
+# --------------- GUI polish (Change 2 item 2). the refusal feeds the banner
+# The window for real over this store: on the One-session tab the identity
+# refusal renders the shared banner IN-PANE - one button per disagreeing
+# store, the same builder Level uses - above the verbatim refusal text; no
+# Toplevel opens at all.
+import threading as _real_threading  # noqa: E402
+import tkinter as tk  # noqa: E402
+
+
+class _Inline(object):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+
+    def start(self):
+        self._t(*self._a, **self._k)
+
+
+class _FakeThreading(object):
+    Thread = _Inline
+    current_thread = staticmethod(_real_threading.current_thread)
+    main_thread = staticmethod(_real_threading.main_thread)
+    Event = _real_threading.Event
+
+
+env.projects_root = os.path.join(home, ".claude", "projects")
+env.ops_dir = os.path.join(root, "journal", "ops")
+env.moved_log = os.path.join(root, "journal", "moved-log.jsonl")
+env.process_lister = lambda: []
+gp.threading = _FakeThreading
+gp.load_pref = lambda: ""
+gp.save_pref = lambda _v: None
+gp.ccs.default_env = lambda: env
+toplevels = []
+_real_toplevel = tk.Toplevel
+
+
+class _SpyToplevel(_real_toplevel):
+    def __init__(self, *a, **kw):
+        toplevels.append(self)
+        _real_toplevel.__init__(self, *a, **kw)
+
+
+gp.tk.Toplevel = _SpyToplevel
+tkroot = tk.Tk()
+tkroot.withdraw()
+app = gp.SyncApp(tkroot)
+
+
+def settle():
+    for _ in range(30):
+        tkroot.update()
+
+
+settle()
+app.nb.select(app.sync_tab)
+settle()
+
+
+def walk(w):
+    out = []
+    for c in w.winfo_children():
+        out.append(c)
+        out += walk(c)
+    return out
+
+
+buttons = [w for w in walk(app.sync_banner) if isinstance(w, gp.ttk.Button)]
+check("the identity refusal renders the banner in-pane, one button per store",
+      len(buttons) == 3, str(len(buttons)))
+check("  with the shared wording", any(
+    isinstance(w, gp.ttk.Label) and "Which account is the Claude desktop app"
+    in str(w.cget("text")) for w in walk(app.sync_banner)))
+check("  the verbatim refusal text renders under it",
+      "cannot identify the signed-in account" in app.text.get("1.0", "end"))
+check("  and no Toplevel opened", toplevels == [])
+check("  the status line asks the question",
+      "signed into" in app.status.get(), app.status.get())
+buttons[0].invoke()
+settle()
+check("a button sets the one answer, bound to its pair",
+      app.live_choice == stores[0][2] and app._live_pair == (A, B),
+      repr((app.live_choice, app._live_pair)))
+check("  and the replan carried it",
+      app.manifest is not None or "more than one other account store"
+      in app.text.get("1.0", "end"))
+tkroot.destroy()
+
 shutil.rmtree(root, ignore_errors=True)
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")

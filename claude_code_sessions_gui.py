@@ -578,7 +578,7 @@ def _ordinal(n):
     return words[n] if 0 < n < len(words) else "{0}th".format(n)
 
 
-def _stage1_dialog_parts(steps):
+def _stage1_dialog_parts(steps, note="", assertion=""):
     """(headline, mapping lines, footer) for the stage-1 confirmation.
 
     Every ticked mapping is listed in full, one line per row - the
@@ -586,7 +586,11 @@ def _stage1_dialog_parts(steps):
     every old->new pair, is the look the opt-out gets. The footer states
     ONCE that each rename applies in every account holding that conversation
     (retitle's default scope, said so the bulk list is not blind trust in
-    routing) and that each is individually undoable.
+    routing) and that each is individually undoable. ASSERTION is the
+    held identity answer's line, when one is held; NOTE is the "the copy
+    step will ask" line, when the preview carried a disagreement and no
+    answer is held - so nobody reads the later question as the tool having
+    written first and asked second (GUI polish, Change 2 item 4).
     """
     head = "Rename {0} conversation{1}?".format(
         len(steps), "" if len(steps) == 1 else "s")
@@ -595,11 +599,16 @@ def _stage1_dialog_parts(steps):
     footer = ("Each rename applies in every account holding that "
               "conversation (retitle's default scope), and each is its own "
               "journalled operation - individually undoable.")
+    if assertion:
+        footer += "\n\n" + assertion
+    if note:
+        footer += "\n\n" + note
     return head, mappings, footer
 
 
-def _stage2_question(fresh):
-    """The stage-2 confirmation, describing the FRESH plan's numbers only."""
+def _stage2_question(fresh, assertion=""):
+    """The stage-2 confirmation, describing the FRESH plan's numbers only,
+    plus the held answer's line when the copy runs under one."""
     rows = fresh.get("rows") or []
     holds = fresh.get("holds") or []
     n_acct = len({r.get("account") for r in rows})
@@ -608,9 +617,105 @@ def _stage2_question(fresh):
         n_acct, "" if n_acct == 1 else "s")
     if holds:
         q += "  ({0} held - they stay held.)".format(len(holds))
-    return (q + "\n\nEach row adds the conversation to that account's "
-                "sidebar; converge never overwrites or deletes. Undo "
-                "removes the created rows again.")
+    q += ("\n\nEach row adds the conversation to that account's "
+          "sidebar; converge never overwrites or deletes. Undo "
+          "removes the created rows again.")
+    if assertion:
+        q += "\n\n" + assertion
+    return q
+
+
+# ------------------------------------------------- the identity answer
+#
+# One RULING 5 answer for the whole window (GUI polish, Change 2): which
+# store the desktop app is signed into right now. It feeds both
+# SyncFlags.live and ConvergeFlags.live, is bound to the (oauth, config)
+# pair _identity_disagreement returned when it was asked - the same pair
+# the engine's own _certified_live_account records and revalidates - and
+# is never written to disk. Its life is this reducer's:
+#
+#   answered(held)      -> held
+#   mutation_ran        -> None   a sync apply that wrote, or a Level
+#                                  sequence whose run_converge ran -
+#                                  completed or unchanged alike, because on
+#                                  an unchanged run the engine's apply-time
+#                                  re-check certified the answer and only
+#                                  then found nothing to write
+#   files_read(pair)    -> held while the files still show THAT pair,
+#                          else None - agreement, a different pair, or the
+#                          same accounts with the roles swapped all drop it
+#   explicit_change     -> None   "Change signed-in account"
+#   anything else       -> held   refused, cancelled, the zero-rows empty
+#                                  outcome, truncated, a tab switch
+#
+# files_read runs BEFORE the answer is used, never after: every plan reads
+# the files first and builds its flags afterwards, and every press that
+# would consume the answer re-reads them at press time and replans instead
+# of running when they changed - a plan-then-drop order would turn the
+# files healing themselves into a plan-time refusal on both tabs.
+
+def _live_answer_next(held, event, payload=None):
+    """The next held answer - None or {"path", "pair", "label"} - after
+    EVENT (see the table above); PAYLOAD is the answer for `answered`, the
+    fresh pair (or None) for `files_read`, the outcome for `mutation_ran`."""
+    if event == "answered":
+        return payload
+    if event in ("mutation_ran", "explicit_change"):
+        return None
+    if event == "files_read":
+        if held is None:
+            return None
+        pair = tuple(payload) if payload else None
+        return held if pair == tuple(held.get("pair") or ()) else None
+    return held
+
+
+def _live_event_for(stage2):
+    """The reducer event a finished Level sequence raises."""
+    if stage2 in ("completed", "unchanged"):
+        return "mutation_ran"
+    if stage2 in ("empty", "cancelled", "truncated"):
+        return stage2
+    return "refused"
+
+
+def _assertion_line(label):
+    """The line every confirmation that precedes a write prints while an
+    answer is held, so the OK on that dialog is the per-operation
+    affirmative act and consuming the answer is never silent."""
+    return "under your assertion: the desktop app is on {0}".format(label)
+
+
+def _current_pair(env):
+    """The (oauth, config) pair the identity files show now, or None."""
+    try:
+        dis = ccs._identity_disagreement(env)
+    except Exception:
+        return None
+    return tuple(dis) if dis else None
+
+
+# The one wording, on both tabs and in the stage-2 picker (the identity
+# design's vocabulary). The old sync picker's "the OTHER one is what gets
+# written" was sync-specific and wrong for converge, which is why this
+# names both.
+IDENTITY_QUESTION = (
+    "!! ~/.claude.json ({0}) and config.json ({1}) disagree about the "
+    "signed-in account, and either can be the stale one. Which account is "
+    "the Claude desktop app signed into right now? One session writes the "
+    "OTHER account's store; Level writes every store that lacks a row, "
+    "with the app closed. The answer holds until an apply runs under it or "
+    "the two files stop showing this disagreement; it is shown while it "
+    "holds and never saved.")
+IDENTITY_CANCEL = (
+    "Or cancel and fix it at the source: run 'claude' then /login as the "
+    "account you are using, or switch the desktop app - which may not "
+    "refresh config.json - so the two records agree.")
+IN_FORCE_LINE = ("!! {0}. Holds until an apply runs under it or the two "
+                 "files stop showing this disagreement; never saved.")
+STAGE1_ASK_NOTE = ("The identity files disagree; the copy step will ask "
+                   "which account the desktop app is on before it creates "
+                   "rows.")
 
 
 # ------------------------------------------------------- the Apply sequence
@@ -625,19 +730,29 @@ def _stage2_question(fresh):
 #                           clear, else what blocked (a list of op ids, or a
 #                           sentence when the journal could not be read)
 #   confirm_stage2(fresh) - show the fresh plan's numbers, return bool
+#   ask_live(fresh)       - the stage-2 identity question, from the FRESH
+#                           manifest's disagreement: the chosen store path,
+#                           or None for Cancel, a closed picker, or a picker
+#                           that failed (a failed picker reads as Cancel,
+#                           never as a raise)
 #   truncate_requested()  - True once the user confirmed closing the window;
 #                           checked at operation boundaries only, so the
-#                           in-flight operation always completes
+#                           in-flight operation always completes - and
+#                           re-checked after every dialog, the picker too
 #   remaining             - attribute this function keeps current: how many
 #                           steps a truncation right now would drop
 #
 # The function NEVER raises - every outcome travels in the result dict, so
-# the worker's finally-refresh cannot be skipped by an exception path.
+# the worker's finally-refresh cannot be skipped by an exception path, and
+# a raise in a daemon worker cannot strand busy(True) with every control
+# disabled.
 
-def _run_level_sequence(env, steps, live, ui):
+def _run_level_sequence(env, steps, live, ui, pair=None):
     """Stage 1 (each ticked rename, its own journalled op) then stage 2 (a
     FRESH plan_converge, confirmed as itself, then run_converge on that fresh
-    manifest only). Returns a dict:
+    manifest only). LIVE is the held identity answer ("" for none) and PAIR
+    the (oauth, config) pair it was given for (None: unbound). Returns a
+    dict:
 
       planned   how many renames were asked for
       landed    how many completed (each individually undoable)
@@ -650,11 +765,16 @@ def _run_level_sequence(env, steps, live, ui):
       fresh     the stage-2 plan manifest, when one was made
       gate      what the press-time re-scan found, when it aborted the press
       mutated   True once anything was written
+      asked     the answer the stage-2 picker returned, when it was asked
+      live_pair the pair the answer in force is bound to, or None
+      live_dropped  True when the files had outgrown the held answer by
+                    the time stage 2 planned, so it was dropped first
     """
     seq = {"planned": len(steps), "landed": 0, "rename_refusal": None,
            "rename_error": False, "stage2": "not_reached",
            "plan_problem": None, "converge_problem": None, "fresh": None,
-           "gate": None, "mutated": False}
+           "gate": None, "mutated": False, "asked": None,
+           "live_pair": tuple(pair) if pair else None, "live_dropped": False}
     ui.remaining = len(steps) + 1
     blocked = ui.gate()
     if blocked:
@@ -684,6 +804,15 @@ def _run_level_sequence(env, steps, live, ui):
         seq["stage2"] = "truncated"
         return seq
     ui.remaining = 1
+    # Rule (b), drop-before-plan: the answer is bound to the pair it was
+    # given for; re-read the files NOW and drop it if they no longer show
+    # that pair, so this plan can never receive an answer the files have
+    # outgrown - with the files agreeing, a stale answer threaded into the
+    # plan would refuse at plan time ("do not currently disagree").
+    if live and pair is not None and _current_pair(env) != tuple(pair):
+        live = ""
+        seq["live_pair"] = None
+        seq["live_dropped"] = True
     ui.status("Planning the copy...")
     try:
         fresh = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
@@ -701,6 +830,41 @@ def _run_level_sequence(env, steps, live, ui):
         # dialog appears and no converge runs.
         seq["stage2"] = "empty"
         return seq
+    dis = fresh.get("identity_disagreement")
+    if isinstance(dis, dict) and not live:
+        # Ask inside stage 2, from the fresh plan, if still unanswered - at
+        # the moment the engine needs the answer, from the manifest it will
+        # act on, never before stage 1 from the stale preview. The replan
+        # is not optional: run_converge acts on the manifest it is handed,
+        # and _converge_recheck refuses unless that manifest's live_asserted
+        # names one of the two disagreeing accounts.
+        answer = ui.ask_live(fresh)
+        if ui.truncate_requested():
+            # A close confirmed while the picker sat open ends the sequence
+            # here, answered or not.
+            seq["stage2"] = "truncated"
+            return seq
+        if not answer:
+            seq["stage2"] = "cancelled"
+            return seq
+        seq["asked"] = answer
+        seq["live_pair"] = (dis.get("oauth") or "", dis.get("config") or "")
+        live = answer
+        ui.status("Planning the copy under your assertion...")
+        try:
+            fresh = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
+        except ccs.Refusal as exc:
+            seq["stage2"] = "plan_failed"
+            seq["plan_problem"] = ("refusal", str(exc))
+            return seq
+        except Exception:
+            seq["stage2"] = "plan_failed"
+            seq["plan_problem"] = ("error", traceback.format_exc())
+            return seq
+        seq["fresh"] = fresh
+        if not fresh.get("rows"):
+            seq["stage2"] = "empty"
+            return seq
     blocked = ui.gate()
     if blocked:
         seq["gate"] = blocked
@@ -792,7 +956,7 @@ def _sequence_status(seq, half=""):
     return ""                                   # press-abort / truncated
 
 
-def _run_level_apply(env, steps, live, ui):
+def _run_level_apply(env, steps, live, ui, pair=None):
     """The whole Apply press, worker side: the sequence, then the
     post-mutation refresh. Returns (seq, refresh).
 
@@ -805,15 +969,18 @@ def _run_level_apply(env, steps, live, ui):
     and must not touch the pane the red line annotates, and a truncated
     sequence is a window on its way closed.
 
-    The refresh plans with live="" because the sequence has ENDED here -
-    completed, refused, or cancelled alike - and an assertion covers one
-    attempt. If the identity files still disagree, this very replan is what
-    re-raises the banner and asks again.
+    The refresh plans WITHOUT the answer after a run of the mutation path -
+    completed or unchanged, rule (a): the assertion was spent exactly as
+    the CLI's would be - and WITH the answer in force after every other
+    ending, because a refusal or a cancel ran nothing and consumed nothing
+    (GUI polish, Change 2 item 5); the files are re-read first either way
+    (rule (b)). If they still disagree and no answer is held, this very
+    replan is what re-raises the banner.
 
     REFRESH is ("ok", alignment_report, manifest, running) or
     ("refusal"|"error", text), or None when skipped.
     """
-    seq = _run_level_sequence(env, steps, live, ui)
+    seq = _run_level_sequence(env, steps, live, ui, pair)
     if seq["stage2"] == "truncated" or (seq["stage2"] == "gate"
                                         and not seq["mutated"]):
         # A truncated sequence is a window on its way closed. A gate abort
@@ -822,10 +989,16 @@ def _run_level_apply(env, steps, live, ui):
         # refresh like any other end, or the pane keeps rendering
         # pre-rename rows under a status that denies the writes.
         return seq, None
+    if _live_event_for(seq["stage2"]) == "mutation_ran":
+        keep = ""
+    else:
+        keep = seq.get("asked") or ("" if seq.get("live_dropped") else live)
+    if keep and seq.get("live_pair") and _current_pair(env) != seq["live_pair"]:
+        keep = ""
     ui.status("Re-measuring...")
     try:
         rep = ccs.gather_alignment(env)
-        man = ccs.plan_converge(env, ccs.ConvergeFlags(live=""))
+        man = ccs.plan_converge(env, ccs.ConvergeFlags(live=keep))
         running = ccs.claude_running(env)
         refresh = ("ok", rep, man, running)
     except ccs.Refusal as exc:
@@ -947,7 +1120,20 @@ class _TkLevelUI(object):
 
     def confirm_stage2(self, fresh):
         return bool(self._on_ui(lambda: messagebox.askokcancel(
-            "Create the rows?", _stage2_question(fresh))))
+            "Create the rows?",
+            _stage2_question(fresh, self.app._assertion_text()))))
+
+    def ask_live(self, fresh):
+        """The stage-2 identity question, marshalled like confirm_stage2.
+        Any failure of the picker returns None: a failed picker reads as
+        Cancel, never as a raise - the sequence never raises, and a raise
+        here would strand busy(True) with every control disabled. (On the
+        threaded path an error inside the Tk callback leaves the result box
+        empty, which _on_ui already returns as None.)"""
+        try:
+            return self._on_ui(lambda: self.app._ask_live_dialog(fresh))
+        except Exception:
+            return None
 
     def _on_ui(self, fn):
         if threading.current_thread() is threading.main_thread():
@@ -971,21 +1157,22 @@ class SyncApp:
         self.env = ccs.default_env()
         self.manifest = None
         self.dest_choice = load_pref()
-        # Never persisted, unlike dest_choice: the destination is a stable fact
-        # about this machine, while "which account is signed in" changes every
-        # time you switch. A remembered answer would be a stale assertion.
-        self.live_choice = ""
+        # The ONE identity answer (GUI polish, Change 2): never persisted,
+        # unlike dest_choice - the destination is a stable fact about this
+        # machine, while "which account is the desktop app signed into"
+        # changes every time you switch. It feeds both tabs' plans, is
+        # bound to the (oauth, config) pair it was given for, and lives by
+        # _live_answer_next: spent by a run of the mutation path, dropped
+        # when the files stop showing its pair or the user changes it, kept
+        # across refusals, cancels and tab switches. Shown on both tabs
+        # while it holds; every confirmation that precedes a write under it
+        # prints the assertion line.
+        self.live_choice = ""            # the store path, or ""
+        self._live_pair = None           # the (oauth, config) it answers
+        self._live_label = ""            # the email (or id) for the line
         # Bumped on every plan; a callback whose generation is stale is dropped
         # rather than allowed to install a superseded manifest.
         self.generation = 0
-        # The Level tab's own state, deliberately separate from the sync
-        # pane's: level_live is the same RULING 5 fact the sync pane can hold
-        # in live_choice, but its lifetime differs (it clears when the Apply
-        # SEQUENCE ends, not when a sync lands), and sharing one variable
-        # would let a Level apply silently consume an assertion the user gave
-        # the sync pane - a behavior change the moved pane's contract forbids.
-        # In-memory only, never written to disk; shown while in force.
-        self.level_live = ""
         self.level_gen = 0
         self.level_manifest = None
         self.hold_models = []
@@ -995,7 +1182,8 @@ class SyncApp:
         # The mutation gate (unresolved journal ops) and the worker plumbing.
         self.gate_text = ""
         self._busy_count = 0
-        self._banner_widgets = []        # rebuilt with the identity banner
+        self._banner_widgets = []        # rebuilt with Level's identity banner
+        self._sync_banner_widgets = []   # and with One session's
         self._hold_widgets = []          # rebuilt with the hold rows
         self._mutation_ui = None
         self._close_after_worker = False
@@ -1217,6 +1405,11 @@ class SyncApp:
         self._wrap_to(sb_detail, head)
         # Row 4 is the running-app notice, weighted like the detail line.
         head.rowconfigure(4, weight=1)
+        # Row 7 is the identity banner - the same builder Level uses: the
+        # question with one button per store on the identity refusal, the
+        # red in-force line with its button while an answer is held.
+        self.sync_banner = ttk.Frame(head)
+        self.sync_banner.grid(row=7, column=0, sticky="we")
 
         # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
         # rather than per-row checkboxes: checkboxes would mean assembling a
@@ -1344,12 +1537,6 @@ class SyncApp:
                                      command=self.forget_destination)
         if self.dest_choice:
             self.forget_btn.pack(side="left", padx=(6, 0))
-        # Only shown while a --live assertion is in force. It is the escape
-        # hatch that lets the assertion persist across replans safely: the
-        # answer stops being re-demanded every time, and stays changeable on
-        # purpose rather than by accident.
-        self.live_btn = ttk.Button(bar, text="Change signed-in account",
-                                   command=self.forget_live)
 
         # ------------------------------------------------ Tab 2: Health
         ht = self.health_tab
@@ -1610,9 +1797,10 @@ class SyncApp:
         for w in ((self.refresh_btn, self.undo_btn, self.doctor_btn,
                    self.only_entry, self.filter_btn, self.clear_btn,
                    self.trust_chk, self.update_chk, self.newer_chk,
-                   self.orphan_chk, self.consent_chk, self.live_btn,
+                   self.orphan_chk, self.consent_chk,
                    self.forget_btn, self.level_refresh_btn, self.copy_btn)
                   + tuple(self._banner_widgets)
+                  + tuple(self._sync_banner_widgets)
                   + tuple(self._hold_widgets)):
             try:
                 w.configure(state=state)
@@ -1642,8 +1830,10 @@ class SyncApp:
 
     # ---------------------------------------------------------------- planning
     def refresh(self, reset_live=False):
-        # The --live assertion survives a replan, and is cleared only on apply
-        # or when the user explicitly changes it.
+        # The identity answer survives a replan (a replan reads, and reads
+        # consume nothing) and is dropped only by a run of the mutation
+        # path, by the files no longer showing its pair, or by the user
+        # changing it - _live_answer_next's rules.
         #
         # It used to be cleared on EVERY replan, on the reasoning that an
         # assertion is a statement about right now and a stale one must not
@@ -1659,11 +1849,12 @@ class SyncApp:
         # executor re-derives the live account itself and revalidates the
         # certification against the identity files before writing (RULING 5,
         # _certified_live_account), so a stale answer refuses at apply rather
-        # than writing the wrong store. It is also cleared the moment an apply
-        # completes, shown in the window while it is in force, and changeable
-        # from the button beside it - visible state, not remembered state.
+        # than writing the wrong store. It is also shown on both tabs while
+        # it is in force and changeable from the button beside the line -
+        # visible state, not remembered state.
         if reset_live:
-            self.live_choice = ""
+            self._apply_live("explicit_change")
+        self._settle_live()              # rule (b): drop BEFORE the plan
         # Snapshot the filter on the UI thread and carry it through. Reading
         # only_var again inside the worker or the callback let a quick A-then-B
         # change install an A-selected manifest while the window described it as
@@ -1681,13 +1872,168 @@ class SyncApp:
         self._show_sync_warning("")
         threading.Thread(
             target=self._plan_worker,
-            args=(gen, only, self.update_var.get(), self.newer_var.get(),
-                  self.orphan_var.get()),
+            args=(gen, only, self.live_choice, self.update_var.get(),
+                  self.newer_var.get(), self.orphan_var.get()),
             daemon=True).start()
 
-    def _plan_worker(self, gen, only, update, newer_only, allow_orphan):
+    # ------------------------------------------------ the identity answer
+    def _apply_live(self, event, payload=None):
+        """Advance the held answer by _live_answer_next's rules."""
+        held = ({"path": self.live_choice, "pair": self._live_pair,
+                 "label": self._live_label} if self.live_choice else None)
+        nxt = _live_answer_next(held, event, payload) or {}
+        self.live_choice = nxt.get("path") or ""
+        pair = nxt.get("pair")
+        self._live_pair = tuple(pair) if pair else None
+        self._live_label = nxt.get("label") or ""
+
+    def _read_pair(self):
+        return _current_pair(self.env)
+
+    def _settle_live(self):
+        """Rule (b), before use: re-read the identity files and drop the
+        answer if they no longer show the pair it was given for. True when
+        an answer was dropped - the caller replans instead of running."""
+        had = bool(self.live_choice)
+        self._apply_live("files_read", self._read_pair())
+        return had and not self.live_choice
+
+    def _assertion_text(self):
+        """The assertion line while an answer is held, else ''."""
+        if not self.live_choice:
+            return ""
+        return _assertion_line(self._live_label or self.live_choice)
+
+    def _change_live(self, replan):
+        """"Change signed-in account": drop the answer and replan - the
+        deliberate re-look, minus the unasked-for repetitions."""
+        self._apply_live("explicit_change")
+        replan()
+
+    def _account_email(self, uuid):
+        """The email for an account id where a file records it, else the
+        id's prefix - the label the assertion line names."""
+        email = ""
         try:
-            flags = ccs.SyncFlags(to=self.dest_choice, live=self.live_choice,
+            with open(os.path.join(self.env.home, ".claude.json"),
+                      encoding="utf-8") as fh:
+                import json
+                oa = (json.load(fh) or {}).get("oauthAccount") or {}
+            if isinstance(oa, dict) and oa.get("accountUuid") == uuid:
+                email = oa.get("emailAddress") or ""
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass
+        email = email or ccs.dormant_account_email(self.env, uuid) or ""
+        return email or "{0}…".format(uuid[:8])
+
+    def _identity_choices(self, pair):
+        """[(account, org, path, button text)] - one button per STORE the
+        two disagreeing accounts own, not per account: an account can own
+        several org directories (this very machine has two per account),
+        and a bare account uuid then matches more than one store, which
+        _resolve_live_assertion refuses. The asserted value is the path."""
+        try:
+            stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env)
+                      if a in pair]
+        except Exception:
+            return []
+        out = []
+        for a, o, p in stores:
+            rows = ccs._listing_row_count(p)
+            count = ("{0} rows".format(rows) if rows
+                     else "no listing rows" if rows == 0
+                     else "row count unreadable")
+            out.append((a, o, p, "Desktop app is signed in as  {0}   "
+                                 "org {1}…   ({2})".format(
+                                     self._account_label(a), o[:8], count)))
+        return out
+
+    def _render_identity_banner(self, frame, pair, replan, registry):
+        """The one banner builder, for either tab (GUI polish, Change 2
+        item 2). While an answer is held: the red in-force line and the
+        "Change signed-in account" button. Else, when PAIR names a
+        disagreement: the question and one button per store, each setting
+        the shared answer and calling REPLAN. REGISTRY collects the buttons
+        for busy() to disable."""
+        for w in frame.winfo_children():
+            w.destroy()
+        self._prune_wrapped()
+        del registry[:]
+        if self.live_choice:
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=(0, 4))
+            lbl = ttk.Label(row, foreground="#a00000", justify="left",
+                            text=IN_FORCE_LINE.format(self._assertion_text()))
+            lbl.pack(side="left")
+            b = ttk.Button(row, text="Change signed-in account",
+                           command=lambda: self._change_live(replan))
+            b.pack(side="left", padx=(6, 0))
+            self._wrap_to(lbl, row, margin=b.winfo_reqwidth() + 12)
+            registry.append(b)
+            return
+        if not pair:
+            return
+        oauth, config = pair
+        box = ttk.Frame(frame)               # dies with the next render
+        box.pack(fill="x")
+        lbl = ttk.Label(box, foreground="#a00000", justify="left",
+                        text=IDENTITY_QUESTION.format(oauth[:8], config[:8]))
+        lbl.pack(anchor="w", pady=(0, 2))
+        self._wrap_to(lbl, box)
+        for a, _o, p, text in self._identity_choices(pair):
+            def pick(path=p, acct=a):
+                self._apply_live("answered", {
+                    "path": path, "pair": tuple(pair),
+                    "label": self._account_email(acct)})
+                replan()
+            b = ttk.Button(box, command=pick, text=text)
+            b.pack(fill="x", pady=2)
+            registry.append(b)
+
+    def _render_sync_banner(self, ask=False):
+        """The One-session tab's banner: the in-force line while an answer
+        is held; the question, when ASK (the identity refusal), from a
+        fresh read of the files."""
+        pair = self._read_pair() if ask else None
+        self._render_identity_banner(self.sync_banner, pair, self.refresh,
+                                     self._sync_banner_widgets)
+
+    def _ask_live_dialog(self, fresh):
+        """The stage-2 identity question, modal, from the FRESH manifest's
+        disagreement (GUI polish, Change 2 item 4): the chosen store path -
+        recorded as the shared answer - or None for Cancel or a closed
+        picker. The only Toplevel the question still uses."""
+        dis = fresh.get("identity_disagreement") or {}
+        pair = (dis.get("oauth") or "", dis.get("config") or "")
+        choices = self._identity_choices(pair)
+        if not choices:
+            return None
+        win = tk.Toplevel(self.root)
+        win.title("Which account is the desktop app signed into?")
+        win.transient(self.root)
+        result = {"path": None}
+        ttk.Label(win, padding=PAD, justify="left", wraplength=560,
+                  text=IDENTITY_QUESTION.format(pair[0][:8], pair[1][:8])
+                  ).pack(anchor="w")
+        for a, _o, p, text in choices:
+            def pick(path=p, acct=a):
+                self._apply_live("answered", {
+                    "path": path, "pair": pair,
+                    "label": self._account_email(acct)})
+                result["path"] = path
+                win.destroy()
+            ttk.Button(win, text=text, command=pick).pack(fill="x", padx=PAD,
+                                                          pady=3)
+        ttk.Label(win, padding=(PAD, 4), foreground="#555", wraplength=520,
+                  justify="left", text=IDENTITY_CANCEL).pack(anchor="w")
+        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
+        win.grab_set()
+        self.root.wait_window(win)
+        return result["path"]
+
+    def _plan_worker(self, gen, only, live, update, newer_only, allow_orphan):
+        try:
+            flags = ccs.SyncFlags(to=self.dest_choice, live=live,
                                   only=only, update=update,
                                   newer_only=newer_only,
                                   allow_orphan=allow_orphan)
@@ -1715,11 +2061,17 @@ class SyncApp:
             if (kind == "refusal" and not self.live_choice
                     and "cannot identify the signed-in account" in msg
                     and "disagree" in msg):
-                self.status.set("Which account is Claude Desktop signed into?")
+                # The identity question, IN-PANE above the verbatim refusal
+                # through the shared banner builder - not a Toplevel at the
+                # screen corner (GUI polish, Change 2 item 2). Presentation
+                # around the refusal, never a rewrite of it.
+                self.status.set("Which account is the Claude desktop app "
+                                "signed into?")
                 self.detail.set("The two files that record this disagree, and either can "
-                                "be the stale one - so the tool refuses to guess.")
+                                "be the stale one - so the tool refuses to guess. "
+                                "Answer above the plan; Level shares the answer.")
                 self.show([msg])
-                self._offer_live_picker()
+                self._render_sync_banner(ask=True)
                 return
             # A SAVED destination can go stale: an 8-char id that identified one
             # store stops being unique the moment another account/org pair appears,
@@ -1899,7 +2251,7 @@ class SyncApp:
         # yesterday and want it back" is the same need, and the CLI was the
         # only answer to it before.
         self._update_undo_button()
-        self._sync_live_button()
+        self._render_sync_banner()
         # A filter that hides candidates must say so on the status line, not only
         # in the tally: "nothing to copy" reads as "you are up to date", which is
         # a different and misleading statement when a filter caused it.
@@ -2066,58 +2418,6 @@ class SyncApp:
         email = email or ccs.dormant_account_email(self.env, uuid) or ""
         return ("{0}  ({1}…)".format(email, uuid[:8]) if email
                 else "{0}…".format(uuid[:8]))
-
-    def _offer_live_picker(self):
-        """Turn the identity-disagreement refusal into an assertion, per RULING 5.
-
-        Deliberately NOT a "just proceed" button. The user is stating a fact -
-        which account the desktop app is signed into - so both candidates are
-        shown neutrally, neither is pre-selected, and the consequence is spelled
-        out: the OTHER store is the one that gets written.
-        """
-        dis = ccs._identity_disagreement(self.env)
-        if not dis:
-            return                       # shape changed: leave the raw refusal
-        # One button per STORE, not per account, and the asserted value is the
-        # store's path. An account can own several org directories - this very
-        # machine has two per account - and a bare account uuid then matches
-        # more than one store, which _resolve_live_assertion refuses. The user
-        # would have been stuck: live_choice is set, so this picker would not
-        # reopen, and there is no other way in the window to name an org.
-        stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env) if a in dis]
-        if not stores:
-            return
-        win = tk.Toplevel(self.root)
-        win.title("Which account is signed in?")
-        win.transient(self.root)
-        ttk.Label(win, padding=PAD, justify="left", wraplength=560,
-                  text="Claude Desktop and the Claude Code CLI disagree about which "
-                       "account is signed in, and either record can be the stale one.\n\n"
-                       "Tell it which store the DESKTOP APP is signed into right now. "
-                       "The OTHER one is what gets written, so an answer that is wrong "
-                       "writes the store you are actually using.\n\nThis answer holds "
-                       "for this window until you copy or change it - it is shown "
-                       "beside the Refresh button, and never saved to disk.").pack(
-                           anchor="w")
-        for a, o, p in stores:
-            rows = ccs._listing_row_count(p)
-            count = ("{0} rows".format(rows) if rows
-                     else "no listing rows" if rows == 0 else "row count unreadable")
-
-            def pick(path=p):
-                self.live_choice = path      # a full path matches exactly one store
-                win.destroy()
-                self.refresh()
-            ttk.Button(win, command=pick,
-                       text="Signed in as  {0}   org {1}…   ({2})".format(
-                           self._account_label(a), o[:8], count)).pack(
-                               fill="x", padx=PAD, pady=3)
-        ttk.Label(win, padding=(PAD, 4), foreground="#555", wraplength=520,
-                  justify="left",
-                  text="Or cancel and fix it at the source: run 'claude' then /login as "
-                       "the account you are using, or switch the desktop app, so the two "
-                       "records agree.").pack(anchor="w")
-        ttk.Button(win, text="Cancel", command=win.destroy).pack(pady=PAD)
 
     def on_toggle_trust(self):
         """RULING 7's opt-in, as a checkbox rather than "go create a file".
@@ -2489,7 +2789,7 @@ class SyncApp:
             self.show([msg])
             messagebox.showwarning("Undo did not complete", msg)   # see _apply_done
             self._update_undo_button()
-            self._sync_live_button()
+            self._render_sync_banner()
             self.refresh_level()
             return
         if kind == "sync":
@@ -2520,7 +2820,7 @@ class SyncApp:
                     len(rep.get("skipped") or []))
                 if rep.get("skipped") else "")
         self._update_undo_button()
-        self._sync_live_button()
+        self._render_sync_banner()
         # Undo after any step triggers the same fresh replan/re-render as
         # Apply does - the Level pane must never keep describing rows an undo
         # just removed.
@@ -2539,22 +2839,10 @@ class SyncApp:
         self.refresh()
 
     def forget_live(self):
-        """Drop the --live assertion and re-ask. The deliberate re-look the
-        old clear-on-every-replan behaviour was trying to provide, minus the
-        three unasked-for repetitions."""
-        self.refresh(reset_live=True)
-
-    def _sync_live_button(self):
-        """Show 'Change signed-in account' only while an assertion is held."""
-        # winfo_manager(), not winfo_ismapped(): the question is "is this packed",
-        # and ismapped answers "is it on screen right now", which is also False
-        # for a minimised or withdrawn window - so the button would be re-packed
-        # on every plan while iconified.
-        if self.live_choice:
-            if not self.live_btn.winfo_manager():
-                self.live_btn.pack(side="left", padx=(6, 0))
-        elif self.live_btn.winfo_manager():
-            self.live_btn.pack_forget()
+        """Drop the identity answer and re-ask on this tab. The deliberate
+        re-look the old clear-on-every-replan behaviour was trying to
+        provide, minus the three unasked-for repetitions."""
+        self._change_live(self.refresh)
 
     # ----------------------------------------------------------- the Level tab
     def refresh_level(self, note=""):
@@ -2565,6 +2853,7 @@ class SyncApp:
         instantly overwritten by the replan it triggers."""
         if note:
             self._level_note = note
+        self._settle_live()              # rule (b): drop BEFORE the plan
         self.level_gen += 1
         gen = self.level_gen
         self.busy(True)
@@ -2572,7 +2861,7 @@ class SyncApp:
         self.level_apply_btn.configure(state="disabled")
         self.level_status.set("Measuring...")
         threading.Thread(target=self._level_plan_worker,
-                         args=(gen, self.level_live), daemon=True).start()
+                         args=(gen, self.live_choice), daemon=True).start()
 
     def _level_plan_worker(self, gen, live):
         # The gate scan gets its own try, OUTSIDE the read block, and its
@@ -2659,72 +2948,16 @@ class SyncApp:
         self.level_footer.set("Measured at " + time.strftime("%H:%M:%S"))
 
     def _render_banner(self, man):
-        """The 0.13.0 identity warning, when the manifest carries one - the
-        existing live-picker pattern inline: one button per disagreeing
-        STORE (an account can own several org directories, the sync picker's
-        hard-won lesson), labeled by email where known, setting the
-        assertion and replanning."""
-        for w in self.level_banner.winfo_children():
-            w.destroy()
-        self._prune_wrapped()
-        self._banner_widgets = []
-        if self.level_live:
-            row = ttk.Frame(self.level_banner)
-            row.pack(fill="x", pady=(0, 4))
-            lbl = ttk.Label(row, foreground="#a00000", justify="left",
-                            text="!! --live assertion in force for the next "
-                                 "press of {0} - cleared when its sequence "
-                                 "ends; never saved.".format(LEVEL_BUTTON))
-            lbl.pack(side="left")
-            b = ttk.Button(row, text="Change signed-in account",
-                           command=self.forget_level_live)
-            b.pack(side="left", padx=(6, 0))
-            self._wrap_to(lbl, row, margin=b.winfo_reqwidth() + 12)
-            self._banner_widgets.append(b)
-            return
+        """Level's identity banner, through the shared builder: the
+        question with one button per disagreeing store when the manifest
+        carries the 0.13.0 identity_disagreement field, the in-force line
+        while an answer is held. Sits between the plan summary and the
+        holds - the pane's stated order."""
         dis = (man or {}).get("identity_disagreement")
-        if not isinstance(dis, dict):
-            return
-        oauth, config = dis.get("oauth") or "", dis.get("config") or ""
-        # A fresh frame per render, so the wrap binding dies with it.
-        box = ttk.Frame(self.level_banner)
-        box.pack(fill="x")
-        lbl = ttk.Label(box, foreground="#a00000", justify="left",
-                        text="!! ~/.claude.json ({0}) and config.json ({1}) "
-                             "disagree about which account is signed in, and "
-                             "either record can be the stale one. The copy "
-                             "stage will refuse (RULING 5) until you say "
-                             "which account the DESKTOP APP is on right now "
-                             "- the answer covers one press of {2} and is "
-                             "never written to disk."
-                             .format(oauth[:8], config[:8], LEVEL_BUTTON))
-        lbl.pack(anchor="w", pady=(0, 2))
-        self._wrap_to(lbl, box)
-        try:
-            stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env)
-                      if a in (oauth, config)]
-        except Exception:
-            stores = []
-        for a, o, p in stores:
-            rows = ccs._listing_row_count(p)
-            count = ("{0} rows".format(rows) if rows
-                     else "no listing rows" if rows == 0
-                     else "row count unreadable")
-
-            def pick(path=p):
-                self.level_live = path   # a full path matches exactly one store
-                self.refresh_level()
-            b = ttk.Button(box, command=pick,
-                           text="Signed in as  {0}   org {1}…   ({2})".format(
-                               self._account_label(a), o[:8], count))
-            b.pack(fill="x", pady=2)
-            self._banner_widgets.append(b)
-
-    def forget_level_live(self):
-        """Drop the Level tab's --live assertion and re-ask - the same
-        deliberate re-look the sync pane's forget_live provides."""
-        self.level_live = ""
-        self.refresh_level()
+        pair = ((dis.get("oauth") or "", dis.get("config") or "")
+                if isinstance(dis, dict) else None)
+        self._render_identity_banner(self.level_banner, pair,
+                                     self.refresh_level, self._banner_widgets)
 
     def _render_holds(self):
         for w in self.hold_frame.winfo_children():
@@ -2908,6 +3141,11 @@ class SyncApp:
             return
         if self._press_gate():
             return                       # the red line is the explanation
+        if self._settle_live():
+            # Rule (b) at press time: the files no longer show the pair the
+            # answer was given for - drop it and replan instead of running.
+            self.refresh_level()
+            return
         models = self._current_models()
         steps, problems = _level_steps_stage1(models)
         if problems:
@@ -2921,7 +3159,13 @@ class SyncApp:
             self.level_status.set("Nothing is ticked - tick a rename, or "
                                   "press Refresh.")
             return
-        if steps and not self._confirm_stage1(steps):
+        # When the preview carried the disagreement and no answer is held,
+        # the stage-1 dialog says the copy step will ask.
+        note = ""
+        if (isinstance(self.level_manifest.get("identity_disagreement"), dict)
+                and not self.live_choice):
+            note = STAGE1_ASK_NOTE
+        if steps and not self._confirm_stage1(steps, note):
             return
         self.level_gen += 1              # this press owns the pane now
         gen = self.level_gen
@@ -2935,14 +3179,16 @@ class SyncApp:
         ui = _TkLevelUI(self)
         self._mutation_ui = ui
         threading.Thread(target=self._level_apply_worker,
-                         args=(gen, steps, self.level_live, ui),
+                         args=(gen, steps, self.live_choice, self._live_pair,
+                               ui),
                          daemon=True).start()
 
-    def _confirm_stage1(self, steps):
+    def _confirm_stage1(self, steps, note=""):
         """Stage 1's dialog: a scrollable Toplevel, not a stock messagebox -
         thirty mapping lines would push a messagebox's buttons off screen.
         The mapping list scrolls; the confirm/cancel row does not move."""
-        head, mappings, footer = _stage1_dialog_parts(steps)
+        head, mappings, footer = _stage1_dialog_parts(
+            steps, note, self._assertion_text())
         win = tk.Toplevel(self.root)
         win.title(head)
         win.transient(self.root)
@@ -2972,8 +3218,8 @@ class SyncApp:
         self.root.wait_window(win)
         return result["ok"]
 
-    def _level_apply_worker(self, gen, steps, live, ui):
-        seq, refresh = _run_level_apply(self.env, steps, live, ui)
+    def _level_apply_worker(self, gen, steps, live, pair, ui):
+        seq, refresh = _run_level_apply(self.env, steps, live, ui, pair=pair)
         self.root.after(0, self._level_apply_done, gen, seq, refresh)
 
     def _level_apply_done(self, gen, seq, refresh):
@@ -2998,11 +3244,13 @@ class SyncApp:
                 return
             # A gate hit BETWEEN the stages: renames landed. Fall through -
             # the refresh ran, and the status below names the landed count.
-        # The sequence has ended - completed, refused, or cancelled alike -
-        # so the assertion it carried is spent. The refresh below already
-        # planned without it; if the files still disagree, that replan is
-        # what re-raises the banner.
-        self.level_live = ""
+        # The answer's life (Change 2 item 5): spent by a run of the
+        # mutation path - completed or unchanged - kept across a refusal, a
+        # cancel and the zero-rows empty outcome, and re-read against the
+        # files. The refresh planned the same way; if the files still
+        # disagree and no answer is held, that replan re-raises the banner.
+        self._apply_live(_live_event_for(seq.get("stage2")), seq.get("stage2"))
+        self._settle_live()
         half = ""
         keep_stale_status = False
         if refresh is not None and refresh[0] == "ok":
@@ -3096,6 +3344,11 @@ class SyncApp:
         # reason over, so the window refuses to be the second writer.
         if self._press_gate():
             return
+        if self._settle_live():
+            # Rule (b) at press time: the files no longer show the pair the
+            # answer was given for - drop it and replan instead of running.
+            self.refresh()
+            return
         rows = self.manifest.get("rows") or []
         # The single-session gate, re-read at press time: a bulk plan needs
         # consent for exactly this row set (the button is disabled without
@@ -3126,6 +3379,11 @@ class SyncApp:
         if n_hide:
             back_note += ("\n{0} of those would leave the conversation they "
                           "displace unreachable from every sidebar.".format(n_hide))
+        # Every confirmation that precedes a write under a held answer
+        # prints the assertion line: the OK is the per-operation act.
+        assertion = self._assertion_text()
+        if assertion:
+            back_note += "\n\n" + assertion
         if n_upd and not messagebox.askokcancel(
                 "Overwrite existing rows?",
                 "{0} of these {1} row(s) ALREADY EXIST in {2}. Each will have its "
@@ -3159,7 +3417,8 @@ class SyncApp:
             does = ("It adds listing rows to that account's sidebar. It never "
                     "deletes anything.")
         if not messagebox.askokcancel(
-                "Copy sessions?", "{0}\n\n{1} Undo reverses it.".format(what, does)):
+                "Copy sessions?", "{0}\n\n{1} Undo reverses it.{2}".format(
+                    what, does, ("\n\n" + assertion) if assertion else "")):
             return
         self._sync_apply_ok = False
         # And the Level pane's verdict: this copy changes the store its plan
@@ -3209,7 +3468,7 @@ class SyncApp:
         done = [r for r in (manifest.get("rows") or []) if r.get("written")]
         written = len(done)
         n_upd = sum(1 for r in done if r.get("is_update"))
-        self.live_choice = ""            # an assertion covers one run, not a session
+        self._apply_live("mutation_ran", "completed")   # rule (a): spent
         # Same rule for the overwrite opt-in: it covers ONE run. Leaving the box
         # ticked after an apply meant the next plan in the same window silently
         # arrived with refreshes already enabled, which is not what "opt-in per
@@ -3229,7 +3488,7 @@ class SyncApp:
                         "send you to a terminal to reverse what it just did.")
         self.manifest = None
         self._update_undo_button()
-        self._sync_live_button()
+        self._render_sync_banner()
         # The copy changed the store the Level pane measured; re-measure so
         # its scoreboard and Apply verdict describe the store as it now is.
         self.refresh_level()

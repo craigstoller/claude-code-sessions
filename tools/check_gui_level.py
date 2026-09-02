@@ -136,18 +136,30 @@ def build_env(collide=True, disagree=False, recency_disagree=False):
 
 
 class FakeUI(object):
-    """The sequence's UI adapter, scripted: records statuses, answers the
-    stage-2 dialog per CONFIRM (a callable hook runs first), and reports
-    whatever GATE returns."""
+    """The sequence's UI adapter, scripted, mirroring _TkLevelUI member for
+    member: records statuses, answers the stage-2 dialog per CONFIRM (a
+    callable hook runs first), reports whatever GATE returns, and answers
+    the stage-2 identity question with ASK (a store path, or None for
+    Cancel; ON_ASK runs first)."""
 
-    def __init__(self, confirm=True, gate=None, on_confirm=None):
+    def __init__(self, confirm=True, gate=None, on_confirm=None, ask=None,
+                 on_ask=None):
         self.statuses = []
         self.confirmed_with = []
+        self.asked_with = []
         self.remaining = 0
         self.truncate = False
         self._confirm = confirm
         self._gate = gate or (lambda: None)
         self._on_confirm = on_confirm
+        self._ask = ask
+        self._on_ask = on_ask
+
+    def ask_live(self, fresh):
+        self.asked_with.append(fresh)
+        if self._on_ask:
+            self._on_ask()
+        return self._ask
 
     def status(self, text):
         self.statuses.append(text)
@@ -464,7 +476,8 @@ models = gp._hold_models(man)
 steps, _ = gp._level_steps_stage1(models)
 with PlanSpy() as spy:
     ui = FakeUI(confirm=True)
-    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui)
+    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui,
+                                       pair=(A1, A2))
 check("the stage-2 plan still carried the live assertion",
       len(spy.plans) == 2 and spy.plans[0][0].live == "alice@example.com",
       repr([p[0].live for p in spy.plans]))
@@ -475,8 +488,12 @@ check("  so the banner re-raises while the files still disagree",
       refresh[0] == "ok"
       and isinstance(refresh[2].get("identity_disagreement"), dict))
 
-# 20b: a stage-1 refusal also ends the sequence; the post-refusal replan
-# re-raises the banner.
+check("  and the answer's pair travelled with the sequence",
+      seq.get("live_pair") == (A1, A2), str(seq.get("live_pair")))
+
+# 20b, INVERTED by the GUI polish (Change 2 item 5, rule (a)): a stage-1
+# refusal ran nothing and consumed nothing, so the answer survives it - the
+# post-refusal replan CARRIES the assertion while the files still disagree.
 env, root = build_env(disagree=True)
 roots.append(root)
 env.process_lister = lambda: DESKTOP          # trips RULING 4 at rename 1
@@ -490,14 +507,159 @@ def clear_guard():
 
 with PlanSpy() as spy:
     ui = FakeUI(confirm=True)
-    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui)
+    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui,
+                                       pair=(A1, A2))
 clear_guard()
-check("stage-1 refusal ends the sequence with live cleared for the replan",
+check("a stage-1 refusal keeps the answer: the post-refusal replan carries it",
       seq["rename_refusal"] is not None and len(spy.plans) == 1
-      and spy.plans[0][0].live == "")
-check("  and the post-refusal replan re-raises the banner",
+      and spy.plans[0][0].live == "alice@example.com",
+      repr([p[0].live for p in spy.plans]))
+check("  and the files still disagree, so the manifest carries the field",
       refresh is not None and refresh[0] == "ok"
       and isinstance(refresh[2].get("identity_disagreement"), dict))
+
+# Rule (a) and `unchanged`: a converge whose apply-time re-check certified
+# the answer and then found nothing to write spent the assertion exactly as
+# the CLI's would - the refresh plans without it.
+env, root = build_env(disagree=True)
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+import base64 as _b64  # noqa: E402
+
+
+def plant_rows_from(spy_ref):
+    """Write the fresh plan's rows fixture-side before run_converge, so its
+    re-check marks every pair already_present and returns unchanged."""
+    def hook():
+        for r in spy_ref.plans[0][1]["rows"]:
+            with open(r["dest_path"], "wb") as fh:
+                fh.write(_b64.b64decode(r["post_b64"]))
+    return hook
+
+
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True, on_confirm=plant_rows_from(spy))
+    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui,
+                                       pair=(A1, A2))
+check("a converge whose re-check writes nothing ends 'unchanged'",
+      seq["stage2"] == "unchanged" and len(spy.runs) == 1, seq["stage2"])
+check("  and that clears the answer too - the refresh plans without it",
+      len(spy.plans) == 2 and spy.plans[1][0].live == "",
+      repr([p[0].live for p in spy.plans]))
+
+# The zero-rows `empty` outcome is different: no converge ran, nothing was
+# certified, the answer stays and the refresh carries it.
+env, root = build_env(collide=False, disagree=True)
+roots.append(root)
+one_step = [{"key": (S1, T_COLL + " one"), "target_sid": S1,
+             "old_title": T_COLL + " one",
+             "new_title": "ACME-REVIEW session - renamed leg (Aug 24-28)"}]
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True)
+    seq, refresh = gp._run_level_apply(env, one_step, "alice@example.com", ui,
+                                       pair=(A1, A2))
+check("the zero-rows empty outcome keeps the answer",
+      seq["stage2"] == "empty" and len(spy.runs) == 0
+      and len(spy.plans) == 2 and spy.plans[1][0].live == "alice@example.com",
+      "%s %s" % (seq["stage2"], [p[0].live for p in spy.plans]))
+
+# ------------------- 13 (GUI polish). the stage-2 ask, from the fresh plan
+# No answer held, the files disagree: the sequence asks AFTER the renames,
+# from the fresh manifest, and replans with the answer before the stage-2
+# dialog - never before stage 1 from the stale preview.
+env, root = build_env(disagree=True)
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+A1_STORE = os.path.join(env.store_candidates[0], A1, O1)
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True, ask=A1_STORE)
+    seq, refresh = gp._run_level_apply(env, steps, "", ui)
+check("the picker fires after the renames, from the fresh plan",
+      seq["landed"] == 1 and len(ui.asked_with) == 1
+      and ui.asked_with[0] is spy.plans[0][1]
+      and isinstance(ui.asked_with[0].get("identity_disagreement"), dict),
+      "asked %d" % len(ui.asked_with))
+check("  an answer replans: four plans counting the preview (fresh, replan, "
+      "refresh)", len(spy.plans) == 3, str(len(spy.plans)))
+check("  the stage-2 dialog saw the REPLANNED manifest, which carries "
+      "live_asserted",
+      ui.confirmed_with and ui.confirmed_with[0] is spy.plans[1][1]
+      and spy.plans[1][1].get("live_asserted") == A1,
+      repr((spy.plans[1][1] or {}).get("live_asserted")))
+check("  and run_converge received that manifest",
+      len(spy.runs) == 1 and spy.runs[0] is spy.plans[1][1]
+      and seq["stage2"] == "completed", seq["stage2"])
+check("  the answer is recorded on the result with its pair",
+      seq.get("asked") == A1_STORE and seq.get("live_pair") == (A1, A2),
+      str((seq.get("asked"), seq.get("live_pair"))))
+check("  and the refresh, after a completed write, plans without it",
+      spy.plans[2][0].live == "", repr(spy.plans[2][0].live))
+
+# Cancel on the picker: the renames stand, the refresh runs, no converge.
+env, root = build_env(disagree=True)
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True, ask=None)
+    seq, refresh = gp._run_level_apply(env, steps, "", ui)
+check("Cancel on the picker ends the sequence as cancelled",
+      seq["stage2"] == "cancelled" and seq["landed"] == 1
+      and len(spy.runs) == 0 and ui.confirmed_with == [], seq["stage2"])
+check("  the status discloses that the renames stand",
+      gp._sequence_status(seq)
+      == "1 rename landed, each undoable; the copy was not confirmed.",
+      gp._sequence_status(seq))
+check("  and the refresh ran, planning without an answer",
+      refresh is not None and refresh[0] == "ok" and len(spy.plans) == 2
+      and spy.plans[1][0].live == "")
+
+# An answer given, then a close confirmed before the replan: truncated.
+env, root = build_env(disagree=True)
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True, ask=A1_STORE)
+    ui._on_ask = lambda: setattr(ui, "truncate", True)
+    seq, refresh = gp._run_level_apply(env, steps, "", ui)
+check("a close confirmed while the picker sits open ends as truncated",
+      seq["stage2"] == "truncated" and len(spy.runs) == 0
+      and len(spy.plans) == 1 and refresh is None, seq["stage2"])
+
+# Rule (b) inside the worker: an answer whose pair the files have outgrown
+# by the time stage 2 plans is dropped BEFORE the plan, never threaded into
+# it - a plan-then-drop order would have turned the healed files into a
+# plan-time refusal.
+env, root = build_env(disagree=True)
+roots.append(root)
+models = gp._hold_models(ccs.plan_converge(env, ccs.ConvergeFlags()))
+steps, _ = gp._level_steps_stage1(models)
+_real_run_retitle_b = ccs.run_retitle
+
+
+def heal_after_rename(env_, manifest):
+    final = _real_run_retitle_b(env_, manifest)
+    write_json(os.path.join(root, "Claude", "config.json"),
+               {"lastKnownAccountUuid": A1})     # the files now agree
+    return final
+
+
+ccs.run_retitle = heal_after_rename
+with PlanSpy() as spy:
+    ui = FakeUI(confirm=True)
+    seq, refresh = gp._run_level_apply(env, steps, "alice@example.com", ui,
+                                       pair=(A1, A2))
+ccs.run_retitle = _real_run_retitle_b
+check("files that healed mid-sequence drop the answer before the stage-2 plan",
+      seq.get("live_dropped") is True and spy.plans[0][0].live == ""
+      and seq["stage2"] == "completed" and not seq.get("plan_problem"),
+      "%s live=%r" % (seq["stage2"], spy.plans[0][0].live))
+check("  and the healed files produce a plan with no banner",
+      not spy.plans[0][1].get("identity_disagreement")
+      and refresh is not None and refresh[0] == "ok")
 
 # ------------------------------- 21. the final refresh fails after success
 env, root = build_env()
@@ -589,6 +751,16 @@ def above(a, b):
     return slaves.index(a) < slaves.index(b)
 
 
+def walk(w):
+    """W's descendants, depth first - the banner builder nests its line and
+    buttons in a row frame."""
+    out = []
+    for c in w.winfo_children():
+        out.append(c)
+        out += walk(c)
+    return out
+
+
 def open_app(env, stage1=True):
     """A real SyncApp over ENV, withdrawn, stage-1 dialog scripted (a
     Toplevel needs a display pump this harness does not want mid-check)."""
@@ -598,13 +770,16 @@ def open_app(env, stage1=True):
     tkroot = tk.Tk()
     tkroot.withdraw()
     stage1_calls = []
+    stage1_notes = []
 
-    def fake_stage1(self, steps):
+    def fake_stage1(self, steps, note=""):
         stage1_calls.append(list(steps))
+        stage1_notes.append(note)
         return stage1
     gp.SyncApp._confirm_stage1 = fake_stage1
     app = gp.SyncApp(tkroot)
     app._stage1_calls = stage1_calls
+    app._stage1_notes = stage1_notes
 
     def settle():
         for _ in range(30):
@@ -816,15 +991,233 @@ check("  labeled by email where known",
 mine = "ACME-REVIEW session - my own words"
 app.hold_models[0]["_entry_var"].set(mine)
 app.hold_models[0]["_tick_var"].set(False)
+check("  the buttons carry the one wording - 'Desktop app is signed in as'",
+      all(b.cget("text").startswith("Desktop app is signed in as")
+          for b in app._banner_widgets),
+      str([b.cget("text")[:40] for b in app._banner_widgets]))
 app._banner_widgets[0].invoke()
 settle()
-check("choosing an account replans with the assertion held",
-      app.level_live and app.level_manifest is not None)
+check("choosing an account replans with the assertion held - in the ONE "
+      "variable, live_choice, bound to its pair",
+      app.live_choice and app.level_manifest is not None
+      and app._live_pair == (A1, A2) and not hasattr(app, "level_live"),
+      str((app.live_choice, app._live_pair)))
 check("  the banner now shows the in-force line instead of the pickers",
       len(app._banner_widgets) == 1)
 check("  and the typed entry text and tick survived that replan",
       app.hold_models and app.hold_models[0]["_entry_var"].get() == mine
       and app.hold_models[0]["_tick_var"].get() is False)
+# Part B item 14: the same answer reaches the sync pane's next plan.
+sync_flags = []
+_real_plan_sync = ccs.plan_sync
+
+
+def spy_plan_sync(env_, flags):
+    sync_flags.append(flags)
+    return _real_plan_sync(env_, flags)
+
+
+ccs.plan_sync = spy_plan_sync
+app.nb.select(app.sync_tab)
+settle()
+ccs.plan_sync = _real_plan_sync
+check("  the same answer reaches the sync pane's next plan",
+      sync_flags and sync_flags[-1].live == app.live_choice,
+      repr([f.live for f in sync_flags]))
+check("  and the One-session tab shows the same in-force line and button",
+      any(isinstance(w, gp.ttk.Button)
+          and w.cget("text") == "Change signed-in account"
+          for w in walk(app.sync_banner))
+      and any(isinstance(w, gp.ttk.Label)
+              and "under your assertion" in str(w.cget("text"))
+              for w in walk(app.sync_banner)))
+tkroot.destroy()
+
+# ---------------- 20b, window-level: a refusal keeps the answer in force
+env, root = build_env(disagree=True)
+roots.append(root)
+env.process_lister = lambda: DESKTOP          # RULING 4 trips at rename 1
+app, tkroot, modals, settle = open_app(env)
+settle()
+app._banner_widgets[0].invoke()
+settle()
+with PlanSpy() as spy:
+    app.on_level_apply()
+    settle()
+check("a stage-1 refusal leaves the answer held",
+      app.live_choice != "" and modals.of("showwarning", "Nothing was renamed"),
+      repr(app.live_choice))
+check("  the post-refusal replan carried it",
+      spy.plans and spy.plans[-1][0].live == app.live_choice)
+check("  and the banner shows the in-force line, not the pickers",
+      len(app._banner_widgets) == 1
+      and app._banner_widgets[0].cget("text") == "Change signed-in account")
+env.process_lister = lambda: []
+tkroot.destroy()
+
+# ------------- 13, window-level: the stage-1 line, the picker, its failure
+env, root = build_env(disagree=True)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+asked = []
+
+
+def scripted_picker(self, fresh):
+    asked.append(fresh)
+    path = os.path.join(env.store_candidates[0], A1, O1)
+    dis = fresh["identity_disagreement"]
+    self._apply_live("answered", {"path": path,
+                                  "pair": (dis["oauth"], dis["config"]),
+                                  "label": "alice@example.com"})
+    return path
+
+
+gp.SyncApp._ask_live_dialog = scripted_picker
+with PlanSpy() as spy:
+    app.on_level_apply()
+    settle()
+check("the stage-1 dialog says the copy step will ask",
+      app._stage1_notes and "the copy step will ask"
+      in app._stage1_notes[0],
+      repr(app._stage1_notes[:1]))
+check("  the picker fired once, after the renames, and the converge ran",
+      len(asked) == 1 and len(spy.runs) == 1
+      and app.level_status.get().startswith("Applied (1 rename + 1 converge)"),
+      app.level_status.get())
+check("  the stage-2 dialog carried the assertion line",
+      any("under your assertion: the desktop app is on" in c[2]
+          for c in modals.of("askokcancel", "Create the rows?")),
+      str(modals.of("askokcancel")))
+check("  after the completed write the answer is spent and the banner is "
+      "back", app.live_choice == "" and len(app._banner_widgets) == 2)
+tkroot.destroy()
+
+# The picker raising (fixture-side) reads as Cancel: the sequence ends
+# cancelled, the busy count is released, no control is stranded.
+env, root = build_env(disagree=True)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+
+
+def broken_picker(self, fresh):
+    raise RuntimeError("simulated Tk failure in the picker")
+
+
+gp.SyncApp._ask_live_dialog = broken_picker
+with PlanSpy() as spy:
+    app.on_level_apply()
+    settle()
+del gp.SyncApp._ask_live_dialog       # the real one again
+check("a picker that raises reads as Cancel",
+      app.level_status.get()
+      == "1 rename landed, each undoable; the copy was not confirmed."
+      and len(spy.runs) == 0, app.level_status.get())
+check("  and the busy count was released - nothing stranded",
+      app._busy_count == 0
+      and str(app.level_refresh_btn.cget("state")) == "normal")
+tkroot.destroy()
+
+# ------------------ 14 (GUI polish). rule (b) and its order, window-level
+env, root = build_env(disagree=True)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+CONFIG = os.path.join(root, "Claude", "config.json")
+OAUTH = os.path.join(env.home, ".claude.json")
+
+
+def set_identity(oauth, config):
+    write_json(OAUTH, {"oauthAccount": {"accountUuid": oauth,
+                                        "organizationUuid": O1,
+                                        "emailAddress": "alice@example.com"}})
+    write_json(CONFIG, {"lastKnownAccountUuid": config})
+
+
+def answer():
+    app._banner_widgets[0].invoke()
+    settle()
+    return app.live_choice
+
+
+check("an answer is held", bool(answer()) and app._live_pair == (A1, A2))
+set_identity(A1, A1)                  # the files now agree
+with PlanSpy() as spy:
+    app.refresh_level()
+    settle()
+check("files that agree drop the answer before the next plan",
+      app.live_choice == "" and spy.plans[-1][0].live == "",
+      repr(spy.plans[-1][0].live))
+check("  the in-force line is gone and nothing refused",
+      app._banner_widgets == [] and app.level_status.get() != "Refused",
+      app.level_status.get())
+set_identity(A1, A2)                  # the disagreement is back
+app.refresh_level()
+settle()
+answer()
+A3 = "eeeeeeee-0000-0000-0000-000000000005"
+set_identity(A1, A3)                  # a different pair
+with PlanSpy() as spy:
+    app.refresh_level()
+    settle()
+check("a changed pair drops it too", app.live_choice == ""
+      and spy.plans[-1][0].live == "")
+set_identity(A1, A2)
+app.refresh_level()
+settle()
+answer()
+set_identity(A2, A1)                  # the same accounts, roles swapped
+with PlanSpy() as spy:
+    app.refresh_level()
+    settle()
+check("the roles swapped drops it", app.live_choice == ""
+      and spy.plans[-1][0].live == "")
+# A press after the files changed drops the answer and replans instead of
+# running: no run_retitle, no stage-1 dialog.
+set_identity(A1, A2)
+app.refresh_level()
+settle()
+answer()
+set_identity(A1, A1)
+before = len(app._stage1_calls)
+retitles = []
+_real_run_retitle_c = ccs.run_retitle
+ccs.run_retitle = lambda e, m: retitles.append(m) or _real_run_retitle_c(e, m)
+with PlanSpy() as spy:
+    app.on_level_apply()
+    settle()
+ccs.run_retitle = _real_run_retitle_c
+check("a Level press after the files changed replans instead of running",
+      len(app._stage1_calls) == before and retitles == []
+      and len(spy.plans) == 1 and app.live_choice == "",
+      "stage1=%d retitles=%d plans=%d" % (len(app._stage1_calls) - before,
+                                          len(retitles), len(spy.plans)))
+# And the sync Apply, the same way.
+set_identity(A1, A2)
+app.refresh_level()
+settle()
+answer()
+app.nb.select(app.sync_tab)
+settle()
+syncs = []
+_real_run_sync = ccs.run_sync
+ccs.run_sync = lambda e, m: syncs.append(m) or "completed"
+plans_before = len(sync_flags)
+sync_plans = []
+_real_plan_sync2 = ccs.plan_sync
+ccs.plan_sync = lambda e, f: sync_plans.append(f) or _real_plan_sync2(e, f)
+set_identity(A1, A1)
+app.manifest = {"rows": [{"name": "local_x.json", "session_id": "x",
+                          "is_update": False}], "tally": {},
+                "dest_account": A2, "dest_email": "bob@example.com"}
+app.on_apply()
+settle()
+ccs.run_sync = _real_run_sync
+ccs.plan_sync = _real_plan_sync2
+check("a sync Apply after the files changed replans instead of running",
+      syncs == [] and len(sync_plans) == 1 and app.live_choice == "",
+      "syncs=%d plans=%d" % (len(syncs), len(sync_plans)))
 tkroot.destroy()
 
 # ------------- 16. two unresolved ops: red line, listing, copy, refresh

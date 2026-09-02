@@ -434,15 +434,24 @@ check("the duplicate-title warning sits above the bar, bottom-pinned too",
 # The holds canvas: at least one row tall at 940x640; scrollable at the floor.
 app.nb.select(app.level_tab)
 settle()
-rows = [w for w in app.hold_frame.winfo_children()
-        if isinstance(w, gp.ttk.Frame)]
+def hold_rows():
+    """The row frames as they are NOW - a replan rebuilds them."""
+    return [w for w in app.hold_frame.winfo_children()
+            if isinstance(w, gp.ttk.Frame)]
+
+
+def long_rows():
+    return [r for r in hold_rows() if any(
+        isinstance(c, gp.ttk.Label) and str(c.cget("text")) == T_LONG
+        for c in r.winfo_children())]
+
+
+rows = hold_rows()
 row_h = max(r.winfo_reqheight() for r in rows) if rows else 0
 check("the holds canvas is at least one row tall at 940x640",
       rows and app.hold_canvas.winfo_height() >= row_h,
       "canvas %d, row %d" % (app.hold_canvas.winfo_height(), row_h))
-long_row = [r for r in rows if any(
-    isinstance(c, gp.ttk.Label) and str(c.cget("text")) == T_LONG
-    for c in r.winfo_children())]
+long_row = long_rows()
 check("  the 130-character title wraps inside its row instead of overflowing",
       long_row and long_row[0].winfo_reqwidth() <= long_row[0].winfo_width(),
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
@@ -453,6 +462,13 @@ check("  the 130-character title wraps inside its row instead of overflowing",
 audit(app, tkroot, settle, gp.FIT_FLOOR)
 app.nb.select(app.level_tab)
 settle()
+# With the two-button question up, the floor leaves the rows no viewport
+# (the question is what there is to act on); the answer collapses the
+# banner to one line and the holds become a scrollable viewport.
+app._banner_widgets[0].invoke()
+settle()
+check("  the answered banner collapses to its in-force line",
+      len(app._banner_widgets) == 1, str(len(app._banner_widgets)))
 check("at the floor the holds canvas is scrollable - a viewport with a "
       "scrollbar over rows taller than itself",
       app.hold_canvas.winfo_height() > 1
@@ -461,6 +477,7 @@ check("at the floor the holds canvas is scrollable - a viewport with a "
       "canvas %d, rows %d, yview %s" % (app.hold_canvas.winfo_height(),
                                         app.hold_frame.winfo_reqheight(),
                                         app.hold_canvas.yview()))
+long_row = long_rows()
 check("  and the 130-character title still wraps inside its row",
       long_row and long_row[0].winfo_reqwidth() <= long_row[0].winfo_width(),
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
