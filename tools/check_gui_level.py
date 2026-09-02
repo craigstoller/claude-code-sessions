@@ -140,13 +140,16 @@ class FakeUI(object):
     member: records statuses, answers the stage-2 dialog per CONFIRM (a
     callable hook runs first), reports whatever GATE returns, and answers
     the stage-2 identity question with ASK (a store path, or None for
-    Cancel; ON_ASK runs first)."""
+    Cancel; ON_ASK runs first). landed_keys collects the rows whose rename
+    landed, as the Tk adapter's does for the close prompt."""
 
     def __init__(self, confirm=True, gate=None, on_confirm=None, ask=None,
                  on_ask=None):
         self.statuses = []
         self.confirmed_with = []
         self.asked_with = []
+        self.landed_keys = []
+        self.current_key = None
         self.remaining = 0
         self.truncate = False
         self._confirm = confirm
@@ -728,14 +731,14 @@ class Modals(object):
         self.default = True
 
     def askokcancel(self, title, message, **kw):
-        self.calls.append(("askokcancel", title, message))
+        self.calls.append(("askokcancel", title, message, kw))
         return self.answers.get(title, self.default)
 
     def showwarning(self, title, message, **kw):
-        self.calls.append(("showwarning", title, message))
+        self.calls.append(("showwarning", title, message, kw))
 
     def showerror(self, title, message, **kw):
-        self.calls.append(("showerror", title, message))
+        self.calls.append(("showerror", title, message, kw))
 
     def of(self, kind, title=None):
         return [c for c in self.calls
@@ -1304,6 +1307,14 @@ closes = modals.of("askokcancel", "Close during an operation?")
 check("the close prompt stated the remaining-step count",
       len(closes) == 1 and "2 remaining step(s) will NOT run" in closes[0][2],
       closes[0][2] if closes else "-")
+# GUI polish (Change 5): the interception names the typed names a close
+# would lose - the second row's rename had not landed at the boundary.
+check("  and the unapplied naming change the close loses",
+      closes and "2 remaining step(s) will NOT run; 1 unapplied naming "
+      "change will be lost. Close?" in closes[0][2],
+      closes[0][2] if closes else "-")
+check("  with the default on Cancel",
+      closes and closes[0][3].get("default") == "cancel", str(closes[0][3:]))
 check("the in-flight rename completed; the remainder was truncated",
       calls["retitle"] == 1)
 check("  no further engine calls - no plan, no converge",
@@ -1318,6 +1329,88 @@ renamed = [json.load(open(os.path.join(env.store_candidates[0], A1, O1, n),
            for n in os.listdir(os.path.join(env.store_candidates[0], A1, O1))]
 check("  the landed rename is in the store, journalled",
       "ACME-REVIEW leg one" in renamed, str(renamed))
+
+# ------- 17b. the interception omits the clause when nothing is unapplied
+env, root = build_env(collide=False)
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+app.hold_models = [
+    {"key": (S1, "a"), "title": T_COLL + " one", "evidence": "x",
+     "target_sid": S1, "prefill": "", "entry": "ACME-REVIEW leg one",
+     "editable": True, "ticked": True, "degrade_reason": "",
+     "classification": "supersession"},
+]
+calls = {"retitle": 0}
+
+
+def closing_run_retitle_2(env_, manifest):
+    final = _real_run_retitle(env_, manifest)
+    calls["retitle"] += 1
+    app._on_close()                      # X during the only rename
+    return final
+
+
+ccs.run_retitle = closing_run_retitle_2
+modals.answers["Close during an operation?"] = True
+with PlanSpy() as spy:
+    app.on_level_apply()
+    try:
+        settle()
+    except tk.TclError:
+        pass
+ccs.run_retitle = _real_run_retitle
+closes = modals.of("askokcancel", "Close during an operation?")
+check("with the only edited row's rename landed, the clause is omitted",
+      len(closes) == 1
+      and closes[0][2] == "The current operation will finish, and the 1 "
+                          "remaining step(s) will NOT run. Close?",
+      closes[0][2] if closes else "-")
+
+# -------------------- 15 (GUI polish). the dirty-close prompt, idle path
+env, root = build_env(recency_disagree=True)     # two editable, empty rows
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+check("two empty editable rows to type into", len(app.hold_models) == 2)
+app.hold_models[0]["_entry_var"].set("ACME-REVIEW session - one leg")
+app.hold_models[1]["_tick_var"].set(True)
+settle()
+modals.answers["Close?"] = False
+app._on_close()
+prompts = modals.of("askokcancel", "Close?")
+check("Close on the idle path prompts, naming two unapplied changes",
+      len(prompts) == 1
+      and prompts[0][2] == "2 unapplied naming changes will be lost. Close?",
+      prompts[0][2] if prompts else "-")
+check("  with the default on Cancel",
+      prompts and prompts[0][3].get("default") == "cancel")
+check("  Cancel keeps the window and the text",
+      tkroot.winfo_exists()
+      and app.hold_models[0]["_entry_var"].get()
+      == "ACME-REVIEW session - one leg"
+      and app.hold_models[1]["_tick_var"].get() is True)
+modals.answers["Close?"] = True
+app._on_close()
+try:
+    gone = not tkroot.winfo_exists()
+except tk.TclError:
+    gone = True
+check("  OK closes it", gone)
+
+# An unedited pane closes without a prompt.
+env, root = build_env()
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+before = len(modals.calls)
+app._on_close()
+try:
+    gone = not tkroot.winfo_exists()
+except tk.TclError:
+    gone = True
+check("an unedited pane closes without a prompt",
+      gone and len(modals.calls) == before)
 
 # --------------------------- 18. read failure on open: in-pane, no modal
 env, root = build_env()

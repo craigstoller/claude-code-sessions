@@ -617,3 +617,53 @@ def test_live_answer_reducer():
     # The line every confirmation prints while an answer is held.
     assert (gui._assertion_line("alice@example.com")
             == "under your assertion: the desktop app is on alice@example.com")
+
+
+# ------------------------------------------------- the dirty-close prompt
+
+def test_dirty_holds_counts_edited_rows():
+    """GUI polish, Change 5: an editable row whose entry differs from its
+    prefill, or whose tick differs from its default, is one unapplied
+    naming change; untouched rows and read-only rows are not."""
+    suggested = gui._hold_models(manifest(holds=[hold()]))[0]
+    unm = hold(session="eeee5555" + "0" * 24, title="Northwind backtest",
+               measured=measured(classification="unmeasured",
+                                 reason="no transcript", superseded=None,
+                                 current=None, a="eeee5555" + "0" * 24,
+                                 b=SID_B, suggested_title=None,
+                                 command_runnable=False),
+               measured_line="no transcript")
+    empty = gui._hold_models(manifest(holds=[unm]))[0]
+    ro = gui._hold_models(manifest(holds=[{
+        "session": "ffff6666" + "0" * 24, "account": ACCT,
+        "label": "alice@example.com", "title": "",
+        "reason": "held_future_reason", "detail": "unknown", "retitle": ""}]
+    ))[0]
+    # Untouched: the prefilled-and-ticked default and the empty-unticked
+    # default are both "as rendered".
+    assert gui._dirty_hold_count([suggested, empty, ro]) == 0
+    # Typed text counts, in either kind of row.
+    assert gui._dirty_hold_count([dict(suggested, entry="my own name")]) == 1
+    assert gui._dirty_hold_count([dict(empty, entry="a name")]) == 1
+    # A changed tick counts as much as typed text - either direction.
+    assert gui._dirty_hold_count([dict(suggested, ticked=False)]) == 1
+    assert gui._dirty_hold_count([dict(empty, ticked=True)]) == 1
+    # One row, one change, however many fields moved.
+    assert gui._dirty_hold_count([dict(suggested, entry="x",
+                                       ticked=False)]) == 1
+    assert gui._dirty_hold_count([dict(suggested, entry="x"),
+                                  dict(empty, entry="y"), ro]) == 2
+    # A read-only row never counts, whatever its fields say.
+    assert gui._dirty_hold_count([dict(ro, entry="typed", ticked=True)]) == 0
+    # Whitespace-only edits are not changes.
+    assert gui._dirty_hold_count([dict(suggested,
+                                       entry=suggested["prefill"] + "  ")]) == 0
+    # The prompt renders the count with the "change(s)" noun.
+    assert gui._close_prompt(1) == ("1 unapplied naming change will be lost. "
+                                    "Close?")
+    assert gui._close_prompt(2) == ("2 unapplied naming changes will be lost. "
+                                    "Close?")
+    # The interception's clause, when nonzero.
+    assert gui._unapplied_clause(0) == ""
+    assert gui._unapplied_clause(1) == "; 1 unapplied naming change will be lost"
+    assert gui._unapplied_clause(3) == "; 3 unapplied naming changes will be lost"

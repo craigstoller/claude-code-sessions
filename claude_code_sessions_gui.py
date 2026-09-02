@@ -572,6 +572,38 @@ def _level_steps_stage1(models):
     return steps, []
 
 
+def _is_dirty_hold(m):
+    """An editable row whose entry differs from its prefill or whose tick
+    differs from its default - one unapplied naming change."""
+    if not m.get("editable"):
+        return False
+    prefill = (m.get("prefill") or "").strip()
+    entry = (m.get("entry") or "").strip()
+    return entry != prefill or bool(m.get("ticked")) != bool(prefill)
+
+
+def _dirty_hold_count(models):
+    """How many unapplied naming changes the rows hold (GUI polish, Change
+    5): the count a close would lose. A changed tick counts as much as
+    typed text; read-only rows never count."""
+    return sum(1 for m in models if _is_dirty_hold(m))
+
+
+def _changes_noun(n):
+    return "{0} unapplied naming change{1}".format(n, "" if n == 1 else "s")
+
+
+def _close_prompt(n):
+    """The dirty-close prompt on the idle path."""
+    return _changes_noun(n) + " will be lost. Close?"
+
+
+def _unapplied_clause(n):
+    """The clause the mid-operation interception gains when edited rows
+    are unapplied at the boundary; '' when none is."""
+    return ("; " + _changes_noun(n) + " will be lost") if n else ""
+
+
 def _ordinal(n):
     words = ("", "first", "second", "third", "fourth", "fifth", "sixth",
              "seventh", "eighth", "ninth", "tenth")
@@ -787,6 +819,11 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
             return seq
         ui.remaining = (len(steps) - i - 1) + 1
         ui.status("Applying rename {0} of {1}...".format(i + 1, len(steps)))
+        # The close prompt's "still unapplied" bookkeeping: the row in
+        # flight will finish, the landed ones stand; every other edited row
+        # is what a confirmed close loses.
+        if hasattr(ui, "current_key"):
+            ui.current_key = st["key"]
         try:
             pm = ccs.plan_retitle(env, ccs.RetitleFlags(
                 only=st["target_sid"], title=st["new_title"]))
@@ -800,6 +837,11 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
             return seq
         seq["landed"] += 1
         seq["mutated"] = True
+        landed = getattr(ui, "landed_keys", None)
+        if landed is not None:
+            landed.append(st["key"])
+        if hasattr(ui, "current_key"):
+            ui.current_key = None
     if ui.truncate_requested():
         seq["stage2"] = "truncated"
         return seq
@@ -1104,6 +1146,8 @@ class _TkLevelUI(object):
         self.app = app
         self.remaining = 0
         self.truncate = False
+        self.landed_keys = []            # rows whose rename has landed
+        self.current_key = None          # the row whose rename is in flight
 
     def status(self, text):
         self.app.root.after(0, self.app.level_status.set, text)
@@ -1208,11 +1252,31 @@ class SyncApp:
         # drops (GUI polish, Change 1 - the layout harness caught it).
         winbar = ttk.Frame(outer)
         winbar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        self.winbar = winbar
+        # Undo at the left, the Chrome-helper setting in the centre, Close
+        # at the right (GUI polish, Change 5): the button that ends the
+        # session and the one that reverses a mutation no longer sit 6 px
+        # apart, and the only persistent setting reads as a setting of the
+        # window rather than of the exception tab.
         self.close_btn = ttk.Button(winbar, text="Close",
                                     command=self._on_close)
-        self.close_btn.pack(side="left")
+        self.close_btn.pack(side="right")
         self.undo_btn = ttk.Button(winbar, text="Undo", command=self.on_undo)
         self.undo_target = None          # the _find_undoable_op descriptor
+        # RULING 7's opt-in as a checkbox. The helper exclusion it toggles
+        # applies to every mutation - a Level converge refuses on the same
+        # helper - so it lives on the window bar, not on one tab. It mirrors
+        # the marker file; the shipped default (off) is untouched.
+        self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
+        self.trust_chk = ttk.Checkbutton(
+            winbar, text="Let Chrome stay open", variable=self.trust_var,
+            command=self.on_toggle_trust)
+        self.trust_chk.pack(side="left", expand=True)
+        # (window, cancel) of a modal Toplevel of this window's own (the
+        # stage-1 dialog, a picker) while it holds the grab: a WM close
+        # then cancels that dialog and does nothing else - one modal at a
+        # time.
+        self._open_dialog = None
         self.nb = ttk.Notebook(outer)
         self.nb.pack(fill="both", expand=True)
         self.level_tab = ttk.Frame(self.nb, padding=PAD)
@@ -1528,11 +1592,6 @@ class SyncApp:
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
         self.refresh_btn.pack(side="right", padx=(0, 6))
         self.consent_chk.pack(side="right", padx=(0, 12))
-        self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
-        self.trust_chk = ttk.Checkbutton(
-            bar, text="Let Chrome stay open", variable=self.trust_var,
-            command=self.on_toggle_trust)
-        self.trust_chk.pack(side="left")
         self.forget_btn = ttk.Button(bar, text="Change destination",
                                      command=self.forget_destination)
         if self.dest_choice:
@@ -2674,7 +2733,8 @@ class SyncApp:
         if self.undo_target:
             self.undo_btn.configure(text=self.undo_target["label"])
             if not self.undo_btn.winfo_manager():
-                self.undo_btn.pack(side="left", padx=(6, 0))
+                self.undo_btn.pack(side="left", padx=(0, 6),
+                                   before=self.trust_chk)
         else:
             self.undo_btn.pack_forget()
 
@@ -3302,24 +3362,60 @@ class SyncApp:
 
     # ------------------------------------------------------- window lifecycle
     def _on_close(self):
-        """Intercept the WM close (and the Close button) while a mutation
-        worker runs: state the remaining-step count up front, finish the
-        in-flight operation, truncate the remainder, close at that boundary.
-        Landed operations are in the journal exactly as if the user had
-        stopped there deliberately. (A hard kill mid-operation lands in the
-        journal as an interrupted op; Health's detection is the net.)"""
+        """The WM close and the Close button (GUI polish, Change 5).
+
+        Three paths, in this order. A modal dialog of this window's own
+        holding the grab: cancel it and do nothing else - one modal at a
+        time, never a prompt fighting a grab; the next Close, from the idle
+        state, gets its prompt. A mutation worker running: the interception,
+        unchanged in its decision - state the remaining-step count up front,
+        plus the unapplied naming changes the close would lose, finish the
+        in-flight operation, truncate the remainder, close at that boundary
+        (landed operations are in the journal exactly as if the user had
+        stopped there deliberately; a hard kill mid-operation lands in the
+        journal as an interrupted op, and Health's detection is the net).
+        Idle: the dirty-close prompt when any editable row's entry differs
+        from its prefill or its tick from its default - read through the
+        same _current_models the apply uses - so the names
+        _merge_hold_models preserves across every replan are not lost to
+        one click. Both prompts default to Cancel. Tk callbacks run on one
+        thread and _render_holds rebuilds every row inside a single
+        callback, so this never observes a row mid-destruction."""
+        open_dialog = self._open_dialog
+        if open_dialog is not None:
+            win, cancel = open_dialog
+            try:
+                if win.winfo_exists():
+                    cancel()
+                    return
+            except tk.TclError:
+                pass
+            self._open_dialog = None
         ui = self._mutation_ui
         if ui is None:
+            n = _dirty_hold_count(self._current_models())
+            if n and not messagebox.askokcancel("Close?", _close_prompt(n),
+                                                default="cancel"):
+                return
             self.root.destroy()
             return
+        # Landed renames stand and the one in flight will finish; every
+        # other edited row goes with the window.
+        applied = set(getattr(ui, "landed_keys", None) or ())
+        applied.add(getattr(ui, "current_key", None))
+        unapplied = sum(1 for m in self._current_models()
+                        if _is_dirty_hold(m) and m.get("key") not in applied)
         n = getattr(ui, "remaining", 0)
         if n:
             msg = ("The current operation will finish, and the {0} "
-                   "remaining step(s) will NOT run. Close?".format(n))
+                   "remaining step(s) will NOT run{1}. Close?".format(
+                       n, _unapplied_clause(unapplied)))
         else:
             msg = ("The operation in progress will finish first, then the "
-                   "window closes. Close?")
-        if not messagebox.askokcancel("Close during an operation?", msg):
+                   "window closes{0}. Close?".format(
+                       _unapplied_clause(unapplied)))
+        if not messagebox.askokcancel("Close during an operation?", msg,
+                                      default="cancel"):
             return
         ui.truncate = True
         self._close_after_worker = True

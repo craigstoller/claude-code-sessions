@@ -332,10 +332,7 @@ def required(app, identity=True):
              ("level_role", lt),
              ("health_bar", ht), ("doctor_btn", ht),
              ("health_status_label", ht), ("health_role", ht),
-             # The Chrome-helper checkbox lives on the sync bar until
-             # Change 5 moves it to the window bar.
-             ("trust_chk", st),
-             ("close_btn", app.root)]
+             ("trust_chk", app.root), ("close_btn", app.root)]
     out = [(name, getattr(app, name), area) for name, area in items]
     if identity:
         out += [("identity button %d" % i, b, lt)

@@ -191,6 +191,74 @@ check("  and the listing marks it and carries the copyable command",
       any("listed first" in line for line in listing)
       and any("claude-code-sessions recover" in line for line in listing))
 
+# ------------------ GUI polish (Change 5, harness item 18). the window bar
+# The window for real (root withdrawn, workers inline): Undo at the left,
+# the Chrome-helper checkbox in the centre, Close at the right - and the
+# mutation gate on every tab unchanged.
+import threading as _real_threading  # noqa: E402
+import tkinter as tk  # noqa: E402
+
+
+class _Inline(object):
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None):
+        self._t, self._a, self._k = target, args, kwargs or {}
+
+    def start(self):
+        self._t(*self._a, **self._k)
+
+
+class _FakeThreading(object):
+    Thread = _Inline
+    current_thread = staticmethod(_real_threading.current_thread)
+    main_thread = staticmethod(_real_threading.main_thread)
+    Event = _real_threading.Event
+
+
+gp.threading = _FakeThreading
+gp.load_pref = lambda: ""
+gp.save_pref = lambda _v: None
+gp.ccs.default_env = lambda: env
+# The unresolved op planted above still sits in the journal: the gate is up.
+tkroot = tk.Tk()
+tkroot.withdraw()
+app = gp.SyncApp(tkroot)
+
+
+def settle():
+    for _ in range(30):
+        tkroot.update()
+
+
+settle()
+bar = app.close_btn.master
+check("Undo, the Chrome checkbox and Close share the window bar",
+      app.undo_btn.master is bar and app.trust_chk.master is bar
+      and bar is not app.sync_bar)
+check("  Close is at the right", app.close_btn.pack_info()["side"] == "right")
+check("  the Chrome checkbox sits in the centre",
+      app.trust_chk.pack_info()["side"] == "left"
+      and app.trust_chk.pack_info()["expand"] in (1, True, "1"))
+check("  the gate holds Apply and Undo down on every tab",
+      "interrupted operation" in app.gate_var.get()
+      and str(app.undo_btn.cget("state")) == "disabled"
+      and str(app.apply_btn.cget("state")) == "disabled"
+      and str(app.level_apply_btn.cget("state")) == "disabled",
+      app.gate_var.get())
+# Resolve the planted ops fixture-side so an undoable op is offered.
+for name in ("20990101T000001Z-feedbb", "20990101T000000Z-feedaa"):
+    shutil.rmtree(os.path.join(env.ops_dir, name), ignore_errors=True)
+app.on_doctor()
+settle()
+check("  with the journal clean the gate lifts", app.gate_var.get() == "")
+app._update_undo_button()
+check("Undo is offered at the LEFT of the bar, before the checkbox",
+      app.undo_target is not None and app.undo_btn.winfo_manager()
+      and app.undo_btn.pack_info()["side"] == "left"
+      and bar.pack_slaves().index(app.undo_btn)
+      < bar.pack_slaves().index(app.trust_chk),
+      str([str(w).split(".")[-1] for w in bar.pack_slaves()]))
+tkroot.destroy()
+
 shutil.rmtree(root, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()
