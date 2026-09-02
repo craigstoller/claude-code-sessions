@@ -225,8 +225,7 @@ class Modals(object):
 gp.messagebox = Modals()
 
 WORK = {"area": (1536, 912)}     # the simulated display's work area
-if hasattr(gp, "_work_area"):
-    gp._work_area = lambda root: WORK["area"]
+gp._work_area = lambda root: WORK["area"]
 
 
 def invisible_root():
@@ -264,113 +263,226 @@ def geom(w):
 
 
 app, tkroot, settle = open_app()
+
+# ----------------------- the audit's constants that still hold (Change 0)
+# The defect the audit measured - the filter row requesting 1101 px in this
+# 896 px frame, its seventh control allocated 1 px - is reproduced by this
+# harness at commit 9bb0651; Change 1 removed it, and the pins below are the
+# fixed state.
 app.nb.select(app.sync_tab)
 settle()
-
-# --------------------------------------------- the audit's numbers, reproduced
 check("the window opens at 940x640",
       (tkroot.winfo_width(), tkroot.winfo_height()) == (940, 640),
       "%dx%d" % (tkroot.winfo_width(), tkroot.winfo_height()))
 check("tab inner width 916", app.sync_tab.winfo_width() == 916,
       str(app.sync_tab.winfo_width()))
-filt = app.only_entry.master
-check("filter frame 896", filt.winfo_width() == 896, str(filt.winfo_width()))
-controls = [w for w in filt.winfo_children()]
-xs = [w.winfo_x() for w in controls]
-widths = [w.winfo_width() for w in controls]
-reqs = [w.winfo_reqwidth() for w in controls]
-print("   filter controls x =", xs)
-print("   allocated        =", widths)
-print("   requested        =", reqs)
-check("the filter row packs at x = 0, 192, 408, 488, 580, 770",
-      xs[:6] == [0, 192, 408, 488, 580, 770], str(xs))
-# The audit's table folded the label's 6 px padx into its width (192); the
-# label itself requests 186 and the Entry starts at 192.
-check("  requesting 186, 210, 76, 76, 184, 157, 168",
-      reqs == [186, 210, 76, 76, 184, 157, 168], str(reqs))
-check("  the sixth ('only where mine is newer') is clipped to 126 of 157",
-      widths[5] == 126, str(widths[5]))
-check("  the seventh ('allow hiding a conversation') is allocated 1 px - "
-      "not drawn", widths[6] == 1, str(widths[6]))
-check("  the row requests 1101 px in a 896 px frame",
-      filt.winfo_reqwidth() == 1101, str(filt.winfo_reqwidth()))
-check("the sync bar requests 416 with four controls",
-      app.sync_bar.winfo_reqwidth() == 416
-      and len(app.sync_bar.pack_slaves()) == 4,
-      "%d, %d controls" % (app.sync_bar.winfo_reqwidth(),
-                           len(app.sync_bar.pack_slaves())))
-check("the guidance label wraps at 880 and the warning at 880",
-      app.sync_guidance.cget("wraplength") == 880
-      and app.sync_warning.cget("wraplength") == 880)
+check("filter frame 896", app.only_entry.master.winfo_width() == 896,
+      str(app.only_entry.master.winfo_width()))
+check("the identity banner offers two buttons", len(app._banner_widgets) == 2,
+      str(len(app._banner_widgets)))
+check("the running-app notice is packed on Level",
+      bool(app.level_notice.winfo_manager()))
 
+
+def rect(w):
+    return (w.winfo_rootx(), w.winfo_rooty(),
+            w.winfo_rootx() + w.winfo_width(),
+            w.winfo_rooty() + w.winfo_height())
+
+
+def inside(w, area):
+    a, b = rect(w), rect(area)
+    return a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2] and a[3] <= b[3]
+
+
+def drawn(w):
+    """Managed, mapped, and allocated more than the 1x1 an unplaced widget
+    reports. winfo_ismapped is meaningful here because the root is mapped;
+    an unmapped widget keeps the stale geometry of its last placement, which
+    is why the size test alone is not enough."""
+    return (bool(w.winfo_manager()) and w.winfo_ismapped()
+            and w.winfo_width() > 1 and w.winfo_height() > 1)
+
+
+# Every required control, by attribute name, with the area it must lie in.
+# Optional widgets (the saved-destination button, the identity buttons) are
+# listed where the fixture packs them.
+def required(app, identity=True):
+    st, lt, ht = app.sync_tab, app.level_tab, app.health_tab
+    items = [("filter_label", st), ("only_entry", st), ("filter_btn", st),
+             ("clear_btn", st), ("refresh_label", st), ("update_chk", st),
+             ("newer_chk", st), ("orphan_chk", st), ("sync_bar", st),
+             ("apply_btn", st), ("refresh_btn", st), ("forget_btn", st),
+             ("sync_status_label", st),
+             ("level_bar", lt), ("level_apply_btn", lt),
+             ("level_refresh_btn", lt), ("level_status_label", lt),
+             ("health_bar", ht), ("doctor_btn", ht),
+             ("health_status_label", ht),
+             # The Chrome-helper checkbox lives on the sync bar until
+             # Change 5 moves it to the window bar.
+             ("trust_chk", st),
+             ("close_btn", app.root)]
+    out = [(name, getattr(app, name), area) for name, area in items]
+    if identity:
+        out += [("identity button %d" % i, b, lt)
+                for i, b in enumerate(app._banner_widgets)]
+    return out
+
+
+def audit(app, tkroot, settle, size, names=None, identity=True):
+    w, h = size
+    tkroot.geometry("%dx%d" % (w, h))
+    settle()
+    label = "%dx%d" % (tkroot.winfo_width(), tkroot.winfo_height())
+    check("the window is %dx%d" % size, label == "%dx%d" % size, label)
+    bad = []
+    for name, widget, area in required(app, identity):
+        if names is not None and name not in names:
+            continue
+        tab = area if area is not app.root else None
+        if tab is not None:
+            app.nb.select(tab)
+            settle()
+        if not drawn(widget):
+            bad.append("%s not drawn (%s, %dx%d)" % (
+                name, widget.winfo_manager() or "unmanaged",
+                widget.winfo_width(), widget.winfo_height()))
+        elif not inside(widget, area):
+            bad.append("%s outside its area %s vs %s" % (
+                name, rect(widget), rect(area)))
+    check("  every required control is drawn inside its tab at %s" % label,
+          not bad, "; ".join(bad))
+    wide = []
+    for lbl, container, _m in app._wrapped:
+        if not lbl.winfo_manager() or container.winfo_width() <= 1:
+            continue                     # not placed at this size at all
+        if lbl.winfo_reqwidth() > container.winfo_width():
+            wide.append("%s %d > %d" % (str(lbl.cget("text"))[:30]
+                                          or lbl.cget("textvariable"),
+                                          lbl.winfo_reqwidth(),
+                                          container.winfo_width()))
+    check("  every wrapping label's requested width is within its container "
+          "at %s" % label, not wide, "; ".join(wide))
+
+
+audit(app, tkroot, settle, (940, 640))
+app.nb.select(app.sync_tab)
+settle()
+filt = app.only_entry.master
+group = app.update_chk.master
+check("the filter block is two rows: the filter row and the refresh group",
+      filt is not group and app.newer_chk.master is group
+      and app.orphan_chk.master is group,
+      "%s / %s" % (filt, group))
+check("  the group is laid out with grid",
+      app.update_chk.winfo_manager() == "grid"
+      and app.orphan_chk.winfo_manager() == "grid")
+check("  and labelled as the opt-in for this run",
+      "Refresh (opt-in for this run):" == str(app.refresh_label.cget("text")),
+      str(app.refresh_label.cget("text")))
+check("  the newer-only advice sits inside the group",
+      app.refresh_hint.master is group
+      and "only where mine is newer" in str(app.refresh_hint.cget("text")))
+check("  the seventh control - 'allow hiding a conversation' - is drawn",
+      drawn(app.orphan_chk),
+      "%dx%d" % (app.orphan_chk.winfo_width(), app.orphan_chk.winfo_height()))
+check("  and 'only where mine is newer' is allocated its full request",
+      app.newer_chk.winfo_width() == app.newer_chk.winfo_reqwidth(),
+      "%d of %d" % (app.newer_chk.winfo_width(), app.newer_chk.winfo_reqwidth()))
+check("no label carries the 880 px wraplength constant",
+      not any(int(lbl.cget("wraplength")) == 880 for lbl, _c, _m in app._wrapped)
+      and len(app._wrapped) >= 8, str(len(app._wrapped)))
+
+# The bars are bottom-pinned on every tab: packed first against the bottom
+# edge, before the region that scrolls.
+for tab, bar, body in ((app.sync_tab, app.sync_bar, app.text.master),
+                       (app.health_tab, app.health_bar, app.health_text.master),
+                       (app.level_tab, app.level_bar, app.holds_wrap)):
+    slaves = tab.pack_slaves()
+    check("the %s bar is bottom-pinned before its scrolling middle" % tab.winfo_name(),
+          bar.pack_info()["side"] == "bottom"
+          and slaves.index(bar) < slaves.index(body)
+          and body.pack_info()["expand"] in (1, True, "1"),
+          str([str(w) for w in slaves]))
+app.nb.select(app.sync_tab)
+settle()
+check("the duplicate-title warning sits above the bar, bottom-pinned too",
+      bool(app.sync_warning.winfo_manager())
+      and app.sync_warning.pack_info()["side"] == "bottom"
+      and app.sync_warning.winfo_rooty() < app.sync_bar.winfo_rooty()
+      and app.sync_warning.winfo_rooty() > app.text.winfo_rooty(),
+      "warning y=%d bar y=%d" % (app.sync_warning.winfo_rooty(),
+                                 app.sync_bar.winfo_rooty()))
+
+# The holds canvas: at least one row tall at 940x640; scrollable at the floor.
 app.nb.select(app.level_tab)
 settle()
-shown = app.level_text.get("1.0", "end-1c").split("\n")
-print("   scoreboard lines:", len(shown), "text box h:",
-      app.level_text.winfo_height(), "body h:", app.level_body.winfo_height())
-check("the Level bar requests 299", app.level_bar.winfo_reqwidth() == 299,
-      str(app.level_bar.winfo_reqwidth()))
-check("the scoreboard box is 13 lines and 186 px tall",
-      len(shown) == 13 and app.level_text.winfo_height() == 186,
-      "%d lines, %d px" % (len(shown), app.level_text.winfo_height()))
-check("the holds canvas gets 185 px", app.hold_canvas.winfo_height() == 185,
-      str(app.hold_canvas.winfo_height()))
-# Row height depends on the fixture's own text (the audit measured 163 for
-# its two rows); what the design cares about is the budget: both rows fit
-# at the default size and a third would scroll.
-check("  and two rows fit inside it (the audit measured 163 for its two)",
-      app.hold_frame.winfo_reqheight() <= app.hold_canvas.winfo_height(),
-      "rows request %d" % app.hold_frame.winfo_reqheight())
-check("the identity banner requests 866 with two buttons",
-      app.level_banner.winfo_reqwidth() == 866
-      and len(app._banner_widgets) == 2,
-      "%d, %d buttons" % (app.level_banner.winfo_reqwidth(),
-                          len(app._banner_widgets)))
-bw = sorted(b.winfo_reqwidth() for b in app._banner_widgets)
-check("  of 406 and 411 px", bw == [406, 411], str(bw))
-check("the running-app notice is packed", bool(app.level_notice.winfo_manager()))
-
-# ------------------------------------------------------------ the 760x520 floor
-resize(tkroot, settle, 760, 520)
-check("at 760x520 the tab inner is 736", app.level_tab.winfo_width() == 736,
-      str(app.level_tab.winfo_width()))
-check("  the holds canvas gets 65 px - less than one row",
-      app.hold_canvas.winfo_height() == 65, str(app.hold_canvas.winfo_height()))
 rows = [w for w in app.hold_frame.winfo_children()
         if isinstance(w, gp.ttk.Frame)]
+row_h = max(r.winfo_reqheight() for r in rows) if rows else 0
+check("the holds canvas is at least one row tall at 940x640",
+      rows and app.hold_canvas.winfo_height() >= row_h,
+      "canvas %d, row %d" % (app.hold_canvas.winfo_height(), row_h))
 long_row = [r for r in rows if any(
     isinstance(c, gp.ttk.Label) and str(c.cget("text")) == T_LONG
     for c in r.winfo_children())]
-# The overflow's exact size is the title text's pixel width (the audit's
-# own 130-character title overflowed by 121); the defect is the overflow.
-check("  the 130-character title overflows its row (the audit measured 121 px)",
-      long_row and long_row[0].winfo_reqwidth() - long_row[0].winfo_width()
-      > 100,
+check("  the 130-character title wraps inside its row instead of overflowing",
+      long_row and long_row[0].winfo_reqwidth() <= long_row[0].winfo_width(),
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
-app.nb.select(app.sync_tab)
-settle()
-check("  the guidance label requests 855 in a 736 px tab",
-      app.sync_guidance.winfo_reqwidth() == 855,
-      str(app.sync_guidance.winfo_reqwidth()))
-check("  the warning label requests 868",
-      app.sync_warning.winfo_reqwidth() == 868,
-      str(app.sync_warning.winfo_reqwidth()))
-check("  'Also refresh rows already there' is clipped to 136 of 184",
-      controls[4].winfo_width() == 136, str(controls[4].winfo_width()))
 
-# ----------------------------------------------------------------- 1200x800
-resize(tkroot, settle, 1200, 800)
+# ------------------------------------------------------------ the fit floor
+# The identity buttons sit below a fixed-height scoreboard until Change 4's
+# sash lets that box yield; they are required at the small sizes from then.
+audit(app, tkroot, settle, gp.FIT_FLOOR, identity=False)
 app.nb.select(app.level_tab)
 settle()
-check("at 1200x800 the holds canvas gets 310",
-      app.hold_canvas.winfo_height() == 310, str(app.hold_canvas.winfo_height()))
-app.nb.select(app.sync_tab)
-settle()
-check("  and every filter control is drawn",
-      all(w.winfo_width() > 1 for w in controls),
-      str([w.winfo_width() for w in controls]))
+check("at the floor the holds canvas is scrollable - a viewport with a "
+      "scrollbar over rows taller than itself",
+      app.hold_canvas.winfo_height() > 1
+      and (app.hold_canvas.yview() != (0.0, 1.0)
+           or app.hold_frame.winfo_reqheight() <= app.hold_canvas.winfo_height()),
+      "canvas %d, rows %d, yview %s" % (app.hold_canvas.winfo_height(),
+                                        app.hold_frame.winfo_reqheight(),
+                                        app.hold_canvas.yview()))
+check("  and the 130-character title still wraps inside its row",
+      long_row and long_row[0].winfo_reqwidth() <= long_row[0].winfo_width(),
+      "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
 
+# ------------------------------------- 871x432: a 1366x768 panel at 150 %
+audit(app, tkroot, settle, (871, 432), identity=False)
 tkroot.destroy()
+
+# ---------------------------- 15b. a work area smaller than the fit floor
+WORK["area"] = (683, 384)
+app, tkroot, settle = open_app()
+size = (tkroot.winfo_width(), tkroot.winfo_height())
+check("on a 683x384 work area the window opens at 643x336 - the area minus "
+      "chrome", size == (643, 336), "%dx%d" % size)
+mins = tkroot.minsize()
+check("  and the computed minsize is no larger than the work area",
+      mins[0] <= 683 and mins[1] <= 384 and tuple(mins) == (643, 336),
+      str(mins))
+FIXED = {"filter_label", "only_entry", "filter_btn", "clear_btn",
+         "refresh_label", "update_chk", "newer_chk", "orphan_chk", "sync_bar",
+         "apply_btn", "refresh_btn", "forget_btn", "sync_status_label",
+         "level_bar", "level_apply_btn", "level_refresh_btn",
+         "level_status_label", "health_bar", "doctor_btn",
+         "health_status_label", "close_btn", "trust_chk"}
+# The fixed chrome only: the identity buttons join once the sash (Change 4)
+# lets the scoreboard yield.
+audit(app, tkroot, settle, size, names=FIXED, identity=False)
+tkroot.destroy()
+
+# --------------------------- 911x480: the same panel at 150 %, work area
+WORK["area"] = (911, 480)
+app, tkroot, settle = open_app()
+size = (tkroot.winfo_width(), tkroot.winfo_height())
+check("on a 911x480 work area the window opens at 871x432", size == (871, 432),
+      "%dx%d" % size)
+check("  with the fit floor as its minsize", tuple(tkroot.minsize()) == (760, 420),
+      str(tkroot.minsize()))
+tkroot.destroy()
+
 shutil.rmtree(root_dir, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()

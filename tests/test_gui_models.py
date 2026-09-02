@@ -495,3 +495,29 @@ def test_sync_dup_warning_counts_adds_that_duplicate_a_title():
     # A manifest from an older engine carries no flags: no warning, no crash.
     assert gui._sync_dup_warning([{"name": "local_y.json", "title": "x",
                                    "is_update": False}]) == ""
+
+
+# ------------------------------------------------- the window's geometry
+
+def test_window_geometry_clamps_to_the_work_area():
+    """Change 1 item 4 of the GUI polish design: the initial size is
+    min(940x640, work area minus window chrome) and the minsize is
+    min(fit floor, work area minus chrome) - a constant minsize larger
+    than the screen would trap controls off-screen."""
+    # A roomy desktop: the defaults apply.
+    assert gui._initial_geometry((1536, 912)) == (940, 640)
+    assert gui._min_size((1536, 912)) == gui.FIT_FLOOR
+    assert gui.FIT_FLOOR == (760, 420)
+    # A 1366x768 panel at 150 % (911x512 logical, 480 after the taskbar):
+    # 871x432 after chrome.
+    assert gui._initial_geometry((911, 480)) == (871, 432)
+    assert gui._min_size((911, 480)) == (760, 420)
+    # The same panel at 200 %: 683x384 logical - the minsize must not
+    # exceed the work area, so both clamp to the area minus chrome.
+    assert gui._initial_geometry((683, 384)) == (643, 336)
+    assert gui._min_size((683, 384)) == (643, 336)
+    w, h = gui._min_size((683, 384))
+    assert w <= 683 and h <= 384
+    # The clamp never produces a size Tk cannot lay out at all.
+    assert gui._min_size((100, 100)) == gui._initial_geometry((100, 100))
+    assert all(v >= 240 for v in gui._min_size((100, 100)))

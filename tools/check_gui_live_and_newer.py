@@ -225,9 +225,14 @@ check("the warning counts the rows that would duplicate a title",
       and "1 of 3 rows would duplicate a title already in that sidebar" in warn,
       warn)
 check("  and points back at Level as the routine", "Level" in warn)
+# Bottom-pinned right after the bar in the pack list (GUI polish, Change
+# 1): the bar takes the bottom edge, the warning the slice above it, so it
+# sits directly above the buttons whatever the window's height.
 slaves = app.sync_tab.pack_slaves()
 check("  it sits above the Apply bar",
-      slaves.index(app.sync_warning) < slaves.index(app.sync_bar),
+      app.sync_warning.pack_info()["side"] == "bottom"
+      and app.sync_bar.pack_info()["side"] == "bottom"
+      and slaves.index(app.sync_warning) == slaves.index(app.sync_bar) + 1,
       str([str(w) for w in slaves]))
 pane_lines = app.text.get("1.0", "end").splitlines()
 check("the tally lines count both kinds",

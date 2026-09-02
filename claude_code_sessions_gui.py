@@ -59,6 +59,65 @@ except ImportError as _exc:            # tkinter is stdlib but packaged separate
 
 PAD = 10
 
+# The window's size comes from the display, not from constants alone
+# (GUI polish, Change 1): the initial size is min(DEFAULT_SIZE, work area
+# minus window chrome) and the minsize is min(FIT_FLOOR, the same). The
+# clamp is not optional - a 1366x768 panel at 200 % is a 683x384 logical
+# desktop, and a constant 760x420 minsize would be larger than the screen and
+# trap controls off-screen. FIT_FLOOR is the size at which the pinned bars,
+# the status lines and one scrolling row fit; below it the window is cramped
+# but nothing is unreachable, because every action bar is bottom-pinned and
+# the middle of each tab is what scrolls. WINDOW_CHROME is the title bar and
+# borders in logical pixels; NON_WINDOWS_MARGIN stands in for a work-area
+# read where there is none (the store mutations are Windows-only, so that
+# branch only has to keep controls reachable).
+DEFAULT_SIZE = (940, 640)
+FIT_FLOOR = (760, 420)
+WINDOW_CHROME = (40, 48)
+NON_WINDOWS_MARGIN = 96
+_ABSOLUTE_MIN = 240
+
+
+def _work_area(root):
+    """(width, height) of the display's work area in logical pixels - on
+    Windows from SystemParametersInfo(SPI_GETWORKAREA), which excludes the
+    taskbar (winfo_screenwidth/height do not); elsewhere the screen minus a
+    fixed margin. Stubbed by the layout harness to simulate a display."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _Rect(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long)]
+            rect = _Rect()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x0030, 0, ctypes.byref(rect), 0):
+                w, h = rect.right - rect.left, rect.bottom - rect.top
+                if w > 0 and h > 0:
+                    return (w, h)
+        except Exception:
+            pass
+    return (root.winfo_screenwidth() - NON_WINDOWS_MARGIN,
+            root.winfo_screenheight() - NON_WINDOWS_MARGIN)
+
+
+def _fit(size, work):
+    return tuple(max(_ABSOLUTE_MIN, min(s, w - c))
+                 for s, w, c in zip(size, work, WINDOW_CHROME))
+
+
+def _initial_geometry(work):
+    """The opening size: the default, clamped to the work area minus chrome."""
+    return _fit(DEFAULT_SIZE, work)
+
+
+def _min_size(work):
+    """The minsize: the fit floor, clamped the same way - never larger than
+    the work area can hold."""
+    return _fit(FIT_FLOOR, work)
+
 # Remembering the destination is the difference between answering the
 # "which store?" question once and answering it on every single run - this
 # machine has two stores for one account, so the picker fires every time
@@ -881,12 +940,31 @@ class SyncApp:
         self._mutation_ui = None
         self._close_after_worker = False
         root.title("Claude sessions")
-        root.geometry("940x640")
-        root.minsize(760, 520)
+        # Sized for the display, not by constants alone: see _work_area.
+        work = _work_area(root)
+        root.geometry("{0}x{1}".format(*_initial_geometry(work)))
+        root.minsize(*_min_size(work))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Every label that wraps to its container's width, as (label,
+        # container, margin) - the layout harness walks this list.
+        self._wrapped = []
 
         outer = ttk.Frame(root, padding=PAD)
         outer.pack(fill="both", expand=True)
+        # One window-level bar outside the notebook: Close, and the SHARED
+        # Undo button - there is one journal, so there is one "last
+        # operation", and a per-tab button would let two tabs disagree about
+        # which op that is. It replaces the sync pane's own undo button.
+        # Packed FIRST, bottom-pinned: pack allocates in list order, and a
+        # bar listed after the expanding notebook is what a short window
+        # drops (GUI polish, Change 1 - the layout harness caught it).
+        winbar = ttk.Frame(outer)
+        winbar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        self.close_btn = ttk.Button(winbar, text="Close",
+                                    command=self._on_close)
+        self.close_btn.pack(side="left")
+        self.undo_btn = ttk.Button(winbar, text="Undo", command=self.on_undo)
+        self.undo_target = None          # the _find_undoable_op descriptor
         self.nb = ttk.Notebook(outer)
         self.nb.pack(fill="both", expand=True)
         self.level_tab = ttk.Frame(self.nb, padding=PAD)
@@ -896,35 +974,37 @@ class SyncApp:
         self.nb.add(self.sync_tab, text="Copy & refresh")
         self.nb.add(self.health_tab, text="Health")
 
-        # One window-level bar outside the notebook: Close, and the SHARED
-        # Undo button - there is one journal, so there is one "last
-        # operation", and a per-tab button would let two tabs disagree about
-        # which op that is. It replaces the sync pane's own undo button.
-        winbar = ttk.Frame(outer)
-        winbar.pack(fill="x", pady=(PAD, 0))
-        ttk.Button(winbar, text="Close", command=self._on_close).pack(
-            side="left")
-        self.undo_btn = ttk.Button(winbar, text="Undo", command=self.on_undo)
-        self.undo_target = None          # the _find_undoable_op descriptor
-
         # ------------------------------------------------- Tab 1: Level
         lt = self.level_tab
+        # The button bar packs FIRST - first in the pack list, before the
+        # status lines, not merely before the holds area - pinned to the
+        # bottom edge, so a short window squeezes the area that scrolls and
+        # never the Apply button. Pack allocates in list order and drops
+        # whatever the cavity cannot hold, so "before the holds" alone left
+        # the bar sixth in line behind a fixed-height scoreboard (GUI
+        # polish, Change 1).
+        lbar = ttk.Frame(lt)
+        lbar.pack(side="bottom", fill="x", pady=(6, 0))
+        self.level_bar = lbar
         self.level_status = tk.StringVar(value="Measuring...")
         lb_status = ttk.Label(lt, textvariable=self.level_status,
-                              font=("Segoe UI", 11, "bold"), wraplength=880,
-                              justify="left")
+                              font=("Segoe UI", 11, "bold"), justify="left")
         lb_status.pack(anchor="w")
+        self.level_status_label = lb_status
+        self._wrap_to(lb_status, lt)
         self.level_detail = tk.StringVar(value="")
-        ttk.Label(lt, textvariable=self.level_detail, wraplength=880,
-                  justify="left", foreground="#555").pack(anchor="w",
-                                                         pady=(4, 2))
+        lb_detail = ttk.Label(lt, textvariable=self.level_detail,
+                              justify="left", foreground="#555")
+        lb_detail.pack(anchor="w", pady=(4, 2))
+        self._wrap_to(lb_detail, lt)
         # The passive environment notice - weather, not a gate: the guard
         # stays in the engine at mutation time; this line exists so nobody
         # types five titles first and learns about RULING 4 second.
         self.level_notice = ttk.Label(
-            lt, foreground="#a05000", wraplength=880, justify="left",
+            lt, foreground="#a05000", justify="left",
             text="!! The Claude desktop app is running - {0} will refuse "
                  "until it is closed.".format(LEVEL_BUTTON))
+        self._wrap_to(self.level_notice, lt)
         body = ttk.Frame(lt)
         body.pack(fill="x", pady=(4, 4))
         self.level_body = body           # the notice packs before this
@@ -948,12 +1028,6 @@ class SyncApp:
         self.level_text.configure(yscrollcommand=lsb.set)
         self.level_text.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
-        # The button bar packs FIRST, pinned to the bottom edge, so a short
-        # window squeezes the hold area (which scrolls) and never the Apply
-        # button; the hold rows then take whatever is left.
-        lbar = ttk.Frame(lt)
-        lbar.pack(side="bottom", fill="x", pady=(6, 0))
-        self.level_bar = lbar
         # The hold rows scroll when they overflow - a canvas-hosted frame,
         # the stock tkinter idiom for a scrollable widget stack.
         holds_wrap = ttk.Frame(lt)
@@ -995,16 +1069,24 @@ class SyncApp:
 
         # ---------------------------------------- Tab 2: Copy & refresh
         st = self.sync_tab
+        # The action bar packs FIRST, bottom-pinned, so a short window
+        # squeezes the plan text (which scrolls) and never the buttons - the
+        # a32798b rule Level already followed (GUI polish, Change 1).
+        bar = ttk.Frame(st)
+        bar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        self.sync_bar = bar
         self.status = tk.StringVar(value="Planning...")
         sb_status = ttk.Label(st, textvariable=self.status,
-                              font=("Segoe UI", 11, "bold"), wraplength=880,
-                              justify="left")
+                              font=("Segoe UI", 11, "bold"), justify="left")
         sb_status.pack(anchor="w")
+        self.sync_status_label = sb_status
+        self._wrap_to(sb_status, st)
 
         self.detail = tk.StringVar(value="")
-        ttk.Label(st, textvariable=self.detail, wraplength=880,
-                  justify="left", foreground="#555").pack(anchor="w",
-                                                          pady=(4, 6))
+        sb_detail = ttk.Label(st, textvariable=self.detail, justify="left",
+                              foreground="#555")
+        sb_detail.pack(anchor="w", pady=(4, 6))
+        self._wrap_to(sb_detail, st)
         # What this tab is FOR, said before the plan (0.15.1, finding E).
         # Measured on a freshly levelled store: this tab offered 78 rows
         # into one account, 77 of them for conversations that sidebar could
@@ -1017,22 +1099,33 @@ class SyncApp:
         # to ~78. The guidance is static because the hazard is structural,
         # not a property of any one plan.
         self.sync_guidance = ttk.Label(
-            st, wraplength=880, justify="left", foreground="#555",
+            st, justify="left", foreground="#555",
             text="Level (the first tab) is the routine. This tab copies "
                  "ROW FILES: it can add rows for conversations the "
                  "destination already opens under another row file, and "
                  "duplicate their titles in that sidebar. It is meant for "
                  "one session at a time - type its title in the filter "
-                 "below, with \"only where mine is newer\" ticked.")
+                 "below.")
         self.sync_guidance.pack(anchor="w", pady=(0, 6))
+        self._wrap_to(self.sync_guidance, st)
 
         # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
         # rather than per-row checkboxes: checkboxes would mean assembling a
         # subset here and handing plan_sync a selection it did not make, i.e. a
         # second route into the store. This stays one route.
+        #
+        # Two rows (GUI polish, Change 1): the filter on the first, the three
+        # RULING 8 checkboxes in a labelled group on the second. One packed
+        # row requested 1101 px in an 896 px frame at the default window
+        # size, so the third box clipped and the fourth - "allow hiding a
+        # conversation", the opt-in whose whole purpose is to be seen and
+        # said yes to - was not drawn at all until the window was about
+        # 1150 px wide.
         filt = ttk.Frame(st)
-        filt.pack(fill="x", pady=(0, PAD))
-        ttk.Label(filt, text="Only sessions whose title contains:").pack(side="left")
+        filt.pack(fill="x", pady=(0, 4))
+        self.filter_label = ttk.Label(filt,
+                                      text="Only sessions whose title contains:")
+        self.filter_label.pack(side="left")
         self.only_var = tk.StringVar(value="")
         self.only_entry = ttk.Entry(filt, textvariable=self.only_var, width=34)
         self.only_entry.pack(side="left", padx=6)
@@ -1041,14 +1134,22 @@ class SyncApp:
         self.filter_btn.pack(side="left")
         self.clear_btn = ttk.Button(filt, text="Clear", command=self._clear_filter)
         self.clear_btn.pack(side="left", padx=(4, 0))
+        # The group label says that everything on these lines is the
+        # overwrite path - the opt-in for this run, never remembered.
+        group = ttk.Frame(st)
+        group.pack(fill="x", pady=(0, PAD))
+        self.refresh_group = group
+        self.refresh_label = ttk.Label(group,
+                                       text="Refresh (opt-in for this run):")
+        self.refresh_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
         # RULING 8. Unticked every time the window opens: this is the only
         # control here that overwrites rather than adds, so it is a decision
         # for one run, never a remembered preference.
         self.update_var = tk.BooleanVar(value=False)
         self.update_chk = ttk.Checkbutton(
-            filt, text="Also refresh rows already there", variable=self.update_var,
+            group, text="Also refresh rows already there", variable=self.update_var,
             command=self._on_update_toggle)
-        self.update_chk.pack(side="left", padx=(16, 0))
+        self.update_chk.grid(row=0, column=1, columnspan=2, sticky="w")
         # Ticked BY DEFAULT, and the one default in this window that is not
         # "do nothing". Refreshing everything is almost never what someone
         # means: each account's rows are a snapshot of when THAT account last
@@ -1059,9 +1160,9 @@ class SyncApp:
         # ever send FEWER rows than the box above it.
         self.newer_var = tk.BooleanVar(value=True)
         self.newer_chk = ttk.Checkbutton(
-            filt, text="only where mine is newer", variable=self.newer_var,
+            group, text="only where mine is newer", variable=self.newer_var,
             command=self.refresh, state="disabled")
-        self.newer_chk.pack(side="left", padx=(6, 0))
+        self.newer_chk.grid(row=1, column=1, sticky="w", padx=(18, 12))
         # Off by default and never remembered. A row is a POINTER to a
         # conversation, and two accounts can point at different ones, so a
         # refresh can leave the displaced conversation reachable from nowhere.
@@ -1069,28 +1170,39 @@ class SyncApp:
         # of updating something, which is why it needs saying yes to.
         self.orphan_var = tk.BooleanVar(value=False)
         self.orphan_chk = ttk.Checkbutton(
-            filt, text="allow hiding a conversation", variable=self.orphan_var,
+            group, text="allow hiding a conversation", variable=self.orphan_var,
             command=self.refresh, state="disabled")
-        self.orphan_chk.pack(side="left", padx=(6, 0))
-
-        body = ttk.Frame(st)
-        body.pack(fill="both", expand=True)
-        self.text = tk.Text(body, wrap="none", height=18, font=("Consolas", 9),
-                            state="disabled", borderwidth=1, relief="solid")
-        sb = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
+        self.orphan_chk.grid(row=1, column=2, sticky="w")
+        # The one piece of advice the 0.15.1 guidance line carried, next to
+        # the box it describes.
+        self.refresh_hint = ttk.Label(
+            group, foreground="#555", justify="left",
+            text="For one session, keep \"only where mine is newer\" ticked "
+                 "- it can only hold rows back, never send more.")
+        self.refresh_hint.grid(row=2, column=1, columnspan=3, sticky="w",
+                               padx=(18, 0), pady=(2, 0))
+        group.columnconfigure(3, weight=1)
+        self._wrap_to(self.refresh_hint, group, margin=18)
 
         # The duplicate-title warning, packed above the Apply bar only when
         # the plan's adds would duplicate a title already in that sidebar
         # (0.15.1, E part 2) - the number the bulk apply would move
         # `distinguishable` by, said before the button that would do it.
         self.sync_warning = ttk.Label(st, foreground="#a05000",
-                                      wraplength=880, justify="left")
-        bar = ttk.Frame(st)
-        bar.pack(fill="x", pady=(PAD, 0))
-        self.sync_bar = bar
+                                      justify="left")
+        self._wrap_to(self.sync_warning, st)
+
+        # The plan text packs LAST, expanding: it is the region that absorbs
+        # a short window.
+        body = ttk.Frame(st)
+        body.pack(fill="both", expand=True)
+        self.text = tk.Text(body, wrap="none", height=8, font=("Consolas", 9),
+                            state="disabled", borderwidth=1, relief="solid")
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
         self.apply_btn = ttk.Button(bar, text="Apply", command=self.on_apply,
                                     state="disabled")
         self.apply_btn.pack(side="right")
@@ -1114,15 +1226,20 @@ class SyncApp:
 
         # ------------------------------------------------ Tab 3: Health
         ht = self.health_tab
+        # Bottom-pinned first, like the other two bars.
+        hbar = ttk.Frame(ht)
+        hbar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        self.health_bar = hbar
         self.health_status = tk.StringVar(
             value="Press Refresh for the full health check.")
         hb_status = ttk.Label(ht, textvariable=self.health_status,
-                              font=("Segoe UI", 11, "bold"), wraplength=880,
-                              justify="left")
+                              font=("Segoe UI", 11, "bold"), justify="left")
         hb_status.pack(anchor="w")
+        self.health_status_label = hb_status
+        self._wrap_to(hb_status, ht)
         hbody = ttk.Frame(ht)
         hbody.pack(fill="both", expand=True, pady=(6, 0))
-        self.health_text = tk.Text(hbody, wrap="none", height=18,
+        self.health_text = tk.Text(hbody, wrap="none", height=8,
                                    font=("Consolas", 9), state="disabled",
                                    borderwidth=1, relief="solid")
         hsb2 = ttk.Scrollbar(hbody, orient="vertical",
@@ -1130,8 +1247,6 @@ class SyncApp:
         self.health_text.configure(yscrollcommand=hsb2.set)
         self.health_text.pack(side="left", fill="both", expand=True)
         hsb2.pack(side="right", fill="y")
-        hbar = ttk.Frame(ht)
-        hbar.pack(fill="x", pady=(PAD, 0))
         self.doctor_btn = ttk.Button(hbar, text="Refresh",
                                      command=self.on_doctor)
         self.doctor_btn.pack(side="right")
@@ -1148,8 +1263,8 @@ class SyncApp:
         for tab, anchor in ((lt, lb_status), (st, sb_status),
                             (ht, hb_status)):
             lbl = ttk.Label(tab, textvariable=self.gate_var,
-                            foreground="#a00000", wraplength=880,
-                            justify="left")
+                            foreground="#a00000", justify="left")
+            self._wrap_to(lbl, tab)
             self._gate_labels.append((lbl, anchor))
 
         self.refresh()
@@ -1168,6 +1283,38 @@ class SyncApp:
             widget.delete("1.0", "end")
             widget.insert("1.0", "\n".join(lines))
         widget.configure(state="disabled")
+
+    def _wrap_to(self, label, container, margin=None):
+        """Bind LABEL's wraplength to CONTAINER's width minus MARGIN, so a
+        line wraps to the window instead of to a constant (GUI polish,
+        Change 1 - nine labels carried wraplength=880 and clipped at the
+        minsize). MARGIN defaults to the container's own padding. Two facts
+        keep this from looping: every scrollbar here is packed
+        unconditionally, so a container's width never changes because
+        content grew taller; and inside the holds canvas the row frame's
+        width is driven from the viewport, not from its own content."""
+        if margin is None:
+            margin = 0
+            try:
+                pad = container.cget("padding")
+                margin = 2 * int(str(pad).split()[0]) if pad else 0
+            except (tk.TclError, ValueError, IndexError):
+                margin = 0
+
+        def fit(event):
+            if event.width > 1:
+                try:
+                    label.configure(wraplength=max(120, event.width - margin))
+                except tk.TclError:
+                    pass                 # the label was rebuilt away
+        container.bind("<Configure>", fit, add="+")
+        self._wrapped.append((label, container, margin))
+
+    def _prune_wrapped(self):
+        """Forget the wrap registrations of labels that a rebuild destroyed.
+        The rebuilt regions (banner, hold rows) bind on frames that die with
+        them, so nothing accumulates on a long-lived container."""
+        self._wrapped = [t for t in self._wrapped if t[0].winfo_exists()]
 
     def show(self, lines):
         self._set_text(self.text, lines)
@@ -1516,8 +1663,10 @@ class SyncApp:
         self.sync_warning.configure(text=text)
         if text:
             if not self.sync_warning.winfo_manager():
-                self.sync_warning.pack(anchor="w", pady=(6, 0),
-                                       before=self.sync_bar)
+                # Bottom-pinned right after the bar in the pack list, so it
+                # sits directly above the buttons whatever the height.
+                self.sync_warning.pack(side="bottom", anchor="w", fill="x",
+                                       pady=(6, 0), after=self.sync_bar)
         elif self.sync_warning.winfo_manager():
             self.sync_warning.pack_forget()
 
@@ -2211,35 +2360,40 @@ class SyncApp:
         assertion and replanning."""
         for w in self.level_banner.winfo_children():
             w.destroy()
+        self._prune_wrapped()
         self._banner_widgets = []
         if self.level_live:
             row = ttk.Frame(self.level_banner)
             row.pack(fill="x", pady=(0, 4))
-            ttk.Label(row, foreground="#a00000", wraplength=680,
-                      justify="left",
-                      text="!! --live assertion in force for the next press "
-                           "of {0} - cleared when its sequence ends; never "
-                           "saved.".format(LEVEL_BUTTON)
-                      ).pack(side="left")
+            lbl = ttk.Label(row, foreground="#a00000", justify="left",
+                            text="!! --live assertion in force for the next "
+                                 "press of {0} - cleared when its sequence "
+                                 "ends; never saved.".format(LEVEL_BUTTON))
+            lbl.pack(side="left")
             b = ttk.Button(row, text="Change signed-in account",
                            command=self.forget_level_live)
             b.pack(side="left", padx=(6, 0))
+            self._wrap_to(lbl, row, margin=b.winfo_reqwidth() + 12)
             self._banner_widgets.append(b)
             return
         dis = (man or {}).get("identity_disagreement")
         if not isinstance(dis, dict):
             return
         oauth, config = dis.get("oauth") or "", dis.get("config") or ""
-        ttk.Label(self.level_banner, foreground="#a00000", wraplength=880,
-                  justify="left",
-                  text="!! ~/.claude.json ({0}) and config.json ({1}) "
-                       "disagree about which account is signed in, and "
-                       "either record can be the stale one. The copy stage "
-                       "will refuse (RULING 5) until you say which account "
-                       "the DESKTOP APP is on right now - the answer covers "
-                       "one press of {2} and is never written to disk."
-                       .format(oauth[:8], config[:8],
-                               LEVEL_BUTTON)).pack(anchor="w", pady=(0, 2))
+        # A fresh frame per render, so the wrap binding dies with it.
+        box = ttk.Frame(self.level_banner)
+        box.pack(fill="x")
+        lbl = ttk.Label(box, foreground="#a00000", justify="left",
+                        text="!! ~/.claude.json ({0}) and config.json ({1}) "
+                             "disagree about which account is signed in, and "
+                             "either record can be the stale one. The copy "
+                             "stage will refuse (RULING 5) until you say "
+                             "which account the DESKTOP APP is on right now "
+                             "- the answer covers one press of {2} and is "
+                             "never written to disk."
+                             .format(oauth[:8], config[:8], LEVEL_BUTTON))
+        lbl.pack(anchor="w", pady=(0, 2))
+        self._wrap_to(lbl, box)
         try:
             stores = [(a, o, p) for a, o, p in ccs._account_dirs(self.env)
                       if a in (oauth, config)]
@@ -2254,7 +2408,7 @@ class SyncApp:
             def pick(path=p):
                 self.level_live = path   # a full path matches exactly one store
                 self.refresh_level()
-            b = ttk.Button(self.level_banner, command=pick,
+            b = ttk.Button(box, command=pick,
                            text="Signed in as  {0}   org {1}…   ({2})".format(
                                self._account_label(a), o[:8], count))
             b.pack(fill="x", pady=2)
@@ -2269,6 +2423,7 @@ class SyncApp:
     def _render_holds(self):
         for w in self.hold_frame.winfo_children():
             w.destroy()
+        self._prune_wrapped()
         self._hold_widgets = []
         self.holds_heading.set("")
         if not self.hold_models:
@@ -2277,9 +2432,12 @@ class SyncApp:
         # must never promise "each ticked row becomes one rename" over a
         # list where nothing is ticked (0.15.1, B).
         self.holds_heading.set(_holds_heading(self.hold_models))
-        ttk.Label(self.hold_frame, textvariable=self.holds_heading,
-                  wraplength=860, justify="left",
-                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(2, 4))
+        head_row = ttk.Frame(self.hold_frame)   # dies with the rebuild
+        head_row.pack(fill="x")
+        heading = ttk.Label(head_row, textvariable=self.holds_heading,
+                            justify="left", font=("Segoe UI", 9, "bold"))
+        heading.pack(anchor="w", pady=(2, 4))
+        self._wrap_to(heading, head_row, margin=0)
         for m in self.hold_models:
             row = ttk.Frame(self.hold_frame)
             row.pack(fill="x", pady=(0, 6), anchor="w")
@@ -2291,32 +2449,47 @@ class SyncApp:
                 chk = ttk.Checkbutton(row, text="Rename",
                                       variable=m["_tick_var"])
                 chk.grid(row=0, column=0, sticky="nw", padx=(0, 6))
-                ttk.Label(row, text=m["title"],
-                          font=("Segoe UI", 9, "bold")).grid(row=0, column=1,
-                                                             sticky="w")
+                # Column 1 starts after the checkbox; both labels wrap to
+                # the row's width minus that, so a 130-character title
+                # wraps instead of overflowing the row (Change 1).
+                col = chk.winfo_reqwidth() + 6
+                title = ttk.Label(row, text=m["title"], justify="left",
+                                  font=("Segoe UI", 9, "bold"))
+                title.grid(row=0, column=1, sticky="w")
+                self._wrap_to(title, row, margin=col)
+                # A stretchy entry: sticky "we" fills the column, so the
+                # character width is a minimum, not the row's width.
                 entry = ttk.Entry(row, textvariable=m["_entry_var"],
-                                  width=86)
+                                  width=40)
                 entry.grid(row=1, column=1, sticky="we", pady=(2, 0))
-                ttk.Label(row, text=m["evidence"], foreground="#555",
-                          wraplength=780, justify="left").grid(row=2,
-                                                               column=1,
-                                                               sticky="w")
+                evidence = ttk.Label(row, text=m["evidence"],
+                                     foreground="#555", justify="left")
+                evidence.grid(row=2, column=1, sticky="w")
+                self._wrap_to(evidence, row, margin=col)
                 if m["degrade_reason"] and not m["prefill"]:
                     # Only when no suggestion survived: the shell-unsafe
                     # degrade keeps its suggested_title (the GUI path is not
                     # the shell path), and labeling a filled, ticked entry
                     # "no suggestion" would deny the very text above it.
-                    ttk.Label(row, text="no suggestion: " + m["degrade_reason"],
-                              foreground="#a05000").grid(row=3, column=1,
-                                                         sticky="w")
+                    reason = ttk.Label(row, justify="left",
+                                       text="no suggestion: "
+                                            + m["degrade_reason"],
+                                       foreground="#a05000")
+                    reason.grid(row=3, column=1, sticky="w")
+                    self._wrap_to(reason, row, margin=col)
                 row.columnconfigure(1, weight=1)
                 self._hold_widgets += [chk, entry]
             else:
-                ttk.Label(row, text="held: " + (m["title"]
-                                                or m["classification"]),
-                          font=("Segoe UI", 9, "bold")).pack(anchor="w")
-                ttk.Label(row, text=m["evidence"], foreground="#555",
-                          wraplength=820, justify="left").pack(anchor="w")
+                held = ttk.Label(row, justify="left",
+                                 text="held: " + (m["title"]
+                                                  or m["classification"]),
+                                 font=("Segoe UI", 9, "bold"))
+                held.pack(anchor="w")
+                self._wrap_to(held, row, margin=0)
+                evidence = ttk.Label(row, text=m["evidence"],
+                                     foreground="#555", justify="left")
+                evidence.pack(anchor="w")
+                self._wrap_to(evidence, row, margin=0)
 
     def _update_holds_heading(self):
         try:
