@@ -580,6 +580,15 @@ class Modals(object):
                 if c[0] == kind and (title is None or c[1] == title)]
 
 
+def above(a, b):
+    """A is placed above B in their common parent - by grid row where both
+    are gridded, else by pack order."""
+    if a.winfo_manager() == "grid" and b.winfo_manager() == "grid":
+        return int(a.grid_info()["row"]) < int(b.grid_info()["row"])
+    slaves = a.master.pack_slaves()
+    return slaves.index(a) < slaves.index(b)
+
+
 def open_app(env, stage1=True):
     """A real SyncApp over ENV, withdrawn, stage-1 dialog scripted (a
     Toplevel needs a display pump this harness does not want mid-check)."""
@@ -630,11 +639,11 @@ check("the hold row rendered as widgets",
 check("Apply is enabled in the naming-only state",
       str(app.level_apply_btn.cget("state")) == "normal")
 # D (0.15.1): two tabs, two labels - Level's button is its spec's name for
-# the flow; the Copy & refresh tab keeps "Apply".
+# the flow; the One-session tab keeps "Apply".
 check("the Level button is labeled 'Level the sidebars'",
       app.level_apply_btn.cget("text") == "Level the sidebars",
       app.level_apply_btn.cget("text"))
-check("  and the Copy & refresh tab's stays 'Apply'",
+check("  and the One-session tab's stays 'Apply'",
       app.apply_btn.cget("text") == "Apply", app.apply_btn.cget("text"))
 check("  the detail line names the button, not 'Apply'",
       "Level the sidebars" in app.level_detail.get()
@@ -692,14 +701,15 @@ settle()
 check("the header names the hold as suggested",
       app.level_status.get() == "Nothing to copy - 1 held: 1 suggested.",
       app.level_status.get())
-# E part 1 (0.15.1): the Copy & refresh tab says what it is for. The
-# newer-only advice moved next to the box it describes (GUI polish,
-# Change 1), so the guidance line no longer names it and the hint does.
-guidance = app.sync_guidance.cget("text")
-check("the Copy & refresh tab carries the guidance line",
-      "Level" in guidance and "one session at a time" in guidance,
-      guidance[:80])
-check("  packed above the plan", bool(app.sync_guidance.winfo_manager()))
+# E part 1 (0.15.1), as the GUI polish (Change 3) reshaped it: the
+# One-session tab's role line says what the tab is for, above the status
+# line, and the newer-only advice sits next to the box it describes.
+role = app.sync_role.cget("text")
+check("the One-session tab carries its role line",
+      "Level is the routine" in role and "one session" in role, role[:80])
+check("  placed above the status line",
+      bool(app.sync_role.winfo_manager())
+      and above(app.sync_role, app.sync_status_label))
 check("  the newer-only advice sits in the refresh group",
       "only where mine is newer" in app.refresh_hint.cget("text")
       and app.refresh_hint.master is app.newer_chk.master)
@@ -727,9 +737,19 @@ check("the sync tab's Apply is void until IT replans - the converge wrote "
       str(app.apply_btn.cget("state")) == "disabled")
 app.refresh()
 settle()
-check("  and its own Refresh re-arms it against a fresh plan",
-      str(app.apply_btn.cget("state")) == "normal"
-      or not (app.manifest or {}).get("rows"))
+n_rows = len((app.manifest or {}).get("rows") or [])
+if n_rows >= 2:
+    # The single-session gate (GUI polish, Change 3): a bulk plan needs
+    # the consent tick for exactly these rows before Apply is live.
+    check("  a fresh bulk plan keeps Apply down until consent is ticked",
+          str(app.apply_btn.cget("state")) == "disabled",
+          str(app.apply_btn.cget("state")))
+    app.consent_var.set(True)
+    app._on_consent_toggle()
+check("  and its own Refresh re-arms it against a fresh plan (%d rows)"
+      % n_rows,
+      str(app.apply_btn.cget("state")) == "normal" or n_rows == 0,
+      str(app.apply_btn.cget("state")))
 # A stale-generation callback must still pay back its busy(True): the
 # counted busy state deadlocks the whole window otherwise.
 app.busy(True)

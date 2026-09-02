@@ -87,6 +87,29 @@ def fake_plan(env, flags):
 
 
 gp2.ccs.plan_sync = fake_plan
+gp2.ccs.run_sync = lambda env, manifest: "completed"   # never a real write
+
+
+class Modals:
+    """Every messagebox call recorded, answered per DEFAULT."""
+
+    def __init__(self):
+        self.calls = []
+        self.default = True
+
+    def askokcancel(self, title, message, **kw):
+        self.calls.append(("askokcancel", title, message, kw))
+        return self.default
+
+    def showwarning(self, title, message, **kw):
+        self.calls.append(("showwarning", title, message, kw))
+
+    def showerror(self, title, message, **kw):
+        self.calls.append(("showerror", title, message, kw))
+
+
+modals = Modals()
+gp2.messagebox = modals
 
 
 class _Inline:
@@ -129,6 +152,15 @@ def mapped(w):
     """Packed into its parent. winfo_ismapped() is False for every widget while
     the root is withdrawn, which is exactly how this harness runs."""
     return bool(w.winfo_manager())
+
+
+def above(a, b):
+    """A is placed above B in their common parent - by grid row where both
+    are gridded, else by pack order."""
+    if a.winfo_manager() == "grid" and b.winfo_manager() == "grid":
+        return int(a.grid_info()["row"]) < int(b.grid_info()["row"])
+    slaves = a.master.pack_slaves()
+    return slaves.index(a) < slaves.index(b)
 
 
 settle()
@@ -247,6 +279,95 @@ FAKE_TALLY.clear()
 app.refresh()
 settle()
 check("no duplicate titles, no warning", not mapped(app.sync_warning))
+
+# ------------------- GUI polish (Change 3). the tab strip and the role lines
+tabs = [app.nb.tab(t, "text") for t in app.nb.tabs()]
+check("the tabs read Level | Health | One session",
+      tabs == ["Level", "Health", "One session"], str(tabs))
+check("  the exception tab is third and named 'One session'",
+      app.nb.tabs()[2] == str(app.sync_tab))
+check("  Level is the selected tab at open",
+      app.nb.select() == str(app.level_tab))
+roles = [(app.level_role, app.level_tab, "The routine."),
+         (app.health_role, app.health_tab, "Diagnostic."),
+         (app.sync_role, app.sync_tab, "The exception.")]
+check("a role line sits on every tab, above the status line",
+      all(mapped(lbl) and str(lbl.cget("text")).startswith(lead)
+          and above(lbl, status)
+          for (lbl, tab, lead), status in zip(
+              roles, (app.level_status_label, app.health_status_label,
+                      app.sync_status_label))),
+      str([str(l.cget("text"))[:20] for l, _t, _s in roles]))
+check("  the One-session role line says what the tab is for",
+      "Copy one session" in app.sync_role.cget("text")
+      and "Level is the routine" in app.sync_role.cget("text"))
+check("  and it replaces the 0.15.1 guidance line - no preamble line net",
+      not hasattr(app, "sync_guidance"))
+
+# ------------------------------ GUI polish (Change 3). the single-session gate
+def row(i, is_update=False):
+    return {"name": "local_%d.json" % i, "title": "Northwind backtest %d" % i,
+            "is_update": is_update, "session_id": "s%d" % i,
+            "pre_b64": None, "post_b64": "e30=", "written": False}
+
+
+def apply_state():
+    return str(app.apply_btn.cget("state"))
+
+
+app.update_var.set(False)
+app._on_update_toggle()
+FAKE_ROWS[:] = [row(1)]
+app.refresh()
+settle()
+check("a one-row plan (an add) enables Apply without consent",
+      apply_state() == "normal" and not app.consent_var.get(), apply_state())
+FAKE_ROWS[:] = [row(1, is_update=True)]
+app.refresh()
+settle()
+check("  a one-row refresh is live too - the tab's routine use",
+      apply_state() == "normal", apply_state())
+FAKE_ROWS[:] = [row(1), row(2), row(3)]
+app.refresh()
+settle()
+check("a three-row plan disables Apply until consent is given",
+      apply_state() == "disabled", apply_state())
+check("  the consent box names the count",
+      app.consent_chk.cget("text") == "copy every row this plan lists (3)",
+      app.consent_chk.cget("text"))
+check("  and is off", not app.consent_var.get())
+app.consent_var.set(True)
+app._on_consent_toggle()
+check("ticking it enables Apply", apply_state() == "normal", apply_state())
+# A replan returning the same rows in a different order, driven through the
+# real _plan_done, keeps the tick.
+FAKE_ROWS[:] = [row(3), row(1), row(2)]
+app.refresh()
+settle()
+check("a replan with the same rows in another order keeps the tick",
+      app.consent_var.get() and apply_state() == "normal",
+      "ticked=%s state=%s" % (app.consent_var.get(), apply_state()))
+# Ticking "Also refresh" adds refresh rows: a different row set.
+FAKE_ROWS[:] = [row(1), row(2), row(3), row(4, is_update=True)]
+app.update_var.set(True)
+app._on_update_toggle()
+settle()
+check("a replan that changes the row set clears the tick",
+      not app.consent_var.get() and apply_state() == "disabled",
+      "ticked=%s state=%s" % (app.consent_var.get(), apply_state()))
+check("  and updates the count",
+      app.consent_chk.cget("text") == "copy every row this plan lists (4)",
+      app.consent_chk.cget("text"))
+app.consent_var.set(True)
+app._on_consent_toggle()
+check("  re-ticked, Apply is live again", apply_state() == "normal")
+app.on_apply()
+settle()
+check("an apply clears the tick",
+      not app.consent_var.get() and app._consent_for is None,
+      "ticked=%s" % app.consent_var.get())
+check("  (the fake apply ran to completion)",
+      app.status.get().startswith("Copied"), app.status.get())
 
 tkroot.destroy()
 shutil.rmtree(root_dir, ignore_errors=True)

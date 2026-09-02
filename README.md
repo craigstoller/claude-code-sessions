@@ -61,18 +61,20 @@ The window is called **"Claude sessions"** and has three tabs:
   next: first every rename as an `old -> new` list (each lands as its own journalled,
   individually undoable operation), then a fresh converge plan's own numbers. After any
   apply the pane re-measures and re-renders from the store as it now is.
-- **Copy & refresh** - the original sync pane, unchanged: destination choice, a title
-  filter (`sync --only`), the refresh checkboxes, and the same confirmations. Still the
-  only tab that can overwrite a row; converge is additive and never refreshes. The two
-  tabs can disagree about counts, because Level counts conversations a sidebar cannot
-  open while this tab counts row files the destination lacks - and a multi-account store
-  accumulates different row filenames for the same conversation - so Level is the
-  routine, and this tab is for one session at a time (the pane says so, and warns when
-  the rows it would add already carry a title that sidebar uses).
 - **Health** - `doctor`'s report (findings first), plus interrupted-operation detection.
   While an unresolved operation sits in the journal, Apply and Undo are disabled on every
   tab and the tab shows each stuck operation with a Copy button for the `recover` command -
   resolving is a directional judgment the CLI walks you through, so execution stays there.
+- **One session** - the exception: the sync pane. Copy one session to the other account,
+  or refresh the row it already has there - type its title in the filter (`sync --only`);
+  destination choice, the refresh checkboxes and the same confirmations as the CLI. Still
+  the only tab that can overwrite a row; converge is additive and never refreshes. Apply is
+  live for a one-row plan; copying every row a plan lists takes a tick that names the
+  count. The two tabs can disagree about counts, because Level counts conversations a
+  sidebar cannot open while this tab counts row files the destination lacks - and a
+  multi-account store accumulates different row filenames for the same conversation - so
+  Level is the routine, and this tab is for one session at a time (the pane says so, and
+  warns when the rows it would add already carry a title that sidebar uses).
 
 One Undo button below the tabs reverses the most recent operation the window can reverse
 (a copy, a rename, or a converge), exactly the one `ccs undo` would pick; pressing it

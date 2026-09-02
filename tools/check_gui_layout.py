@@ -292,8 +292,20 @@ def rect(w):
 
 
 def inside(w, area):
-    a, b = rect(w), rect(area)
-    return a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2] and a[3] <= b[3]
+    """W lies within every ancestor up to AREA - a widget can sit inside
+    the tab's rectangle while its own parent frame has been squeezed to
+    nothing around it."""
+    a = rect(w)
+    p = w
+    while p is not None and p is not area:
+        p = p.master
+        if p is None:
+            return True
+        b = rect(p)
+        if not (a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2]
+                and a[3] <= b[3]):
+            return False
+    return True
 
 
 def drawn(w):
@@ -312,13 +324,14 @@ def required(app, identity=True):
     st, lt, ht = app.sync_tab, app.level_tab, app.health_tab
     items = [("filter_label", st), ("only_entry", st), ("filter_btn", st),
              ("clear_btn", st), ("refresh_label", st), ("update_chk", st),
-             ("newer_chk", st), ("orphan_chk", st), ("sync_bar", st),
-             ("apply_btn", st), ("refresh_btn", st), ("forget_btn", st),
-             ("sync_status_label", st),
+             ("newer_chk", st), ("orphan_chk", st), ("consent_chk", st),
+             ("sync_bar", st), ("apply_btn", st), ("refresh_btn", st),
+             ("forget_btn", st), ("sync_status_label", st), ("sync_role", st),
              ("level_bar", lt), ("level_apply_btn", lt),
              ("level_refresh_btn", lt), ("level_status_label", lt),
+             ("level_role", lt),
              ("health_bar", ht), ("doctor_btn", ht),
-             ("health_status_label", ht),
+             ("health_status_label", ht), ("health_role", ht),
              # The Chrome-helper checkbox lives on the sync bar until
              # Change 5 moves it to the window bar.
              ("trust_chk", st),
@@ -384,6 +397,9 @@ check("  and labelled as the opt-in for this run",
 check("  the newer-only advice sits inside the group",
       app.refresh_hint.master is group
       and "only where mine is newer" in str(app.refresh_hint.cget("text")))
+check("  the consent box sits in the action bar beside the button it gates",
+      app.consent_chk.master is app.sync_bar
+      and app.consent_chk.winfo_rootx() < app.refresh_btn.winfo_rootx())
 check("  the seventh control - 'allow hiding a conversation' - is drawn",
       drawn(app.orphan_chk),
       "%dx%d" % (app.orphan_chk.winfo_width(), app.orphan_chk.winfo_height()))
@@ -464,16 +480,16 @@ check("  and the computed minsize is no larger than the work area",
       mins[0] <= 683 and mins[1] <= 384 and tuple(mins) == (643, 336),
       str(mins))
 FIXED = {"filter_label", "only_entry", "filter_btn", "clear_btn",
-         "refresh_label", "update_chk", "newer_chk", "orphan_chk", "sync_bar",
-         "apply_btn", "refresh_btn", "forget_btn", "sync_status_label",
-         "level_bar", "level_apply_btn", "level_refresh_btn",
-         "level_status_label", "health_bar", "doctor_btn",
-         "health_status_label", "close_btn", "trust_chk"}
+         "refresh_label", "update_chk", "newer_chk", "orphan_chk",
+         "consent_chk", "sync_bar", "apply_btn", "refresh_btn", "forget_btn",
+         "sync_status_label", "sync_role", "level_bar", "level_apply_btn",
+         "level_refresh_btn", "level_status_label", "level_role",
+         "health_bar", "doctor_btn", "health_status_label", "health_role",
+         "close_btn", "trust_chk"}
 # 15b governs here: the fixed chrome is what must fit; the scrolling middle
 # yields (the scoreboard to two lines, the holds to one row, the panes to
 # whatever remains).
-audit(app, tkroot, settle, size,
-      names=FIXED | {"identity button 0", "identity button 1"})
+audit(app, tkroot, settle, size, names=FIXED, identity=False)
 app.nb.select(app.level_tab)
 settle()
 check("  and the scoreboard yielded to its two-line minimum - the first "

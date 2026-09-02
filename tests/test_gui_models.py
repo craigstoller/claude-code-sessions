@@ -528,3 +528,50 @@ def test_window_geometry_clamps_to_the_work_area():
     # The clamp never produces a size Tk cannot lay out at all.
     assert gui._min_size((100, 100)) == gui._initial_geometry((100, 100))
     assert all(v >= 240 for v in gui._min_size((100, 100)))
+
+
+# ------------------------------------------- the One-session tab's gate
+
+def _sync_row(name, sid, is_update=False):
+    return {"name": name, "session_id": sid, "is_update": is_update,
+            "title": "Northwind backtest", "pre_b64": None, "post_b64": "e30="}
+
+
+def test_plan_digest_binds_consent_to_the_row_set():
+    """GUI polish, Change 3: the bulk-copy consent is bound to a digest of
+    the rendered rows - per row the filename, the session id and is_update,
+    order-independent - so a replan with the same rows keeps the tick and
+    one with a different row set clears it."""
+    a = _sync_row("local_1.json", "aaaa1111" + "0" * 24)
+    b = _sync_row("local_2.json", "bbbb2222" + "0" * 24)
+    c = _sync_row("local_3.json", "eeee5555" + "0" * 24, is_update=True)
+    same = gui._rows_digest([a, b, c])
+    assert gui._rows_digest([c, a, b]) == same
+    assert gui._rows_digest([b, c, a]) == same
+    assert gui._rows_digest([a, b, dict(c, is_update=False)]) != same
+    assert gui._rows_digest([a, b, dict(c, session_id="f" * 32)]) != same
+    assert gui._rows_digest([a, b, dict(c, name="local_9.json")]) != same
+    assert gui._rows_digest([a, b]) != same
+    assert gui._rows_digest([]) != same
+    # A title change alone is not a different row set.
+    assert gui._rows_digest([a, b, dict(c, title="renamed")]) == same
+
+
+def test_sync_apply_gate():
+    """_sync_apply_allowed(rows, consent): one row -> live without consent
+    (an add or a refresh alike); zero rows -> never; two or more -> only
+    with consent whose digest matches the rendered rows."""
+    a = _sync_row("local_1.json", "aaaa1111" + "0" * 24)
+    b = _sync_row("local_2.json", "bbbb2222" + "0" * 24)
+    r = _sync_row("local_3.json", "eeee5555" + "0" * 24, is_update=True)
+    assert gui._sync_apply_allowed([a], None) is True
+    assert gui._sync_apply_allowed([r], None) is True
+    assert gui._sync_apply_allowed([], None) is False
+    assert gui._sync_apply_allowed([], gui._rows_digest([])) is False
+    assert gui._sync_apply_allowed([a, b], None) is False
+    assert gui._sync_apply_allowed([a, b], gui._rows_digest([b, a])) is True
+    assert gui._sync_apply_allowed([a, b, r], gui._rows_digest([a, b])) is False
+    stale = gui._rows_digest([a, dict(b, is_update=True)])
+    assert gui._sync_apply_allowed([a, b], stale) is False
+    assert gui._consent_label(3) == "copy every row this plan lists (3)"
+    assert gui._consent_label(78) == "copy every row this plan lists (78)"

@@ -5,19 +5,24 @@ remember.
     ccs-gui --install-shortcut  put "Claude sessions" on the Desktop + Start Menu
     ccs-gui --remove-shortcut   take them away again
 
-Three tabs (docs/specs/2026-08-31-gui-level-design.md):
-  Level           the home - the alignment scoreboard, the converge plan, and
-                  the title-collision holds as rename rows (prefilled where
-                  the measurement suggested a name, empty where it declined -
-                  a human can still name those); "Level the sidebars" runs
-                  the renames then a fresh converge, two confirmations, each
-                  describing exactly what runs next.
-  Copy & refresh  the original sync pane, moved intact - still the only tab
-                  that can OVERWRITE a row (converge is additive and
-                  deliberately never refreshes).
-  Health          the doctor report plus interrupted-operation detection;
-                  while an unresolved operation exists, Apply and Undo are
-                  disabled on every tab and `recover` runs in the terminal.
+Three tabs (docs/specs/2026-08-31-gui-level-design.md, revised by
+docs/specs/2026-09-01-gui-polish-design.md):
+  Level           the home, the routine - the alignment scoreboard, the
+                  converge plan, and the title-collision holds as rename rows
+                  (prefilled where the measurement suggested a name, empty
+                  where it declined - a human can still name those); "Level
+                  the sidebars" runs the renames then a fresh converge, two
+                  confirmations, each describing exactly what runs next.
+  Health          the diagnostic - the doctor report plus interrupted-
+                  operation detection; while an unresolved operation exists,
+                  Apply and Undo are disabled on every tab and `recover` runs
+                  in the terminal.
+  One session     the exception - the sync pane: copy one session to the
+                  other account, or refresh the row it already has there.
+                  Still the only tab that can OVERWRITE a row (converge is
+                  additive and deliberately never refreshes). Apply is live
+                  for a one-row plan; copying every row a plan lists takes a
+                  tick that names the count.
 
 Installed as a GUI script (pyproject's [project.gui-scripts]), so the launcher
 runs under pythonw and no console window ever appears - the console-script
@@ -32,7 +37,7 @@ the store.
 
 Two rules it holds to:
   - Nothing is written until you press a tab's action button ("Level the
-    sidebars", or the Copy & refresh tab's "Apply"). Opening the window
+    sidebars", or the One-session tab's "Apply"). Opening the window
     plans only.
   - A refusal is shown verbatim, never summarised into something friendlier.
     The refusals in this tool carry the reason and the fix, and softening them
@@ -365,9 +370,20 @@ def _scoreboard_half(rep):
 
 
 # The Level tab's action button, by its own spec's name for the flow - not
-# "Apply", which is the Copy & refresh tab's button, and two tabs sharing one
+# "Apply", which is the One-session tab's button, and two tabs sharing one
 # label read as one action (0.15.1, finding D).
 LEVEL_BUTTON = "Level the sidebars"
+
+# One role line per tab, in the same slot above the status line (GUI
+# polish, Change 3): the strip reads as a checklist otherwise, and the only
+# role sentence the window had sat under the exception tab's bold count.
+ROLE_LEVEL = ("The routine. Measure the sidebars, name the held collisions, "
+              "level them.")
+ROLE_HEALTH = ("Diagnostic. The doctor report and any interrupted operation. "
+               "Nothing here writes.")
+ROLE_SYNC = ("The exception. Copy one session to the other account, or "
+             "refresh the row it already has there. Type its title in the "
+             "filter; Level is the routine.")
 
 # The scoreboard box shows its content up to this many lines above the
 # sash, then scrolls; the holds - the decisions, the point of the tab - get
@@ -471,8 +487,41 @@ def _level_state(rep, manifest, models):
             "detail": detail(""), "apply": False}
 
 
+def _rows_digest(rows):
+    """A digest of a sync plan's rendered rows - per row the filename, the
+    session id (a row's cliSessionId) and is_update, order-independent -
+    that the bulk-copy consent is bound to (GUI polish, Change 3). A replan
+    whose rows digest identically keeps the tick; one that changes the row
+    set clears it: consent was for a different N."""
+    import hashlib
+    items = sorted((str(r.get("name") or ""), str(r.get("session_id") or ""),
+                    "1" if r.get("is_update") else "0") for r in rows)
+    return hashlib.sha1("\n".join("\t".join(i) for i in items)
+                        .encode("utf-8")).hexdigest()
+
+
+def _sync_apply_allowed(rows, consent):
+    """The single-session gate: Apply on the One-session tab is live when
+    the rendered plan lists exactly one row - an add or a refresh alike, the
+    tab's routine use - or when consent was given for exactly this row set
+    (CONSENT is the digest the tick was given for, or None). Zero rows is
+    never live. `rows` holds exactly what run_sync would write: plan_sync
+    never puts a held, skipped, unchanged or filtered row in it, so N is the
+    number the confirmation already quotes."""
+    n = len(rows)
+    if n == 0:
+        return False
+    if n == 1:
+        return True
+    return consent is not None and consent == _rows_digest(rows)
+
+
+def _consent_label(n):
+    return "copy every row this plan lists ({0})".format(n)
+
+
 def _sync_dup_warning(rows):
-    """The Copy & refresh tab's warning above Apply, or '' (0.15.1, E part
+    """The One-session tab's warning above Apply, or '' (0.15.1, E part
     2): how many of the rows it would ADD already name a row in that sidebar,
     from plan_sync's per-row `dup_title` (computed with the engine's own
     title_key). Adds only - a refresh duplicates its own conversation by
@@ -981,9 +1030,12 @@ class SyncApp:
         self.level_tab = ttk.Frame(self.nb, padding=PAD)
         self.sync_tab = ttk.Frame(self.nb, padding=PAD)
         self.health_tab = ttk.Frame(self.nb, padding=PAD)
+        # Level | Health | One session: the exception goes last and the
+        # diagnostic sits next to the home, so the gate line's "see Health"
+        # points one tab over (GUI polish, Change 3). Level stays selected.
         self.nb.add(self.level_tab, text="Level")
-        self.nb.add(self.sync_tab, text="Copy & refresh")
         self.nb.add(self.health_tab, text="Health")
+        self.nb.add(self.sync_tab, text="One session")
 
         # ------------------------------------------------- Tab 1: Level
         lt = self.level_tab
@@ -997,6 +1049,10 @@ class SyncApp:
         lbar = ttk.Frame(lt)
         lbar.pack(side="bottom", fill="x", pady=(6, 0))
         self.level_bar = lbar
+        self.level_role = ttk.Label(lt, text=ROLE_LEVEL, foreground="#555",
+                                    justify="left")
+        self.level_role.pack(anchor="w", pady=(0, 4))
+        self._wrap_to(self.level_role, lt)
         self.level_status = tk.StringVar(value="Measuring...")
         lb_status = ttk.Label(lt, textvariable=self.level_status,
                               font=("Segoe UI", 11, "bold"), justify="left")
@@ -1094,7 +1150,7 @@ class SyncApp:
                                                      width=e.width))
         self.hold_canvas.pack(side="left", fill="both", expand=True)
         hsb.pack(side="right", fill="y")
-        # Its own label, not "Apply": the Copy & refresh tab's button is
+        # Its own label, not "Apply": the One-session tab's button is
         # "Apply", and two tabs sharing one label read as one action.
         self.level_apply_btn = ttk.Button(lbar, text=LEVEL_BUTTON,
                                           command=self.on_level_apply,
@@ -1110,47 +1166,57 @@ class SyncApp:
         ttk.Label(lbar, textvariable=self.level_footer,
                   foreground="#555").pack(side="left")
 
-        # ---------------------------------------- Tab 2: Copy & refresh
+        # ------------------------------------------- Tab 3: One session
         st = self.sync_tab
         # The action bar packs FIRST, bottom-pinned, so a short window
         # squeezes the plan text (which scrolls) and never the buttons - the
         # a32798b rule Level already followed (GUI polish, Change 1).
         bar = ttk.Frame(st)
-        bar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        bar.pack(side="bottom", fill="x", pady=(6, 0))
         self.sync_bar = bar
+        # The role line replaces the 0.15.1 guidance line: what this tab is
+        # FOR, said before the plan and above the status, so the invitation
+        # is not read before the caveat. Measured on a freshly levelled
+        # store: this tab offered 78 rows into one account, 77 of them for
+        # conversations that sidebar could already open under a different
+        # row file. Sync counts ROW FILES the destination lacks; converge
+        # counts CONVERSATIONS it cannot open; a multi-account store
+        # accumulates different row filenames for the same conversations -
+        # so the two tabs can disagree about counts, and bulk-applying this
+        # one would have driven `distinguishable` from 0 to ~78. The gate
+        # below is what makes that press a said-yes-to act.
+        # The header is a GRID, not a pack stack (GUI polish, Changes 1
+        # and 3): its rows are, top to bottom, the role line, the status
+        # line, the mutation-gate line, the detail line, the running-app
+        # notice, the filter row and the refresh group. Only the detail and
+        # notice rows carry weight, so on a window too short for everything
+        # they are what the shortfall takes - grid shrinks weighted rows
+        # first - while the filter, the checkboxes and the status line keep
+        # their height. Pack allocates in list order and would have dropped
+        # whatever came last.
+        head = ttk.Frame(st)
+        head.pack(fill="x")
+        head.columnconfigure(0, weight=1)
+        self.sync_head = head
+        self.sync_role = ttk.Label(head, text=ROLE_SYNC, foreground="#555",
+                                   justify="left")
+        self.sync_role.grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self._wrap_to(self.sync_role, head)
         self.status = tk.StringVar(value="Planning...")
-        sb_status = ttk.Label(st, textvariable=self.status,
+        sb_status = ttk.Label(head, textvariable=self.status,
                               font=("Segoe UI", 11, "bold"), justify="left")
-        sb_status.pack(anchor="w")
+        sb_status.grid(row=1, column=0, sticky="w")
         self.sync_status_label = sb_status
-        self._wrap_to(sb_status, st)
-
+        self._wrap_to(sb_status, head)
+        # Row 2 is the mutation-gate line, gridded by _set_gate.
         self.detail = tk.StringVar(value="")
-        sb_detail = ttk.Label(st, textvariable=self.detail, justify="left",
+        sb_detail = ttk.Label(head, textvariable=self.detail, justify="left",
                               foreground="#555")
-        sb_detail.pack(anchor="w", pady=(4, 6))
-        self._wrap_to(sb_detail, st)
-        # What this tab is FOR, said before the plan (0.15.1, finding E).
-        # Measured on a freshly levelled store: this tab offered 78 rows
-        # into one account, 77 of them for conversations that sidebar could
-        # already open under a different row file, 78 carrying a title
-        # already naming a row there. Sync counts ROW FILES the destination
-        # lacks; converge counts CONVERSATIONS it cannot open; a multi-
-        # account store accumulates different row filenames for the same
-        # conversations - so the two tabs can disagree about counts, and
-        # bulk-applying this one would have driven `distinguishable` from 0
-        # to ~78. The guidance is static because the hazard is structural,
-        # not a property of any one plan.
-        self.sync_guidance = ttk.Label(
-            st, justify="left", foreground="#555",
-            text="Level (the first tab) is the routine. This tab copies "
-                 "ROW FILES: it can add rows for conversations the "
-                 "destination already opens under another row file, and "
-                 "duplicate their titles in that sidebar. It is meant for "
-                 "one session at a time - type its title in the filter "
-                 "below.")
-        self.sync_guidance.pack(anchor="w", pady=(0, 6))
-        self._wrap_to(self.sync_guidance, st)
+        sb_detail.grid(row=3, column=0, sticky="w", pady=(2, 4))
+        head.rowconfigure(3, weight=1)
+        self._wrap_to(sb_detail, head)
+        # Row 4 is the running-app notice, weighted like the detail line.
+        head.rowconfigure(4, weight=1)
 
         # Title filter -> sync's --only. Deliberately the SAME flag the CLI uses
         # rather than per-row checkboxes: checkboxes would mean assembling a
@@ -1164,8 +1230,8 @@ class SyncApp:
         # conversation", the opt-in whose whole purpose is to be seen and
         # said yes to - was not drawn at all until the window was about
         # 1150 px wide.
-        filt = ttk.Frame(st)
-        filt.pack(fill="x", pady=(0, 4))
+        filt = ttk.Frame(head)
+        filt.grid(row=5, column=0, sticky="we", pady=(0, 2))
         self.filter_label = ttk.Label(filt,
                                       text="Only sessions whose title contains:")
         self.filter_label.pack(side="left")
@@ -1178,13 +1244,22 @@ class SyncApp:
         self.clear_btn = ttk.Button(filt, text="Clear", command=self._clear_filter)
         self.clear_btn.pack(side="left", padx=(4, 0))
         # The group label says that everything on these lines is the
-        # overwrite path - the opt-in for this run, never remembered.
-        group = ttk.Frame(st)
-        group.pack(fill="x", pady=(0, PAD))
+        # overwrite path - the opt-in for this run, never remembered. The
+        # one piece of advice the 0.15.1 guidance line carried sits beside
+        # it, next to the boxes it describes.
+        group = ttk.Frame(head)
+        group.grid(row=6, column=0, sticky="we", pady=(0, 6))
         self.refresh_group = group
         self.refresh_label = ttk.Label(group,
                                        text="Refresh (opt-in for this run):")
         self.refresh_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.refresh_hint = ttk.Label(
+            group, foreground="#555", justify="left",
+            text="for one session, keep \"only where mine is newer\" ticked "
+                 "- it can only hold rows back, never send more")
+        self.refresh_hint.grid(row=0, column=1, columnspan=3, sticky="w")
+        self._wrap_to(self.refresh_hint, group,
+                      margin=self.refresh_label.winfo_reqwidth() + 8)
         # RULING 8. Unticked every time the window opens: this is the only
         # control here that overwrites rather than adds, so it is a decision
         # for one run, never a remembered preference.
@@ -1192,7 +1267,7 @@ class SyncApp:
         self.update_chk = ttk.Checkbutton(
             group, text="Also refresh rows already there", variable=self.update_var,
             command=self._on_update_toggle)
-        self.update_chk.grid(row=0, column=1, columnspan=2, sticky="w")
+        self.update_chk.grid(row=1, column=0, sticky="w", padx=(0, 12))
         # Ticked BY DEFAULT, and the one default in this window that is not
         # "do nothing". Refreshing everything is almost never what someone
         # means: each account's rows are a snapshot of when THAT account last
@@ -1205,7 +1280,7 @@ class SyncApp:
         self.newer_chk = ttk.Checkbutton(
             group, text="only where mine is newer", variable=self.newer_var,
             command=self.refresh, state="disabled")
-        self.newer_chk.grid(row=1, column=1, sticky="w", padx=(18, 12))
+        self.newer_chk.grid(row=1, column=1, sticky="w", padx=(0, 12))
         # Off by default and never remembered. A row is a POINTER to a
         # conversation, and two accounts can point at different ones, so a
         # refresh can leave the displaced conversation reachable from nowhere.
@@ -1216,16 +1291,24 @@ class SyncApp:
             group, text="allow hiding a conversation", variable=self.orphan_var,
             command=self.refresh, state="disabled")
         self.orphan_chk.grid(row=1, column=2, sticky="w")
-        # The one piece of advice the 0.15.1 guidance line carried, next to
-        # the box it describes.
-        self.refresh_hint = ttk.Label(
-            group, foreground="#555", justify="left",
-            text="For one session, keep \"only where mine is newer\" ticked "
-                 "- it can only hold rows back, never send more.")
-        self.refresh_hint.grid(row=2, column=1, columnspan=3, sticky="w",
-                               padx=(18, 0), pady=(2, 0))
         group.columnconfigure(3, weight=1)
-        self._wrap_to(self.refresh_hint, group, margin=18)
+
+        # The single-session gate (GUI polish, Change 3): Apply is live when
+        # the rendered plan lists exactly one row, or when this box - off at
+        # every open, never remembered - is ticked for exactly the row set
+        # on screen. It sits in the action bar beside the button it gates.
+        # It is bound to a digest of the rendered rows (see _rows_digest): a
+        # replan with the same rows keeps the tick, a replan that changes
+        # the row set clears it and updates the count, and every apply
+        # clears it. The bulk copy stays available - it is a valid sync, and
+        # the only overwrite route - but it becomes a said-yes-to act
+        # instead of the default state of an empty filter.
+        self.consent_var = tk.BooleanVar(value=False)
+        self._consent_for = None         # the digest the tick was given for
+        self._consent_rows = 0
+        self.consent_chk = ttk.Checkbutton(
+            bar, text=_consent_label(0), variable=self.consent_var,
+            command=self._on_consent_toggle, state="disabled")
 
         # The duplicate-title warning, packed above the Apply bar only when
         # the plan's adds would duplicate a title already in that sidebar
@@ -1251,6 +1334,7 @@ class SyncApp:
         self.apply_btn.pack(side="right")
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
         self.refresh_btn.pack(side="right", padx=(0, 6))
+        self.consent_chk.pack(side="right", padx=(0, 12))
         self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
         self.trust_chk = ttk.Checkbutton(
             bar, text="Let Chrome stay open", variable=self.trust_var,
@@ -1267,12 +1351,16 @@ class SyncApp:
         self.live_btn = ttk.Button(bar, text="Change signed-in account",
                                    command=self.forget_live)
 
-        # ------------------------------------------------ Tab 3: Health
+        # ------------------------------------------------ Tab 2: Health
         ht = self.health_tab
         # Bottom-pinned first, like the other two bars.
         hbar = ttk.Frame(ht)
         hbar.pack(side="bottom", fill="x", pady=(PAD, 0))
         self.health_bar = hbar
+        self.health_role = ttk.Label(ht, text=ROLE_HEALTH, foreground="#555",
+                                     justify="left")
+        self.health_role.pack(anchor="w", pady=(0, 4))
+        self._wrap_to(self.health_role, ht)
         self.health_status = tk.StringVar(
             value="Press Refresh for the full health check.")
         hb_status = ttk.Label(ht, textvariable=self.health_status,
@@ -1302,13 +1390,15 @@ class SyncApp:
         # The mutation-gate red line, one per tab (the text carries its own
         # !! prefix - never color alone). One StringVar backs all three.
         self.gate_var = tk.StringVar(value="")
-        self._gate_labels = []
-        for tab, anchor in ((lt, lb_status), (st, sb_status),
-                            (ht, hb_status)):
-            lbl = ttk.Label(tab, textvariable=self.gate_var,
+        self._gate_labels = []           # (label, placer) per tab
+        for parent, place in (
+                (lt, lambda l: l.pack(anchor="w", after=lb_status)),
+                (head, lambda l: l.grid(row=2, column=0, sticky="w")),
+                (ht, lambda l: l.pack(anchor="w", after=hb_status))):
+            lbl = ttk.Label(parent, textvariable=self.gate_var,
                             foreground="#a00000", justify="left")
-            self._wrap_to(lbl, tab)
-            self._gate_labels.append((lbl, anchor))
+            self._wrap_to(lbl, parent)
+            self._gate_labels.append((lbl, place))
 
         self.refresh()
         self.refresh_level()
@@ -1455,8 +1545,8 @@ class SyncApp:
         for w in ((self.refresh_btn, self.undo_btn, self.doctor_btn,
                    self.only_entry, self.filter_btn, self.clear_btn,
                    self.trust_chk, self.update_chk, self.newer_chk,
-                   self.orphan_chk, self.live_btn, self.forget_btn,
-                   self.level_refresh_btn, self.copy_btn)
+                   self.orphan_chk, self.consent_chk, self.live_btn,
+                   self.forget_btn, self.level_refresh_btn, self.copy_btn)
                   + tuple(self._banner_widgets)
                   + tuple(self._hold_widgets)):
             try:
@@ -1465,10 +1555,12 @@ class SyncApp:
                 pass                    # a rebuilt hold row already destroyed it
         # newer_chk qualifies update_chk, so re-releasing everything must not
         # leave it live while the box it qualifies is unticked - it would read
-        # as a control that does nothing.
+        # as a control that does nothing. The consent box likewise means
+        # something only over a plan of two or more rows.
         if not self._busy_count and not self.update_var.get():
             self.newer_chk.configure(state="disabled")
             self.orphan_chk.configure(state="disabled")
+        self._sync_consent_state()
         # BOTH transitions recompute the Apply/Undo verdicts, so a worker
         # starting anywhere (the Health check included, which is not a
         # mutation but reads state a concurrent apply would be tearing)
@@ -1740,14 +1832,19 @@ class SyncApp:
         # in the tally: "nothing to copy" reads as "you are up to date", which is
         # a different and misleading statement when a filter caused it.
         suffix = "  (filtered by “{0}”)".format(only) if only else ""
+        # The single-session gate binds the consent box to THIS row set
+        # (carve-out 4 of the moved pane's "unchanged" contract).
+        self._bind_consent(rows)
         if rows:
             self.status.set("{0} session{1} ready to copy{2}".format(
                 len(rows), "" if len(rows) == 1 else "s", suffix))
             self.detail.set("Nothing is written until you press Apply. The Claude "
                             "desktop app must be closed for that step.")
             # Carve-out 1 of the moved pane's "unchanged" contract: the
-            # mutation gate can hold this button down even with rows ready.
-            self._sync_apply_ok = True
+            # mutation gate can hold this button down even with rows ready;
+            # carve-out 4: so can the single-session gate.
+            self._sync_apply_ok = _sync_apply_allowed(
+                rows, self._consent_for if self.consent_var.get() else None)
             self._apply_gate_to_buttons()
         elif only:
             # NOT "no titles match": a title can match and still not be copyable
@@ -1759,6 +1856,33 @@ class SyncApp:
         else:
             self.status.set("Nothing to copy - the other account is up to date")
             self.detail.set("")
+
+    def _bind_consent(self, rows):
+        """Bind the bulk-copy consent box to the rendered row set: a tick
+        given for a different digest is cleared, the label carries this
+        plan's count, and the box is live only over two or more rows."""
+        digest = _rows_digest(rows)
+        if self.consent_var.get() and self._consent_for != digest:
+            self.consent_var.set(False)
+            self._consent_for = None
+        self._consent_rows = len(rows)
+        self.consent_chk.configure(text=_consent_label(len(rows)))
+        self._sync_consent_state()
+
+    def _sync_consent_state(self):
+        state = ("normal" if (self._consent_rows >= 2
+                              and not self._busy_count) else "disabled")
+        self.consent_chk.configure(state=state)
+
+    def _on_consent_toggle(self):
+        """The tick is consent for exactly the rows on screen: record their
+        digest (or drop it) and recompute the Apply verdict."""
+        rows = (self.manifest or {}).get("rows") or []
+        self._consent_for = (_rows_digest(rows) if self.consent_var.get()
+                             else None)
+        self._sync_apply_ok = bool(self.manifest) and _sync_apply_allowed(
+            rows, self._consent_for)
+        self._apply_gate_to_buttons()
 
     def _show_sync_warning(self, text):
         """Pack the duplicate-title warning above the Apply bar, or take it
@@ -2634,10 +2758,12 @@ class SyncApp:
         else:
             self.gate_text = ""
         self.gate_var.set(self.gate_text)
-        for lbl, anchor in self._gate_labels:
+        for lbl, place in self._gate_labels:
             if self.gate_text:
                 if not lbl.winfo_manager():
-                    lbl.pack(anchor="w", after=anchor)
+                    place(lbl)
+            elif lbl.winfo_manager() == "grid":
+                lbl.grid_remove()
             elif lbl.winfo_manager():
                 lbl.pack_forget()
         if self.gate_text and not error:
@@ -2891,9 +3017,15 @@ class SyncApp:
         # reason over, so the window refuses to be the second writer.
         if self._press_gate():
             return
-        n = len(self.manifest.get("rows") or [])
-        dst = self.manifest.get("dest_email") or self.manifest["dest_account"][:8]
         rows = self.manifest.get("rows") or []
+        # The single-session gate, re-read at press time: a bulk plan needs
+        # consent for exactly this row set (the button is disabled without
+        # it; this is the belt to that brace).
+        if not _sync_apply_allowed(
+                rows, self._consent_for if self.consent_var.get() else None):
+            return
+        n = len(rows)
+        dst = self.manifest.get("dest_email") or self.manifest["dest_account"][:8]
         n_upd = sum(1 for r in rows if r.get("is_update"))
         # Rows are per-account snapshots of one shared transcript, so the copy
         # being overwritten is not automatically the older one. Saying "the
@@ -3003,8 +3135,13 @@ class SyncApp:
         # ticked after an apply meant the next plan in the same window silently
         # arrived with refreshes already enabled, which is not what "opt-in per
         # run, never implied" promises - and the window is the one place a user
-        # is least likely to re-read what the checkbox does.
+        # is least likely to re-read what the checkbox does. The bulk-copy
+        # consent covers one run the same way.
         self.update_var.set(False)
+        self.consent_var.set(False)
+        self._consent_for = None
+        self._consent_rows = 0
+        self._sync_consent_state()
         self.status.set("Copied {0} session{1}{2}".format(
             written - n_upd, "" if written - n_upd == 1 else "s",
             ", refreshed {0}".format(n_upd) if n_upd else ""))
