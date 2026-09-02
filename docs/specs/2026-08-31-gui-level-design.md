@@ -78,6 +78,22 @@ attempt, the same "covers one run" rule the sync pane records; if the files stil
 disagree, the post-refusal replan re-raises the banner and asks again). It never clears
 *mid*-sequence, so the fresh plan in stage 2 below still carries it. It does **not** thread into `RetitleFlags`: retitle has no RULING 5 gate (a documented
 0.13.0 scope decision), so passing it would assert something retitle never asks.
+**Revised for 0.16.0 (2026-09-01, the GUI polish design, Change 2):** `live_choice` is
+the window's one identity answer, shared with the One-session tab and bound to the
+`(oauth, config)` pair the identity files showed when it was given. It is dropped when a
+run of the mutation path consumed it (a sync apply that wrote, or a converge ending
+`completed` or `unchanged`), when a fresh read of the identity files no longer returns
+that pair (agreement, a different pair, or the roles swapped), or when the user presses
+"Change signed-in account"; it survives refusals, cancels, the zero-rows `empty`
+outcome, truncation and tab switches. Every plan reads the files before building its
+flags and every consuming press re-reads them, so a plan never receives an answer the
+files have outgrown. When the fresh stage-2 plan carries the disagreement and no answer
+is held, the sequence asks then - a sixth adapter member, `ask_live(fresh)`, whose
+failure reads as Cancel - and replans with the answer before the stage-2 dialog; the
+stage-1 dialog says in advance that the copy step will ask. The same red in-force line
+and button show on both tabs, and every confirmation that precedes a write under the
+answer prints the assertion line. The 0.15.0 clear-on-every-ending rule, and harness
+item 20b that pinned it, are superseded (item 20b is inverted).
 
 **The holds, as structured rows — the point of the tab.** Each `held_title_collision`
 hold renders as a row widget. The row model is a pure function,
@@ -246,6 +262,18 @@ dialogs. Its code moves; its contracts do not — and the existing
 `tools/check_gui_*.py` harness must keep passing over the moved pane, which is the
 regression net for the move itself. (`--update` refresh remains this tab's reason to
 exist — converge is additive and deliberately never refreshes.)
+**Revised for 0.16.0 (2026-09-01, the GUI polish design, Changes 2 and 3):** the tab is
+third in the strip and named **One session**, with a role line above its status line,
+and its "unchanged in behavior" contract carries two more carve-outs beside the mutation
+gate and the shared Undo button. Carve-out 3: the identity answer is the one variable
+shared with Level, the pane plans on the first selection of its tab rather than at open
+(through the same one-pending-run mechanism Health's first-visit doctor run uses), and
+its identity refusal renders the shared banner in-pane above the verbatim text instead
+of raising a popup. Carve-out 4: Apply is live only when the rendered plan lists exactly
+one row - an add or a refresh alike - or under a "copy every row this plan lists (N)"
+tick bound to a digest of the rendered rows, off at every open and never remembered.
+The engine is untouched; `plan_sync` plans as before, and the window decides when Apply
+is live.
 
 ## Tab 3 — Health
 
