@@ -891,6 +891,35 @@ window into `journaled`/`completed`/`rolled_back`.
   would have taken `distinguishable` from 0 to the seventies. The sync plan now reports both
   counts, per row and in its tally, the tab warns above Apply with the number, and a
   guidance line says what the tab is for: one session at a time, through the title filter.
+- **0.16.0 makes the window legible.** After the first-use patch came a full audit of the
+  window, read-only, over a headless layout probe, and its verdict was that the engine's
+  guards reach the window intact while the window itself is hard to read. The one question
+  it must ask - which account the desktop app is signed into, when the two identity files
+  disagree - was asked twice, by two tabs, in two wordings, into two variables, the first
+  time as a popup in a screen corner before the home tab had been seen. The tab strip read
+  as a three-step checklist although one tab is the routine, one a diagnostic and one a
+  rare exception. And the exception tab's filter row wanted 1101 px in an 896 px frame, so
+  its third checkbox clipped and its fourth, "allow hiding a conversation", the RULING 8
+  opt-in whose whole purpose is to be seen and said yes to, was not drawn at all at the
+  default window size. This release is the audit's fixes in the order its design set. A
+  layout harness lands first (`tools/check_gui_layout.py`, the window measured for real
+  over a fake-cast store), and it found a defect nobody had reported: the bar holding Undo
+  and Close was clipped at every window size, packed after the notebook that expands into
+  it. Then the filter block becomes two rows and every label wraps to the window; the tabs
+  read **Level | Health | One session**, each with a role line, and the exception tab's
+  Apply is live for a one-row plan or for a tick that names the count ("copy every row
+  this plan lists (78)"), bound to the rows on screen so consent cannot go stale; there is
+  one identity answer, asked in-pane where it is read, shared by both tabs, bound to the
+  file pair it was given for and dropped before any plan the files have outgrown - the
+  sync pane plans on first visit, so nothing asks at open unless the home tab does, and
+  the copy stage asks from its fresh plan if the question is still open; Level's
+  scoreboard yields to seven lines behind a sash and the holds keep the rest; the window
+  bar reads Undo, the Chrome setting, Close, and Close asks before losing typed names;
+  every dialog opens centred, with Escape and the default on Cancel; the wheel reaches
+  the holds. No default flipped: the audit's per-control table ended in visibility and
+  placement, and the one box the operator's own habit would have flipped stays opt-in per
+  run because RULING 8 says so. DPI awareness, the audit's last item, is its own later
+  release; the harness it needed now exists.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
