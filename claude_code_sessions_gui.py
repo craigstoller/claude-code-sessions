@@ -520,6 +520,40 @@ def _consent_label(n):
     return "copy every row this plan lists ({0})".format(n)
 
 
+def _sync_status(manifest, only):
+    """The One-session status line (GUI polish, Change 6): the honest count
+    the 0.15.1 manifest can support - row files the destination lacks, and
+    how many of them are conversations it already opens under another row
+    (plan_sync's per-row dup_conversation) - never "sessions ready to
+    copy", and an empty state that claims only a row-file fact, not the
+    conversation-level "up to date". Refreshes count apart. An older
+    manifest without the flag falls back to the row-file count alone."""
+    rows = manifest.get("rows") or []
+    dst = manifest.get("dest_email") or (manifest.get("dest_account") or "?")[:8]
+    if not rows:
+        if only:
+            return 'No row files matching "{0}" to add to {1}\'s sidebar'.format(
+                only, dst)
+        return "No row files to add to {0}'s sidebar".format(dst)
+    adds = [r for r in rows if not r.get("is_update")]
+    upd = [r for r in rows if r.get("is_update")]
+    parts = []
+    if adds:
+        line = "{0} row file{1} missing from {2}'s sidebar".format(
+            len(adds), "" if len(adds) == 1 else "s", dst)
+        dup = sum(1 for r in adds if r.get("dup_conversation"))
+        if dup:
+            line += (" - {0} of them for {1} it already opens under another "
+                     "row".format(dup, "a conversation" if dup == 1
+                                  else "conversations"))
+        parts.append(line)
+    if upd:
+        n = "{0} row{1} to refresh".format(len(upd), "" if len(upd) == 1 else "s")
+        parts.append(n if adds else n + " in {0}'s sidebar".format(dst))
+    suffix = '  (filtered by "{0}")'.format(only) if only else ""
+    return "; ".join(parts) + suffix
+
+
 def _sync_dup_warning(rows):
     """The One-session tab's warning above Apply, or '' (0.15.1, E part
     2): how many of the rows it would ADD already name a row in that sidebar,
@@ -1351,6 +1385,7 @@ class SyncApp:
         root.geometry("{0}x{1}".format(*_initial_geometry(work)))
         root.minsize(*_min_size(work))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._set_icon()
         # Every label that wraps to its container's width, as (label,
         # container, margin) - the layout harness walks this list.
         self._wrapped = []
@@ -1499,10 +1534,14 @@ class SyncApp:
         holds_wrap = ttk.Frame(bottom)
         holds_wrap.pack(fill="both", expand=True)
         self.holds_wrap = holds_wrap
-        self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0)
+        # takefocus: the paging keys need a focus target, and clicks land
+        # in entries - the rows carry the same bindings (Change 6).
+        self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0,
+                                     takefocus=1, yscrollincrement=24)
         hsb = ttk.Scrollbar(holds_wrap, orient="vertical",
                             command=self.hold_canvas.yview)
         self.hold_canvas.configure(yscrollcommand=hsb.set)
+        self._bind_holds_scroll(self.hold_canvas)
         self.hold_frame = ttk.Frame(self.hold_canvas)
         self._hold_window = self.hold_canvas.create_window(
             (0, 0), window=self.hold_frame, anchor="nw")
@@ -1581,8 +1620,15 @@ class SyncApp:
         sb_detail.grid(row=3, column=0, sticky="w", pady=(2, 4))
         head.rowconfigure(3, weight=1)
         self._wrap_to(sb_detail, head)
-        # Row 4 is the running-app notice, weighted like the detail line.
+        # Row 4 is the running-app notice, weighted like the detail line -
+        # the same measurement Level's notice shows (claude_running, read
+        # by the Level worker), gridded by _set_running_notice.
         head.rowconfigure(4, weight=1)
+        self.sync_notice = ttk.Label(
+            head, foreground="#a05000", justify="left",
+            text="!! The Claude desktop app is running - Apply will refuse "
+                 "until it is closed.")
+        self._wrap_to(self.sync_notice, head)
         # Row 7 is the identity banner - the same builder Level uses: the
         # question with one button per store on the identity refusal, the
         # red in-force line with its button while an answer is held.
@@ -1782,6 +1828,28 @@ class SyncApp:
         self._pending = {"sync": False, "health": False}
         self.nb.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
         self.refresh_level()
+
+    def _set_icon(self):
+        """An icon of the window's own on the root - the launcher's where
+        the installed layout provides one, else the embedded image; every
+        Toplevel inherits it. Never fatal: a window without an icon beats
+        no window."""
+        self._icon = None
+        try:
+            exe, _arg = _launcher()
+            if (os.path.basename(exe).lower().startswith("ccs-gui")
+                    and os.path.isfile(exe)):
+                self.root.iconbitmap(default=exe)
+                self._icon = exe
+                return
+        except (tk.TclError, OSError):
+            pass
+        try:
+            img = tk.PhotoImage(data=ICON_PNG)
+            self.root.iconphoto(True, img)
+            self._icon = img
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------- first-visit dispatch
     def _visit_key(self):
@@ -2424,15 +2492,17 @@ class SyncApp:
         # A filter that hides candidates must say so on the status line, not only
         # in the tally: "nothing to copy" reads as "you are up to date", which is
         # a different and misleading statement when a filter caused it.
-        suffix = "  (filtered by “{0}”)".format(only) if only else ""
+        # The status counts ROW FILES the destination lacks, and how many
+        # of them it already opens under another row (Change 6) - a filter
+        # that hides candidates says so on the line, not only in the tally.
+        # The running-app notice is a widget of its own, fed by Level's
+        # measurement, not a static sentence here.
+        self.status.set(_sync_status(manifest, only))
         # The single-session gate binds the consent box to THIS row set
         # (carve-out 4 of the moved pane's "unchanged" contract).
         self._bind_consent(rows)
         if rows:
-            self.status.set("{0} session{1} ready to copy{2}".format(
-                len(rows), "" if len(rows) == 1 else "s", suffix))
-            self.detail.set("Nothing is written until you press Apply. The Claude "
-                            "desktop app must be closed for that step.")
+            self.detail.set("Nothing is written until you press Apply.")
             # Carve-out 1 of the moved pane's "unchanged" contract: the
             # mutation gate can hold this button down even with rows ready;
             # carve-out 4: so can the single-session gate.
@@ -2443,11 +2513,9 @@ class SyncApp:
             # NOT "no titles match": a title can match and still not be copyable
             # - already present, transcript gone, tombstoned. The tally above
             # shows which, so claim only what is certain.
-            self.status.set("No sessions matching “{0}” are ready to copy".format(only))
             self.detail.set("Any that matched but were skipped are counted above. "
                             "Clear the filter to see everything.")
         else:
-            self.status.set("Nothing to copy - the other account is up to date")
             self.detail.set("")
 
     def _bind_consent(self, rows):
@@ -2654,11 +2722,12 @@ class SyncApp:
                                 st0.get("detail") or "no detail reported"))
         if rep.get("stale_lock"):
             blocking.append("A stale lock is present - a previous run was interrupted. "
-                            "`ccs recover` resolves it.")
+                            "`{0}` resolves it.".format(RECOVER_COMMAND))
         n = len(rep.get("nonterminal_ops") or [])
         if n:
             blocking.append("{0} operation(s) left unresolved by an interruption. "
-                            "`ccs recover` classifies and finishes them.".format(n))
+                            "`{1}` classifies and finishes them.".format(
+                                n, RECOVER_COMMAND))
         if rep.get("row_errors"):
             blocking.append("{0} listing row(s) are unreadable - mutations are blocked "
                             "until they are readable again.".format(len(rep["row_errors"])))
@@ -3095,12 +3164,7 @@ class SyncApp:
         self.level_manifest = man
         self.hold_models = _merge_hold_models(_hold_models(man),
                                               self._current_models())
-        if running:
-            if not self.level_notice.winfo_manager():
-                self.level_notice.pack(anchor="w", pady=(0, 2),
-                                       before=self.level_pane)
-        elif self.level_notice.winfo_manager():
-            self.level_notice.pack_forget()
+        self._set_running_notice(running)
         self._render_banner(man)
         self.show_level(_scoreboard_lines(rep) + [""]
                         + _plan_summary_lines(man))
@@ -3116,6 +3180,22 @@ class SyncApp:
         self._apply_gate_to_buttons()
         self._update_undo_button()
         self.level_footer.set("Measured at " + time.strftime("%H:%M:%S"))
+
+    def _set_running_notice(self, running):
+        """The passive environment notice on BOTH tabs from Level's one
+        measurement (GUI polish, Change 6) - weather, not a gate."""
+        if running:
+            if not self.level_notice.winfo_manager():
+                self.level_notice.pack(anchor="w", pady=(0, 2),
+                                       before=self.level_pane)
+            if not self.sync_notice.winfo_manager():
+                self.sync_notice.grid(row=4, column=0, sticky="w",
+                                      pady=(0, 4))
+        else:
+            if self.level_notice.winfo_manager():
+                self.level_notice.pack_forget()
+            if self.sync_notice.winfo_manager():
+                self.sync_notice.grid_remove()
 
     def _render_banner(self, man):
         """Level's identity banner, through the shared builder: the
@@ -3189,6 +3269,8 @@ class SyncApp:
                     self._wrap_to(reason, row, margin=col)
                 row.columnconfigure(1, weight=1)
                 self._hold_widgets += [chk, entry]
+                for w in (row,) + tuple(row.winfo_children()):
+                    self._bind_holds_scroll(w)
             else:
                 held = ttk.Label(row, justify="left",
                                  text="held: " + (m["title"]
@@ -3200,6 +3282,43 @@ class SyncApp:
                                      foreground="#555", justify="left")
                 evidence.pack(anchor="w")
                 self._wrap_to(evidence, row, margin=0)
+                for w in (row,) + tuple(row.winfo_children()):
+                    self._bind_holds_scroll(w)
+
+    def _bind_holds_scroll(self, w):
+        """The wheel and the paging keys, bound on the canvas and on each
+        row widget as it is built (GUI polish, Change 6) - a Canvas does
+        not scroll natively, and clicks land in the rows' entries. Never
+        bind_all, which would reach the scrolling Text panes on the other
+        tabs; the row widgets are labels, checkbuttons and one-line
+        entries, none of which scrolls vertically on its own."""
+        w.bind("<MouseWheel>", self._on_holds_wheel)
+        w.bind("<Button-4>", self._on_holds_wheel)
+        w.bind("<Button-5>", self._on_holds_wheel)
+        w.bind("<Prior>", lambda _e: self._page_holds(-1))
+        w.bind("<Next>", lambda _e: self._page_holds(1))
+
+    def _on_holds_wheel(self, event):
+        """One unit per notch, per platform: Windows delivers delta in
+        multiples of 120, X11 Button-4/Button-5, macOS small integers."""
+        num = getattr(event, "num", None)
+        if num == 4:
+            units = -1
+        elif num == 5:
+            units = 1
+        else:
+            delta = getattr(event, "delta", 0) or 0
+            if abs(delta) >= 120:
+                units = -int(delta / 120)
+            else:
+                units = -1 if delta > 0 else (1 if delta < 0 else 0)
+        if units:
+            self.hold_canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _page_holds(self, direction):
+        self.hold_canvas.yview_scroll(direction, "pages")
+        return "break"
 
     def _update_holds_heading(self):
         try:
@@ -3325,8 +3444,10 @@ class SyncApp:
             return
         if not steps and not (self.level_manifest.get("rows") or []):
             # Everything unticked and nothing to copy: an enabled button
-            # whose press does nothing at all reads as a broken button.
-            self.level_status.set("Nothing is ticked - tick a rename, or "
+            # whose press does nothing at all reads as a broken button. On
+            # the DETAIL line: in the status font a no-op press looked like
+            # a state change (Change 6).
+            self.level_detail.set("Nothing is ticked - tick a rename, or "
                                   "press Refresh.")
             return
         # When the preview carried the disagreement and no answer is held,
@@ -3692,6 +3813,15 @@ class SyncApp:
 
 
 # ------------------------------------------------------------------- shortcuts
+
+# The window's own icon (GUI polish, Change 6): a 32x32 PNG - three level
+# bars on a dark square - for the root, hence the taskbar and every
+# Toplevel, where the installed layout provides no launcher icon. Tk showed
+# its feather while the shortcut showed the launcher's.
+ICON_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAASklEQVR42mNggAL92K7/9MQM"
+    "yIDelqM4YqAshzti1AGjDhjUDqAWGHXAaCIcdcBoLhjNhqMOGM2Gow4YTYSjDhjcDhjwzulA"
+    "d88BB3FvujNTg6QAAAAASUVORK5CYII=")
 
 SHORTCUT_NAME = "Claude sessions.lnk"
 # The pre-0.15 name. --install-shortcut deletes it so a rename does not leave

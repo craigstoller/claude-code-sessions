@@ -813,11 +813,56 @@ app, tkroot, modals, settle = open_app(env)
 settle()
 check("the passive notice renders while the app is up",
       bool(app.level_notice.winfo_manager()))
+check("  on the One-session tab too, from the same measurement (Change 6)",
+      bool(app.sync_notice.winfo_manager())
+      and "Apply will refuse" in app.sync_notice.cget("text"),
+      app.sync_notice.cget("text"))
 env.process_lister = lambda: []
 app.refresh_level()
 settle()
 check("  and clears once it is closed - weather, not a gate",
-      not app.level_notice.winfo_manager())
+      not app.level_notice.winfo_manager()
+      and not app.sync_notice.winfo_manager())
+# GUI polish (Change 6): the wheel and the paging keys reach the hold rows
+# - bound on the canvas and on every row widget, never bind_all.
+scroll_seqs = ("<MouseWheel>", "<Button-4>", "<Button-5>", "<Key-Prior>",
+               "<Key-Next>")
+
+
+def bound(w):
+    seqs = set(w.bind())
+    return all(x in seqs for x in scroll_seqs)
+
+
+row_widgets = [c for r in app.hold_frame.winfo_children()
+               if isinstance(r, gp.ttk.Frame) for c in r.winfo_children()]
+check("the wheel and Prior/Next are bound on the holds canvas",
+      bound(app.hold_canvas), str(app.hold_canvas.bind()))
+check("  and on every row widget (%d)" % len(row_widgets),
+      row_widgets and all(bound(w) for w in row_widgets))
+check("  the canvas takes focus",
+      str(app.hold_canvas.cget("takefocus")) == "1")
+app.hold_canvas.configure(scrollregion=(0, 0, 800, 4000))
+
+
+class _Wheel(object):
+    def __init__(self, delta=0, num=None):
+        self.delta, self.num = delta, num
+
+
+app._on_holds_wheel(_Wheel(delta=-120))          # one notch down, Windows
+check("  a wheel notch scrolls the canvas one unit",
+      app.hold_canvas.yview()[0] > 0, str(app.hold_canvas.yview()))
+app._on_holds_wheel(_Wheel(delta=120))
+check("  and back", app.hold_canvas.yview()[0] == 0)
+app._on_holds_wheel(_Wheel(num=5))               # X11's Button-5
+check("  X11's Button-5 scrolls down too", app.hold_canvas.yview()[0] > 0)
+app._on_holds_wheel(_Wheel(num=4))
+check("  and Button-4 back up", app.hold_canvas.yview()[0] == 0)
+# (Paging scrolls by the canvas's height - pinned in check_gui_layout.py,
+# where the root is mapped and a page has a height.)
+check("the root carries an icon of its own, not Tk's feather",
+      getattr(app, "_icon", None) is not None)
 check("the hold row rendered as widgets",
       len(app.hold_models) == 1 and len(app._hold_widgets) == 2)
 check("Apply is enabled in the naming-only state",
@@ -974,10 +1019,14 @@ check("  the button is enabled - there are rows a human can tick",
       str(app.level_apply_btn.cget("state")) == "normal")
 app.on_level_apply()
 settle()
-check("pressing it with nothing ticked runs nothing and says so",
+# GUI polish (Change 6): the no-op press speaks on the detail line, where
+# the muted font does not make it read as a state change.
+check("pressing it with nothing ticked runs nothing and says so - on the "
+      "detail line, the status unchanged",
       len(app._stage1_calls) == 0
-      and app.level_status.get().startswith("Nothing is ticked"),
-      app.level_status.get())
+      and app.level_detail.get().startswith("Nothing is ticked")
+      and app.level_status.get() == "Nothing to copy - 2 held: 2 need a name.",
+      app.level_detail.get())
 leg = app.hold_models[0]
 leg["_tick_var"].set(True)
 leg["_entry_var"].set("ACME-REVIEW session - the other leg")

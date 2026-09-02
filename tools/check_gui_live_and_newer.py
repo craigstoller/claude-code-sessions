@@ -335,6 +335,14 @@ FAKE_TALLY.update({"dup_conversation": ["ACME-REVIEW session",
                    "dup_title": ["ACME-REVIEW session"]})
 app.refresh()
 settle()
+# GUI polish (Change 6): the status counts ROW FILES, and how many are
+# conversations the sidebar already opens under another row.
+check("the status line counts row files, not sessions",
+      app.status.get() == "3 row files missing from dorm@example.com's "
+                          "sidebar - 2 of them for conversations it already "
+                          "opens under another row", app.status.get())
+check("  and the detail no longer carries the static running-app sentence",
+      "must be closed" not in app.detail.get(), app.detail.get())
 warn = app.sync_warning.cget("text")
 check("the warning counts the rows that would duplicate a title",
       mapped(app.sync_warning)
@@ -363,6 +371,19 @@ FAKE_TALLY.clear()
 app.refresh()
 settle()
 check("no duplicate titles, no warning", not mapped(app.sync_warning))
+FAKE_ROWS[:] = []
+app.refresh()
+settle()
+check("the empty state claims only a row-file fact",
+      app.status.get() == "No row files to add to dorm@example.com's sidebar",
+      app.status.get())
+app.only_var.set("zzz")
+app.refresh()
+settle()
+check("  and the filtered empty state uses the same vocabulary",
+      app.status.get() == 'No row files matching "zzz" to add to '
+                          "dorm@example.com's sidebar", app.status.get())
+app.only_var.set("")
 
 # ------------------- GUI polish (Change 3). the tab strip and the role lines
 tabs = [app.nb.tab(t, "text") for t in app.nb.tabs()]

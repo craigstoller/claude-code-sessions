@@ -728,3 +728,53 @@ def test_sync_second_box_title_follows_its_body():
     assert gui._sync_box_title(n_add=3, n_upd=0) == "Copy sessions?"
     assert gui._sync_box_title(n_add=0, n_upd=2) == "Refresh rows?"
     assert gui._sync_box_title(n_add=1, n_upd=2) == "Add and refresh rows?"
+
+
+# ------------------------------------------- the One-session status line
+
+def test_sync_status_line_counts_row_files_not_sessions():
+    """GUI polish, Change 6: the honest count the 0.15.1 manifest can
+    support - row files the destination lacks, and how many of them are
+    conversations it already opens under another row (dup_conversation) -
+    never "sessions ready to copy"; an older manifest without the flag
+    falls back to the row-file count alone."""
+    def add(i, dup=False, is_update=False):
+        return {"name": "local_%d.json" % i, "session_id": "s%d" % i,
+                "is_update": is_update, "dup_conversation": dup,
+                "title": "Northwind backtest %d" % i}
+    man = {"dest_email": "bob@example.com", "dest_account": "bbbb2222" + "0" * 24,
+           "rows": [add(i, dup=i < 77) for i in range(78)]}
+    assert gui._sync_status(man, "") == (
+        "78 row files missing from bob@example.com's sidebar - 77 of them for "
+        "conversations it already opens under another row")
+    one = dict(man, rows=[add(1)])
+    assert gui._sync_status(one, "") == (
+        "1 row file missing from bob@example.com's sidebar")
+    # An older manifest carries no flag: the row-file count alone.
+    old = dict(man, rows=[{"name": "local_%d.json" % i, "session_id": "s%d" % i,
+                           "is_update": False} for i in range(3)])
+    assert gui._sync_status(old, "") == (
+        "3 row files missing from bob@example.com's sidebar")
+    # Refreshes are counted apart, as rows to refresh.
+    upd = dict(man, rows=[add(1, is_update=True), add(2, is_update=True)])
+    assert gui._sync_status(upd, "") == (
+        "2 rows to refresh in bob@example.com's sidebar")
+    mixed = dict(man, rows=[add(1, dup=True), add(2), add(3),
+                            add(4, is_update=True), add(5, is_update=True)])
+    assert gui._sync_status(mixed, "") == (
+        "3 row files missing from bob@example.com's sidebar - 1 of them for a "
+        "conversation it already opens under another row; 2 rows to refresh")
+    # The filter suffix, in straight quotes.
+    assert gui._sync_status(one, "Northwind") == (
+        '1 row file missing from bob@example.com\'s sidebar  (filtered by '
+        '"Northwind")')
+    # The empty states claim only what a row-file count can: no
+    # conversation-level "up to date".
+    empty = dict(man, rows=[])
+    assert gui._sync_status(empty, "") == (
+        "No row files to add to bob@example.com's sidebar")
+    assert gui._sync_status(empty, "Northwind") == (
+        'No row files matching "Northwind" to add to bob@example.com\'s sidebar')
+    # Without an email the destination is its id prefix.
+    anon = dict(empty, dest_email="")
+    assert gui._sync_status(anon, "") == "No row files to add to bbbb2222's sidebar"

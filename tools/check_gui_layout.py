@@ -590,6 +590,22 @@ check("  a re-enlargement restores the dragged offset", pw.sashpos(0) == dragged
       str(pw.sashpos(0)))
 tkroot.destroy()
 
+# ------------------- 16c (GUI polish, Change 6). paging the holds canvas
+# The keys are bound on the canvas and every row widget (pinned in
+# check_gui_level.py); the handler scrolls by a page of the canvas's real
+# height, which only a mapped root has.
+WORK["area"] = (1536, 912)
+app, tkroot, settle = open_app()
+app.nb.select(app.level_tab)
+settle()
+app.hold_canvas.configure(scrollregion=(0, 0, 800, 4000))
+app._page_holds(1)
+check("Next pages the holds canvas down",
+      app.hold_canvas.yview()[0] > 0, str(app.hold_canvas.yview()))
+app._page_holds(-1)
+check("  and Prior back up", app.hold_canvas.yview()[0] == 0)
+tkroot.destroy()
+
 # ------------------- 16b (GUI polish, Change 6). every _dialog Toplevel
 # The three Toplevels of the window's own - the stage-1 dialog, the
 # destination picker, the stage-2 identity picker - open centred over the

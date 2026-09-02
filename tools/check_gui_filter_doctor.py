@@ -109,6 +109,15 @@ for key, val, word in (("stale_lock", True, "stale lock"),
     check("%s surfaces as NEEDS ATTENTION" % key, lines[0] == "NEEDS ATTENTION")
     check("  and names it", any(word in l for l in lines), word)
 
+# GUI polish (Change 6): one spelling for the command - the copyable
+# RECOVER_COMMAND and the doctor lines agree.
+lines = gp.SyncApp.doctor_lines(dict(clean, stale_lock=True,
+                                     nonterminal_ops=["op1"]))
+check("the doctor lines and RECOVER_COMMAND agree on one spelling",
+      all("ccs recover" not in l for l in lines)
+      and sum(1 for l in lines if gp.RECOVER_COMMAND in l) == 2,
+      "\n".join(l for l in lines if "recover" in l))
+
 # blocking findings must come BEFORE the inventory, not after it
 lines = gp.SyncApp.doctor_lines(dict(noisy, stale_lock=True))
 check("blocking findings precede the inventory",
