@@ -679,11 +679,11 @@ def test_dialog_quoting_is_not_repr():
     steps = [{"key": ("a", "x"), "target_sid": SID_A,
               "old_title": "Northwind's plan", "new_title": "Northwind plan"},
              {"key": ("b", "y"), "target_sid": SID_B,
-              "old_title": "C:\\Users\\craig",
+              "old_title": "C:\\Users\\alice",
               "new_title": "Users folder"}]
     _head, mappings, _footer = gui._stage1_dialog_parts(steps)
     assert mappings[0] == '"Northwind\'s plan"  ->  "Northwind plan"'
-    assert mappings[1] == '"C:\\Users\\craig"  ->  "Users folder"'
+    assert mappings[1] == '"C:\\Users\\alice"  ->  "Users folder"'
     assert all(m.startswith('"') for m in mappings)
     assert "\\\\" not in mappings[1]              # no doubled backslash
     assert gui._q("it's") == '"it\'s"'
