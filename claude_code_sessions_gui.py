@@ -369,10 +369,13 @@ def _scoreboard_half(rep):
 # label read as one action (0.15.1, finding D).
 LEVEL_BUTTON = "Level the sidebars"
 
-# The scoreboard box grows to its content up to this many lines, then
-# scrolls: enough for a three-account store's ~13-line summary, small enough
-# that a traceback never eats the holds pane (0.15.1, finding A).
-LEVEL_TEXT_MAX_LINES = 16
+# The scoreboard box shows its content up to this many lines above the
+# sash, then scrolls; the holds - the decisions, the point of the tab - get
+# the rest. The tab's headline number lives in the detail line, not in the
+# box, so no box height can hide it (GUI polish, Change 4; the 0.15.1 cap
+# of 16 lines was a cap in lines, not in available height, and a short
+# window lost the holds before it lost a scoreboard line).
+SCOREBOARD_LINES = 7
 
 
 def _holds_clause(models):
@@ -427,6 +430,13 @@ def _level_state(rep, manifest, models):
     rows = manifest.get("rows") or []
     short_n = (rep.get("complete") or {}).get("short", 0)
     tickable = any(m.get("editable") for m in models)
+    # The detail line leads with the scoreboard half - the tab's headline
+    # number, above the box a sash can shorten, never inside it (GUI
+    # polish, Change 4).
+    half = _scoreboard_half(rep)
+
+    def detail(text):
+        return (half + "  " + text) if text else half
     if rows:
         n_acct = len({r.get("account") for r in rows})
         status = "{0} row{1} to create across {2} account{3}".format(
@@ -435,29 +445,30 @@ def _level_state(rep, manifest, models):
         if models:
             status += " - " + _holds_clause(models)
         return {"kind": "rows", "status": status,
-                "detail": "Nothing is written until you press {0}."
-                          .format(LEVEL_BUTTON),
+                "detail": detail("Nothing is written until you press {0}."
+                                 .format(LEVEL_BUTTON)),
                 "apply": True}
     if models:
         return {"kind": "naming",
                 "status": "Nothing to copy - {0}.".format(
                     _holds_clause(models)),
-                "detail": ("Each ticked rename applies in every account "
-                           "holding that conversation; nothing is written "
-                           "until you press {0}.".format(LEVEL_BUTTON)),
+                "detail": detail("Each ticked rename applies in every "
+                                 "account holding that conversation; "
+                                 "nothing is written until you press {0}."
+                                 .format(LEVEL_BUTTON)),
                 "apply": tickable}
     if short_n:
         return {"kind": "short",
                 "status": "{0} conversation{1} short of a sidebar, but "
                           "nothing to copy or rename - see Health."
                           .format(short_n, "" if short_n == 1 else "s"),
-                "detail": ("Usually a conversation whose transcript is gone, "
-                           "so converge has nothing to spread. This tab "
-                           "cannot fix that state."),
+                "detail": detail("Usually a conversation whose transcript "
+                                 "is gone, so converge has nothing to "
+                                 "spread. This tab cannot fix that state."),
                 "apply": False}
     return {"kind": "level",
             "status": "Nothing to do - the sidebars are level.",
-            "detail": "", "apply": False}
+            "detail": detail(""), "apply": False}
 
 
 def _sync_dup_warning(rows):
@@ -1005,21 +1016,34 @@ class SyncApp:
             text="!! The Claude desktop app is running - {0} will refuse "
                  "until it is closed.".format(LEVEL_BUTTON))
         self._wrap_to(self.level_notice, lt)
-        body = ttk.Frame(lt)
-        body.pack(fill="x", pady=(4, 4))
-        self.level_body = body           # the notice packs before this
-        # The identity banner sits between the plan summary and the holds -
-        # the pane's stated top-to-bottom order.
-        self.level_banner = ttk.Frame(lt)
-        self.level_banner.pack(fill="x")
-        # Sized to its content by show_level (capped at LEVEL_TEXT_MAX_LINES,
-        # then scrolling). A fixed 8 lines clipped the tab's own headline:
-        # the summary runs ~13 lines (three account lines, the five
-        # properties, the completeness line, one per destination), and
-        # `complete ... N short` sat below an inner scrollbar while the holds
-        # pane got twenty lines for two rows (0.15.1, finding A). The holds
-        # area takes whatever height is left, with its own scrollbar; the
-        # button bar is bottom-pinned so it is never what gets squeezed.
+        # The middle of the tab is a vertical sash (GUI polish, Change 4):
+        # the scoreboard box above it, the identity banner, the fixed holds
+        # heading and the scrolling hold rows below it - the pane's stated
+        # top-to-bottom order, with the room split by a sash the user can
+        # drag instead of a cap in lines. Until the first drag the window
+        # sets the sash at every render to min(SCOREBOARD_LINES, content)
+        # lines of text height, so a 40-line traceback scrolls inside seven
+        # lines and the holds keep the remainder; after a drag the user's
+        # position holds, clamped on every resize so the holds pane keeps
+        # at least one row and the scoreboard at least two lines. Not a
+        # height-aware line cap: a box whose height derives from the
+        # available height that the box itself feeds back into the pack
+        # negotiation can oscillate on resize; a sash has no such loop.
+        pane = ttk.PanedWindow(lt, orient="vertical")
+        pane.pack(fill="both", expand=True, pady=(4, 0))
+        self.level_pane = pane
+        self._sash_user = None           # the user's dragged offset, if any
+        self._sash_auto = 0              # the content-derived target
+        self._sash_set = None            # the last position this code set
+        top = ttk.Frame(pane)
+        bottom = ttk.Frame(pane)
+        pane.add(top, weight=0)
+        pane.add(bottom, weight=1)
+        pane.bind("<ButtonRelease-1>", lambda _e: self._on_sash_release())
+        pane.bind("<Configure>", lambda _e: self._clamp_sash(), add="+")
+        body = ttk.Frame(top)
+        body.pack(fill="both", expand=True)
+        self.level_body = body
         self.level_text = tk.Text(body, wrap="none", height=8,
                                   font=("Consolas", 9), state="disabled",
                                   borderwidth=1, relief="solid")
@@ -1028,9 +1052,29 @@ class SyncApp:
         self.level_text.configure(yscrollcommand=lsb.set)
         self.level_text.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
+        # One text line in pixels, and the box's fixed overhead (border and
+        # padding), from the widget itself - the sash is set in lines.
+        import tkinter.font as tkfont
+        self._line_px = tkfont.Font(
+            font=self.level_text.cget("font")).metrics("linespace")
+        self._text_extra_px = 2 * sum(
+            int(self.level_text.cget(k))
+            for k in ("borderwidth", "pady", "highlightthickness"))
+        # The identity banner sits between the plan summary and the holds -
+        # the pane's stated top-to-bottom order.
+        self.level_banner = ttk.Frame(bottom)
+        self.level_banner.pack(fill="x", pady=(4, 0))
+        # The holds heading is a FIXED header above the canvas, outside the
+        # scrolled frame, so it never scrolls away with the first rows; it
+        # still follows the ticks live through holds_heading.
+        self.holds_heading = tk.StringVar(value="")
+        self.holds_head = ttk.Label(bottom, textvariable=self.holds_heading,
+                                    justify="left",
+                                    font=("Segoe UI", 9, "bold"))
+        self._wrap_to(self.holds_head, bottom, margin=0)
         # The hold rows scroll when they overflow - a canvas-hosted frame,
         # the stock tkinter idiom for a scrollable widget stack.
-        holds_wrap = ttk.Frame(lt)
+        holds_wrap = ttk.Frame(bottom)
         holds_wrap.pack(fill="both", expand=True)
         self.holds_wrap = holds_wrap
         self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0)
@@ -1038,7 +1082,6 @@ class SyncApp:
                             command=self.hold_canvas.yview)
         self.hold_canvas.configure(yscrollcommand=hsb.set)
         self.hold_frame = ttk.Frame(self.hold_canvas)
-        self.holds_heading = tk.StringVar(value="")
         self._hold_window = self.hold_canvas.create_window(
             (0, 0), window=self.hold_frame, anchor="nw")
         self.hold_frame.bind(
@@ -1320,12 +1363,72 @@ class SyncApp:
         self._set_text(self.text, lines)
 
     def show_level(self, lines):
-        # Sized to its content, capped: the completeness line is the tab's
-        # headline number and must never sit below an inner scrollbar; a
-        # 40-line traceback still scrolls rather than eating the holds pane.
-        self.level_text.configure(
-            height=max(2, min(len(lines), LEVEL_TEXT_MAX_LINES)))
+        # Sized to its content up to SCOREBOARD_LINES; the sash follows
+        # (until the user has dragged it). The headline number is in the
+        # detail line, so nothing here can hide it.
+        n = max(2, min(len(lines), SCOREBOARD_LINES))
+        self.level_text.configure(height=n)
         self._set_text(self.level_text, lines)
+        self._sash_auto = self._sash_px(n)
+        self._clamp_sash()
+
+    # ---------------------------------------------------------- the sash
+    def _sash_px(self, lines):
+        """The sash offset that shows LINES of scoreboard text: the box's
+        line height times LINES plus its border and padding, plus the
+        pane's own top padding."""
+        return lines * self._line_px + self._text_extra_px
+
+    def _sash_min_px(self):
+        return self._sash_px(2)
+
+    def _holds_min_px(self):
+        """One row's height plus the banner and heading above the rows -
+        what the holds pane must keep on a shrink."""
+        rows = [w for w in self.hold_frame.winfo_children()
+                if isinstance(w, ttk.Frame)]
+        row = max((r.winfo_reqheight() for r in rows), default=40)
+        fixed = (self.level_banner.winfo_reqheight()
+                 + (self.holds_head.winfo_reqheight()
+                    if self.holds_head.winfo_manager() else 0))
+        return row + fixed + 8
+
+    def _clamp_sash(self):
+        """Place the sash: the user's dragged offset when there is one,
+        else the content target - clamped so the holds keep one row's height
+        and the scoreboard two lines, and re-applied on every resize so an
+        absolute offset survives a shrink and a later enlargement restores
+        the dragged position. Nothing can push the holds to zero."""
+        pane = self.level_pane
+        try:
+            total = pane.winfo_height()
+        except tk.TclError:
+            return
+        if total <= 1:
+            return                       # not laid out yet: the next resize
+        target = (self._sash_user if self._sash_user is not None
+                  else self._sash_auto)
+        lo = self._sash_min_px()
+        hi = max(lo, total - self._holds_min_px() - 8)
+        pos = max(lo, min(target, hi))
+        try:
+            if pane.sashpos(0) != pos:
+                pane.sashpos(0, pos)
+            self._sash_set = pane.sashpos(0)
+        except tk.TclError:
+            pass
+
+    def _on_sash_release(self):
+        """A button release on the pane after the sash moved from where
+        this code put it is the user's drag: keep that offset for the life
+        of the window."""
+        try:
+            pos = self.level_pane.sashpos(0)
+        except tk.TclError:
+            return
+        if self._sash_set is not None and abs(pos - self._sash_set) > 1:
+            self._sash_user = pos
+            self._sash_set = pos
 
     def show_health(self, lines):
         self._set_text(self.health_text, lines)
@@ -2333,7 +2436,7 @@ class SyncApp:
         if running:
             if not self.level_notice.winfo_manager():
                 self.level_notice.pack(anchor="w", pady=(0, 2),
-                                       before=self.level_body)
+                                       before=self.level_pane)
         elif self.level_notice.winfo_manager():
             self.level_notice.pack_forget()
         self._render_banner(man)
@@ -2427,17 +2530,18 @@ class SyncApp:
         self._hold_widgets = []
         self.holds_heading.set("")
         if not self.hold_models:
+            if self.holds_head.winfo_manager():
+                self.holds_head.pack_forget()
+            self._clamp_sash()
             return
         # The label counts what is ticked NOW and follows every tick: it
         # must never promise "each ticked row becomes one rename" over a
-        # list where nothing is ticked (0.15.1, B).
+        # list where nothing is ticked (0.15.1, B). It is the fixed header
+        # above the canvas, so it never scrolls away with the first rows.
         self.holds_heading.set(_holds_heading(self.hold_models))
-        head_row = ttk.Frame(self.hold_frame)   # dies with the rebuild
-        head_row.pack(fill="x")
-        heading = ttk.Label(head_row, textvariable=self.holds_heading,
-                            justify="left", font=("Segoe UI", 9, "bold"))
-        heading.pack(anchor="w", pady=(2, 4))
-        self._wrap_to(heading, head_row, margin=0)
+        if not self.holds_head.winfo_manager():
+            self.holds_head.pack(anchor="w", fill="x", pady=(2, 4),
+                                 before=self.holds_wrap)
         for m in self.hold_models:
             row = ttk.Frame(self.hold_frame)
             row.pack(fill="x", pady=(0, 6), anchor="w")

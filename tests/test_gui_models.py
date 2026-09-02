@@ -258,6 +258,9 @@ def test_level_predicate_states():
     st = gui._level_state(alignment(short=0), manifest(), [])
     assert st["status"] == "Nothing to do - the sidebars are level."
     assert st["apply"] is False
+    # GUI polish, Change 4: the detail line leads with the scoreboard half -
+    # the tab's headline number, above the box a sash can shorten.
+    assert st["detail"] == "Level: 379 / 379 / 379 - 0 short."
 
     # Naming-only: rows 0, holds N - Apply stays enabled (renames to run).
     # The header counts honestly (0.15.1, B): holds WITH a suggestion apart
@@ -271,6 +274,7 @@ def test_level_predicate_states():
     assert st["status"] == "Nothing to copy - 1 held: 1 suggested."
     assert st["apply"] is True
     assert "Level the sidebars" in st["detail"]
+    assert st["detail"].startswith("Level: 379 / 379 / 379 - 0 short.  ")
 
     # A suggested supersession beside an unmeasured leg: "2 held - 1
     # suggested, 1 needs a name", and Apply is live (one rename is ticked).
@@ -311,6 +315,7 @@ def test_level_predicate_states():
     assert st["apply"] is False
     assert "Health" in st["status"] + st["detail"]
     assert "2" in st["status"]
+    assert st["detail"].startswith("Level: 379 / 379 / 379 - 2 short.  ")
 
     # Rows present: Apply is live.
     row = {"name": "local_x.json", "dest_path": "/x/local_x.json",
@@ -322,6 +327,8 @@ def test_level_predicate_states():
     assert st["apply"] is True
     assert "1 row" in st["status"]
     assert "held" not in st["status"]
+    assert st["detail"] == ("Level: 379 / 379 / 379 - 1 short.  Nothing is "
+                            "written until you press Level the sidebars.")
     # Rows AND holds: the same honest clause after the row count.
     st = gui._level_state(alignment(short=1), manifest(rows=[row]), mixed)
     assert st["status"] == ("1 row to create across 1 account - 2 held: "

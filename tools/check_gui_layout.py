@@ -175,7 +175,8 @@ DESKTOP = [r"c:\program files\windowsapps\claude_2.1_x64\app\claude.exe"]
 # --------------------------------------------------------- the engine, stubbed
 gp.ccs.default_env = fake_env
 gp.ccs.plan_sync = lambda env, flags: sync_manifest(flags)
-gp.ccs.gather_alignment = lambda env: alignment()
+REPORT = {"rep": alignment()}      # switchable for the sash items
+gp.ccs.gather_alignment = lambda env: REPORT["rep"]
 gp.ccs.plan_converge = lambda env, flags: converge_manifest(flags.live)
 gp.ccs.claude_running = lambda env: list(DESKTOP)
 gp.ccs.nonterminal_ops = lambda env: []
@@ -397,7 +398,7 @@ check("no label carries the 880 px wraplength constant",
 # edge, before the region that scrolls.
 for tab, bar, body in ((app.sync_tab, app.sync_bar, app.text.master),
                        (app.health_tab, app.health_bar, app.health_text.master),
-                       (app.level_tab, app.level_bar, app.holds_wrap)):
+                       (app.level_tab, app.level_bar, app.level_pane)):
     slaves = tab.pack_slaves()
     check("the %s bar is bottom-pinned before its scrolling middle" % tab.winfo_name(),
           bar.pack_info()["side"] == "bottom"
@@ -431,9 +432,9 @@ check("  the 130-character title wraps inside its row instead of overflowing",
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
 
 # ------------------------------------------------------------ the fit floor
-# The identity buttons sit below a fixed-height scoreboard until Change 4's
-# sash lets that box yield; they are required at the small sizes from then.
-audit(app, tkroot, settle, gp.FIT_FLOOR, identity=False)
+# The identity buttons are required at every size: the sash (Change 4) lets
+# the scoreboard yield to two lines so the banner keeps its room.
+audit(app, tkroot, settle, gp.FIT_FLOOR)
 app.nb.select(app.level_tab)
 settle()
 check("at the floor the holds canvas is scrollable - a viewport with a "
@@ -449,7 +450,7 @@ check("  and the 130-character title still wraps inside its row",
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
 
 # ------------------------------------- 871x432: a 1366x768 panel at 150 %
-audit(app, tkroot, settle, (871, 432), identity=False)
+audit(app, tkroot, settle, (871, 432))
 tkroot.destroy()
 
 # ---------------------------- 15b. a work area smaller than the fit floor
@@ -468,9 +469,26 @@ FIXED = {"filter_label", "only_entry", "filter_btn", "clear_btn",
          "level_bar", "level_apply_btn", "level_refresh_btn",
          "level_status_label", "health_bar", "doctor_btn",
          "health_status_label", "close_btn", "trust_chk"}
-# The fixed chrome only: the identity buttons join once the sash (Change 4)
-# lets the scoreboard yield.
-audit(app, tkroot, settle, size, names=FIXED, identity=False)
+# 15b governs here: the fixed chrome is what must fit; the scrolling middle
+# yields (the scoreboard to two lines, the holds to one row, the panes to
+# whatever remains).
+audit(app, tkroot, settle, size,
+      names=FIXED | {"identity button 0", "identity button 1"})
+app.nb.select(app.level_tab)
+settle()
+check("  and the scoreboard yielded to its two-line minimum - the first "
+      "thing that yields below the floor",
+      app.level_pane.sashpos(0) == app._sash_px(2),
+      "sash %d, two lines %d" % (app.level_pane.sashpos(0), app._sash_px(2)))
+# With the two-button question in the lower pane nothing is left for the
+# rows at this height; the buttons are what there is to act on, and the
+# answer collapses the banner to one line and gives the rows a viewport.
+app._banner_widgets[0].invoke()
+settle()
+check("  and once the question is answered the holds canvas has height - "
+      "cramped, never unreachable",
+      app.hold_canvas.winfo_ismapped() and app.hold_canvas.winfo_height() > 1,
+      str(app.hold_canvas.winfo_height()))
 tkroot.destroy()
 
 # --------------------------- 911x480: the same panel at 150 %, work area
@@ -481,6 +499,65 @@ check("on a 911x480 work area the window opens at 871x432", size == (871, 432),
       "%dx%d" % size)
 check("  with the fit floor as its minsize", tuple(tkroot.minsize()) == (760, 420),
       str(tkroot.minsize()))
+tkroot.destroy()
+
+# ------------------------------------------- 15c. the sash follows content
+WORK["area"] = (1536, 912)
+REPORT["rep"] = {"stores": {"status": "not found", "detail": "no store"},
+                 "accounts": [], "complete": {"short": 0}}
+app, tkroot, settle = open_app()
+app.nb.select(app.level_tab)
+settle()
+pw = app.level_pane
+lines = len(app.level_text.get("1.0", "end-1c").split("\n"))
+check("a short first render puts the sash at the content height (%d lines)"
+      % lines, lines < 7 and pw.sashpos(0) == app._sash_px(lines),
+      "sash %d, content %d" % (pw.sashpos(0), app._sash_px(lines)))
+REPORT["rep"] = alignment()
+app.refresh_level()
+settle()
+check("  and a full scoreboard grows it to seven lines",
+      pw.sashpos(0) == app._sash_px(7)
+      and int(app.level_text.cget("height")) == 7,
+      "sash %d, seven lines %d" % (pw.sashpos(0), app._sash_px(7)))
+# With the identity question answered (the banner collapses to its in-force
+# line) the lower pane's fixed part is one line and a button; the two-button
+# question plus a row do not fit above the floor's height, and there the
+# scoreboard's two-line minimum is what holds - the buttons stay reachable,
+# as the floor audit above pins.
+app._banner_widgets[0].invoke()
+settle()
+check("  the answered banner collapses to its in-force line",
+      len(app._banner_widgets) == 1, str(len(app._banner_widgets)))
+dragged = app._sash_px(7) + 60
+pw.sashpos(0, dragged)
+pw.event_generate("<ButtonRelease-1>")
+settle()
+check("a scripted drag is remembered", app._sash_user == dragged,
+      str(app._sash_user))
+app.refresh_level()
+settle()
+check("  and the dragged position survives a replan", pw.sashpos(0) == dragged,
+      str(pw.sashpos(0)))
+rows = [w for w in app.hold_frame.winfo_children()
+        if isinstance(w, gp.ttk.Frame)]
+row_h = max(r.winfo_reqheight() for r in rows) if rows else 0
+tkroot.geometry("940x%d" % gp.FIT_FLOOR[1])
+settle()
+check("after a shrink to the floor the holds pane keeps at least one row's "
+      "height - the sash yields first",
+      app.hold_canvas.winfo_height() >= row_h > 0
+      and pw.sashpos(0) < dragged,
+      "canvas %d, row %d, sash %d" % (app.hold_canvas.winfo_height(), row_h,
+                                      pw.sashpos(0)))
+check("  and the scoreboard keeps at least two lines",
+      pw.sashpos(0) >= app._sash_px(2), str(pw.sashpos(0)))
+# (Below the floor is unreachable here: the window's own minsize is the
+# floor. The small-work-area case above is where that state is pinned.)
+tkroot.geometry("940x640")
+settle()
+check("  a re-enlargement restores the dragged offset", pw.sashpos(0) == dragged,
+      str(pw.sashpos(0)))
 tkroot.destroy()
 
 shutil.rmtree(root_dir, ignore_errors=True)
