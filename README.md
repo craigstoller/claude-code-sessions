@@ -596,9 +596,10 @@ The dates are measurements against specific builds - most recently Claude Deskto
 read-only paths were verified against a real Desktop 2.x store (`list`, `doctor`, `alignment`,
 `recover` without `--apply`, and a `converge` dry run): the row format had only gained keys,
 and every row this tool had written under 1.x was still present, some already re-saved by
-the new app. Mutations under 2.x are still unmeasured: `converge --apply` has not yet run
-against the new app. The on-disk format has changed once already during this tool's own
-development; treat a much newer build as unverified territory.
+the new app. Later on 2026-10-14 a `converge --apply` ran against that 2.x store with the
+app closed: after the app restarted, every row it had written was still present and
+`doctor` reported none vanished. The on-disk format has changed once already during this
+tool's own development; treat a much newer build as unverified territory.
 
 **On non-Windows, `move` and every `sync` route refuse to touch the desktop store, and there
 is no flag to override that.** The layout is confirmed on Windows only; macOS reportedly has
