@@ -592,9 +592,13 @@ window.
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds - most recently Claude Desktop
-1.24012.11.0 (Microsoft Store install) and Claude Code CLI 2.1.220. The on-disk format has
-changed once already during this tool's own development; treat a much newer build as
-unverified territory.
+2.37337.1.0 (Microsoft Store MSIX install) and Claude Code CLI 2.1.296. On 2026-10-14 the
+read-only paths were verified against a real Desktop 2.x store (`list`, `doctor`, `alignment`,
+`recover` without `--apply`, and a `converge` dry run): the row format had only gained keys,
+and every row this tool had written under 1.x was still present, some already re-saved by
+the new app. Mutations under 2.x are still unmeasured: `converge --apply` has not yet run
+against the new app. The on-disk format has changed once already during this tool's own
+development; treat a much newer build as unverified territory.
 
 **On non-Windows, `move` and every `sync` route refuse to touch the desktop store, and there
 is no flag to override that.** The layout is confirmed on Windows only; macOS reportedly has
