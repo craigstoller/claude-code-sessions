@@ -1239,7 +1239,7 @@ the helper by its path instead of "the process above": the converge and sync ref
 the first process it found, which may be the desktop app. It says a browser running the Claude
 extension, Chrome or Edge, launches the helper and that it can outlive the app. It says that
 closing every such browser should stop it. That is measured for Chrome, whose disconnect made the
-helper exit by itself in August; for Edge it is expected, not probed. It no longer says the
+helper exit by itself in August; for Edge it was expected, not probed, when this was written. Observed later the same day (2026-10-17), once, on one machine: with Edge closed, no `chrome-native-host.exe` was running, checked both in Task Manager and in a process listing. That is an observation, not a controlled probe. It no longer says the
 helper updates "in place".
 
 A second note covers the next move. This one failed closed in silence because the note only
