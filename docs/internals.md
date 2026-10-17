@@ -1338,6 +1338,19 @@ note. Two checks under `tools/`, which CI does not run, cover the tools.
 the processes the guard recognises. `tools/check_signed_helper_optin.py`'s live leg ran on
 2026-10-17 against the installed helper and read it signed.
 
+**Follow-up, 2026-10-17, after 0.16.1.** Two notes were extended; no decision changed. First, the
+helper note now rides the running-app refusals of `move`, `undo` and `recover` as well as those
+of converge and sync, through the same `helper_hash_note`. The last-instant process re-check
+inside a move or undo transaction rolls back rather than refusing, and prints its abort reason
+without the note, as before. Second, with the opt-in on, a recognised helper that still counts
+now gets a line saying why the opt-in did not excuse it. An unreadable helper never qualifies.
+Otherwise its signature was not confirmed as valid and by Anthropic, PBC: it is unsigned, signed
+by someone else, or the check could not run. That line does not re-run the signature check. It
+states what a changed helper still counting with the opt-in on implies. Both are note-only:
+`claude_running` decides exactly as RULINGS 6 and 7 say, and no note excuses a process. Pinned
+by one refusal test each in `tests/test_plan_move.py`, `tests/test_undo.py` and
+`tests/test_recover.py`, and three tests in `TestClaudeRunningNarrowing`.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via
