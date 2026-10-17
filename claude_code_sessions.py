@@ -361,6 +361,166 @@ def find_transcripts(projects_root, session_id):
     return hits
 
 
+# How much of each copy the duplicated-transcript diagnosis reads at a time.
+# Streaming, so no copy is ever held whole and the longest is read once, only
+# as far as the longest of the others: transcripts run to 96 MB, and this is
+# advice printed beside a refusal, not a reason to read one twice.
+_COPIES_CHUNK = 1024 * 1024
+
+
+def _byte_prefixes(ref_path, others):
+    """For each (path, size) in OTHERS, whether that file's SIZE bytes are
+    exactly the first SIZE bytes of REF_PATH. One pass over REF_PATH, every
+    other copy read alongside it and dropped at its first mismatch. None when
+    a file ends short of its stat size - it changed under the read. OSError
+    propagates."""
+    results = [None] * len(others)
+    handles = []
+    try:
+        ref = open(ref_path, "rb")
+        handles.append(ref)
+        for p, _n in others:
+            handles.append(open(p, "rb"))
+        pending = list(range(len(others)))
+        pos = 0
+        while pending:
+            chunk = ref.read(_COPIES_CHUNK)
+            for i in list(pending):
+                n = others[i][1]
+                need = min(len(chunk), n - pos)
+                got = handles[i + 1].read(need)
+                if len(got) < need:
+                    return None
+                if got != chunk[:need]:
+                    results[i] = False
+                    pending.remove(i)
+                elif pos + need >= n:
+                    results[i] = True
+                    pending.remove(i)
+            if not chunk:
+                return None if pending else results
+            pos += len(chunk)
+        return results
+    finally:
+        for fh in handles:
+            fh.close()
+
+
+def _transcript_copies(paths):
+    """How the copies of ONE session's transcript relate: a diagnosis for the
+    duplicated-transcript refusal, never a choice. The refusal stands whatever
+    this says, and nothing here removes, prefers or writes a file.
+
+    `relation` is one of
+      strict_prefix  every copy but the longest is a byte-prefix of it - what
+                     an append-only transcript leaves when one copy stopped
+                     growing and another carried on (seen in 2026-10 after a
+                     desktop session entered a second worktree and was later
+                     resumed from its sidebar row) - so the shorter copies are
+                     `stale` and the longest is `live`;
+      identical      every copy is the same bytes, so any one of them can go;
+      diverged       some copy is not a prefix of the longest: two histories,
+                     which only the user can choose between or merge;
+      inconclusive   the bytes do not settle it - a copy unreadable or
+                     changing under the read, or several tied for longest -
+                     with `reason` saying which.
+    Only strict_prefix fills `live` and `stale`; `copies` lists every path
+    with its size.
+    """
+    out = {"relation": "inconclusive", "reason": "", "live": "", "stale": [],
+           "copies": []}
+    sizes = []
+    for p in paths:
+        try:
+            sizes.append(os.path.getsize(p))
+        except OSError:
+            sizes.append(None)
+    out["copies"] = [{"path": p, "bytes": n} for p, n in zip(paths, sizes)]
+    if None in sizes:
+        out["reason"] = "a copy could not be read"
+        return out
+    top = max(sizes)
+    ref = sizes.index(top)
+    others = [i for i in range(len(paths)) if i != ref]
+    try:
+        same = _byte_prefixes(paths[ref], [(paths[i], sizes[i])
+                                           for i in others])
+        after = [os.path.getsize(p) for p in paths]
+    except OSError:
+        out["reason"] = "a copy could not be read"
+        return out
+    if same is None or after != sizes:
+        # Stat, compare, stat again - _transcript_facts' own rule: an answer
+        # about bytes that moved during the read describes no file.
+        out["reason"] = "a copy changed while it was being compared"
+        return out
+    if not all(same):
+        out["relation"] = "diverged"
+        return out
+    longest = [i for i in range(len(paths)) if sizes[i] == top]
+    if len(longest) == len(paths):
+        out["relation"] = "identical"
+    elif len(longest) == 1:
+        out["relation"] = "strict_prefix"
+        out["live"] = paths[ref]
+        out["stale"] = [paths[i] for i in others]
+    else:
+        out["reason"] = "more than one copy is the longest"
+    return out
+
+
+def _remove_command(env, path):
+    """The removal a stale-copy diagnosis prints, quoted for the platform's
+    usual shell. Single quotes, so nothing in the path expands; -LiteralPath,
+    so PowerShell does not read [ ] as a wildcard. PowerShell also treats the
+    typographic single quotes as quotes, so each is doubled like the ASCII
+    one."""
+    if env.is_windows:
+        for q in "'\u2018\u2019\u201a\u201b":
+            path = path.replace(q, q + q)
+        return "Remove-Item -LiteralPath '{0}'".format(path)
+    return "rm -- '{0}'".format(path.replace("'", "'\\''"))
+
+
+def _copies_advice(env, tc):
+    """The diagnosis half of a duplicated-transcript refusal - the text that
+    follows 'Nothing was written.' - or None when the copies are diverged or
+    inconclusive, which keep the older advice: a diagnosis is only worth
+    printing when the bytes settle it. Paths are printed whole, so redact()
+    and --anonymize treat them as they treat every path in a refusal."""
+    size = {c["path"]: c["bytes"] for c in tc["copies"]}
+    if tc["relation"] == "strict_prefix":
+        stale = tc["stale"]
+        one = len(stale) == 1
+        lines = ["   live  : {0}  ({1:,} bytes)".format(
+            tc["live"], size[tc["live"]])]
+        lines += ["   stale : {0}  ({1:,} bytes)".format(p, size[p])
+                  for p in stale]
+        lines.append("   suggested fix - remove the stale cop{0} (--verbose "
+                     "prints {1} in full):".format("y" if one else "ies",
+                                                   "its path" if one
+                                                   else "their paths"))
+        lines += ["      " + _remove_command(env, p) for p in stale]
+        return ("The copies are one history at different lengths: {0} a "
+                "strict byte-prefix of the {3}, which is what an "
+                "append-only transcript leaves when one copy stopped growing "
+                "and another carried on. So the shorter cop{1} stale and the "
+                "{3} is the live one. Nothing is chosen for you; once the "
+                "stale cop{1} gone, the row will open the live one:\n{2}"
+                .format("the shorter copy is" if one
+                        else "every shorter copy is",
+                        "y is" if one else "ies are", "\n".join(lines),
+                        "longer" if one else "longest"))
+    if tc["relation"] == "identical":
+        return ("The copies are byte-identical ({0:,} bytes each), so {1} can "
+                "go. Remove or rename all but one - whichever is left is what "
+                "the row will open:\n{2}".format(
+                    tc["copies"][0]["bytes"],
+                    "either" if len(tc["copies"]) == 2 else "any of them",
+                    "\n".join("   " + c["path"] for c in tc["copies"])))
+    return None
+
+
 def iter_transcripts(projects_root):
     out = []
     try:
@@ -2891,8 +3051,10 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "a", "a_in_b", "a_total", "a_unique", "account", "accounts",
     "activity_unknown", "after", "age_days", "allow_orphan", "b",
     "b_in_a", "b_total", "b_unique", "blank_rows", "by_account_count",
+    "bytes",
     "classification", "cli_session_id", "command_runnable", "complete",
-    "config", "consistent", "conversations", "created", "current",
+    "config", "consistent", "conversations", "copies", "created",
+    "current",
     "dead_excluded", "dead_rows", "degrade_reason", "deleted",
     "dest_account", "dest_dropped", "dest_email_source", "dest_org",
     "dest_path", "dest_reset", "destinations", "detail",
@@ -2904,26 +3066,29 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "held_orphan_detail", "held_same", "held_unknown", "holder_titles",
     "holders", "holds", "identity_disagreement", "in_all_accounts",
     "incoming_turns", "is_update", "last_activity", "leaving_a_gap",
-    "leg_suffix_note", "legacy", "legacy_folders", "listed",
+    "leg_suffix_note", "legacy", "legacy_folders", "listed", "live",
     "live_asserted", "local_id", "max_containment", "mb", "measured",
     "measured_line", "model", "name", "newer_only", "no_transcript",
     "non_destinations", "nonterminal_ops", "notes", "now", "oauth",
     "of", "only", "only_session", "op_id", "op_type", "opens", "org",
     "orphan_ids", "orphans", "overrode_tombstone", "pairs", "path",
     "per_account", "post_b64", "pre_activity", "pre_b64", "present",
-    "reachable", "reason", "regresses", "regressing", "removed",
+    "reachable", "reason", "regresses", "regressing", "relation",
+    "removed",
     "reset", "result", "resurrected", "retitle", "rollback_declined",
     "rollback_residue", "roots", "row", "row_count", "row_errors",
     "row_path", "rows", "safe", "scope", "scoped", "session",
     "session_id", "sessions", "shared", "short",
     "short_of_all_accounts", "sibling_divergence", "siblings",
     "skip_detail", "skipped", "source_account", "source_org",
-    "source_path", "source_resolved_from", "stale_lock", "status",
+    "source_path", "source_resolved_from", "stale", "stale_lock",
+    "status",
     "store_is_a_guess", "store_label", "store_org", "store_path",
     "store_why", "stores", "superseded", "swapping",
     "swaps_conversation", "tally", "title_collision",
     "title_provenance", "title_source", "titles", "to_session",
-    "transcript", "transcript_count", "transcript_mb",
+    "transcript", "transcript_copies", "transcript_count",
+    "transcript_mb",
     "transcript_mtime", "transcript_paths", "transcript_size",
     "transcripts", "turns", "unchanged", "unknown_layout",
     "unlisted_ranked", "unlisted_recent", "unlisted_transcripts",
@@ -6183,13 +6348,21 @@ def _transcript_facts(env, session_id, fps_cache=None):
     if len(found) > 1:
         # The paths alone are evidence, not a way forward - this plan's rule is
         # that a refusal names one, and listing the duplicates and stopping left
-        # the user holding the evidence with no instruction.
-        raise Refusal(
+        # the user holding the evidence with no instruction. When the bytes
+        # settle which copies are stale (or that they are identical), the
+        # refusal says so and names the fix; it still chooses nothing. The
+        # structured diagnosis rides on the exception for converge's hold.
+        copies = _transcript_copies(found)
+        exc = Refusal(
             "{0} exists in more than one project folder, so a row built for it "
             "would name a file this tool cannot identify; refusing to guess "
-            "which. Nothing was written. Remove or rename the copies you do not "
-            "want - whichever one is left is what the row will open:\n{1}"
-            .format(session_id, "\n".join("   " + f for f in found)))
+            "which. Nothing was written. {1}".format(
+                session_id, _copies_advice(env, copies) or (
+                    "Remove or rename the copies you do not want - whichever "
+                    "one is left is what the row will open:\n" +
+                    "\n".join("   " + f for f in found))))
+        exc.transcript_copies = copies
+        raise exc
     path = found[0]
     # Stat BEFORE reading, and again after - see the comparison at the end.
     try:
@@ -6747,11 +6920,13 @@ def _new_row_preflight(env, m):
             "the transcript for {0} is no longer on disk, so this row would open "
             "nothing. Nothing was written.".format(m["to_session"]))
     if len(found) > 1:
+        advice = _copies_advice(env, _transcript_copies(found))
         raise Refusal(
             "{0} now exists in more than one project folder, so the row planned "
             "against a single transcript no longer names one. Nothing was "
-            "written:\n{1}".format(m["to_session"], "\n".join("   " + f
-                                                             for f in found)))
+            "written{1}".format(m["to_session"], (". " + advice) if advice
+                                else ":\n" + "\n".join("   " + f
+                                                       for f in found)))
     if os.path.realpath(found[0]) != os.path.realpath(m["transcript"]):
         raise Refusal(
             "the transcript for {0} has moved since this was planned ({1} -> "
@@ -11192,11 +11367,20 @@ def plan_converge(env, flags):
             # pair proceeds. Refusing the whole bulk run over one such
             # conversation would leave the monthly chore permanently stuck on
             # its weirdest member.
+            copies = getattr(prep, "transcript_copies", None)
             for acct in missing:
-                holds.append({"session": sid, "account": acct,
-                              "label": dests[acct]["label"], "title": "",
-                              "reason": "held_transcript_unusable",
-                              "detail": str(prep), "retitle": ""})
+                hold = {"session": sid, "account": acct,
+                        "label": dests[acct]["label"], "title": "",
+                        "reason": "held_transcript_unusable",
+                        "detail": str(prep), "retitle": ""}
+                if copies is not None:
+                    # The duplicated-transcript diagnosis, for --json. One
+                    # copy per hold, never shared: the public manifest's
+                    # anonymize scrub rewrites these paths in place.
+                    hold["transcript_copies"] = dict(
+                        copies, stale=list(copies["stale"]),
+                        copies=[dict(c) for c in copies["copies"]])
+                holds.append(hold)
             continue
         facts, title, title_source, disagree, holder_titles = prep
         if disagree:
@@ -11772,6 +11956,16 @@ def _public_converge_manifest(env, m):
                 # not gain a null key from being displayed.
                 if isinstance(h.get("measured_line"), str):
                     h["measured_line"] = _scrub(h["measured_line"])
+                # The duplicated-transcript diagnosis carries the same paths
+                # the detail quotes, as fields - and a path names its
+                # app-encoded project folder, which only this pass replaces.
+                tc = h.get("transcript_copies")
+                if isinstance(tc, dict):
+                    tc["live"] = _scrub(tc.get("live"))
+                    tc["stale"] = [_scrub(p) for p in tc.get("stale") or []]
+                    for c in tc.get("copies") or []:
+                        if isinstance(c, dict):
+                            c["path"] = _scrub(c.get("path"))
         for note in out.get("notes") or []:
             if isinstance(note, dict):
                 note["retitle"] = _scrub(note.get("retitle"))
