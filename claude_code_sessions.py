@@ -868,17 +868,15 @@ def _is_cli_process(text):
 # host, and why it still counts" and its 2026-08-07 amendment - including the
 # standing caveat that this is ONE clean trial.
 #
-# The binding is the anchored package-path segment chain AND the binary's hash,
-# because the helper auto-updates in place: it changed under this very
-# investigation (744187C7... -> 711AD7E7..., same path, same byte length). A
-# path-only exclusion would therefore silently inherit trust for code nobody
-# measured. On any mismatch - different hash, unreadable file, a path that is not
-# the anchored chain - the helper COUNTS exactly as it did before, so the worst
-# case is the previous behaviour and never worse.
+# The binding is the helper's location derived from the store roots (see
+# _expected_helper_paths) AND the binary's hash, because the helper auto-updates
+# in place: it changed under this very investigation (744187C7... -> 711AD7E7...,
+# same path, same byte length). A path-only exclusion would therefore silently
+# inherit trust for code nobody measured. On any mismatch - different hash,
+# unreadable file, a path that is not the derived location - the helper COUNTS
+# exactly as it did before, so the worst case is the previous behaviour and never
+# worse.
 _HELPER_SHA256 = "711ad7e7dec73aa58187479f5f99b13480df93ab1306bd171a61027d84fa81f1"
-_HELPER_PKG_ANCHOR = "\\packages\\claude_"
-_HELPER_DIR_ANCHOR = "\\localcache\\roaming\\claude\\chromenativehost\\"
-_HELPER_EXE = "\\chrome-native-host.exe"
 
 
 def _expected_helper_paths(env):
