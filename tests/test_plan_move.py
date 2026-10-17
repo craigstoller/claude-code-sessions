@@ -441,6 +441,229 @@ class TestClaudeRunningNarrowing:
         env.process_lister = lambda: [(99999, exe), (99998, DESKTOP_EXE)]
         assert ct.claude_running(env) == [DESKTOP_EXE]
 
+    # ------------- the versioned native-host layout (Desktop 2.42304, 2026-10-17)
+    #
+    # The app moved the helper from <Roaming>\Claude\ChromeNativeHost\ to
+    # <Roaming>\Claude-NativeHost\<version>\. RULINGS 6 and 7 must reach it
+    # there, and only there: the location is still derived from the real store
+    # root, and the version segment must be dotted ASCII digits.
+
+    MEASURED = b"measured-helper-bytes"
+
+    @staticmethod
+    def _packaged_root(env, tmp_path):
+        """A store root shaped like the packaged app's, so every helper path
+        derived from it contains "claude" the way the real ones do - the
+        versioned folder sits BESIDE the store's claude folder, not under it,
+        and without a claude-named ancestor a test entry would be dropped by
+        the claude-named filter before any helper logic ran."""
+        root = (tmp_path / "packages" / "claude_x" / "localcache" / "roaming" /
+                "claude" / "claude-code-sessions")
+        root.mkdir(parents=True, exist_ok=True)
+        env.store_candidates = [str(root).lower()]
+        return env.store_candidates[0]
+
+    @classmethod
+    def _versioned_helper(cls, env, tmp_path, version="2.42304.0",
+                          content=MEASURED):
+        root = cls._packaged_root(env, tmp_path)
+        roaming = os.path.dirname(os.path.dirname(root))
+        d = os.path.join(roaming, "Claude-NativeHost", version)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "chrome-native-host.exe")
+        with open(p, "wb") as fh:
+            fh.write(content)
+        return p
+
+    @pytest.fixture
+    def measured_hash(self, monkeypatch):
+        import hashlib
+        monkeypatch.setattr(ct, "_HELPER_SHA256",
+                            hashlib.sha256(self.MEASURED).hexdigest())
+
+    @staticmethod
+    def _opt_in_and_sign(env, monkeypatch):
+        """RULING 7's opt-in on, and Windows reporting a valid Anthropic
+        signature for whatever file is asked about."""
+        with open(ct.trust_signed_helper_path(env), "w") as fh:
+            fh.write("on\n")
+        monkeypatch.setattr(
+            ct, "_authenticode_publisher",
+            lambda path: 'CN="Anthropic, PBC", O="Anthropic, PBC", C=US')
+
+    def test_measured_helper_at_the_versioned_layout_is_excluded(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path)
+        assert ct._measured_helper_state(exe, env) == "measured"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    def test_versioned_layout_helper_counts_when_it_is_not_measured(
+            self, mkenv, tmp_path, measured_hash):
+        # Also proves the entry reaches the helper logic at all: were it
+        # dropped as not claude-named, it could not count here.
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        assert ct._measured_helper_state(exe, env) == "changed"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_signed_opt_in_reaches_the_versioned_layout(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        # The 2026-10-17 failure: opted in, helper validly signed, app closed -
+        # and the apply still refused, because the helper at its new location
+        # was never recognised and the signature was never consulted.
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        self._opt_in_and_sign(env, monkeypatch)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    def test_excused_versioned_helper_does_not_excuse_the_desktop_app(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        self._opt_in_and_sign(env, monkeypatch)
+        env.process_lister = lambda: [(99999, exe), (99998, DESKTOP_EXE)]
+        assert ct.claude_running(env) == [DESKTOP_EXE]
+
+    def test_unreadable_versioned_helper_counts_even_signed_and_opted_in(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        # A directory where the binary should be: open() fails, so the state is
+        # "unreadable", which neither ruling excuses.
+        env = mkenv(tmp_path)
+        root = self._packaged_root(env, tmp_path)
+        exe = os.path.join(os.path.dirname(os.path.dirname(root)),
+                           "Claude-NativeHost", "2.42304.0",
+                           "chrome-native-host.exe")
+        os.makedirs(exe)
+        self._opt_in_and_sign(env, monkeypatch)
+        assert ct._measured_helper_state(exe, env) == "unreadable"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    @pytest.mark.parametrize("version", [
+        "latest", "2.42304.0-beta", "v2.42304.0", "2..1", "2_42304_0",
+        "٢.42304.0",           # a non-ASCII digit: \d would accept it
+    ])
+    def test_non_numeric_version_segment_counts(
+            self, mkenv, tmp_path, measured_hash, monkeypatch, version):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, version=version)
+        self._opt_in_and_sign(env, monkeypatch)
+        assert ct._measured_helper_state(exe, env) is None
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_versioned_lookalike_outside_the_real_root_counts(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        # Every segment of the new layout, measured bytes, opt-in on - but not
+        # under the discovered store root's own Roaming folder.
+        env = mkenv(tmp_path)
+        self._packaged_root(env, tmp_path)
+        fake = (tmp_path / "tmp" / "packages" / "claude_x" / "localcache" /
+                "roaming" / "Claude-NativeHost" / "2.42304.0")
+        fake.mkdir(parents=True)
+        p = fake / "chrome-native-host.exe"
+        p.write_bytes(self.MEASURED)
+        self._opt_in_and_sign(env, monkeypatch)
+        exe = str(p)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    def test_versioned_layout_needs_the_exact_depth(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        # One extra folder between the version and the binary, or none at all:
+        # neither is the derived location.
+        env = mkenv(tmp_path)
+        root = self._packaged_root(env, tmp_path)
+        nh = os.path.join(os.path.dirname(os.path.dirname(root)),
+                          "Claude-NativeHost")
+        deeper = os.path.join(nh, "2.42304.0", "extra")
+        os.makedirs(deeper)
+        entries = []
+        for d in (deeper, nh):
+            p = os.path.join(d, "chrome-native-host.exe")
+            with open(p, "wb") as fh:
+                fh.write(self.MEASURED)
+            entries.append(p)
+        self._opt_in_and_sign(env, monkeypatch)
+        env.process_lister = lambda: [(99999 - i, e) for i, e in enumerate(entries)]
+        assert ct.claude_running(env) == entries
+
+    def test_versioned_helper_named_as_an_argument_still_counts(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path)
+        masquerade = exe + " --parent-window 0"
+        env.process_lister = lambda: [(99999, masquerade)]
+        assert ct.claude_running(env) == [masquerade]
+
+    def test_old_and_versioned_layouts_are_both_recognised(
+            self, mkenv, tmp_path, measured_hash):
+        # Installs that have not updated keep the old folder; the move must not
+        # cost them the exclusion.
+        env = mkenv(tmp_path)
+        new = self._versioned_helper(env, tmp_path)
+        old = os.path.join(os.path.dirname(env.store_candidates[0]),
+                           "ChromeNativeHost", "chrome-native-host.exe")
+        os.makedirs(os.path.dirname(old))
+        with open(old, "wb") as fh:
+            fh.write(self.MEASURED)
+        assert ct._measured_helper_state(old, env) == "measured"
+        assert ct._measured_helper_state(new, env) == "measured"
+        env.process_lister = lambda: [(99999, old), (99998, new)]
+        assert ct.claude_running(env) == []
+
+    def test_helper_note_names_the_browser_not_just_chrome(
+            self, mkenv, tmp_path, measured_hash):
+        # Observed 2026-10-17: Edge launched the helper, and the note said to
+        # close Chrome. It must fire at the new location and name both.
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        note = ct.helper_hash_note([exe], env)
+        assert "different binary" in note
+        assert "Chrome or Edge" in note
+        assert "Closing Chrome" not in note
+
+    def test_relative_candidate_derives_no_helper_location(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        # With APPDATA unset the classic candidate is relative; abspath then
+        # resolved its helper location against the working directory. Neither
+        # layout may be derived from such a candidate.
+        env = mkenv(tmp_path)
+        cwd = tmp_path / "claude_cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        env.store_candidates = [os.path.join("claude", "claude-code-sessions")]
+        old = cwd / "claude" / "ChromeNativeHost" / "chrome-native-host.exe"
+        new = cwd / "Claude-NativeHost" / "2.42304.0" / "chrome-native-host.exe"
+        for p in (old, new):
+            p.parent.mkdir(parents=True)
+            p.write_bytes(self.MEASURED)
+        entries = [str(old), str(new)]
+        env.process_lister = lambda: [(99999 - i, e) for i, e in enumerate(entries)]
+        assert ct.claude_running(env) == entries
+
+    def test_helper_note_names_the_helper_when_the_app_is_listed_first(
+            self, mkenv, tmp_path, measured_hash):
+        # The refusal prints only running[0]; "the process above" would then
+        # label the desktop app as the helper.
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        note = ct.helper_hash_note([DESKTOP_EXE, exe], env)
+        assert exe in note
+        assert "the process above" not in note
+
+    def test_helper_note_at_the_old_layout_names_the_browser_too(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        exe = self._helper_on_disk(env, tmp_path, b"a-different-build-entirely")
+        note = ct.helper_hash_note([exe], env)
+        assert "Chrome or Edge" in note
+        assert "Closing Chrome" not in note
+
     # ------------------------- cross-org tagging in "which store did you mean"
 
     def test_cross_org_candidate_is_tagged(self, tmp_path):
