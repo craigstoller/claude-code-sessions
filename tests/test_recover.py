@@ -276,6 +276,19 @@ def test_finish_committed_refuses_while_claude_running(crashed):
     assert os.path.isfile(t)
 
 
+def test_finish_committed_guard_refusal_carries_the_helper_note(crashed):
+    """The same helper note converge and sync refusals print. A helper at a
+    location nothing recognises needs no file on disk to produce one."""
+    env, m, t = crashed("committed")
+    op = ct.nonterminal_ops(env)[0]
+    helper = "c:\\somewhere\\claude-elsewhere\\chrome-native-host.exe"
+    env.process_lister = lambda: [(999999, helper)]
+    with pytest.raises(ct.Refusal) as exc:
+        ct.recover_op(env, op, "forward")
+    assert "not at a location this version recognises" in str(exc.value)
+    assert os.path.isfile(t)
+
+
 def test_finish_committed_refuses_on_untracked_sidecar_file(crashed):
     """I6(b): the same C1 guard execute_op's own commit step uses - a file
     that appeared in the source sidecar after commit was never journaled and

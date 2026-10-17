@@ -223,6 +223,18 @@ def test_process_guard_ignores_self_and_own_tool(setup):
     assert ct.plan_move(env, SID, target, flags())["mode"] == "desktop"
 
 
+def test_process_guard_refusal_carries_the_helper_note(setup):
+    # converge and sync refusals explained a counted helper; move's did not. A
+    # helper at a location nothing recognises needs no file on disk, so it is
+    # the simplest entry that makes helper_hash_note say something.
+    env, t, target = setup
+    helper = "c:\\somewhere\\claude-elsewhere\\chrome-native-host.exe"
+    env.process_lister = lambda: [(99999, "claude.exe"), (99998, helper)]
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_move(env, SID, target, flags())
+    assert "not at a location this version recognises" in str(exc.value)
+
+
 def test_mtime_guard_force(setup):
     env, t, target = setup
     env.now = lambda: os.path.getmtime(t) + 60      # transcript written 1 min "ago"
@@ -703,6 +715,51 @@ class TestClaudeRunningNarrowing:
         note = ct.helper_hash_note([exe], env)
         assert "Chrome or Edge" in note
         assert "Closing Chrome" not in note
+
+    # The opt-in is ON and a recognised helper still counts. The note says why,
+    # and only says: claude_running decides exactly as RULINGS 6 and 7 do.
+
+    @pytest.mark.parametrize("subject", [
+        None,                                                  # unsigned, or no check
+        'CN="Not Anthropic, PBC", O="Not Anthropic, PBC", C=US',  # someone else
+    ])
+    def test_opted_in_helper_failing_the_signature_check_is_explained(
+            self, mkenv, tmp_path, measured_hash, monkeypatch, subject):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        self._opt_in_and_sign(env, monkeypatch)
+        monkeypatch.setattr(ct, "_authenticode_publisher", lambda path: subject)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+        note = ct.helper_hash_note([exe], env)
+        assert "opt-in is on" in note
+        assert "signature was not confirmed" in note
+        assert "trust-signed-helper --on" not in note
+
+    def test_opted_in_unreadable_helper_is_explained(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        env = mkenv(tmp_path)
+        root = self._packaged_root(env, tmp_path)
+        exe = os.path.join(os.path.dirname(os.path.dirname(root)),
+                           "Claude-NativeHost", "2.42304.0",
+                           "chrome-native-host.exe")
+        os.makedirs(exe)
+        self._opt_in_and_sign(env, monkeypatch)
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+        note = ct.helper_hash_note([exe], env)
+        assert "opt-in is on" in note
+        assert "never qualifies" in note
+        assert "signature was not confirmed" not in note
+        assert "trust-signed-helper --on" not in note
+
+    def test_opted_out_helper_note_does_not_claim_the_opt_in(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        note = ct.helper_hash_note([exe], env)
+        assert "trust-signed-helper --on" in note
+        assert "opt-in is on" not in note
 
     # ------------------------- cross-org tagging in "which store did you mean"
 

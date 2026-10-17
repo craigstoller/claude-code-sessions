@@ -101,6 +101,20 @@ def test_undo_refuses_while_claude_running(moved):
     assert prior.manifest["status"] == "completed"
 
 
+def test_undo_guard_refusal_carries_the_helper_note(moved):
+    """The same helper note converge and sync refusals print. A helper at a
+    location nothing recognises needs no file on disk to produce one."""
+    env, m, t = moved
+    prior = ct.list_ops(env)[0]
+    helper = "c:\\somewhere\\claude-elsewhere\\chrome-native-host.exe"
+    env.process_lister = lambda: [(999999, helper)]
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_undo(env, prior)
+    assert helper in str(exc.value)
+    assert "not at a location this version recognises" in str(exc.value)
+    assert prior.manifest["status"] == "completed"
+
+
 def test_undo_refuses_when_lock_held(moved):
     """run_undo takes the single-instance lock (a distinctive 'undo-<op_id>'
     name), same as run_move/recover_op."""
