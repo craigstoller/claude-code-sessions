@@ -1170,6 +1170,139 @@ A version-bound exclusion would have expired for no reason; a hash-bound one cor
 survived. The converse — a helper update under a static app version — is the case the hash
 binding exists to catch.
 
+#### Amendment 2026-10-17 — the helper moved, and the derived location follows it
+
+**Status: proposed, not implemented.** Peer review raised alternatives to the version pattern
+below. Round 1 raised binding to the browser's manifest or listing the folder. Round 2 raised
+accepting any single folder name, or adding a note for a helper seen at a location nothing
+recognises. The shape therefore waits for the maintainer's ruling, which will be recorded here.
+
+**What changed (observed 2026-10-17, read-only probes).** Claude Desktop 2.42304.0.0, installed
+by the 2026-10-15 update, removed `<Roaming>\Claude\ChromeNativeHost\`. The helper now lives at
+`<Roaming>\Claude-NativeHost\<version>\chrome-native-host.exe`, where `<Roaming>` is the folder
+holding the store's `Claude` folder (for the packaged app,
+`...\Packages\Claude_<pkgid>\LocalCache\Roaming`) and `<version>` is a dotted number such as
+`2.42304.0`. The browser's native-messaging manifest in the same `Claude-NativeHost` folder
+names that versioned path. On the probed machine both store candidates' `Claude` folders exist,
+the classic `%APPDATA%\Claude-NativeHost` exists too, and its manifest reads as the same file as
+the packaged one. The copy that outlived the app was launched by Edge, not Chrome.
+
+**What that broke.** `_expected_helper_paths` derived only the old location, so the live helper
+was not recognised as the helper at all. It counted as the desktop app, and neither ruling was
+reached: RULING 6's hash check and RULING 7's signature check both sit behind that recognition.
+A `converge --apply` refused with the app closed. That is the fail-closed direction, but the
+opt-in silently stopped working. RULING 7 was written to end exactly that failure, where the
+user believes the feature still works. The refusal named the helper's path and nothing else.
+The helper note, which only fires for a recognised helper, never appeared. So there was no
+pointer to the opt-in, and the only advice, "close the desktop app", could not help with the
+app already closed. Had the note fired, its "Closing Chrome clears this" would have been wrong
+too: Edge had launched the helper.
+
+**The change.** The helper is recognised at either of two locations, both derived from each
+store-root candidate exactly as before (the packaged-app roots found on disk, plus the classic
+`%APPDATA%` one whether or not it exists):
+
+- old (kept for installs that have not updated): `<store root's parent>\ChromeNativeHost\chrome-native-host.exe`;
+- new: `<the parent of the store root's parent>\Claude-NativeHost\<version>\chrome-native-host.exe`,
+  where `<version>` is one path component made of ASCII digits separated by single dots,
+  `[0-9]+(\.[0-9]+)*` matched whole. Python's `\d` also accepts digits from other scripts, so
+  it is not used.
+
+The old location is still an exact path. The new one is exact except for the version: the
+`Claude-NativeHost` folder is derived exactly, and only the version folder's name varies,
+within the pattern. After the same separator folding and normalisation as today, the entry's
+grandparent must equal a derived `Claude-NativeHost` folder, its parent's name must match the
+pattern, and its basename must be `chrome-native-host.exe`. A fabricated path that merely
+contains these segments still counts. So do an entry carrying arguments, a binary one folder too
+deep or too shallow, and a helper that cannot be read. RULING 6 (measured hash) and RULING 7
+(opt-in, a valid signature with CN and O exactly `Anthropic, PBC`) decide exactly as before, for
+a helper at either location.
+
+One narrowing rides along. A candidate that is not an absolute path now derives no helper
+location. With `APPDATA` unset, the classic candidate is the relative `Claude\claude-code-sessions`,
+and the old code resolved its helper location against the working directory. The new layout
+would have done the same one level higher, so both are closed.
+
+The refusal note fires at either location, because it uses the same recognition. It now names
+the helper by its path instead of "the process above": the converge and sync refusal prints only
+the first process it found, which may be the desktop app. It says a browser running the Claude
+extension, Chrome or Edge, launches the helper and that it can outlive the app. It says that
+closing every such browser should stop it. That is measured for Chrome, whose disconnect made the
+helper exit by itself in August; for Edge it is expected, not probed. It no longer says the
+helper updates "in place".
+
+The remedy the note names has to work as well. `tools/native-host-measurement/watch_ceremony.py`
+carried its own definition of the helper, a path-tail test for the old location plus a
+`\packages\claude_` anchor check. At the new location the first gate finds no helper, and the
+ceremony waits at "helper running" until the operator aborts. The ceremony stops carrying its own
+definition: both gates ask the guard's recognition instead, so the instrument and the guard cannot
+disagree about which process is the helper, and `check_watch_ceremony.py` pins that. Its shutdown
+prompt names the browser that launched the helper rather than Chrome alone.
+`tools/check_signed_helper_optin.py`'s live signature check looked only at the old path and
+reported a skip; it is changed to look at both. Its decision table patches recognition away, so
+it pins the decisions, not recognition, which the tests below pin.
+
+**Why the trust does not widen.** Measured 2026-10-17 on the probed machine, where both store
+candidates' `Claude` folders exist: in each, the `Claude-NativeHost` folder beside it carries
+exactly the `Claude` folder's ACL, every entry inherited. Whoever can plant a binary there can
+already plant one at the old location, or write the store directly, so RULING 7's limit covers
+both. A machine without the classic `%APPDATA%\Claude` rests on an equivalence, not a
+measurement. `%APPDATA%\Claude\ChromeNativeHost\` was a trusted location before this change
+whether or not `%APPDATA%\Claude` existed, and creating that folder is no harder than creating
+`%APPDATA%\Claude-NativeHost`. Deriving only from candidates that exist would change nothing for
+such a writer, so the candidates stay as they are.
+
+**Why every version folder, not only the one the manifest names, and why no listing.** The guard
+judges running processes only. A process is excused only if its image can be read and hashed,
+or signature-checked; an unreadable one counts. So only a version whose binary exists and can be
+read can ever be excused. Listing the folder would add I/O and a new failure to handle without
+narrowing what can be excused. The browser launches the helper at the path its manifest names. A leftover
+version folder therefore matters only while a helper started before an update is still running
+from it (an inference; not observed). Binding to the manifest would make that helper count until
+the browser restarts it. It would also add a parse of an undocumented, user-writable file to
+every guard check, and it would move the fragility rather than remove it, because the manifest's
+name and folder are layout details too. Each recognised build is still judged on its own bytes:
+by measured hash, or, with the opt-in on, by a valid Anthropic signature. With the opt-in on, a
+leftover signed build is trusted exactly as much as a current one. RULING 7 already accepts that
+for any future build.
+
+**Why a version pattern at all.** It limits recognition to the folder naming the app was seen to
+use. It is not a security boundary, because the folder is user-writable. Its cost: a future
+folder name with a suffix, such as a pre-release tag, fails closed, and that would be the next
+report.
+
+**Alternatives set aside.** Trusting any Anthropic-signed `chrome-native-host.exe` wherever it
+sits would undo the August fix above, which made a copied binary under a look-alike tree count.
+Leaving the code alone means closing the browser before every apply, the friction RULING 7
+removed. Binding to the manifest and listing the folder are set aside for the reasons above.
+
+**What this says about the new build.** It restores the opt-in's reach; it is not a measurement
+of 2.42304.0, and the August measurement is not claimed to transfer to it. What is restored is
+RULING 7's existing policy: trust in the publisher, not in measured bytes. Two read-only probes
+ran on 2026-10-17. RULING 7's own signature reader reports the installed helper `signed`, CN and
+O both `Anthropic, PBC`. A static string scan with the 2026-08-05 literal list finds no
+`claude-code-sessions`, `sessions`, `Roaming`, `projects` or `jsonl`. It finds only the
+log-location variable `LOCALAPPDATA`, the browser-bridge pipe prefix and `CLAUDE_LOG_LEVEL`.
+Like the August scan, that bounds the literals in one image and nothing more. The build's bytes
+are not RULING 6's measured hash, so without the opt-in it counts, as it did before the move.
+
+**Residuals.** A future layout move will fail closed the same way, and silently, as this one
+did: the note only fires for a recognised helper. Several live helpers (browsers or profiles)
+are each signature-checked separately and uncached, as before. The measurement ceremony was not
+re-run at the new location, so its changed recognition is untested end to end. Lister entries
+are lowercased on every platform while a derived folder keeps its case off Windows; the helper
+is a Windows binary, and the old layout had the same property.
+
+**Pinned by** `tests/test_plan_move.py::TestClaudeRunningNarrowing`, which CI runs on Windows and
+Linux. At the new location: a measured build is excluded; a changed build counts; changed,
+signed and opted in is excluded; that excused helper does not excuse the desktop app beside it;
+an unreadable helper counts even signed and opted in; a non-numeric version segment counts,
+a non-ASCII digit included; a look-alike tree outside the real root counts; a binary one folder
+too deep or too shallow counts; an entry carrying arguments counts; a relative candidate derives
+nothing. Both layouts are recognised side by side, and the note's wording and attribution are
+checked at both. The ceremony's use of the guard's recognition is pinned by
+`tools/native-host-measurement/check_watch_ceremony.py`, which CI does not run.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via
