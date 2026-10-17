@@ -1418,7 +1418,7 @@ class SyncApp:
         # the marker file; the shipped default (off) is untouched.
         self.trust_var = tk.BooleanVar(value=ccs.signed_helper_trust_enabled(self.env))
         self.trust_chk = ttk.Checkbutton(
-            winbar, text="Let Chrome stay open", variable=self.trust_var,
+            winbar, text="Let browsers stay open", variable=self.trust_var,
             command=self.on_toggle_trust)
         self.trust_chk.pack(side="left", expand=True)
         # (window, cancel) of a modal Toplevel of this window's own (the
@@ -2666,10 +2666,11 @@ class SyncApp:
         """
         want = self.trust_var.get()
         if want and not messagebox.askokcancel(
-                "Let Chrome stay open?", default="cancel", message=
-                "The desktop app's Chrome helper normally blocks writes unless it is "
-                "the exact build this tool measured - and it auto-updates every few "
-                "days, which is why Chrome keeps having to be closed.\n\n"
+                "Let browsers stay open?", default="cancel", message=
+                "The desktop app's browser helper, launched by Chrome or Edge, normally "
+                "blocks writes unless it is the exact build this tool measured - and it "
+                "auto-updates every few days, which is why the browser keeps having to "
+                "be closed.\n\n"
                 "Turning this on trusts ANY helper at the app's own path that Windows "
                 "reports as validly signed by Anthropic, PBC.\n\n"
                 "It is weaker than the default: a future Anthropic build that started "
@@ -2693,8 +2694,8 @@ class SyncApp:
             messagebox.showerror("Could not change the setting", str(exc))
         actual = ccs.signed_helper_trust_enabled(self.env)
         self.trust_var.set(actual)
-        self.status.set("Chrome may stay open (the desktop app still cannot)"
-                        if actual else "Chrome must be closed again (the default)")
+        self.status.set("Browsers may stay open (the desktop app still cannot)"
+                        if actual else "Browsers must be closed again (the default)")
         self.detail.set("")
 
     def _clear_filter(self):

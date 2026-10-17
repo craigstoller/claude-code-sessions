@@ -94,13 +94,14 @@ of the standard library, but packaged separately on some Linux distributions
 replaces the old "Claude session sync" shortcut with the new name; a taskbar pin to the
 old name is yours to re-pin.
 
-## Optional: let Chrome stay open
+## Optional: let the browser stay open
 
-The desktop app ships a helper for its Chrome extension that can outlive the app, so the
-guard counts it and you have to close Chrome too. A measured build of that helper is
-excluded - but **the helper auto-updates every few days** (three builds in eight days, as
-measured), and each update correctly fails closed, so the exclusion lapses and Chrome has to
-be closed again until someone re-runs the ~12-minute measurement in
+The desktop app ships a helper for its browser extension that Chrome or Edge launches and
+that can outlive the app, so the guard counts it and you have to close that browser too. A
+measured build of that helper is excluded - but **the helper auto-updates every few days**
+(three builds in eight days, as measured), and each update correctly fails closed, so the
+exclusion lapses and the browser has to be closed again until someone re-runs the ~12-minute
+measurement in
 `tools/native-host-measurement/`.
 
 If that trade isn't worth it to you, there is an opt-in: trust **any** helper at the app's
@@ -112,7 +113,7 @@ claude-code-sessions trust-signed-helper --on     # enable it
 claude-code-sessions trust-signed-helper --off    # back to the default
 ```
 
-In the window it is the **"Let Chrome stay open"** checkbox, which explains the trade before
+In the window it is the **"Let browsers stay open"** checkbox, which explains the trade before
 enabling anything. Either way it is one marker file - `~/.claude-code-journal/trust-signed-helper` -
 so deleting that file also revokes it.
 
@@ -145,9 +146,10 @@ files agree - or, if you know which account the desktop app is signed into, asse
 full). Signing into the desktop app does **not** refresh `~/.claude.json`. A refused
 `sync --apply` (desktop app running) refuses **before anything is journaled** - no lock file,
 no op directory - so there's nothing left behind for `doctor` to flag or `recover` to clean up;
-just close the app and re-run. One measured wrinkle: the desktop ships a helper for its Chrome
-extension (`chrome-native-host.exe`) that can outlive the app itself, and the guard counts it -
-if a refusal names that process, fully exit Chrome too (the refusal always names what it saw).
+just close the app and re-run. One measured wrinkle: the desktop ships a helper for its browser
+extension (`chrome-native-host.exe`), launched by Chrome or Edge, that can outlive the app
+itself, and the guard counts it - if a refusal names that process, fully exit that browser too
+(the refusal always names what it saw).
 
 ## Usage
 

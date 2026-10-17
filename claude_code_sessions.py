@@ -4204,7 +4204,7 @@ def build_parser():
 
     sp = sub.add_parser(
         "trust-signed-helper",
-        help="let Chrome stay open by trusting the signed Chrome helper (opt-in)")
+        help="let Chrome or Edge stay open by trusting the signed helper (opt-in)")
     grp = sp.add_mutually_exclusive_group()
     grp.add_argument("--on", action="store_true", help="enable it")
     grp.add_argument("--off", action="store_true", help="disable it (the default)")
@@ -4560,14 +4560,14 @@ def cmd_trust_signed_helper(env, ns):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write("Created by 'claude-code-sessions trust-signed-helper --on'.\n"
-                         "While this file exists, a Chrome helper at the app's own\n"
-                         "package path that Windows reports as validly signed by\n"
+                         "While this file exists, a Chrome or Edge helper at the app's\n"
+                         "own package path that Windows reports as validly signed by\n"
                          "Anthropic, PBC does not block mutations, even when its bytes\n"
                          "are not the build this tool measured. Delete it to revoke.\n"
                          "See docs/internals.md, RULING 7.\n")
         except OSError as exc:
             raise Refusal("could not enable it: {0}".format(exc))
-        print("Signed-helper trust is ON. Chrome may stay open; the desktop app "
+        print("Signed-helper trust is ON. Chrome or Edge may stay open; the desktop app "
               "still has to be closed.")
         print("It is weaker than the default: trust moves from the exact measured "
               "bytes to the publisher, so a future Anthropic build that started "
@@ -4582,7 +4582,7 @@ def cmd_trust_signed_helper(env, ns):
         except OSError as exc:
             raise Refusal("could not disable it: {0}".format(exc))
         print("Signed-helper trust is OFF (the default). Only the measured build "
-              "is excluded, so Chrome has to be closed whenever the helper has "
+              "is excluded, so Chrome or Edge has to be closed whenever the helper has "
               "updated.")
         return 0
     on = signed_helper_trust_enabled(env)
