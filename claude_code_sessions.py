@@ -1135,6 +1135,18 @@ def helper_hash_note(running, env):
                     "default because it rests on evidence you have not examined. Turn "
                     "it on with:\n"
                     "   claude-code-sessions trust-signed-helper --on")
+            # Note-only, like the rest: claude_running has already decided, and
+            # this line only says why the opt-in did not excuse the helper.
+            elif state == "unreadable":
+                note += (
+                    "\nThe signed-helper opt-in is on but did not excuse it: a helper "
+                    "that cannot be read never qualifies, because its bytes cannot be "
+                    "shown to be the file whose signature was checked.")
+            else:
+                note += (
+                    "\nThe signed-helper opt-in is on but did not excuse it: its "
+                    "signature was not confirmed as valid and by Anthropic, PBC "
+                    "(unsigned, signed by someone else, or the check could not run).")
             return note
     # Ruled 2026-10-17: the next layout move must announce itself. This only
     # advises - the process keeps counting either way.
@@ -1318,8 +1330,9 @@ def plan_move(env, session_id, target, flags):
     # 6. guards
     running = claude_running(env)
     if running:
-        raise Refusal("Claude appears to be running ({0}). Close the app, then retry."
-                      .format(", ".join(sorted(set(running))[:3])))
+        raise Refusal("Claude appears to be running ({0}). Close the app, then retry.{1}"
+                      .format(", ".join(sorted(set(running))[:3]),
+                              helper_hash_note(running, env)))
     age = env.now() - os.path.getmtime(source)
     if age < MTIME_GUARD_SECONDS and not flags.force:
         raise Refusal("transcript was written {0:.0f} seconds ago - this session may be "
@@ -1948,8 +1961,10 @@ def run_undo(env, prior_op):
     """
     acquire_lock(env, "undo-" + prior_op.manifest["op_id"])
     try:
-        if claude_running(env):
-            raise Refusal("Claude appears to be running; close the app before undoing.")
+        running = claude_running(env)
+        if running:
+            raise Refusal("Claude appears to be running; close the app before undoing.{0}"
+                          .format(helper_hash_note(running, env)))
         manifest = plan_undo(env, prior_op)
         op = new_op(env, manifest)
         final = execute_op(env, op)
@@ -2846,7 +2861,9 @@ def _finish_committed(env, op):
     running = claude_running(env)
     if running:
         raise Refusal("cannot finish op {0}: Claude appears to be running ({1}). "
-                      "Close it, then retry recover.".format(m["op_id"], ", ".join(sorted(set(running))[:3])))
+                      "Close it, then retry recover.{2}".format(
+                          m["op_id"], ", ".join(sorted(set(running))[:3]),
+                          helper_hash_note(running, env)))
 
     if m.get("sidecar_source") and os.path.isdir(m["sidecar_source"]):
         # I6(b): same C1 guard as execute_op's own commit step - a file
