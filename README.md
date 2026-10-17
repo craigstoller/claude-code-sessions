@@ -592,14 +592,17 @@ window.
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds - most recently Claude Desktop
-2.37337.1.0 (Microsoft Store MSIX install) and Claude Code CLI 2.1.296. On 2026-10-14 the
-read-only paths were verified against a real Desktop 2.x store (`list`, `doctor`, `alignment`,
-`recover` without `--apply`, and a `converge` dry run): the row format had only gained keys,
-and every row this tool had written under 1.x was still present, some already re-saved by
-the new app. Later on 2026-10-14 a `converge --apply` ran against that 2.x store with the
-app closed: after the app restarted, every row it had written was still present and
-`doctor` reported none vanished. The on-disk format has changed once already during this
-tool's own development; treat a much newer build as unverified territory.
+2.42304.0.0 (Microsoft Store MSIX install) and Claude Code CLI 2.1.302. On 2026-10-14 the
+read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
+`doctor`, `alignment`, `recover` without `--apply`, and a `converge` dry run): the row format
+had only gained keys, and every row this tool had written under 1.x was still present, some
+already re-saved by the new app. Later on 2026-10-14 a `converge --apply` ran against that
+2.x store with the app closed: after the app restarted, every row it had written was still
+present and `doctor` reported none vanished. On 2026-10-17 two more `converge --apply` runs
+went through against 2.42304.0.0 with the app closed, with the same result. That build moved
+the browser-extension helper, which the running-app guard follows from 0.16.1 (see Roadmap).
+The on-disk format has changed once already during this tool's own development; treat a
+much newer build as unverified territory.
 
 **On non-Windows, `move` and every `sync` route refuse to touch the desktop store, and there
 is no flag to override that.** The layout is confirmed on Windows only; macOS reportedly has
@@ -925,6 +928,28 @@ window into `journaled`/`completed`/`rolled_back`.
   placement, and the one box the operator's own habit would have flipped stays opt-in per
   run because RULING 8 says so. DPI awareness, the audit's last item, is its own later
   release; the harness it needed now exists.
+- **0.16.1 follows the desktop app's browser helper to its new folder.** Desktop 2.42304.0
+  deleted the `ChromeNativeHost` folder beside the session store and installed the helper in
+  a versioned `Claude-NativeHost\<version>` folder instead. This tool recognised the helper
+  only at the old exact path, so the copy at the new one counted as the running app. With the
+  desktop app closed and a browser running the Claude extension, every apply refused, and
+  neither the measured-build exclusion nor the signed-helper opt-in was consulted. The guard
+  failed closed, but the refusal said only to close the desktop app, which was already
+  closed. The guard now also recognises the new layout, derived from the real store root,
+  with the version folder accepted only when it is dotted ASCII digits; what each exclusion
+  requires is unchanged. When a process named like the helper sits at a location neither
+  rule recognises, the refusal now names its path and says neither exclusion can apply, so
+  the next move shows up in the refusal instead of failing silently. The note says Chrome or
+  Edge can launch the helper; on the machine where this was found, Edge did. The measurement
+  ceremony and the opt-in check script now find the helper where the guard does; the
+  ceremony had been waiting indefinitely for a helper it could not see. Also in this
+  release: when a session's transcript exists in two project folders and one copy is a
+  strict byte-prefix of the other, the duplicated-transcript hold names the stale copy, the
+  live copy and the removal command. It still chooses nothing. Identical copies are named
+  as interchangeable; copies that have diverged keep the old wording. The prefix case is
+  what a desktop session leaves behind when it enters a second worktree and is later
+  resumed in the one its sidebar row remembers: the copy in the second worktree stops
+  growing. It was seen twice on one machine in October.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
