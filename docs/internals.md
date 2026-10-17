@@ -488,6 +488,10 @@ against there, and implying one would be worse than saying nothing.
 
 ### The Chrome native host, and why it still counts (measured 2026-08-05)
 
+*Superseded location, 2026-10-17: Desktop 2.42304 moved the helper to a versioned
+`Claude-NativeHost` folder, and Edge as well as Chrome can launch it. See "Amendment
+2026-10-17" below. The text here records the August layout as measured.*
+
 The desktop app ships a helper for its Chrome extension —
 `...\Packages\Claude_<pkgid>\LocalCache\Roaming\Claude\ChromeNativeHost\chrome-native-host.exe`
 — which Chrome launches as a native-messaging host. It lives under the desktop's own package
@@ -1172,10 +1176,17 @@ binding exists to catch.
 
 #### Amendment 2026-10-17 — the helper moved, and the derived location follows it
 
-**Status: proposed, not implemented.** Peer review raised alternatives to the version pattern
-below. Round 1 raised binding to the browser's manifest or listing the folder. Round 2 raised
-accepting any single folder name, or adding a note for a helper seen at a location nothing
-recognises. The shape therefore waits for the maintainer's ruling, which will be recorded here.
+**Status: the maintainer's ruling of 2026-10-17, implemented.** Peer review raised alternatives
+to the version pattern below. Round 1 raised binding to the browser's manifest or listing the
+folder. Round 2 raised accepting any single folder name, or adding a note for a helper seen at
+a location nothing recognises. The maintainer ruled on three points, each as recommended:
+
+1. The new location is recognised by a version folder of dotted ASCII digits only. Not taken:
+   any single folder name, binding to the manifest, listing the folder.
+2. A note-only warning is added for a `chrome-native-host.exe` counted at a location nothing
+   recognises. It advises and never excuses. Not taken: leaving the next move silent.
+3. The re-measurement tools are fixed in this change. The 12-minute ceremony itself is not
+   re-run. Not taken: deferring the tools to a follow-up.
 
 **What changed (observed 2026-10-17, read-only probes).** Claude Desktop 2.42304.0.0, installed
 by the 2026-10-15 update, removed `<Roaming>\Claude\ChromeNativeHost\`. The helper now lives at
@@ -1231,16 +1242,28 @@ closing every such browser should stop it. That is measured for Chrome, whose di
 helper exit by itself in August; for Edge it is expected, not probed. It no longer says the
 helper updates "in place".
 
+A second note covers the next move. This one failed closed in silence because the note only
+fires for a recognised helper. Now, when a counted process's file name is
+`chrome-native-host.exe` but it sits at a location neither rule recognises, the refusal names it
+and says neither exclusion can apply. It says the app may have moved the helper again, and that
+reporting the location lets the guard follow it. The file-name test only decides whether to
+warn: the process keeps counting either way. A recognised helper's note takes precedence.
+
 The remedy the note names has to work as well. `tools/native-host-measurement/watch_ceremony.py`
 carried its own definition of the helper, a path-tail test for the old location plus a
 `\packages\claude_` anchor check. At the new location the first gate finds no helper, and the
 ceremony waits at "helper running" until the operator aborts. The ceremony stops carrying its own
 definition: both gates ask the guard's recognition instead, so the instrument and the guard cannot
-disagree about which process is the helper, and `check_watch_ceremony.py` pins that. Its shutdown
-prompt names the browser that launched the helper rather than Chrome alone.
-`tools/check_signed_helper_optin.py`'s live signature check looked only at the old path and
-reported a skip; it is changed to look at both. Its decision table patches recognition away, so
-it pins the decisions, not recognition, which the tests below pin.
+disagree about which process is the helper, and `check_watch_ceremony.py` pins that. The store
+roots it watches are still its own. The cost is a dependency: the ceremony now imports the
+guard's module, so it runs from a source checkout, where `tools/` always lived (it does not ship
+in the package). Its shutdown prompt names the browser that launched the helper rather than
+Chrome alone. `tools/check_signed_helper_optin.py`'s live signature check looked only at the old
+packaged path and reported a skip. It now looks wherever the guard looks, both layouts under
+every store candidate. It checks every helper it recognises, not the first, and its skip line
+says how many candidates it examined. Its decision
+table patches recognition away, so it pins the decisions, not recognition, which the tests below
+pin.
 
 **Why the trust does not widen.** Measured 2026-10-17 on the probed machine, where both store
 candidates' `Claude` folders exist: in each, the `Claude-NativeHost` folder beside it carries
@@ -1285,9 +1308,17 @@ O both `Anthropic, PBC`. A static string scan with the 2026-08-05 literal list f
 log-location variable `LOCALAPPDATA`, the browser-bridge pipe prefix and `CLAUDE_LOG_LEVEL`.
 Like the August scan, that bounds the literals in one image and nothing more. The build's bytes
 are not RULING 6's measured hash, so without the opt-in it counts, as it did before the move.
+With this change, a read-only probe on the same machine fed the installed helper's lowercased
+path to `claude_running` as the only process, the helper itself not running at the time. Both
+store candidates recognise it and read it `changed`. With the opt-in marker present it is
+excused: the guard reports nothing running.
 
-**Residuals.** A future layout move will fail closed the same way, and silently, as this one
-did: the note only fires for a recognised helper. Several live helpers (browsers or profiles)
+**Residuals.** A future layout move will still fail closed, but no longer silently, on two
+conditions. The helper must keep its file name, and its path must still contain `claude`. The
+guard counts only claude-named processes (RULING 4's narrowing), and the helper has always
+counted only because its path does. A helper moved to a path without `claude` would not count at
+all, warning or not, exactly as before this change. Counting it would change the guard's
+counting rule, which this ruling does not touch. Several live helpers (browsers or profiles)
 are each signature-checked separately and uncached, as before. The measurement ceremony was not
 re-run at the new location, so its changed recognition is untested end to end. Lister entries
 are lowercased on every platform while a derived folder keeps its case off Windows; the helper
@@ -1300,8 +1331,12 @@ an unreadable helper counts even signed and opted in; a non-numeric version segm
 a non-ASCII digit included; a look-alike tree outside the real root counts; a binary one folder
 too deep or too shallow counts; an entry carrying arguments counts; a relative candidate derives
 nothing. Both layouts are recognised side by side, and the note's wording and attribution are
-checked at both. The ceremony's use of the guard's recognition is pinned by
-`tools/native-host-measurement/check_watch_ceremony.py`, which CI does not run.
+checked at both. The unrecognised-location warning fires, including behind the desktop app; it
+stays silent with no helper or for a near-miss name; and it gives way to a recognised helper's
+note. Two checks under `tools/`, which CI does not run, cover the tools.
+`tools/native-host-measurement/check_watch_ceremony.py` pins that the ceremony picks exactly
+the processes the guard recognises. `tools/check_signed_helper_optin.py`'s live leg ran on
+2026-10-17 against the installed helper and read it signed.
 
 ### The lister, and its two deliberate costs
 
