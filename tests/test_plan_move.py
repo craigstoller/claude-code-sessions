@@ -656,6 +656,46 @@ class TestClaudeRunningNarrowing:
         assert exe in note
         assert "the process above" not in note
 
+    # A helper at a location nothing recognises (ruled 2026-10-17): the next
+    # layout move must announce itself instead of failing closed in silence. The
+    # warning only advises - the process keeps counting, as the look-alike and
+    # version-segment tests above already pin.
+
+    def test_unrecognised_helper_gets_a_warning_of_its_own(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        self._packaged_root(env, tmp_path)
+        moved = os.path.join(str(tmp_path).lower(), "packages", "claude_x",
+                             "localcache", "roaming", "claude-helper-next",
+                             "chrome-native-host.exe")
+        note = ct.helper_hash_note([moved], env)
+        assert moved in note
+        assert "not at a location this version recognises" in note
+        assert "Chrome or Edge" in note
+
+    def test_unrecognised_helper_warning_finds_it_behind_the_desktop_app(
+            self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        moved = "c:\\somewhere\\claude-elsewhere\\chrome-native-host.exe"
+        note = ct.helper_hash_note([DESKTOP_EXE, moved], env)
+        assert moved in note
+        assert DESKTOP_EXE not in note
+
+    def test_no_helper_warning_without_a_helper(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        assert ct.helper_hash_note([DESKTOP_EXE], env) == ""
+        assert ct.helper_hash_note(
+            ["c:\\tools\\claude-chrome-native-host.exe.bak"], env) == ""
+
+    def test_recognised_helper_note_wins_over_the_unrecognised_warning(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        exe = self._versioned_helper(env, tmp_path, content=b"a-newer-build")
+        moved = "c:\\somewhere\\claude-elsewhere\\chrome-native-host.exe"
+        note = ct.helper_hash_note([moved, exe], env)
+        assert exe in note and "different binary" in note
+        assert "not at a location this version recognises" not in note
+
     def test_helper_note_at_the_old_layout_names_the_browser_too(
             self, mkenv, tmp_path, measured_hash):
         env = mkenv(tmp_path)

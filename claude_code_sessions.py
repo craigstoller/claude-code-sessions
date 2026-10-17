@@ -894,23 +894,59 @@ def _expected_helper_paths(env):
     copied to C:\\tmp\\packages\\claude_x\\localcache\\roaming\\claude\\
     chromenativehost\\chrome-native-host.exe would have been excused. The
     "out-of-path binaries still count" guarantee was not actually enforced.
+
+    A candidate that is not an absolute path derives nothing. With APPDATA unset
+    the classic candidate is the relative Claude\\claude-code-sessions, and abspath
+    resolved its helper location against whatever the working directory was.
     """
     out = set()
     for cand in getattr(env, "store_candidates", ()) or ():
+        if not os.path.isabs(cand):
+            continue
         parent = os.path.dirname(cand)
         out.add(os.path.normcase(os.path.abspath(
             os.path.join(parent, "ChromeNativeHost", "chrome-native-host.exe"))))
     return out
 
 
+# Amendment 2026-10-17 (docs/internals.md). Desktop 2.42304 moved the helper to
+# <Roaming>\Claude-NativeHost\<version>\chrome-native-host.exe, <Roaming> being the
+# folder that holds the store's Claude folder. The guard stopped recognising it, so
+# neither ruling was reached and the signed-helper opt-in silently stopped working.
+# The version folder is constrained to the naming the app was seen to use - dotted
+# ASCII digits, matched whole; \d would also accept other scripts' digits. That is a
+# narrowing, not a boundary: the folder carries the store's own ACL, so whoever can
+# plant a binary there can already plant one at the old location.
+_HELPER_NAME = "chrome-native-host.exe"
+_NATIVE_HOST_DIR = "Claude-NativeHost"
+_HELPER_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
+
+def _expected_native_host_dirs(env):
+    """The versioned layout's Claude-NativeHost folder(s), derived from the same
+    store candidates as _expected_helper_paths and skipping relative ones for the
+    same reason."""
+    out = set()
+    for cand in getattr(env, "store_candidates", ()) or ():
+        if not os.path.isabs(cand):
+            continue
+        roaming = os.path.dirname(os.path.dirname(cand))
+        out.add(os.path.normcase(os.path.abspath(
+            os.path.join(roaming, _NATIVE_HOST_DIR))))
+    return out
+
+
 def _looks_like_chrome_helper(text, env):
     """True when TEXT is the helper's own image path at a REAL store root.
 
-    Exact match against _expected_helper_paths, not a substring or segment test.
-    A lister entry carrying trailing arguments (POSIX `ps` reports whole command
-    lines) will not equal a path and therefore falls through to counting, which
-    is the safe direction - a process merely NAMING the helper must never
-    inherit its exclusion.
+    The old location is an exact match against _expected_helper_paths. The
+    versioned one is exact but for the version: the grandparent must equal a
+    derived Claude-NativeHost folder, the parent's name must be dotted ASCII
+    digits, and the basename must be the helper's. Neither is a substring or
+    segment test. A lister entry carrying trailing arguments (POSIX `ps` reports
+    whole command lines) will not match either and therefore falls through to
+    counting, which is the safe direction - a process merely NAMING the helper
+    must never inherit its exclusion.
     """
     if not text:
         return False
@@ -922,7 +958,12 @@ def _looks_like_chrome_helper(text, env):
     if os.sep == "\\":
         text = text.replace("/", "\\")
     norm = os.path.normcase(os.path.abspath(text))
-    return norm in _expected_helper_paths(env)
+    if norm in _expected_helper_paths(env):
+        return True
+    version_dir = os.path.dirname(norm)
+    return (os.path.basename(norm) == os.path.normcase(_HELPER_NAME)
+            and _HELPER_VERSION_RE.fullmatch(os.path.basename(version_dir)) is not None
+            and os.path.dirname(version_dir) in _expected_native_host_dirs(env))
 
 
 def _measured_helper_state(text, env):
@@ -1052,30 +1093,60 @@ def _signed_helper_state(text):
     return "signed" if cn == _HELPER_PUBLISHER and org == _HELPER_PUBLISHER else "unsigned"
 
 
+_HELPER_LAUNCHED_BY = (
+    "A browser running the Claude extension (Chrome or Edge) launches it, and it can "
+    "outlive the desktop app. Closing every browser that runs the extension should "
+    "stop it.")
+
+
+def _named_like_helper(text):
+    """The entry's last path component is the helper's file name. Note-only: this
+    decides whether to WARN about a helper nothing recognises, never whether to
+    excuse one. Both separators are split on whatever the platform, because the
+    helper is a Windows binary and its path is a Windows path."""
+    return re.split(r"[\\/]", text or "")[-1].lower() == _HELPER_NAME
+
+
 def helper_hash_note(running, env):
-    """Explain a helper that is counted because it is not the measured build."""
+    """Explain a helper that is counted: one that is not the measured build, or,
+    failing that, one at a location this version does not recognise.
+
+    The helper is named by its path, never as "the process above": the refusal
+    prints only the first process it found, which may be the desktop app."""
     for text in running:
         state = _measured_helper_state(text, env)
         if state in ("changed", "unreadable"):
             note = (
-                "\nNote: the process above is the desktop app's Chrome-extension "
-                "helper. A measured build of it is excluded from this guard, but this "
-                "one {0} - the helper auto-updates in place, so an exclusion cannot "
-                "carry over to code that was never measured. Closing Chrome clears "
-                "this. To restore the exclusion, re-measure with "
+                "\nNote: {0} is the desktop app's browser-extension helper. {1} A "
+                "measured build of it is excluded from this guard, but this one {2} - "
+                "the helper auto-updates, so an exclusion cannot carry over to code "
+                "that was never measured. To restore the exclusion, re-measure with "
                 "tools/native-host-measurement/watch_ceremony.py (about 12 minutes) "
                 "and update _HELPER_SHA256.".format(
+                    text, _HELPER_LAUNCHED_BY,
                     "could not be read" if state == "unreadable"
                     else "is a different binary"))
             if not signed_helper_trust_enabled(env):
                 note += (
                     "\nThe helper updates every few days, so re-measuring each time is "
                     "usually not worth it. The alternative is to trust any helper at "
-                    "this path that Windows reports as validly signed by Anthropic, "
-                    "PBC - weaker than measured bytes, and OFF by default because it "
-                    "rests on evidence you have not examined. Turn it on with:\n"
+                    "the app's own helper location that Windows reports as validly "
+                    "signed by Anthropic, PBC - weaker than measured bytes, and OFF by "
+                    "default because it rests on evidence you have not examined. Turn "
+                    "it on with:\n"
                     "   claude-code-sessions trust-signed-helper --on")
             return note
+    # Ruled 2026-10-17: the next layout move must announce itself. This only
+    # advises - the process keeps counting either way.
+    for text in running:
+        if _named_like_helper(text) and _measured_helper_state(text, env) is None:
+            return (
+                "\nNote: {0} is named like the desktop app's browser-extension helper "
+                "but is not at a location this version recognises, so neither the "
+                "measured-build exclusion nor the signed-helper opt-in can apply to "
+                "it. {1} If it is the app's own helper, the app may have moved it "
+                "again; reporting the location lets the guard follow it.".format(
+                    text, _HELPER_LAUNCHED_BY))
     return ""
 
 
