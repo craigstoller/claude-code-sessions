@@ -32,7 +32,10 @@ measuring session was hosted by the desktop app, so closing the app killed the
 measurement. This script walks its own ancestry and refuses to start from inside
 the app's process tree.
 
-No elevation. Run from your own terminal. Python 3.9+, stdlib only, Windows.
+No elevation. Run from your own terminal. Python 3.9+, Windows, the standard
+library plus this repository's own claude_code_sessions.py, whose rule for
+recognising the helper is used here: run it from a source checkout, where this
+folder sits two levels below that module (tools/ does not ship in the package).
 """
 
 import argparse
@@ -87,8 +90,29 @@ NOTIFY_FILTER = (0x001 | 0x002 | 0x004 | 0x008 | 0x010 | 0x040 | 0x100)
 ACTIONS = {1: "ADDED", 2: "REMOVED", 3: "MODIFIED", 4: "RENAMED_OLD", 5: "RENAMED_NEW"}
 
 APP_IMAGE_RE = r"\windowsapps\claude_"          # the MSIX app EXECUTES from here
-HELPER_TAIL = r"\chromenativehost\chrome-native-host.exe"
 CANARY_PREFIX = ".ccs-watch-canary-"
+
+# The helper is recognised by the guard's own rule, not by a copy of it here. This
+# file used to carry its own path-tail test plus a \packages\claude_ anchor, and that
+# second definition drifted: when Desktop 2.42304 moved the helper to
+# <Roaming>\Claude-NativeHost\<version>\, the ceremony stopped seeing it and waited
+# at "helper running" forever. One rule means the instrument and the guard cannot
+# disagree about which process is the helper (docs/internals.md, Amendment 2026-10-17).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+import claude_code_sessions as ccs  # noqa: E402
+
+_GUARD_ENV = None
+
+
+def is_helper(path, env=None):
+    """True when PATH is the helper at a location the guard itself recognises."""
+    global _GUARD_ENV
+    if env is None:
+        if _GUARD_ENV is None:
+            _GUARD_ENV = ccs.default_env()
+        env = _GUARD_ENV
+    return bool(path) and ccs._looks_like_chrome_helper(path, env)
 # The mapped-write control's own file is control traffic too. The first run classified it
 # as REAL traffic, which meant our own control could satisfy the "watcher sees genuine
 # store writes" check -- a control validating itself.
@@ -146,10 +170,9 @@ def app_procs(table=None):
             if p and APP_IMAGE_RE in p.lower()}
 
 
-def helper_procs(table=None):
+def helper_procs(table=None, env=None):
     t = table if table is not None else process_table()
-    return {pid: p for pid, (_, _, p) in t.items()
-            if p and p.lower().endswith(HELPER_TAIL)}
+    return {pid: p for pid, (_, _, p) in t.items() if is_helper(p, env)}
 
 
 def open_exit_watch(pid):
@@ -550,7 +573,7 @@ def run_ceremony(outdir, hold_minutes):
 
     helpers = helper_procs(table)
     if not helpers:
-        print("\nHelper not running. Open Chrome and use the Claude extension once.")
+        print("\nHelper not running. Open Chrome or Edge and use the Claude extension once.")
         wait_gate(lambda: helper_procs(), "chrome-native-host.exe running")
         helpers = helper_procs()
     distinct = sorted(set(helpers.values()))
@@ -563,10 +586,8 @@ def run_ceremony(outdir, hold_minutes):
             print("   ", p)
         return 2
     helper_path = distinct[0]
-    anchor = r"\packages\claude_"
-    lp = helper_path.lower()
-    if anchor not in lp or not lp.endswith(HELPER_TAIL):
-        print("REFUSING: helper image is not under the anchored package path chain:",
+    if not is_helper(helper_path):
+        print("REFUSING: helper image is not at a location the guard recognises:",
               helper_path)
         return 2
     st = os.stat(helper_path)
@@ -600,8 +621,8 @@ def run_ceremony(outdir, hold_minutes):
         print("  mapped-section write control caught by snapshot pipeline:", mapped_caught)
         d1 = ask("Use the DESKTOP APP briefly (new chat + a throwaway message) so its own "
                  "store writes are observed. Describe what you did")
-        d2 = ask("Now use the CHROME EXTENSION several times. What did you do, how many "
-                 "round trips?")
+        d2 = ask("Now use the Claude extension in that browser several times. What did "
+                 "you do, how many round trips?")
         phase("p1_end")
 
         print("\n=== PHASE 2 - close the desktop app; the helper must SURVIVE ===")
@@ -617,7 +638,7 @@ def run_ceremony(outdir, hold_minutes):
             snap_start = {r: snapshot(r, hb.names) for r in roots}
             phase("app_closed_helper_alive")
             print("Holding the helper-only window for %d minute(s)." % hold_minutes)
-            print("USE THE CHROME EXTENSION during this window.")
+            print("USE THE BROWSER EXTENSION during this window.")
             deadline = time.time() + hold_minutes * 60
             while time.time() < deadline:
                 time.sleep(5)
@@ -631,12 +652,14 @@ def run_ceremony(outdir, hold_minutes):
                      "and how many?")
             phases["window_workload"] = d3
 
-            print("\n=== PHASE 3 - exit Chrome; let the helper close ITSELF ===")
-            print("The helper shuts down when Chrome disconnects (EOF). Its shutdown path is")
-            print("a plausible moment for a write, which is why this leg exists.")
+            print("\n=== PHASE 3 - exit the browser; let the helper close ITSELF ===")
+            print("The helper shuts down when the browser that launched it disconnects (EOF);")
+            print("measured for Chrome, expected for Edge. Its shutdown path is a plausible")
+            print("moment for a write, which is why this leg exists.")
             print("*** Do NOT End Task on chrome-native-host.exe. Killing it skips the very")
             print("*** shutdown code this phase is here to observe.")
-            ask("Fully exit Chrome now (all windows; check the tray). Press Enter when done")
+            ask("Fully exit the browser that launched the helper, Chrome or Edge (all "
+                "windows; check the tray). Press Enter when done")
             wait_gate(lambda: not helper_procs(), "helper exited")
             phase("helper_exited")
             helper_exit = read_exit_code(helper_watch)

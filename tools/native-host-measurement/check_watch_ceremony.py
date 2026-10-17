@@ -1,6 +1,6 @@
 """Verdict tests after the review fixes, including the false-PASS routes Codex found."""
 import sys, os, tempfile, shutil, mmap
-sys.path.insert(0, r"C:\Users\craig\Projects\_Tools\claude-code-sessions\tools\native-host-measurement")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib, watch_ceremony
 importlib.reload(watch_ceremony)
 from watch_ceremony import verdict, snapshot, diff_snapshots, mapped_write_control
@@ -101,6 +101,35 @@ after = snapshot(d, set())
 dd = diff_snapshots(before, after)
 print("diff on a 9 MB in-place mapped write:", {k: dd[k] for k in ("added", "changed")})
 ok.append(bool(dd["changed"]))
+shutil.rmtree(d, ignore_errors=True)
+
+print("\n--- the ceremony recognises the helper exactly where the guard does ---")
+# A second definition of "the helper" drifted once: when the app moved it to
+# <Roaming>\Claude-NativeHost\<version>\, this tool's own path-tail test stopped
+# seeing it and the ceremony waited at "helper running" forever.
+ccs = watch_ceremony.ccs
+d = tempfile.mkdtemp(prefix="wc-")
+root = os.path.join(d, "packages", "claude_x", "localcache", "roaming", "claude",
+                    "claude-code-sessions")
+roaming = os.path.dirname(os.path.dirname(root))
+genv = ccs.Env(home=d, projects_root=d, store_candidates=[root], ops_dir=d,
+               moved_log=d, is_windows=True, process_lister=lambda: [],
+               now=lambda: 0.0)
+paths = {
+    1: os.path.join(os.path.dirname(root), "ChromeNativeHost", "chrome-native-host.exe"),
+    2: os.path.join(roaming, "Claude-NativeHost", "2.42304.0", "chrome-native-host.exe"),
+    3: os.path.join(d, "tmp", "packages", "claude_x", "localcache", "roaming",
+                    "Claude-NativeHost", "2.42304.0", "chrome-native-host.exe"),
+    4: os.path.join(roaming, "Claude-NativeHost", "2.42304.0-beta", "chrome-native-host.exe"),
+}
+table = {pid: (0, "chrome-native-host.exe", p) for pid, p in paths.items()}
+got = sorted(watch_ceremony.helper_procs(table, genv))
+print("helper_procs picks the old and new locations only:", got)
+ok.append(got == [1, 2])
+agree = all(watch_ceremony.is_helper(p, genv) == ccs._looks_like_chrome_helper(p, genv)
+            for p in paths.values())
+print("is_helper agrees with the guard on every path:", agree)
+ok.append(agree)
 shutil.rmtree(d, ignore_errors=True)
 
 print()

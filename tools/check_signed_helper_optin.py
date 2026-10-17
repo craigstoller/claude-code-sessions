@@ -81,18 +81,34 @@ finally:
 # ------------------------------------------------- the real signature reader
 if sys.platform == "win32":
     import glob
-    found = glob.glob(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Packages",
-                                   "Claude_*", "LocalCache", "Roaming", "Claude",
-                                   "ChromeNativeHost", "chrome-native-host.exe"))
+    # Look wherever the guard looks: both layouts, under every store candidate
+    # the guard derives from (packaged and classic). A glob of one packaged path
+    # skipped this check without failing when Desktop 2.42304 moved the helper.
+    # Only paths the guard itself recognises are kept.
+    real_env = ccs.default_env()
+    found = []
+    for cand in real_env.store_candidates:
+        claude_dir = os.path.dirname(cand)
+        found += glob.glob(os.path.join(claude_dir, "ChromeNativeHost",
+                                        "chrome-native-host.exe"))
+        found += glob.glob(os.path.join(os.path.dirname(claude_dir),
+                                        "Claude-NativeHost", "*",
+                                        "chrome-native-host.exe"))
+    found = sorted({p.lower() for p in found
+                    if ccs._looks_like_chrome_helper(p, real_env)})
     if found:
-        p = found[0].lower()
-        subj = ccs._authenticode_publisher(p)
-        check("the real helper reads as validly signed", bool(subj),
-              (subj or "no verdict")[:50])
-        check("  and names the expected publisher",
-              ccs._signed_helper_state(p) == "signed")
+        # Every recognised helper, not the first: with both layouts on disk the
+        # old one would sort first and the one the browser launches go unread.
+        for p in found:
+            subj = ccs._authenticode_publisher(p)
+            check("a real helper reads as validly signed", bool(subj),
+                  "%s: %s" % (os.path.basename(os.path.dirname(p)),
+                              (subj or "no verdict")[:40]))
+            check("  and names the expected publisher",
+                  ccs._signed_helper_state(p) == "signed")
     else:
-        print("--  no helper on this machine; live signature check skipped")
+        print("--  no helper under any of the %d store candidate(s); live signature "
+              "check skipped" % len(real_env.store_candidates))
     # a file that is certainly not signed
     unsigned = os.path.join(root, "not-signed.exe")
     with open(unsigned, "wb") as fh:
