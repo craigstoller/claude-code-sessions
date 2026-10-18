@@ -145,7 +145,7 @@ consist only of `[0-9a-f-]` after lowercasing. A pair-shaped query is resolved s
   hex-only half, so neither can be captured by accident.
 
 Consequences, intended: the printed 8-char form works, the full-uuid form works, and so does
-any unambiguous prefix pair (`d0fc/ef43`-style) — anchored prefixes are what a human
+any unambiguous prefix pair (`aaaa/cccc`-style) — anchored prefixes are what a human
 shortening an id actually types. If two stores genuinely share both prefixes, the ordinary
 >1-match refusal fires, which is the correct outcome.
 
@@ -303,7 +303,7 @@ naming account B beside the store root, matching `_identity_disagreement`'s read
 9. `test_mid_uuid_fragment_pair_is_refused` — `--live "1111/cccc"` (left half not a prefix)
    is refused with the candidate listing, proving pair-shaped queries never fall back to
    substring matching.
-10. `test_non_hex_slash_query_stays_substring` — a query like `Users/craig` (non-hex halves)
+10. `test_non_hex_slash_query_stays_substring` — a query like `Users/alice` (non-hex halves)
     is not treated as a pair; existing path-substring behavior is unchanged.
 11. `test_pair_form_resolves_sync_to` (`tests/test_sync.py`) — `--to` accepts the printed
     form.

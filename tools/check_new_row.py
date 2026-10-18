@@ -84,7 +84,7 @@ def prose(n):
 
 
 OPENER = rec("user", "the opening message, long enough to be a real one",
-             ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal")
+             ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal")
 
 
 # ------------------------------------------------------------ transcript facts
@@ -115,7 +115,7 @@ check("_iso_ms returns None for something unparseable, per its documented contra
 root, env, live, dorm = build([OPENER] + prose(8))
 f = ccs._transcript_facts(env, SID)
 check("cwd comes from the transcript",
-      f["cwd"] == r"C:\Users\craig\Projects\Personal", f["cwd"])
+      f["cwd"] == r"C:\Users\alice\Projects\Personal", f["cwd"])
 check("createdAt is the FIRST record in sequential order, not the earliest",
       f["created_ms"] == ccs._iso_ms("2026-06-14T09:00:00.000Z"), str(f["created_ms"]))
 check("lastActivityAt is the LAST record in sequential order",
@@ -155,7 +155,7 @@ shutil.rmtree(root, ignore_errors=True)
 # distinct customTitle - 9%, not a corner case.
 root, env, live, dorm = build([
     rec("user", "the opening message, long enough to be a real one",
-        ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+        ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal",
         custom="Task manager performance audit"),
     rec("assistant", "a reply long enough to count as a real message",
         ts="2026-06-14T09:30:00.000Z", model="claude-fable-5"),
@@ -198,8 +198,8 @@ EXPECTED = {
     "cliSessionId": SID,
     "title": "A title",
     "titleSource": "user",
-    "cwd": r"C:\Users\craig\Projects\Personal",
-    "originCwd": r"C:\Users\craig\Projects\Personal",
+    "cwd": r"C:\Users\alice\Projects\Personal",
+    "originCwd": r"C:\Users\alice\Projects\Personal",
     "createdAt": ccs._iso_ms("2026-06-14T09:00:00.000Z"),
     "lastActivityAt": ccs._iso_ms("2026-06-14T10:08:00.000Z"),
     "lastFocusedAt": ccs._iso_ms("2026-06-14T10:08:00.000Z"),
@@ -255,7 +255,7 @@ shutil.rmtree(root, ignore_errors=True)
 # ------------------------------------------------------------ titles
 print("\n--- title derivation ---")
 
-FACTS = {"cwd": r"C:\Users\craig\Projects\Personal", "created_ms": 0,
+FACTS = {"cwd": r"C:\Users\alice\Projects\Personal", "created_ms": 0,
          "last_ms": ccs._iso_ms("2026-06-14T10:08:00.000Z"), "turns": 181,
          "custom_title": None, "path": "x", "model": "claude-fable-5",
          "effort": "xhigh"}
@@ -295,9 +295,9 @@ check("a Windows cwd yields its leaf on ANY host, not the whole path",
       ccs._placeholder_title(FACTS).endswith("Personal)"),
       ccs._placeholder_title(FACTS))
 check("  and a POSIX cwd works the same way",
-      ccs._placeholder_title(dict(FACTS, cwd="/home/craig/Projects/Personal"))
+      ccs._placeholder_title(dict(FACTS, cwd="/home/alice/Projects/Personal"))
       == "(untitled - 2026-06-14, 181 turns, Personal)",
-      ccs._placeholder_title(dict(FACTS, cwd="/home/craig/Projects/Personal")))
+      ccs._placeholder_title(dict(FACTS, cwd="/home/alice/Projects/Personal")))
 
 check("an uncountable transcript says so rather than claiming a number",
       ccs._placeholder_title(dict(FACTS, turns=None))
@@ -404,7 +404,7 @@ shutil.rmtree(root, ignore_errors=True)
 # disagree with.
 root, env, live, dorm = build(
     [rec("user", "typed a prompt and closed the app before any reply",
-         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal")])
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal")])
 refusal("a transcript with no assistant reply refuses, naming why",
         lambda: ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID)),
         "no assistant reply")
@@ -468,7 +468,7 @@ shutil.rmtree(root, ignore_errors=True)
 # technical constraint. completedTurns takes 0 and the placeholder renders it.
 root, env, live, dorm = build(
     [rec("system", None, ts="2026-06-14T09:00:00.000Z",
-         cwd=r"C:\Users\craig\Projects\Personal", model="claude-fable-5")])
+         cwd=r"C:\Users\alice\Projects\Personal", model="claude-fable-5")])
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
 check("a transcript with zero prose turns is allowed", m["turns"] == 0)
 check("  and its placeholder says so", "0 turns" in m["title"], m["title"])
@@ -573,7 +573,7 @@ shutil.rmtree(root, ignore_errors=True)
 # title set rather than discarding it.
 root, env, live, dorm = build(
     [rec("user", "opening message long enough to count",
-         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal",
          custom="Shared name")] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
 check("the generated title was taken from the transcript", m["title"] == "Shared name")
@@ -592,7 +592,7 @@ shutil.rmtree(root, ignore_errors=True)
 # now called X - it appeared since this was planned" about its own row.
 root, env, live, dorm = build(
     [rec("user", "opening message long enough to count",
-         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal",
          custom="Self collision")] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
 ccs.run_new_row(env, m)
@@ -970,7 +970,7 @@ print("\n--- the report, and --json ---")
 
 root, env, live, dorm = build(
     [rec("user", "opening message long enough to count",
-         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\craig\Projects\Personal",
+         ts="2026-06-14T09:00:00.000Z", cwd=r"C:\Users\alice\Projects\Personal",
          custom="Their own title")] + prose(8))
 m = ccs.plan_new_row(env, ccs.NewRowFlags(to_session=SID))
 out = []
@@ -1554,7 +1554,7 @@ print("\n--- doctor recommends new-row for an unlisted transcript ---")
 # the point of this fixture: redact() only shortens ids matching the uuid
 # pattern, so every existing check here is blind to a truncated id - and these
 # lines hand the user a command to paste back.
-UUID_SID = "174eb7c1-879f-4f0e-abff-8fdc7210f3d9"
+UUID_SID = "a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5"
 
 
 def doctor_output(env, verbose=False):

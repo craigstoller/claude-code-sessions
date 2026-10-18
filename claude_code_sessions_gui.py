@@ -2563,7 +2563,7 @@ class SyncApp:
         """(org_token, whole_line) for each candidate in a 'name one with --to'
         refusal. Candidate lines look like:
 
-            dd44e101/53346e14   (286 rows)          ~\\...\\dd44e101...\\53346e14...
+            bbbb2222/dddd4444   (286 rows)          ~\\...\\bbbb2222...\\dddd4444...
 
         The whole line becomes the button text, so the row count and any
         [shares your signed-in org] tag travel with it - those are exactly what
@@ -2600,7 +2600,7 @@ class SyncApp:
 
         The pair is resolved against the real store list rather than saved as-is,
         because BOTH halves are 8-character prefixes and neither is guaranteed
-        unique: saving a bare org id is what broke here - "ef430bfb" identified
+        unique: saving a bare org id is what broke here - "cccc3333" identified
         one store until a third account appeared, then matched two and every plan
         refused with a disabled Apply and no way forward in the window. A full
         path is unique by construction.

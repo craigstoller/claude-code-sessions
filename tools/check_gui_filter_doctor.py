@@ -136,9 +136,9 @@ check("  and the reason is shown", any("access denied" in l for l in lines))
 # was moved off the candidate line to stop it wrapping in a terminal, and the
 # GUI silently lost it - so on a three-account machine every empty candidate
 # rendered identically and the wrong one was picked. Pin the contract.
-LIVE_ORG = "53346e14" + "0" * 24
-a1, a2 = "250c8128" + "0" * 24, "d0fcaa6f" + "0" * 24
-o_own = "d4e23045" + "0" * 24
+LIVE_ORG = "dddd4444" + "0" * 24
+a1, a2 = "eeee5555" + "0" * 24, "aaaa1111" + "0" * 24
+o_own = "ffff6666" + "0" * 24
 d1 = os.path.join(root, "s1"); d2 = os.path.join(root, "s2")
 os.makedirs(d1, exist_ok=True); os.makedirs(d2, exist_ok=True)
 listing = ccs._candidate_listing([(a1, LIVE_ORG, d1), (a1, o_own, d2)],
@@ -149,7 +149,7 @@ check("  each entry carries a note field", all(len(c) == 3 for c in cands))
 warned = [c for c in cands if c[2]]
 check("  exactly the cross pair is warned", len(warned) == 1, str(len(warned)))
 check("  and it is the one sharing the signed-in org",
-      warned and warned[0][0].endswith("/53346e14"), warned[0][0] if warned else "-")
+      warned and warned[0][0].endswith("/dddd4444"), warned[0][0] if warned else "-")
 # the candidate token must be the FULL account/org pair, not a bare org id: a
 # saved org id stopped being unique the moment a third account appeared, and
 # every plan then refused with Apply disabled

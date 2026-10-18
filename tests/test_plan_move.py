@@ -714,14 +714,14 @@ class TestClaudeRunningNarrowing:
         (tmp_path / "a").mkdir()
         (tmp_path / "b").mkdir()
         listing = ct._candidate_listing(
-            [("d0fcaa6f" + "0" * 24, "53346e14" + "0" * 24, str(tmp_path / "a")),
-             ("d0fcaa6f" + "0" * 24, "ef430bfb" + "0" * 24, str(tmp_path / "b"))],
-            live_org="53346e14" + "0" * 24)
+            [("aaaa1111" + "0" * 24, "dddd4444" + "0" * 24, str(tmp_path / "a")),
+             ("aaaa1111" + "0" * 24, "cccc3333" + "0" * 24, str(tmp_path / "b"))],
+            live_org="dddd4444" + "0" * 24)
         rows = listing.splitlines()
         cross_at = [i for i, l in enumerate(rows)
-                    if l.startswith("   d0fcaa6f/53346e14")]
+                    if l.startswith("   aaaa1111/dddd4444")]
         own_at = [i for i, l in enumerate(rows)
-                  if l.startswith("   d0fcaa6f/ef430bfb")]
+                  if l.startswith("   aaaa1111/cccc3333")]
         assert cross_at and own_at
         # the marker is its own line directly UNDER the cross candidate: a
         # trailing suffix landed past column 155 and wrapped off-screen
@@ -758,7 +758,7 @@ class TestClaudeRunningNarrowing:
         # org to compare against; they must not imply one.
         (tmp_path / "a").mkdir()
         listing = ct._candidate_listing(
-            [("d0fcaa6f" + "0" * 24, "53346e14" + "0" * 24, str(tmp_path / "a"))])
+            [("aaaa1111" + "0" * 24, "dddd4444" + "0" * 24, str(tmp_path / "a"))])
         assert "[shares your signed-in org]" not in listing
 
     def test_forward_slash_cli_path_is_still_the_cli(self, mkenv, tmp_path):

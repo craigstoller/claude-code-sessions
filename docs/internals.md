@@ -86,7 +86,7 @@ accounts, 346 sessions present in more than one of them:
   `lastActivityAt`, permission and MCP fields. **No messages, no transcript excerpt, and no
   offset, cursor or checkpoint into the conversation.** There is nothing in a row with which
   the app *could* truncate history.
-- The decisive test: session "LinkedIn project structure", whose row read **28 Jun** in two
+- The decisive test: session "Quarterly board report finalization", whose row read **28 Jun** in two
   accounts and **3 Aug** in the third — 36 days apart. Opened under one of the stale rows, the
   full 3 August exchange rendered, including the five messages that postdate the row's own
   timestamp by more than a month.
@@ -108,8 +108,8 @@ whichever one that account last saw**. Two accounts can hold the same filename p
 entirely different conversations:
 
 ```
-local_a00afbc1-….json   in craig@foundryside.co    -> 0678aca4  17.9 MB, 1386 msgs, last used 19 Aug
-local_a00afbc1-….json   in claude@craigstoller.com -> c92ae7b1  13.0 MB,  738 msgs, last used 14 Aug
+local_a00afbc1-….json   in alice@example.com -> 0678aca4  17.9 MB, 1386 msgs, last used 19 Aug
+local_a00afbc1-….json   in bob@example.com   -> c92ae7b1  13.0 MB,  738 msgs, last used 14 Aug
 ```
 
 Both are titled "ACME-REVIEW session Northwind". Opening it under the second account does
@@ -117,7 +117,7 @@ not show a truncated version of the first — it shows **a different conversatio
 current as of its own last use. To a user that is indistinguishable from "my history is behind",
 and it is the far more serious failure: the newer conversation is intact on disk but
 **unreachable from that account's sidebar**. On this machine, **15 of 333 shared rows** were in
-that state, with the newer conversation on the foundryside side for 9 and the other side for 6.
+that state, with the newer conversation on the alice side for 9 and the other side for 6.
 
 Two consequences worth stating plainly:
 
@@ -460,10 +460,10 @@ and the split was clean:
 
 | store | rows |
 |---|---|
-| `d0fcaa6f/ef430bfb` — account with **its own** org | 266 |
-| `dd44e101/53346e14` — account with **its own** org | 315 |
-| `d0fcaa6f/53346e14` — **cross pair** | 0 |
-| `dd44e101/ef430bfb` — **cross pair** | 0 |
+| `aaaa1111/cccc3333` — account with **its own** org | 266 |
+| `bbbb2222/dddd4444` — account with **its own** org | 315 |
+| `aaaa1111/dddd4444` — **cross pair** | 0 |
+| `bbbb2222/cccc3333` — **cross pair** | 0 |
 
 Only the pairs joining an account to its own org ever held sessions. One cross pair was
 watched being created two minutes after a sync, containing exactly one file

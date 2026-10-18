@@ -82,17 +82,17 @@ def test_an_email_is_not_chewed_up_by_path_matching(
     """The second bug.
 
     Directory BASENAMES were in the substitution table, so short generic ones
-    matched inside unrelated text and rewrote `craig@foundryside.co` into
+    matched inside unrelated text and rewrote `alice@example.com` into
     `<project-b83d>@<project-7aa2>`. Over-matching corrupts the report while
     still looking like it worked.
     """
     env = mkenv(tmp_path)
-    write_transcript(env, "C--Users-craig-work", "s-1", [{"cwd": "C:\\Users\\craig\\work"}])
+    write_transcript(env, "C--Users-alice-work", "s-1", [{"cwd": "C:\\Users\\alice\\work"}])
     write_row(env, 0, "acct", "org", "local_1",
-              {"sessionId": "local_1", "cliSessionId": "s-1", "cwd": "C:\\Users\\craig\\work",
+              {"sessionId": "local_1", "cliSessionId": "s-1", "cwd": "C:\\Users\\alice\\work",
                "title": "Something", "lastActivityAt": 9})
     ct._ANONYMIZE = True
-    assert ct.anonymize(env, "craig@foundryside.co") == "craig@foundryside.co"
+    assert ct.anonymize(env, "alice@example.com") == "alice@example.com"
     assert ct.anonymize(env, "the work directory") == "the work directory"
 
 
@@ -102,10 +102,10 @@ def test_dict_keys_are_anonymised_not_just_values(mkenv, tmp_path):
     values left it in the key, one line below where it had been replaced."""
     env = mkenv(tmp_path)
     ct._ANONYMIZE = True
-    rep = {"per_account": {"craig@foundryside.co": 3},
-           "titles": {"Board complaint finalisation": {"craig@foundryside.co": ["s-1"]}}}
+    rep = {"per_account": {"alice@example.com": 3},
+           "titles": {"Board complaint finalisation": {"alice@example.com": ["s-1"]}}}
     out = ct.anonymize_report(env, rep)
-    assert "craig@foundryside.co" not in json.dumps(out)
+    assert "alice@example.com" not in json.dumps(out)
     assert list(out["per_account"])[0].startswith("<account-")
 
 

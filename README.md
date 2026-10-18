@@ -162,7 +162,7 @@ alone cannot tell you which copy answered:
 ```
 $ ccs --version
 claude-code-sessions 0.10.0
-running from: C:\Users\craig\AppData\Local\pipx\...\claude_code_sessions.py
+running from: C:\Users\<name>\AppData\Local\pipx\...\claude_code_sessions.py
 ```
 
 **`list`** - inventory sessions, optionally filtered by a search term:
@@ -234,7 +234,7 @@ at. The app must be closed either way, and `undo` puts the old pointer back.
 **`new-row`** - create a sidebar row for a conversation that has none:
 
 ```
-ccs new-row --to 174eb7c1-879f-4f0e-abff-8fdc7210f3d9
+ccs new-row --to a1b2c3d4-e5f6-4a7b-8c9d-e0f1a2b3c4d5
 ```
 
 `repoint` moves an existing row and `sync` copies one between accounts; neither can

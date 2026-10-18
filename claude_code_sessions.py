@@ -2980,8 +2980,8 @@ def _anon_pairs(env):
         c = (r.cwd or "").strip()
         if len(c) >= _ANON_MIN:
             # WHOLE paths only. Mapping the basename too seemed thorough and
-            # was actively harmful: "craig" and "Projects" are basenames, so
-            # the line pass rewrote 'craig@foundryside.co' into nonsense.
+            # was actively harmful: "alice" and "Projects" are basenames, so
+            # the line pass rewrote 'alice@example.com' into nonsense.
             # Over-matching corrupts the report; the structured pass below is
             # what actually guarantees coverage.
             seen.setdefault(c, _anon_label("project", c))
@@ -3986,7 +3986,7 @@ def cmd_doctor(env, ns):
                 "(op {1}, {2})".format(v["title"], v["op_id"], v["store_label"]))
         # say_ids, not say. redact() shortens a uuid-shaped id to eight
         # characters, and these lines hand the user a command to type back -
-        # `new-row --to 174eb7c1…` is not a command. Same reason the ranked
+        # `new-row --to a1b2c3d4…` is not a command. Same reason the ranked
         # orphan block above uses say_ids; this branch was written with say and
         # never noticed, because every test id here is 32 digits with no hyphens
         # and the uuid pattern does not match one.
@@ -6656,7 +6656,7 @@ def _placeholder_title(facts):
     day = time.strftime("%Y-%m-%d", time.gmtime((facts["last_ms"] or 0) / 1000.0))
     # Split on BOTH separators, never os.path.basename. The cwd comes out of a
     # transcript, not off this filesystem, so a store synced from Windows can
-    # hand a POSIX machine `C:\Users\craig\Projects\Personal` - where basename
+    # hand a POSIX machine `C:\Users\alice\Projects\Personal` - where basename
     # finds no `/`, returns the whole string, and the "placeholder" becomes an
     # absolute path. The test below pins a Windows cwd precisely so this stays
     # correct when the suite runs on macOS or Linux.

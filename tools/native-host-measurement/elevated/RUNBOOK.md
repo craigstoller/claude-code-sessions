@@ -27,7 +27,7 @@ helper survives, then exercising the extension.
 1. Open **your own** Windows Terminal / PowerShell — NOT a terminal inside any Claude
    surface. Run:
 
-       pwsh -File "C:\Users\craig\Projects\_Tools\claude-code-sessions\tools\native-host-measurement\elevated\run-elevated-capture.ps1"
+       pwsh -File "C:\Users\<name>\Projects\_Tools\claude-code-sessions\tools\native-host-measurement\elevated\run-elevated-capture.ps1"
 
    It relaunches itself elevated (one UAC prompt) and from there walks you through numbered
    phases, recording a UTC timestamp for every step into `workload-timeline.json`. Follow
