@@ -952,6 +952,16 @@ window into `journaled`/`completed`/`rolled_back`.
   what a desktop session leaves behind when it enters a second worktree and is later
   resumed in the one its sidebar row remembers: the copy in the second worktree stops
   growing. It was seen twice on one machine in October.
+- **0.16.2 puts the fake cast everywhere, and the helper note on every refusal.** Examples and
+  fixtures across the repository, from the README to the tests and the check scripts, now use
+  the project's fake cast rather than values read off the maintainer's own machine: account and
+  store identifiers, an address, a Windows user path, a sidebar title and a session id. Nothing
+  about what the tool reads, writes or refuses changed, and every test still exercises what it
+  did. Also, from the browser-helper work: the note that explains a counted helper now appears
+  on `move`, `undo` and `recover` refusals, not only on converge and sync; when the signed-helper
+  opt-in is on and a helper still counts, the note says why; and the opt-in's wording, in this
+  README, the window's checkbox and the command's help, says Chrome or Edge, since either can
+  launch the helper. Three constants left unused since the August anti-fabrication fix are gone.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
