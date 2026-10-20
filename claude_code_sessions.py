@@ -58,15 +58,19 @@ class Env:
     # moved (_windows_store_layout). Discovery names any that still exists and
     # reads the app's marker in its folder; it never reads rows from one.
     superseded_stores: list = dataclasses.field(default_factory=list)
+    # What could not be looked at while the layout was built. Discovery reports
+    # each as an error, every time: a failure that later clears must not be read
+    # as "nothing there".
+    layout_errors: list = dataclasses.field(default_factory=list)
 
 
 def default_env():
     home = os.path.expanduser("~")
-    superseded = []
+    superseded, layout_errors = [], []
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA", "")
         appdata = os.environ.get("APPDATA", "")
-        candidates, superseded = _windows_store_layout(local, appdata)
+        candidates, superseded, layout_errors = _windows_store_layout(local, appdata)
         helper_roots = _windows_helper_roots(local, appdata)
     elif sys.platform == "darwin":
         support = os.path.join(home, "Library", "Application Support")
@@ -88,6 +92,7 @@ def default_env():
         now=time.time,
         helper_roots=helper_roots,
         superseded_stores=superseded,
+        layout_errors=layout_errors,
     )
 
 
@@ -101,8 +106,9 @@ _MOVED_MARKER_PREFIX = ".user-data-left."
 
 
 def _windows_store_layout(localappdata, appdata):
-    """(candidates, superseded): where the store may be on Windows, in the order
-    it is read, and the old stores deliberately left unread.
+    """(candidates, superseded, errors): where the store may be on Windows, in
+    the order it is read; the old stores deliberately left unread; and what
+    could not be looked at.
 
     Candidates:
     1. Each moved data root, %LOCALAPPDATA%\\Claude-Data\\claude_<pkg>\\: every
@@ -110,10 +116,10 @@ def _windows_store_layout(localappdata, appdata):
        store or not, as the classic candidate always was: discovery then proves
        a missing store there, reads the app's marker beside it, and the identity
        checks read that root's own config.json. When Claude-Data exists but
-       cannot be listed, nobody can say which packages moved, so the folder
-       itself goes in as a candidate's parent: discovery fails to list it the
-       same way and reports "error" rather than reading an old store as though
-       nothing had moved.
+       cannot be listed, nobody can say which packages moved: that goes in
+       `errors`, which the Env carries and discovery reports as an error every
+       time - so an old store is never read as though nothing had moved, even
+       if a later listing would succeed.
     2. Each packaged data folder from before the move,
        ...\\Packages\\Claude_<pkg>\\LocalCache\\Roaming\\Claude\\, listed whenever
        it exists, store or not, so the marker the app leaves there is read -
@@ -131,7 +137,7 @@ def _windows_store_layout(localappdata, appdata):
     look-alike tree would become a store. Glob metacharacters in either are
     escaped, so a folder name holding "[" is read as written.
     """
-    moved, old, superseded = [], [], []
+    moved, old, superseded, errors = [], [], [], []
     if localappdata and os.path.isabs(localappdata):
         moved_parent = os.path.join(localappdata, _MOVED_DATA_DIR)
         moved_pkgs = set()
@@ -139,10 +145,11 @@ def _windows_store_layout(localappdata, appdata):
             names = os.listdir(moved_parent)
         except FileNotFoundError:
             names = []
-        except OSError:
+        except OSError as exc:
             names = None
+            errors.append("{0}: {1} - cannot tell which packages' data moved"
+                          .format(moved_parent, exc))
         if names is None:
-            moved = [moved_parent]       # discovery reports it as unreadable
             moved_pkgs = None
         else:
             moved = sorted(os.path.join(moved_parent, n) for n in names
@@ -163,7 +170,7 @@ def _windows_store_layout(localappdata, appdata):
     classic = ([os.path.join(appdata, "Claude", "claude-code-sessions")]
                if appdata and os.path.isabs(appdata) else [])
     return ([os.path.join(p, "claude-code-sessions") for p in moved] + old + classic,
-            superseded)
+            superseded, errors)
 
 
 def _windows_store_candidates(localappdata, appdata):
@@ -395,7 +402,8 @@ def discover_stores(env):
     # installed the desktop app has no %APPDATA%\Claude parent at all - that is
     # the normal CLI-only case, not an error). Any OTHER OSError means "couldn't
     # look", which is never "nothing there".
-    roots, errors, seen, markers = [], [], set(), set()
+    roots, seen, markers = [], set(), set()
+    errors = list(getattr(env, "layout_errors", ()) or ())
     for cand in env.store_candidates:
         try:
             os.listdir(cand)                       # store exists and is enumerable
@@ -431,7 +439,7 @@ def discover_stores(env):
             continue                               # advisory: nothing decides on it
         markers.update(os.path.join(os.path.dirname(old), n) for n in names
                        if n.startswith(_MOVED_MARKER_PREFIX))
-        if "claude-code-sessions" in names:
+        if any(n.lower() == "claude-code-sessions" for n in names):
             left_behind.append(old)
     if errors:
         return StoreDiscovery("error", roots, "; ".join(errors))
