@@ -15,9 +15,17 @@ a bare "Refused". The maintainer's ruling of 2026-10-20 (docs/internals.md,
 3. A saved store whose account is now signed in is named rather than asked
    about; the candidate with the saved ids is marked.
 
-Real planning (plan_sync over the synthetic stores), inline "threads", the
-preference file in a temp folder, and every dialog answered by a script.
-Touches nothing real. Fake ids only.
+The re-root ruling of the same day (docs/internals.md, "Amendment 2026-10-20
+(re-root)"): a saved value proven gone is first re-rooted through the
+journal's package pairs and planned into when discovery lists that store -
+the same destination, moved by the app - and the preference file changes on
+a pick, or after a successful Apply into a re-rooted saved destination, to
+that same store's new path. Set-aside and ask remain for a value no pair
+re-roots, so those scenarios save a path under a package with no pair.
+
+Real planning (plan_sync over the synthetic stores), a real Apply where one
+is pressed, inline "threads", the preference file in a temp folder, and every
+dialog answered by a script. Touches nothing real. Fake ids only.
 """
 import json
 import os
@@ -53,6 +61,12 @@ A, B, C = "a" * 32, "b" * 32, "c" * 32
 O1, O2, O3 = "1" * 32, "2" * 32, "3" * 32
 
 GONE = "no longer names a store"
+MOVED = "moved with the desktop app's data folder"
+SAVE_ON_APPLY = "Applying saves its new path"
+SAVE_BY_PICK = "pick it under Change destination to save its new path"
+SAVED = "saved at its new path"
+NOT_SAVED = "could not be saved"
+ELSEWHERE = "chosen in another window"
 SIGNED = "signed into now"
 POINTER = "Change destination picks another"
 MARK = "same account and org ids as your saved destination"
@@ -81,10 +95,13 @@ gp.threading = _FakeThreading
 ROOTS = []
 
 
-def layout(stores, live, classic=(), disagree=None):
+def layout(stores, live, classic=(), disagree=None, rows=0):
     """A moved layout: STORES under the moved root, CLASSIC under
     %APPDATA%\\Claude, the old package folder holding only the app's marker,
-    and both identity files naming LIVE (or config.json naming DISAGREE)."""
+    and both identity files naming LIVE (or config.json naming DISAGREE).
+    ROWS session rows in LIVE's store, each with its transcript, so a plan
+    has something to copy. The Env's pairs come from this layout, never
+    from the machine's own %LOCALAPPDATA%."""
     root = tempfile.mkdtemp(prefix="stale-dest-")
     ROOTS.append(root)
     local = os.path.join(root, "Local")
@@ -108,6 +125,17 @@ def layout(stores, live, classic=(), disagree=None):
                                     "organizationUuid": live[1]}}, fh)
     with open(os.path.join(moved, "config.json"), "w", encoding="utf-8") as fh:
         json.dump({"lastKnownAccountUuid": disagree or live[0]}, fh)
+    for i in range(rows):
+        sid = "sid-%d" % i
+        with open(os.path.join(moved_store, live[0], live[1], "local_%d.json" % i),
+                  "w", encoding="utf-8") as fh:
+            json.dump({"sessionId": "local_%d" % i, "cliSessionId": sid,
+                       "cwd": "C:\\p", "title": "Session %d" % i,
+                       "lastActivityAt": 1}, fh)
+        folder = os.path.join(home, ".claude", "projects", "C--p")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, sid + ".jsonl"), "w", encoding="utf-8") as fh:
+            fh.write('{"cwd":"C:\\\\p"}\n')
     cands, superseded, errors = ccs._windows_store_layout(local, appdata)
     env = ccs.default_env()
     env.home = home
@@ -115,6 +143,7 @@ def layout(stores, live, classic=(), disagree=None):
     env.store_candidates = cands
     env.superseded_stores = superseded
     env.layout_errors = errors
+    env.store_moves = [] if errors else ccs._windows_store_moves(local)
     env.ops_dir = os.path.join(root, "journal", "ops")
     env.moved_log = os.path.join(root, "journal", "moved-log.jsonl")
     env.process_lister = lambda: []
@@ -122,6 +151,12 @@ def layout(stores, live, classic=(), disagree=None):
     paths = {
         "moved": lambda a, o: os.path.join(moved_store, a, o),
         "old": lambda a, o: os.path.join(old_claude, "claude-code-sessions", a, o),
+        # A package this layout's moved root does not pair with - an app
+        # reinstalled under another package id, say: proven gone, and no
+        # pair re-roots it, so the window sets it aside and asks.
+        "unpaired": lambda a, o: os.path.join(
+            local, "Packages", "Claude_pkgy", "LocalCache", "Roaming", "Claude",
+            "claude-code-sessions", a, o),
         "classic": lambda a, o: os.path.join(classic_store, a, o),
         "root": root,
         "pref": os.path.join(root, "gui-pref.json"),
@@ -212,17 +247,17 @@ def marked(rec, p):
 
 
 # ------------------------------------------------------------------ 1
-print("-- a destination saved before the move, two other stores of one account")
+print("-- a saved destination no pair re-roots, two other stores of one account")
 env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2))
-s = Session(env, P, P["old"](A, O1), [has(P["moved"](A, O1))])
+s = Session(env, P, P["unpaired"](A, O1), [has(P["moved"](A, O1))])
 d = s.dialogs[0] if s.dialogs else {}
 check("the window asks by itself: one picker", len(s.dialogs) == 1, str(len(s.dialogs)))
 check("  headed as today", d.get("headline") == MULTI, d.get("headline"))
 check("  with the reason on the detail line", GONE in d.get("detail", ""), d.get("detail"))
 check("  and in the picker", any(GONE in t for t in d.get("labels", [])))
 check("  no plan installed under it", d.get("manifest") is None)
-check("  the file unchanged until the pick", d.get("pref") == P["old"](A, O1))
-check("  the moved copy of the saved store is marked",
+check("  the file unchanged until the pick", d.get("pref") == P["unpaired"](A, O1))
+check("  the store with the saved ids is marked",
       len(marked(d, P["moved"](A, O1))) == 1)
 check("  and only it", not marked(d, P["moved"](A, O2)))
 check("the pick saves that candidate's own path", same(s.pref(), P["moved"](A, O1)),
@@ -233,7 +268,7 @@ s.close()
 
 print("-- the same, two other stores of two accounts")
 env, P = layout([(A, O1), (C, O3), (B, O2)], live=(B, O2))
-s = Session(env, P, P["old"](A, O1), ["cancel"])
+s = Session(env, P, P["unpaired"](A, O1), ["cancel"])
 d = s.dialogs[0] if s.dialogs else {}
 check("one picker, the saved account's store marked",
       len(s.dialogs) == 1 and len(marked(d, P["moved"](A, O1))) == 1)
@@ -243,8 +278,8 @@ s.close()
 # ------------------------------------------------------------------ 2
 print("-- a cancel after a set-aside")
 env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2))
-s = Session(env, P, P["old"](A, O1), ["cancel", "cancel"])
-check("the file is unchanged", s.pref() == P["old"](A, O1), s.pref())
+s = Session(env, P, P["unpaired"](A, O1), ["cancel", "cancel"])
+check("the file is unchanged", s.pref() == P["unpaired"](A, O1), s.pref())
 check("  the status says no destination is chosen",
       "No destination chosen" in s.app.status.get(), s.app.status.get())
 check("  the detail keeps the reason and points at the button",
@@ -256,20 +291,20 @@ check("  no second picker on its own", len(s.dialogs) == 1, str(len(s.dialogs)))
 s.app.refresh()
 s.settle()
 check("the next plan asks again", len(s.dialogs) == 2, str(len(s.dialogs)))
-check("  and the file is still unchanged", s.pref() == P["old"](A, O1))
+check("  and the file is still unchanged", s.pref() == P["unpaired"](A, O1))
 s.close()
 
 # ------------------------------------------------------------------ 3
-print("-- one other store after the move")
+print("-- one other store, a saved destination no pair re-roots")
 env, P = layout([(A, O1), (B, O2)], live=(B, O2))
-s = Session(env, P, P["old"](A, O1), ["cancel"])
+s = Session(env, P, P["unpaired"](A, O1), ["cancel"])
 d = s.dialogs[0] if s.dialogs else {}
 check("a one-candidate picker opens", len(s.dialogs) == 1 and len(d.get("buttons", [])) == 1,
       str(d.get("buttons")))
 check("  under its own headline", d.get("headline") == SINGLE, d.get("headline"))
 check("  without the all-empty advice",
       not any(ALL_EMPTY in t for t in d.get("labels", [])))
-check("  marked, since it is the saved store moved",
+check("  marked, by the saved ids",
       len(marked(d, P["moved"](A, O1))) == 1)
 check("  with no plan installed, Apply and the bulk-copy tick off",
       d.get("manifest") is None and d.get("apply") == "disabled"
@@ -283,7 +318,7 @@ check("a pick saves it", same(s.pref(), P["moved"](A, O1)), s.pref())
 check("  and only then plans into it", same(s.dest(), P["moved"](A, O1)))
 s.close()
 
-print("-- one other store, of another account than the saved one")
+print("-- one other store, of another account than the saved one, which did not move")
 env, P = layout([(C, O3), (B, O2)], live=(B, O2))
 s = Session(env, P, P["old"](A, O1), ["cancel"])
 d = s.dialogs[0] if s.dialogs else {}
@@ -303,6 +338,8 @@ for name, stores, n_other in (("one other store", [(A, O1), (A, O2), (B, O2)], 1
     s = Session(env, P, P["old"](A, O1), ["cancel"])
     check("%s: the signed-in store is named, no picker" % name,
           not s.dialogs and SIGNED in s.app.detail.get(), s.app.detail.get())
+    check("  at its new path", gp.short(P["moved"](A, O1), env.home)
+          in s.app.detail.get(), s.app.detail.get())
     check("  nothing installed, the file unchanged",
           s.app.manifest is None and s.pref() == P["old"](A, O1))
     if n_other:
@@ -358,7 +395,7 @@ s.close()
 # ------------------------------------------------------------------ 6
 print("-- two roots holding the same ids")
 env, P = layout([(A, O1), (B, O2)], live=(B, O2), classic=[(A, O1)])
-s = Session(env, P, P["old"](A, O1), [has(P["classic"](A, O1))])
+s = Session(env, P, P["unpaired"](A, O1), [has(P["classic"](A, O1))])
 d = s.dialogs[0] if s.dialogs else {}
 check("the picker offers both", len(d.get("buttons", [])) == 2, str(d.get("buttons")))
 check("  and marks neither, since both match",
@@ -410,12 +447,21 @@ check("the signed-in store itself, still there: refused, named, no picker",
 s.close()
 
 env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), disagree=A)
-s = Session(env, P, P["old"](A, O1))
+s = Session(env, P, P["unpaired"](A, O1))
 check("an identity disagreement: the identity question as today",
       not s.dialogs and "cannot identify the signed-in account" in s.text())
 check("  the set-aside reason kept, no signed-in claim",
       GONE in s.app.detail.get() and SIGNED not in s.app.detail.get(),
       s.app.detail.get())
+check("  the file unchanged", s.pref() == P["unpaired"](A, O1))
+s.close()
+
+s = Session(env, P, P["old"](A, O1))
+check("an identity disagreement over a re-rootable value: the question as today",
+      not s.dialogs and "cannot identify the signed-in account" in s.text())
+check("  with the location sentence, no signed-in claim, no plan claimed",
+      MOVED in s.app.detail.get() and SIGNED not in s.app.detail.get()
+      and SAVE_ON_APPLY not in s.app.detail.get(), s.app.detail.get())
 check("  the file unchanged", s.pref() == P["old"](A, O1))
 s.close()
 
@@ -485,6 +531,174 @@ check("a '/'-spelled signed-in store: refused, named, no picker",
       and "matched no other account store" in s.text(),
       s.app.detail.get())
 s.close()
+
+# ------------------------------------------------------------------ 9
+print("-- re-rooting: a destination saved before the move, its store moved whole")
+
+
+class _Modals:
+    """Apply's confirmation answered OK; every call recorded."""
+
+    def __init__(self):
+        self.calls = []
+
+    def askokcancel(self, title, message, **kw):
+        self.calls.append(("askokcancel", title))
+        return True
+
+    def showwarning(self, title, message, **kw):
+        self.calls.append(("showwarning", title))
+
+    def showerror(self, title, message, **kw):
+        self.calls.append(("showerror", title))
+
+
+real_messagebox = gp.messagebox
+gp.messagebox = _Modals()
+
+
+def apply_state(s):
+    return str(s.app.apply_btn.cget("state"))
+
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1))
+check("no picker: the saved store is planned into at its new place",
+      not s.dialogs and same(s.dest(), P["moved"](A, O1)), str(s.dest()))
+check("  Apply is available", apply_state(s) == "normal", apply_state(s))
+check("  the location and plan sentences on the detail line",
+      MOVED in s.app.detail.get() and SAVE_ON_APPLY in s.app.detail.get(),
+      s.app.detail.get())
+check("  the file unchanged before Apply", s.pref() == P["old"](A, O1))
+check("  Change destination is shown", bool(s.app.forget_btn.winfo_manager()))
+s.app.on_apply()
+s.settle()
+check("a successful Apply copies into the moved store",
+      s.app.status.get().startswith("Copied 1")
+      and os.path.isfile(os.path.join(P["moved"](A, O1), "local_0.json")),
+      s.app.status.get())
+check("  saves the new path", same(s.pref(), P["moved"](A, O1)), s.pref())
+check("  and says so", SAVED in s.app.detail.get(), s.app.detail.get())
+check("  the window's destination follows the save",
+      same(s.app.dest_choice, P["moved"](A, O1)), s.app.dest_choice)
+s.app.refresh()
+s.settle()
+check("the next plan needs no re-root, and shows no notice",
+      MOVED not in s.app.detail.get() and same(s.dest(), P["moved"](A, O1)),
+      s.app.detail.get())
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1))
+real_run_sync = gp.ccs.run_sync
+
+
+def _refuse(_env, _manifest):
+    raise ccs.Refusal("refused for this check")
+
+
+gp.ccs.run_sync = _refuse
+try:
+    s.app.on_apply()
+    s.settle()
+finally:
+    gp.ccs.run_sync = real_run_sync
+check("a refused Apply saves nothing", s.pref() == P["old"](A, O1), s.pref())
+check("  and the window keeps the saved value", s.app.dest_choice == P["old"](A, O1))
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1))
+real_save_pref = gp.save_pref
+gp.save_pref = lambda _v: False
+try:
+    s.app.on_apply()
+    s.settle()
+finally:
+    gp.save_pref = real_save_pref
+check("a preference file that cannot be written: reported, not claimed",
+      NOT_SAVED in s.app.detail.get() and SAVED not in s.app.detail.get(),
+      s.app.detail.get())
+check("  the file and the window keep the saved value",
+      s.pref() == P["old"](A, O1) and s.app.dest_choice == P["old"](A, O1))
+s.app.refresh()
+s.settle()
+check("  the next plan re-roots again", MOVED in s.app.detail.get()
+      and same(s.dest(), P["moved"](A, O1)), s.app.detail.get())
+check("  nothing left to copy: the pick sentence, Apply off",
+      SAVE_BY_PICK in s.app.detail.get() and SAVE_ON_APPLY not in s.app.detail.get()
+      and apply_state(s) == "disabled", s.app.detail.get())
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1))
+with open(P["pref"], "w", encoding="utf-8") as fh:
+    json.dump({"to": P["moved"](A, O2)}, fh)             # another window's pick
+s.app.on_apply()
+s.settle()
+check("a pick made meanwhile in another window is left as it is",
+      s.pref() == P["moved"](A, O2), s.pref())
+check("  adopted by this window", s.app.dest_choice == P["moved"](A, O2))
+check("  and named, not reported as a failed write",
+      ELSEWHERE in s.app.detail.get() and NOT_SAVED not in s.app.detail.get(),
+      s.app.detail.get())
+s.app.refresh()
+s.settle()
+check("  the next plan goes to it", same(s.dest(), P["moved"](A, O2)), str(s.dest()))
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2))
+s = Session(env, P, P["old"](A, O1))
+check("a level re-rooted store: planned into, Apply off",
+      not s.dialogs and same(s.dest(), P["moved"](A, O1)) and apply_state(s) == "disabled")
+check("  the pick sentence, never the Apply one",
+      MOVED in s.app.detail.get() and SAVE_BY_PICK in s.app.detail.get()
+      and SAVE_ON_APPLY not in s.app.detail.get(), s.app.detail.get())
+check("  the file unchanged", s.pref() == P["old"](A, O1))
+s.close()
+
+env, P = layout([(A, O1), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1))
+check("one other store: the same destination, re-rooted - no picker",
+      not s.dialogs and same(s.dest(), P["moved"](A, O1)), str(s.dest()))
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), disagree=A, rows=1)
+s = Session(env, P, P["old"](A, O1))
+s.app._apply_live("answered", {"path": P["moved"](A, O1),
+                               "pair": s.app._read_pair(), "label": ""})
+s.app.refresh()
+s.settle()
+banner = [str(w.cget("text")) for w in walk(s.app.sync_banner)
+          if isinstance(w, gp.ttk.Button)]
+check("a held answer naming the saved account: named as signed in, no picker",
+      not s.dialogs and SIGNED in s.app.detail.get(), s.app.detail.get())
+check("  at its new path", gp.short(P["moved"](A, O1), env.home)
+      in s.app.detail.get(), s.app.detail.get())
+check("  nothing installed, the file unchanged",
+      s.app.manifest is None and s.pref() == P["old"](A, O1))
+check("  the banner shows the answer in force, not the question",
+      banner == ["Change signed-in account"], str(banner))
+s.close()
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2), rows=1)
+s = Session(env, P, P["old"](A, O1), ["cancel"])
+s.app.forget_btn.invoke()
+s.settle()
+d = s.dialogs[0] if s.dialogs else {}
+check("Change destination over a re-rooted value opens the picker",
+      len(s.dialogs) == 1 and d.get("headline") == MULTI, d.get("headline"))
+check("  the re-rooted store marked", len(marked(d, P["moved"](A, O1))) == 1)
+check("  the location sentence its reason, and no plan claimed",
+      any(MOVED in t for t in d.get("labels", []))
+      and not any(SAVE_ON_APPLY in t for t in d.get("labels", []))
+      and SAVE_ON_APPLY not in d.get("detail", ""), str(d.get("labels")))
+check("a cancel brings the re-rooted plan back, no second picker",
+      same(s.dest(), P["moved"](A, O1)) and len(s.dialogs) == 1, str(s.dest()))
+check("  the file unchanged", s.pref() == P["old"](A, O1))
+s.close()
+
+gp.messagebox = real_messagebox
 
 for r in ROOTS:
     shutil.rmtree(r, ignore_errors=True)
