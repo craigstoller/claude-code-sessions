@@ -1513,7 +1513,10 @@ helper.
   a pre-move `converge` left unfinished would skip its rows as absent and close the operation
   with the rows still in place; none was unfinished on the probed machine. (The `undo` and
   `recover` behaviour is read from the code, not run.) Not fixed here, because it needs a
-  decision on how journaled paths are re-rooted.
+  decision on how journaled paths are re-rooted. *(Fixed by "Amendment 2026-10-19
+  (journal)" below, which re-measured these in a sandbox: `undo` of a `sync` also reported
+  "undone" while removing nothing, and `recover --back` of an unfinished `new-row` or `sync`
+  closed the operation the same way.)*
 - The measurement tools' own store lookups (`watch_ceremony.py`, `measure_native_host.py`,
   `attribute_store_writers.py`, `resolver_positive_control.py`) still list only the old roots.
   With no store left there they stop with "no store root found"; where a superseded old store
@@ -1547,6 +1550,145 @@ And by `TestClaudeRunningNarrowing` in `tests/test_plan_move.py`, whose tests ch
 `tools/check_signed_helper_optin.py`'s live leg now walks the guard's helper roots. On
 2026-10-19 it found both helper versions under the packaged root and under the classic one, and
 read each as signed.
+
+#### Amendment 2026-10-19 (journal) — paths recorded before the data moved
+
+**Status: the maintainer's ruling of 2026-10-19, implemented.** The amendment above left the
+journaled paths of operations from before the move as a residual. The brief for it went
+through three rounds of independent review by four models; the third round's fixes were not
+reviewed again. The maintainer then ruled on seven points, each as recommended:
+
+1. Re-root at read time. Not taken: rewriting the journal once; re-rooting in `doctor` only
+   and refusing everywhere else; leaving it; the resolution gate (3) alone.
+2. The mapping lives in memory, and no command changes the paths a manifest recorded. Not
+   taken: persisting the mapped paths with a provenance record.
+3. The resolution gate, in this change rather than a follow-up. 3.1: unresolved rows are
+   listed by `doctor`, not counted in its exit code. Not taken: exit 1.
+4. `recover --back`: nothing beyond 1 and 3. Not taken: refusing back.
+5. `undo` of a move checks containment and reads every row before anything is journaled.
+   Not taken: only catching the error.
+6. `new-row`'s "that row is already gone" stays. Not taken: rewording it.
+7. Sync's `undo` reports what it reversed, and the window's line follows it. Not taken: the
+   bare "undone".
+
+**What was wrong (measured 2026-10-19 in a sandbox against the 0.16.3 code, read from it
+where marked).** Every operation journals each row it touched by absolute path. After the
+move, a path recorded before it names a folder that holds only the app's marker, and every
+consumer read it as written:
+
+- `doctor` reported every row this tool had created as "no longer on disk" and exited 1,
+  advising `new-row` again (320 rows in 10 operations on the probed machine).
+- `undo` of a `sync` said "undone", exit 0, and removed nothing; with `--update` it put no
+  pre-image back; either way the operation was consumed. Its live-store refusal compared the
+  old path with the moved store, so it no longer fired.
+- `undo` of a `move` ended in an unhandled error. With the old store left behind it read the
+  old row, journaled an undo, and then failed path validation, leaving an operation that
+  `recover` refused in both directions for good.
+- `undo` of a `new-row` refused with "that row is already gone", which was false; of
+  `converge` and `retitle` with a layout error; of `repoint` with a misleading one.
+- `recover --back` of an unfinished `converge`, `new-row` or `sync` closed it with its rows
+  still in the store and recorded nothing; of a `repoint` it recorded "gone from the store",
+  and `doctor`'s residue reader, which stats the recorded path, then dropped it.
+- With the old store copied rather than moved, `undo` of a `new-row` deleted the row from the
+  store discovery never reads and reported success.
+- Nothing created the old store folder or wrote a row under it. `recover --forward` refused
+  for every type (retitle's and repoint's read from the code).
+
+**The change.**
+
+- The pairs. `_windows_store_moves` takes them from the `Claude-Data` listing alone:
+  `Claude-Data\claude_<pkg>\claude-code-sessions` pairs with
+  `Packages\Claude_<pkg>\LocalCache\Roaming\Claude\claude-code-sessions` under the same
+  `LOCALAPPDATA`, by the package name ruling 1 pairs on. Not the layout's superseded list,
+  which names an old store only while its vacated folder exists. `Env.store_moves` carries
+  them, and is empty when the layout had errors.
+- The mapping. `list_ops`, the only code that loads a manifest, maps the keys a decision
+  reads back: `store_path` and sync's `dest_path`; each row's `path`, `dest_path` and
+  `store_path`; and each entry of `rollback_residue_paths`. A value equal to an old store, or
+  below it at a separator boundary, becomes the moved store plus the same relative path, both
+  sides normalized as discovery normalizes its roots, so `claude-code-sessions-bak` never
+  matches. Not mapped: `row_path`, `source_path` and `destinations[].path`, which nothing
+  decides on, and `live_override.config_path`, audit data beside the store. Every tagged
+  release used these key names (checked 2026-10-19). Every consumer, and every comparison
+  between operations (rotation's hold, the ownership claims, the live-store check), then sees
+  one path.
+- Nothing already journaled is rewritten. `Op.rerooted` records each mapping, and
+  `save_manifest` serializes a copy with the recorded strings put back, leaving the in-memory
+  manifest mapped for the rest of the run. A new operation records the paths it acts on: an
+  `undo` of a move from before the move, journaled after it, records the moved ones.
+- The resolution gate, `_row_resolved`. A journaled row is resolved when discovery found the
+  store and the row's path lies in a discovered root at `<root>\<acct>\<org>\<file>`, and,
+  for an operation that records a store, that store is the row's folder. Every function that
+  reads a journaled row's file or acts on it asks first; `tests/test_journal_reroot.py` checks
+  that list against the code. For an unresolved row:
+  - `undo` refuses before changing anything, naming the rows. That includes converge's
+    forgiving undo, which used to check containment inside its delete loop, after earlier
+    rows were already deleted.
+  - `recover --back` reverses what it can check and records the rest under
+    `rollback_residue`, with the paths in `rollback_residue_paths`, on every operation type.
+    It records an unresolved row whether or not the operation marked it written, since a hard
+    kill can land a row and lose the flag; only a converge row marked skipped, never
+    attempted, is left out. For sync, retitle and move this replaces a refusal that left the
+    operation stuck. A move
+    goes through `_abort`, which counted such a row as drifted and refused at `aborting`; it
+    now leaves the row alone and keeps both transcript copies, since the row may already point
+    at the destination copy.
+  - `recover --forward` is not offered. Finishing a committed move touches no row, so it is.
+  - `doctor` lists the row under "cannot be checked", apart from the vanished rows, and does
+    not count it in the exit code.
+  A discovery error refuses `undo` and `recover` in both directions, and changes nothing: on
+  a layout error the old packaged stores come back as discovery's roots. The nine sites that
+  checked containment against the journal's own store path meet the gate first.
+- `doctor`'s residue reader checks every row a residue names: the paths in
+  `rollback_residue_paths`, or, for a residue recorded before those existed, its first row's
+  `dest_path` or a move's `path`. It reports while any named row is present, lists an
+  unresolved one, and drops the residue when every named row is resolved and absent.
+- `undo` of a move checks discovery and every row's containment, then reads each row, before
+  an undo operation is journaled. A missing row refuses as missing; any other read error
+  refuses naming it.
+- Sync's `undo` records `undo_report`: rows removed, restored, added rows already gone, and
+  refreshed rows not restored because the account deleted them since. `undo` prints it and
+  the window's line follows it, where it used to say "the copied rows were removed" every
+  time.
+- `doctor` prints "N operation(s) recorded before the data moved; their paths are read under
+  the moved root" when there are any, and `--json` carries the count.
+- Three expectations changed. A hand-edited sync row outside the store is refused by the
+  gate as a refusal (exit 1) where a layout error (exit 2) answered before. A stalled sync with
+  an uncontained pending row offers `back` alone, no longer a `forward` that could only fail.
+  And `back` on a new-row whose path a corrupt journal sent outside the store records why it
+  left the row ("not one this version reads") where it used to record "could not remove",
+  having tried.
+
+**Measured with the change (2026-10-20, read-only, the probed machine).** From the branch,
+against the live store and journal: `doctor` exited 0 with no row vanished, none unresolved
+and 10 operations read under the moved root; all 320 written rows resolved and present. An
+`undo` dry run previewed the newest converge. On a copy of the journal with one row's file and
+conversation made up, `doctor` reported that one row vanished, exit 1. The live journal's
+files hashed the same before and after.
+
+**Residuals.**
+
+- Converge's `undo` deletes a row the app has since rewritten when its conversation, title
+  and title source are unchanged and it is not the last pointer: field evidence, not bytes.
+  With the mapping it reaches pre-move rows again, on that rule and the gate. On the probed
+  machine 155 of the 320 rows had been rewritten. Every other undo route refuses a changed
+  row.
+- A further move from the moved root needs discovery to learn the new root before the pairs
+  can follow it.
+- Rows that resolve are still checked against the journal's recorded store at the write
+  paths, after the gate.
+- A Windows folder with per-directory case sensitivity, where two package folders could
+  differ only by case, is not considered.
+- An unresolved row stays listed for as long as its store is out of reach.
+- macOS and Linux have no moved roots, so nothing changes there.
+
+**Pinned by** `tests/test_journal_reroot.py`, 60 tests: the pairs, what maps and what does
+not, the save-side restore, `doctor`'s counts and its untouched journal, `undo` and `recover`
+of every operation type from before the move, a store left behind, every route of the gate,
+an operation half resolved in both row orders, a discovery error, the residue reader, move
+undo's refusals, the sync tally and the window's line, and a check that every function reading
+a journaled row goes through the gate. Two tests in `tests/test_sync.py` and one case in
+`tools/check_new_row.py` changed expectation, as above.
 
 #### Amendment 2026-10-20 — the window's saved destination, after the move
 
@@ -1607,6 +1749,7 @@ over zero, one and two other stores, "Change destination" over a saved destinati
 fine, two roots holding the same ids, and, unchanged, no saved destination, an unlisted path, a
 fragment, the signed-in store itself, an identity disagreement, a discovery error and a saved
 value that went ambiguous.
+
 
 ### The lister, and its two deliberate costs
 
@@ -1814,6 +1957,11 @@ This is a deliberate asymmetry with `undo` of a *completed* sync: `undo` refuses
 touching nothing, if even one row it wrote has drifted or gone unreadable. A completed operation
 being reversed at the user's explicit request is a case where a surprise should mean stop and
 ask, not best-effort cleanup — the opposite of what a stuck, still-in-flight op needs.
+
+Every route here first asks whether each row is in a store this version reads, and a row in
+one it does not read follows the same asymmetry: `undo` refuses, `back` leaves it alone and
+records it. `undo` also records what it did in `undo_report` and prints it. See "Amendment
+2026-10-19 (journal)".
 
 ## Open question — is anchoring `sync` to the live account still earning its cost? (2026-08-21)
 
@@ -2338,11 +2486,12 @@ the command having failed.
 **`doctor`'s detection of a rejected row is bounded by journal retention, not by time.**
 `rotate_ops` keeps the ten most recent *terminal* ops across every operation type, and
 `_collides` is what holds an op back from that rotation. It shields two things: an unresolved
-`sync`'s claim on a destination row, and any op carrying a `rollback_residue` — which today
-only a rolled-back `new-row` can, and which is pinned indefinitely so `doctor` can go on
-reporting the row that rollback could not remove (`gather_doctor`'s `rollback_residue` list;
-the alert clears when the row is actually gone, because it asks the store rather than the
-journal). A **completed** `new-row` op — the only kind `vanished_new_rows` reads — is never
+`sync`'s claim on a destination row, and any op carrying a `rollback_residue` — which a
+rollback of any operation type can now carry (see "Amendment 2026-10-19 (journal)"), and
+which is pinned indefinitely so `doctor` can go on reporting the rows that rollback could not
+remove (`gather_doctor`'s `rollback_residue` list; the alert clears when every row it names is
+actually gone, because it asks the store rather than the journal, and a row in a store this
+version does not read is listed apart rather than counted). A **completed** `new-row` op — the only kind `vanished_new_rows` reads — is never
 shielded. So the window that check can see is however many other operations happen to run
 next, not a number of days. Measured
 2026-08-23: after 15 sequential `new-row` runs, the first run's op had aged out of the journal,

@@ -609,13 +609,14 @@ On 2026-10-19, 2.42304.2.0 moved the app's whole user-data folder, session store
 from the package's `LocalCache\Roaming\Claude` to `%LOCALAPPDATA%\Claude-Data\claude_<pkg>`,
 and left the helper where it was. 0.16.2 and earlier report the store absent there. 0.16.3
 reads the moved store and still finds the helper. Its read-only paths (`doctor`, `alignment`
-and a `converge` dry run) were checked against the moved store the same day. One known gap
-remains: rows this tool created before the move are journaled at their old paths, so `doctor`
-reports them as "no longer on disk" although they moved with the store. Those lines are false,
-and so is their advice to run `new-row` again. For the same reason `undo` cannot reverse an
-operation from before the move, and changes nothing trying: it refuses a `converge`, refuses a
-`new-row` with "that row is already gone", which is false too, and fails with an unhandled
-error on a `move`.
+and a `converge` dry run) were checked against the moved store the same day. 0.16.3 has one
+known gap: rows this tool created before the move are journaled at their old paths, so
+`doctor` reports them as "no longer on disk" although they moved with the store, and advises
+running `new-row` again; for the same reason `undo` cannot reverse an operation from before
+the move. The release after 0.16.3 reads those paths under the moved store: `doctor` checks
+the rows where they now are, and `undo` and `recover` treat such an operation as they did
+before the move. A row in a store the tool cannot read at all is listed by `doctor` apart, not
+counted in its exit code, and `undo` refuses it.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
