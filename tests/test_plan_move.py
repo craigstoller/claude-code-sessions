@@ -321,6 +321,14 @@ class TestClaudeRunningNarrowing:
         "c:\\users\\u\\appdata\\local\\claude-data\\claude_\\claude-code\\claude.exe",
         "c:\\users\\u\\appdata\\local\\claude-data\\claude_abc\\x\\claude-code\\claude.exe",
         "c:\\users\\u\\appdata\\local\\claude-data\\claude_ab-c\\claude-code\\claude.exe",
+        # the measured shape is <version>\<hash>\claude.exe, nothing else under it
+        "c:\\tmp\\appdata\\local\\claude-data\\claude_x\\claude-code\\app\\claude.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_x\\claude-code\\"
+        "2.1.299\\0123456789ab\\other.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_x\\claude-code\\"
+        "2.1.299\\0123456789ab\\sub\\claude.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_x\\claude-code\\"
+        "2.1.299\\0123456789ab\\claude.exe.bak",
     ])
     def test_moved_cli_marker_is_exact_segments(self, mkenv, tmp_path, exe):
         # A near miss of the new CLI home stays a desktop match: the marker is a

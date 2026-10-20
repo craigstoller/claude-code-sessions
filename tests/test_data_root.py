@@ -178,6 +178,8 @@ def test_default_env_on_windows_lists_both(monkeypatch, roots):
     monkeypatch.setenv("APPDATA", str(appdata))
     monkeypatch.setattr(ct.sys, "platform", "win32")
     env = ct.default_env()
+    assert (env.store_candidates, env.superseded_stores) == ct._windows_store_layout(
+        str(local), str(appdata))
     assert env.store_candidates == ct._windows_store_candidates(str(local), str(appdata))
     assert env.helper_roots == ct._windows_helper_roots(str(local), str(appdata))
     assert env.helper_roots[0] == str(_old_claude_dir(local).parent)
@@ -220,15 +222,16 @@ def test_absent_store_without_a_marker_says_only_that(mkenv, tmp_path):
     assert (d.status, d.detail) == ("absent", "no store under any known candidate")
 
 
-def test_found_store_does_not_mention_a_marker(mkenv, tmp_path):
+def test_found_store_does_not_mention_the_marker_of_its_own_move(mkenv, tmp_path):
+    # mkenv's store sits in a folder named store0: a marker naming that folder
+    # records the move this version followed, and is noise in the report.
     env = mkenv(tmp_path, n_store_roots=1)
     left = tmp_path / "left"
     left.mkdir()
-    (left / ".user-data-left.claude_y").write_bytes(b"")
+    (left / ".user-data-left.store0").write_bytes(b"")
     env.store_candidates = env.store_candidates + [str(left / "claude-code-sessions")]
     d = ct.discover_stores(env)
-    assert d.status == "found"
-    assert "user-data-left" not in d.detail
+    assert (d.status, d.detail) == ("found", "1 root(s)")
 
 
 def test_doctor_and_alignment_carry_the_marker_note(mkenv, tmp_path, capsys):
@@ -242,3 +245,153 @@ def test_doctor_and_alignment_carry_the_marker_note(mkenv, tmp_path, capsys):
     ct.cmd_doctor(env, _ns())
     out = capsys.readouterr().out
     assert "[observed] store: absent" in out and ".user-data-left.claude_y" in out
+
+
+# ------------------------------------- round-1 review: the end-to-end paths
+
+def _env_from_layout(mkenv, tmp_path, local, appdata):
+    env = mkenv(tmp_path, n_store_roots=0)
+    env.store_candidates, env.superseded_stores = ct._windows_store_layout(
+        str(local), str(appdata))
+    return env
+
+
+def test_marker_in_an_old_folder_is_seen_when_no_moved_root_exists(
+        mkenv, tmp_path, roots):
+    # The case the note exists for: the data went somewhere this version does
+    # not know, so there is no moved root to find. The old Claude folder is
+    # listed by the folder itself, store or not, so its marker is read.
+    local, appdata = roots
+    old = _old_claude_dir(local)
+    old.mkdir(parents=True)
+    (old / ".user-data-left.claude_elsewhere").write_bytes(b"")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert d.status == "absent"
+    assert os.path.join(str(old), ".user-data-left.claude_elsewhere") in d.detail
+    assert "does not know" in d.detail
+
+
+def test_marker_naming_a_known_moved_root_without_a_store_says_so(
+        mkenv, tmp_path, roots):
+    # This version DID look where the marker says: the note must say that
+    # folder holds no store, not that the location is unknown.
+    local, appdata = roots
+    _moved_root(local).mkdir(parents=True)
+    old = _old_claude_dir(local)
+    old.mkdir(parents=True)
+    (old / ".user-data-left.claude_abc123").write_bytes(b"")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert d.status == "absent"
+    assert ".user-data-left.claude_abc123" in d.detail
+    assert str(_moved_root(local)) in d.detail and "holds no store" in d.detail
+    assert "does not know" not in d.detail
+
+
+def test_marker_for_the_move_this_version_followed_is_not_mentioned(
+        mkenv, tmp_path, roots):
+    local, appdata = roots
+    (_moved_root(local) / "claude-code-sessions").mkdir(parents=True)
+    old = _old_claude_dir(local)
+    old.mkdir(parents=True)
+    (old / ".user-data-left.claude_abc123").write_bytes(b"")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert (d.status, d.detail) == ("found", "1 root(s)")
+
+
+def test_unknown_move_is_named_even_when_a_stale_store_is_found(
+        mkenv, tmp_path, roots):
+    # A leftover classic store must not hide the active install's next move.
+    local, appdata = roots
+    _row(appdata / "Claude" / "claude-code-sessions", "local_classic")
+    old = _old_claude_dir(local)
+    old.mkdir(parents=True)
+    (old / ".user-data-left.claude_elsewhere").write_bytes(b"")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert d.status == "found"
+    assert ".user-data-left.claude_elsewhere" in d.detail
+
+
+def test_a_superseded_store_that_still_exists_is_named_not_read(
+        mkenv, tmp_path, roots):
+    local, appdata = roots
+    moved = _moved_root(local) / "claude-code-sessions"
+    old = _old_claude_dir(local) / "claude-code-sessions"
+    _row(moved, "local_moved")
+    _row(old, "local_stale")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    assert env.superseded_stores == [str(old)]
+    d = ct.discover_stores(env)
+    assert d.status == "found"
+    assert str(old) in d.detail and "not read" in d.detail
+    rows, _errs = ct.load_rows(d.roots)
+    assert [r.local_id for r in rows] == ["local_moved"]
+
+
+def test_unreadable_moved_data_folder_is_an_error_not_an_old_store(
+        mkenv, tmp_path, roots, monkeypatch):
+    # "Couldn't look" is never "nothing moved": with Claude-Data unlistable,
+    # nobody can say which packages moved, so the populated old store must not
+    # be read as if none had.
+    local, appdata = roots
+    (local / "Claude-Data").mkdir()
+    _row(_old_claude_dir(local) / "claude-code-sessions", "local_stale")
+    real_listdir = os.listdir
+
+    def denied(p):
+        if os.path.basename(os.path.normpath(str(p))) == "Claude-Data":
+            raise PermissionError(13, "denied", str(p))
+        return real_listdir(p)
+
+    monkeypatch.setattr(os, "listdir", denied)
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert d.status == "error"
+    assert "Claude-Data" in d.detail
+
+
+def test_a_file_named_like_a_moved_root_is_not_one(roots):
+    local, appdata = roots
+    (local / "Claude-Data").mkdir()
+    (local / "Claude-Data" / "claude_abc123").write_bytes(b"not a folder")
+    _row(_old_claude_dir(local) / "claude-code-sessions", "local_old")
+    cands, superseded = ct._windows_store_layout(str(local), str(appdata))
+    assert str(_old_claude_dir(local) / "claude-code-sessions") in cands
+    assert superseded == []
+
+
+def test_precedence_folds_the_case_of_the_whole_package_name(roots):
+    local, appdata = roots
+    old = _old_claude_dir(local, pkg="AbC123") / "claude-code-sessions"
+    old.mkdir(parents=True)
+    (_moved_root(local, pkg="abc123") / "claude-code-sessions").mkdir(parents=True)
+    cands, superseded = ct._windows_store_layout(str(local), str(appdata))
+    assert str(old) not in cands and superseded == [str(old)]
+
+
+def test_no_classic_candidate_or_helper_root_without_an_absolute_appdata(
+        tmp_path, monkeypatch, roots):
+    # The same narrowing as LOCALAPPDATA's: an unset APPDATA made the classic
+    # candidate the relative Claude\claude-code-sessions, read against the cwd.
+    local, _appdata = roots
+    cwd = tmp_path / "cwd"
+    (cwd / "Claude" / "claude-code-sessions").mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    assert ct._windows_store_candidates(str(local), "") == []
+    assert ct._windows_helper_roots(str(local), "") == []
+
+
+def test_glob_metacharacters_in_localappdata_are_literal(tmp_path):
+    local = tmp_path / "lo[c]al"
+    appdata = tmp_path / "roaming"
+    appdata.mkdir()
+    moved = _moved_root(local) / "claude-code-sessions"
+    moved.mkdir(parents=True)
+    old = _old_claude_dir(local, pkg="zzz999") / "claude-code-sessions"
+    old.mkdir(parents=True)
+    cands = ct._windows_store_candidates(str(local), str(appdata))
+    assert str(moved) in cands and str(old) in cands
+    assert ct._windows_helper_roots(str(local), str(appdata))[0] == str(old.parent.parent)
