@@ -590,12 +590,13 @@ window.
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03; sync-undo drift refusal live 2026-08-04 | read-only + mutations |
-| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store; no `--apply` on this build yet. 0.16.2 and earlier find no store | read-only + mutations |
+| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store. 0.16.2 and earlier find no store | read-only + mutations, `--apply` not yet verified on this build |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds - most recently Claude Desktop
-2.42304.0.0 (Microsoft Store MSIX install) and Claude Code CLI 2.1.302. On 2026-10-14 the
+2.42304.2.0 (Microsoft Store MSIX install) for the read-only paths, and 2.42304.0.0 with Claude
+Code CLI 2.1.302 for the last `--apply` runs. On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
 `doctor`, `alignment`, `recover` without `--apply`, and a `converge` dry run): the row format
 had only gained keys, and every row this tool had written under 1.x was still present, some
@@ -611,7 +612,9 @@ reads the moved store and still finds the helper. Its read-only paths (`doctor`,
 and a `converge` dry run) were checked against the moved store the same day. One known gap
 remains: rows this tool created before the move are journaled at their old paths, so `doctor`
 reports them as "no longer on disk" although they moved with the store. Those lines are false,
-and so is their advice to run `new-row` again.
+and so is their advice to run `new-row` again. For the same reason `undo` cannot reverse an
+operation from before the move: it refuses and changes nothing, and for `new-row` its "that
+row is already gone" is false too.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 

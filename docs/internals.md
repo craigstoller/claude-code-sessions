@@ -1366,7 +1366,9 @@ by one refusal test each in `tests/test_plan_move.py`, `tests/test_undo.py` and
 
 **Status: implemented on a branch for the maintainer's review; not yet ruled on.** The
 precedence between the old and moved roots, the marker note, and leaving the journaled-path
-gap (Residuals) to a follow-up are the implementation's choices.
+gap (Residuals) to a follow-up are the implementation's choices. Revised the same evening after
+an independent review by four models: the layout now lists data folders rather than stores,
+names what it does not read, and fails closed when it cannot look (below).
 
 **What changed (observed 2026-10-19, read-only).** Claude Desktop 2.42304.2.0, installed by an
 automatic update, moved the app's whole user-data folder out of the package, from
@@ -1382,64 +1384,90 @@ and the browser's manifest names that path.
 **What that broke.** 0.16.2 listed only the old candidates, so every command started from
 "store absent": `converge` planned 0 of 0, and `doctor` and `alignment` reported the store
 absent. `converge` has no `--store`, so there was no workaround. The guard's CLI marker missed
-the moved CLI, which then counted as the desktop app. That changed nothing in practice: the CLI
-runs only while the app does. The real trap was the helper. It was derived from the store
-candidates, two folders up, and two folders up from the moved store is
+the moved CLI, which then counted as the desktop app. That should have changed nothing in
+practice, on the 2026-08-02 reasoning that the app-spawned CLI exists only while the app runs;
+that was not measured for the moved CLI. The real trap was the helper. It was derived from the
+store candidates, two folders up, and two folders up from the moved store is
 `%LOCALAPPDATA%\Claude-Data\Claude-NativeHost`, where no helper lives. A fix that only added the
 new store candidate would have silently disabled the signed-helper opt-in again, the failure
 the 2026-10-17 amendment fixed.
 
 **The change.**
 
-- Store candidates, in the order they are read:
-  1. each moved data root that exists, as `Claude-Data\claude_<pkg>\claude-code-sessions`,
-     listed whether or not the store folder exists, just as the classic candidate always was.
-     That way discovery proves an absence there, and the identity checks read that root's own
-     `config.json`;
-  2. each old packaged store that exists, unless the same package's moved root exists;
-  3. the classic `%APPDATA%\Claude\claude-code-sessions`, as before.
-- Precedence: when a package's moved root exists, its old root is not read, neither its store
-  nor its `config.json`. The updated app was seen writing to the moved root, and the old one is
-  what it left. Reading both would list every row twice and give the identity checks a
-  pre-move `config.json`. Packages match by folder name, case folded.
+- Store candidates, in the order they are read (`_windows_store_layout`):
+  1. each moved data root, every entry of `Claude-Data` named `claude_*` that is not a plain
+     file, as `<root>\claude-code-sessions`, listed whether or not the store folder exists, as
+     the classic candidate always was. Discovery then proves an absence there, reads the app's
+     marker beside it, and the identity checks read that root's own `config.json`;
+  2. each old packaged data folder, `...\Roaming\Claude\`, that exists, store or not, so the
+     marker the app leaves there is read, unless the same package's moved root exists;
+  3. the classic `%APPDATA%\Claude\claude-code-sessions`, when `APPDATA` is absolute.
+- Precedence: when a package's moved root exists, its old root is superseded. It is not read:
+  not its store, not its `config.json`, not its agent-mode folder (the identity and email
+  lookups follow the candidates). The updated app was seen writing to the moved root, and the
+  old one is what it left; after the observed move it holds only the marker. Reading both would
+  list every row twice and give the identity checks a pre-move `config.json`. A superseded
+  store that still exists is named in the discovery detail ("not read: ..."), so the state is
+  visible rather than silent. Packages match by folder name, case folded.
+- Couldn't look is never "nothing moved": when `Claude-Data` exists but cannot be listed,
+  nobody can say which packages moved, so the folder goes in as a candidate's parent and
+  discovery reports an error, which refuses every mutation, instead of reading an old store as
+  though nothing had moved. An unreadable moved root does the same.
 - Helper roots: `Env.helper_roots`, listed apart from the store. On Windows they are each
-  package's `LocalCache\Roaming` that exists, plus `%APPDATA%`. Both layouts derive from them
-  exactly as they did from the store candidates' `<Roaming>`: the old one
-  `<root>\Claude\ChromeNativeHost\chrome-native-host.exe`, the versioned one
+  package's `LocalCache\Roaming` that is a folder, plus `%APPDATA%` when it is absolute. Both
+  layouts derive from them exactly as they did from the store candidates' `<Roaming>`: the old
+  one `<root>\Claude\ChromeNativeHost\chrome-native-host.exe`, the versioned one
   `<root>\Claude-NativeHost\<version>\chrome-native-host.exe`. An Env that names no helper root
   recognises no helper. A relative root still derives nothing. Off Windows the roots are what
   the store candidate gave before: `~/Library/Application Support` and `~/.config`.
-- The CLI marker adds `\appdata\local\claude-data\claude_<pkg>\claude-code\`, matched as whole
-  segments, where `<pkg>` is ASCII letters and digits. The existing markers are unchanged.
-- The marker note. When no store is found and a candidate's folder holds a `.user-data-left.*`
-  file, the "store absent" detail names the file and says the data has moved somewhere this
-  version does not know. That detail reaches `doctor`, `alignment` and the window. It only
-  explains the absence, and no decision depends on it. 0.16.2's bare "store absent" read as "no
-  sessions on this machine", although the app had left a note in the folder saying the data
-  had gone.
-- One narrowing rides along: only an absolute `LOCALAPPDATA` is globbed. With it unset, the old
-  code globbed relative to the working directory.
+- The CLI marker adds the measured shape to the end of the entry:
+  `\appdata\local\claude-data\claude_<pkg>\claude-code\<version>\<hash>\claude.exe`, whole
+  segments, `<pkg>` lowercase letters and digits as observed, `<version>` dotted digits,
+  `<hash>` hex. The existing markers are unchanged.
+- The marker note. A `.user-data-left.<folder>` file in a folder discovery looked in names the
+  folder the data moved to. Discovery's detail, which reaches `doctor`, `alignment` and the
+  window, says per marker: nothing, when a store was found in the folder it names (the move this
+  version followed); that the folder holds no store, when this version looked there; otherwise
+  that it names a location this version does not know. That last one is reported beside a found
+  store too, so a stale leftover store cannot hide the next move. It only explains, and no
+  decision depends on it. 0.16.2's bare "store absent" read as "no sessions on this machine",
+  although the app had left a marker naming the folder its data went to.
+- One narrowing rides along: only an absolute `LOCALAPPDATA` is globbed and only an absolute
+  `APPDATA` is used, and glob metacharacters in either are escaped. With either unset, the old
+  code resolved a candidate against the working directory, where a look-alike tree would have
+  become a store. "Absolute" is `os.path.isabs`, whose reading of a drive-relative `\path`
+  differs across Python versions on Windows.
 
-**Why the trust does not widen.** The helper roots are the folders the store candidates'
-`<Roaming>` gave on a machine that has not updated. One widening rides along: a package's
-`Roaming` now counts whether or not a store sits under it. That is exactly the updated
-machine's case, and it is the package's own folder. The 2026-10-17 measurement found
-`Claude-NativeHost` carrying the `Claude` folder's ACL there. No moved data root is ever a
-helper root, and each recognised build is still judged on its own bytes or signature.
+**How far the helper trust widens.** The helper roots are the folders the store candidates'
+`<Roaming>` gave on a machine that has not updated, with one widening: a package's `Roaming`
+now counts whether or not a store sits under it, which is exactly the updated machine's case.
+Any folder matching `Packages\Claude_*` counts, a third party's included. The bar for planting
+a binary there is unchanged: before, creating `Packages\Claude_<x>\LocalCache\Roaming\Claude\claude-code-sessions`
+made that same `Roaming` a helper root, and whoever can create either can already write the
+store directly, which is RULING 7's stated limit. The 2026-10-17 measurement found
+`Claude-NativeHost` carrying the `Claude` folder's ACL on the probed machine. No moved data root
+is ever a helper root, and each recognised build is still judged on its own bytes or, with the
+opt-in, its signature.
 
 **What the precedence costs.** Downgrading to an app version from before the move would make the
-old root live again, and this version would keep reading the moved one. That has not been
-observed. A moved root whose folder name differed from its package's would not supersede the
-old root, so both would be read. On the observed move the old store folder is gone, so that
-cannot happen there.
+old root live again, while this version kept reading the moved one: `converge` and `sync` would
+then report success while writing rows the running app never reads. That has not been observed,
+and the old store reappearing would show as "not read: ..." in the detail. A stray or empty
+`Claude-Data\claude_<pkg>` folder, or a junction of that name, supersedes the package's old root
+the same way; the detail then names the unread store, and with no store under the moved root
+nothing is planned. A moved root whose folder name differed from its package's would not
+supersede the old root, so both would be read. On the observed move the old store folder is
+gone, so none of these arises there. Whether a superseded store that still holds rows should
+refuse mutations outright is left to the maintainer.
 
-**What was measured with the change (2026-10-19, read-only).** A wheel was built from the fix
-commit, installed into a fresh virtual environment, and run from a process without package
-identity. Results:
+**What was measured with the change (2026-10-19, read-only).** A wheel was built from the
+revised fix commit, installed into a fresh virtual environment, and run from a process without
+package identity, the installed 0.16.2 run through the same checks as a control. Results, 30
+checks, all passing:
 
 - the store was found at the moved root only, 2333 rows in three accounts, matching an
-  independent count of the files;
-- the old packaged store was not a candidate;
+  independent count of the files, with the detail a clean "1 root(s)";
+- the old packaged store was not a candidate, and was listed as superseded, holding no store;
 - the manifest-named helper, both versions on disk and the running one were recognised, state
   `changed`;
 - with the opt-in on, the manifest-named helper alone was excused, its signature read live;
@@ -1447,8 +1475,8 @@ identity. Results:
 - the moved CLI was classified as the CLI;
 - with the real process list, only the desktop app's processes counted.
 
-The installed 0.16.2, run through the same checks, found no store, recognised neither the
-helper nor the CLI, and counted the helper.
+The installed 0.16.2 found no store, recognised neither the helper nor the CLI, and counted the
+helper.
 
 **Residuals.**
 
@@ -1456,23 +1484,34 @@ helper nor the CLI, and counted the helper.
   each row's absolute path. Those paths are gone after the move, so `doctor` reports every such
   row as vanished, exits 1, and advises running `new-row` again. On the probed machine that was
   320 rows in 10 operations, and every one was present at the same relative path under the moved
-  root. `undo` of such an operation would find its rows absent at the recorded paths and skip
-  them as already gone. Not fixed here, because it needs a decision on how journaled paths are
-  re-rooted.
+  root. `undo` refuses such an operation and changes nothing: for `converge` because the
+  recorded paths fall outside every discovered root (a layout error), for `new-row` with "that
+  row is already gone", which is false, since the row moved with the store. `recover --back` of
+  a pre-move `converge` left unfinished would skip its rows as absent and close the operation
+  with the rows still in place; none was unfinished on the probed machine. (The `undo` and
+  `recover` behaviour is read from the code, not run.) Not fixed here, because it needs a
+  decision on how journaled paths are re-rooted.
 - The measurement tools' own store lookups (`watch_ceremony.py`, `measure_native_host.py`,
   `attribute_store_writers.py`, `resolver_positive_control.py`) still list only the old roots.
-  They stop with "no store root found" instead of measuring the wrong thing.
+  With no store left there they stop with "no store root found"; where a superseded old store
+  still holds rows they would measure that store, not the live one.
+- The CLI marker is a run of segments, not a path derived from `LOCALAPPDATA`: the same run under
+  another prefix still matches, as with the Roaming marker, and a relocated `LOCALAPPDATA`
+  counts the CLI as the desktop app (fail-closed).
 - No `--apply` has run against the moved store yet. macOS and Linux are untouched.
 
-**Pinned by** `tests/test_data_root.py`, which covers the candidates and their order, the
-precedence (per package), the relative-`LOCALAPPDATA` narrowing, the helper roots, the
-`default_env` wiring and the marker note, and by `TestClaudeRunningNarrowing` in
-`tests/test_plan_move.py`. The tests there check that:
+**Pinned by** `tests/test_data_root.py`, which goes through `_windows_store_layout` and
+`discover_stores` end to end: the candidates and their order, per-package precedence with the
+package name's case folded, a superseded store named and not read, an unlistable `Claude-Data`
+as an error, a file named like a moved root, relative `LOCALAPPDATA` and `APPDATA`, glob
+metacharacters, the helper roots, the `default_env` wiring, and each form of the marker note.
+And by `TestClaudeRunningNarrowing` in `tests/test_plan_move.py`, whose tests check that:
 
 - a store candidate alone derives no helper;
 - the moved layout's helper is recognised, and the opt-in reaches it;
 - three locations under the moved root are not helper locations;
-- the moved CLI is recognised by whole segments, and six near misses still count;
+- the moved CLI is recognised, and ten near misses, among them other depths and files under
+  `claude-code`, still count;
 - relative helper roots derive nothing.
 
 `tools/check_signed_helper_optin.py`'s live leg now walks the guard's helper roots. On
