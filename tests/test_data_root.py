@@ -475,3 +475,41 @@ def test_a_superseded_store_is_named_whatever_its_case(mkenv, tmp_path, roots):
     env = _env_from_layout(mkenv, tmp_path, local, appdata)
     d = ct.discover_stores(env)
     assert "not read" in d.detail
+
+
+@pytest.mark.parametrize("where", ["moved", "old", "classic"])
+def test_unknown_move_beside_a_store_that_is_still_there_is_named(
+        mkenv, tmp_path, roots, where):
+    # Review round 3: a later move that copies rather than moves leaves the
+    # store AND the marker in the same folder. The marker must still be read.
+    local, appdata = roots
+    folder = {"moved": _moved_root(local),
+              "old": _old_claude_dir(local, pkg="zzz999"),
+              "classic": appdata / "Claude"}[where]
+    _row(folder / "claude-code-sessions", "local_still_here")
+    (folder / ".user-data-left.claude_elsewhere").write_bytes(b"")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert d.status == "found"
+    assert ".user-data-left.claude_elsewhere" in d.detail
+    assert "does not know" in d.detail
+
+
+def test_a_marker_beside_a_found_store_cannot_turn_discovery_into_an_error(
+        mkenv, tmp_path, roots, monkeypatch):
+    # The extra look is advisory: a parent that cannot be listed beside a store
+    # that could be is not "couldn't look" about the store.
+    local, appdata = roots
+    moved = _moved_root(local)
+    _row(moved / "claude-code-sessions", "local_moved")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    real_listdir = os.listdir
+
+    def denied(p):
+        if os.path.normcase(os.path.normpath(str(p))) == os.path.normcase(str(moved)):
+            raise PermissionError(13, "denied", str(p))
+        return real_listdir(p)
+
+    monkeypatch.setattr(os, "listdir", denied)
+    d = ct.discover_stores(env)
+    assert (d.status, d.detail) == ("found", "1 root(s)")
