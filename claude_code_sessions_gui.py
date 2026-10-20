@@ -46,6 +46,7 @@ Two rules it holds to:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -148,6 +149,124 @@ def save_pref(value):
             json.dump({"to": value}, fh)
     except OSError:
         pass                    # a preference that cannot be saved is not an error
+
+
+# ------------------------------------------------- the saved destination
+#
+# Claude Desktop 2.42304.2 moved its user data out of the package, and a
+# destination saved before that names a folder under the old root: every plan
+# refused it with a bare "Refused". The maintainer's ruling of 2026-10-20
+# (docs/internals.md, "Amendment 2026-10-20"): no write target changes without
+# a pick, and the preference file changes only on one; a saved value proven
+# gone is set aside and the window asks; a saved store whose account is now
+# signed in is named; the candidate with the saved ids is marked. Pure
+# helpers, importable without tkinter (tests/test_gui_destination.py).
+
+# The core's sentences the window routes on, pinned in the tests above.
+NO_MATCH = "matched no other account store"
+MORE_THAN_ONE = "more than one other account store"
+
+DEST_GONE = ("Your saved destination, {0}, no longer names a store on this "
+             "machine - the desktop app may have moved its data folder, or the "
+             "store was removed. It stays saved until a pick replaces it.")
+DEST_SIGNED_IN = ("Your saved destination, {0}, belongs to the account the Claude "
+                  "desktop app is signed into now, and sync never writes the "
+                  "signed-in account. Change destination picks another.")
+DEST_POINTER = ("Your saved destination, {0}, matches no other account's store. "
+                "Change destination picks another.")
+DEST_MARK = ("same account and org ids as your saved destination - the path "
+             "above says where this one lives")
+ONE_OTHER_STORE = "One other account store on this machine."
+
+# A candidate line is `<acct8>/<org8>   <label padded to 17>   <path>`, but
+# the padding does not hold: "(row count unreadable)" is 22 characters and
+# "(286 rows)" holds a space. So the path is read after one of the label's
+# known forms, never by column.
+_CANDIDATE_PATH = re.compile(
+    r"^\s*[0-9a-f]{8}/[0-9a-f]{8}\s+"
+    r"\((?:\d+ rows?|no listing rows|row count unreadable)\)\s+(\S.*?)\s*$")
+_ID_CHARS = frozenset("0123456789abcdef-")
+
+
+def _candidate_path(line):
+    """The store path a candidate line ends in, or ''."""
+    m = _CANDIDATE_PATH.match(line or "")
+    return m.group(1) if m else ""
+
+
+def _saved_ids(value):
+    """(account, org), lower-cased, from a saved path's last two folders - or
+    None when VALUE is not an absolute path ending in two id-shaped folders."""
+    value = (value or "").strip()
+    if not value or not os.path.isabs(value):
+        return None
+    parts = [p for p in re.split(r"[\\/]+", value) if p]
+    if len(parts) < 2:
+        return None
+    acct, org = parts[-2].lower(), parts[-1].lower()
+    if not (set(acct) <= _ID_CHARS and set(org) <= _ID_CHARS):
+        return None
+    return acct, org
+
+
+def _dest_key(path):
+    """A path for comparison: realpath, then the module's own folding (lower
+    case, forward slashes), trailing separators removed - no second spelling
+    rule."""
+    return ccs._path_match_key(os.path.realpath(path)).rstrip("/")
+
+
+def _destination_gone(value, superseded=(), stat=None):
+    """True only when VALUE is an absolute path that is PROVEN gone: it lies
+    at or under a store discovery deliberately leaves unread (a moved
+    package's old root - ruling 1, a leftover copy included), or looking at
+    it says nothing is there. Couldn't look is never "nothing there", and a
+    path that exists but is not listed - one a newer build knows, say - is
+    not gone."""
+    value = (value or "").strip()
+    if not value or not os.path.isabs(value):
+        return False
+    key = _dest_key(value)
+    for old in superseded or ():
+        k = _dest_key(old)
+        if key == k or key.startswith(k + "/"):
+            return True
+    try:
+        (stat or os.stat)(value)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def _mark_index(paths, ids):
+    """The index of the one candidate path ending in IDS, else None - no
+    match and two matches (two roots holding the same ids) mark nothing."""
+    if not ids:
+        return None
+    hits = [i for i, p in enumerate(paths) if p and _saved_ids(p) == ids]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _destination_findings(env, value):
+    """What the plan worker knows about the saved destination before it
+    plans: whether it is proven gone, its ids, and whether its account is
+    the signed-in one - asked of the core's live_account, never inferred from
+    which candidates are missing. No answer, files that disagree, or a
+    discovery error make no signed-in claim."""
+    value = (value or "").strip()
+    ids = _saved_ids(value)
+    signed_in = False
+    if ids:
+        try:
+            live = ccs.live_account(env)
+        except Exception:
+            live = None
+        signed_in = live is not None and live.account_uuid.lower() == ids[0]
+    return {"value": value,
+            "gone": _destination_gone(value, getattr(env, "superseded_stores", ())),
+            "ids": ids, "signed_in": signed_in}
 
 
 def short(path, home):
@@ -1349,6 +1468,10 @@ class SyncApp:
         self.env = ccs.default_env()
         self.manifest = None
         self.dest_choice = load_pref()
+        # "Change destination" pressed: the next plan runs with no destination,
+        # through the pick flow, and the saved value stays until a pick
+        # replaces it (Amendment 2026-10-20). One plan's worth.
+        self._ask_destination = False
         # The ONE identity answer (GUI polish, Change 2): never persisted,
         # unlike dest_choice - the destination is a stable fact about this
         # machine, while "which account is the desktop app signed into"
@@ -2104,6 +2227,11 @@ class SyncApp:
         self.generation += 1
         gen = self.generation
         only = self.only_var.get().strip()
+        # The saved destination, and a pending "Change destination", are read
+        # here on the UI thread like the filter, and the request is spent by
+        # this plan.
+        dest, ask = self.dest_choice, self._ask_destination
+        self._ask_destination = False
         self.busy(True)
         self._sync_apply_ok = False
         self.apply_btn.configure(state="disabled")
@@ -2114,7 +2242,7 @@ class SyncApp:
         threading.Thread(
             target=self._plan_worker,
             args=(gen, only, self.live_choice, self.update_var.get(),
-                  self.newer_var.get(), self.orphan_var.get()),
+                  self.newer_var.get(), self.orphan_var.get(), dest, ask),
             daemon=True).start()
 
     # ------------------------------------------------ the identity answer
@@ -2268,21 +2396,36 @@ class SyncApp:
                   text=IDENTITY_CANCEL).pack(anchor="w")
         return dlg.run()
 
-    def _plan_worker(self, gen, only, live, update, newer_only, allow_orphan):
+    def _plan_worker(self, gen, only, live, update, newer_only, allow_orphan,
+                     dest="", ask=False):
+        # What is known about the saved destination travels with the result:
+        # `pick` is "change" for a "Change destination" press and "gone" for a
+        # saved value set aside as proven gone - either way this plan runs
+        # with no destination and _plan_done routes it through the pick flow.
+        # A value blank once stripped is no saved destination at all.
+        dest = (dest or "").strip()
+        ctx = {"dest": dest, "pick": None, "findings": None}
         try:
-            flags = ccs.SyncFlags(to=self.dest_choice, live=live,
+            if dest:
+                ctx["findings"] = _destination_findings(self.env, dest)
+            if ask:
+                ctx["pick"] = "change"
+            elif ctx["findings"] and ctx["findings"]["gone"]:
+                ctx["pick"] = "gone"
+            flags = ccs.SyncFlags(to="" if ctx["pick"] else dest, live=live,
                                   only=only, update=update,
                                   newer_only=newer_only,
                                   allow_orphan=allow_orphan)
             manifest = ccs.plan_sync(self.env, flags)
-            self.root.after(0, self._plan_done, gen, only, manifest, None)
+            self.root.after(0, self._plan_done, gen, only, manifest, None, ctx)
         except ccs.Refusal as exc:
-            self.root.after(0, self._plan_done, gen, only, None, ("refusal", str(exc)))
+            self.root.after(0, self._plan_done, gen, only, None,
+                            ("refusal", str(exc)), ctx)
         except Exception:
             self.root.after(0, self._plan_done, gen, only, None,
-                            ("error", traceback.format_exc()))
+                            ("error", traceback.format_exc()), ctx)
 
-    def _plan_done(self, gen, only, manifest, problem):
+    def _plan_done(self, gen, only, manifest, problem, ctx=None):
         # The decrement comes BEFORE the staleness check: every worker owned
         # exactly one busy(True), and a superseded callback that returned
         # without paying it back would strand the counted busy state above
@@ -2292,8 +2435,51 @@ class SyncApp:
         self.busy(False)
         if gen != self.generation:
             return                       # superseded by a newer plan
+        # The saved destination (Amendment 2026-10-20). `pick` set means
+        # this plan ran with no destination on the user's behalf, and every
+        # route below ends in an explicit pick or says why none is offered:
+        # nothing is planned into, and nothing is saved, without one.
+        ctx = ctx or {}
+        pick = ctx.get("pick")
+        find = ctx.get("findings") or {}
+        dest = ctx.get("dest") or ""
+        shown = short(dest, self.env.home)
+        reason = (DEST_SIGNED_IN.format(shown) if find.get("signed_in") else
+                  DEST_GONE.format(shown) if find.get("gone") else "")
+        kind, msg = problem or (None, "")
+        if pick:
+            self._clear_plan()
+        if pick == "gone" and find.get("signed_in") and kind != "error":
+            # The move and an account switch together: the saved store's
+            # account is the signed-in one, and sync never writes it - so no
+            # picker of the OTHER accounts' stores opens on the window's own
+            # account. "Change destination" still reaches a pick.
+            self.status.set("Your saved destination's account is signed in")
+            self.detail.set(reason)
+            self.show([msg] if msg else [])
+            return
+        if pick and manifest is not None:
+            # Exactly one other store: never planned into without a pick. The
+            # candidate is built the way the core builds its own listings.
+            try:
+                live_org = ccs._authenticated_org(self.env,
+                                                  manifest["source_account"])
+            except Exception:
+                live_org = None
+            listing = ccs._candidate_listing(
+                [(manifest["dest_account"], manifest["dest_org"],
+                  manifest["dest_path"])], live_org)
+            self.status.set("Pick the destination")
+            self.detail.set(((reason + " ") if reason else "") +
+                            "Nothing is planned into the one other store "
+                            "until you pick it.")
+            self.show([listing])
+            if self._offer_destination_picker(listing, reason=reason,
+                                              mark=find.get("ids"),
+                                              single=True) is None:
+                self._pick_cancelled(pick, find, reason)
+            return
         if problem:
-            kind, msg = problem
             self.manifest = None
             if (kind == "refusal" and not self.live_choice
                     and "cannot identify the signed-in account" in msg
@@ -2304,11 +2490,21 @@ class SyncApp:
                 # around the refusal, never a rewrite of it.
                 self.status.set("Which account is the Claude desktop app "
                                 "signed into?")
-                self.detail.set("The two files that record this disagree, and either can "
+                self.detail.set(((reason + " ") if pick and reason else "") +
+                                "The two files that record this disagree, and either can "
                                 "be the stale one - so the tool refuses to guess. "
                                 "Answer above the plan; Level shares the answer.")
                 self.show([msg])
                 self._render_sync_banner(ask=True)
+                return
+            if kind == "refusal" and NO_MATCH in msg and dest and not pick:
+                # The values a set-aside leaves in place - a store whose
+                # account is now signed in, a path that exists but no root
+                # holds, an id fragment - get a pointer, not a bare refusal.
+                self.status.set("Refused")
+                self.detail.set(reason if find.get("signed_in") else
+                                DEST_POINTER.format(shown))
+                self.show([msg])
                 return
             # A SAVED destination can go stale: an 8-char id that identified one
             # store stops being unique the moment another account/org pair appears,
@@ -2325,17 +2521,24 @@ class SyncApp:
                 self.show([msg])
                 self._offer_destination_picker(msg)
                 return
-            if kind == "refusal" and "more than one other account store" in msg:
+            if kind == "refusal" and MORE_THAN_ONE in msg:
                 self.status.set("Which account should these sessions go to?")
-                self.detail.set("More than one other account store exists on this "
+                self.detail.set(((reason + " ") if pick and reason else "") +
+                                "More than one other account store exists on this "
                                 "machine. Pick the destination, then Refresh.")
                 self.show([msg])
-                self._offer_destination_picker(msg)
+                if (self._offer_destination_picker(
+                        msg, reason=reason if pick else "",
+                        mark=find.get("ids") if pick else None) is None
+                        and pick):
+                    self._pick_cancelled(pick, find, reason)
                 return
             self.status.set("Refused" if kind == "refusal" else "Something went wrong")
-            self.detail.set("Nothing was written. The tool's own explanation:"
-                            if kind == "refusal" else
-                            "This is a bug in the launcher, not a refusal.")
+            self.detail.set(((reason + " ") if pick and reason and kind == "refusal"
+                             else "") +
+                            ("Nothing was written. The tool's own explanation:"
+                             if kind == "refusal" else
+                             "This is a bug in the launcher, not a refusal."))
             self.show([msg])
             return
 
@@ -2610,35 +2813,90 @@ class SyncApp:
                 if a.startswith(acct) and o.startswith(org)]
         return hits[0] if len(hits) == 1 else ""
 
-    def _offer_destination_picker(self, msg):
+    def _offer_destination_picker(self, msg, reason="", mark=None, single=False):
+        """The destination picker over the candidate lines in MSG: the
+        picked pair (and a replan), or None for Cancel or no candidates.
+        REASON heads it when the window opened it on the user's behalf; MARK,
+        the saved destination's ids, marks the one candidate whose own path
+        ends in them; SINGLE is the one-other-store form."""
         cands = self._candidates(msg)
         if not cands:
-            return                      # unrecognised shape: leave the raw refusal
+            return None                 # unrecognised shape: leave the raw refusal
         dlg = _Dialog(self, "Choose a destination",
+                      ONE_OTHER_STORE if single else
                       "More than one other account store on this machine.")
-        text = "Pick the one whose sidebar should get these sessions."
+        if reason:
+            ttk.Label(dlg.body, padding=(PAD, 0, PAD, 6), justify="left",
+                      wraplength=620, text=reason).pack(anchor="w")
+        text = ("Pick it to make it the destination; nothing is planned into "
+                "it until you do." if single else
+                "Pick the one whose sidebar should get these sessions.")
         # Every candidate empty is the just-created-an-account case, where the row
         # count cannot help at all. Say the one thing that reliably settles it
-        # rather than leaving the user to read uuids out of paths.
-        if all("(no listing rows)" in line for _t, line, _n in cands):
+        # rather than leaving the user to read uuids out of paths. With one
+        # candidate there is nothing to tell apart.
+        if len(cands) > 1 and all("(no listing rows)" in line
+                                  for _t, line, _n in cands):
             text += ("\n\nAll of them are empty, so row counts cannot tell them "
                      "apart. The reliable way:\nsend one message in the new "
                      "account, close the app, then press Refresh - the store\n"
                      "that gained a row is the right one.")
         ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
                   wraplength=620, text=text).pack(anchor="w")
-        for pair, line, note in cands:
+        paths = [_candidate_path(line) for _t, line, _n in cands]
+        marked = _mark_index(paths, mark)
+        for i, (pair, line, note) in enumerate(cands):
             label = line if not note else line + "\n     \u26a0 " + note
+            if i == marked:
+                label += "\n     \u2190 " + DEST_MARK
 
-            def pick(p=pair):
-                # Save the resolved PATH, not the id fragment shown on the button.
-                self.dest_choice = self._resolve_pair(p) or p
+            def pick(p=pair, path=paths[i]):
+                # Save the PATH the candidate's own line prints, not the id
+                # fragment shown on the button: where two roots hold the same
+                # ids, _resolve_pair finds two stores and the bare pair it
+                # fell back to was refused as ambiguous - back into this
+                # picker, round and round.
+                self.dest_choice = path or self._resolve_pair(p) or p
                 save_pref(self.dest_choice)
+                self._show_forget()
                 dlg.finish(p)
             ttk.Button(dlg.body, text=label, command=pick).pack(
                 fill="x", padx=PAD, pady=2)
-        if dlg.run():
+        picked = dlg.run()
+        if picked:
             self.refresh()
+        return picked
+
+    def _clear_plan(self):
+        """Nothing installed for Apply or the bulk-copy tick to act on: the
+        pick flow opens over no plan (Amendment 2026-10-20)."""
+        self.manifest = None
+        self._sync_apply_ok = False
+        self._bind_consent([])
+        self._apply_gate_to_buttons()
+
+    def _pick_cancelled(self, pick, find, reason):
+        """A pick-flow picker closed without a pick. After "Change
+        destination" over a saved destination that is still there, its plan
+        comes back as it was; otherwise the pane says no destination is
+        chosen and keeps the reason - and the saved value stays, untouched."""
+        if pick == "change" and not find.get("gone"):
+            self.refresh()
+            return
+        self._clear_plan()
+        if find.get("signed_in"):
+            self.status.set("Your saved destination's account is signed in")
+            self.detail.set(reason)
+        else:
+            self.status.set("No destination chosen")
+            self.detail.set(((reason + " ") if reason else "") +
+                            "Change destination picks one.")
+
+    def _show_forget(self):
+        """'Change destination' shows whenever a destination is saved - after
+        a first pick in this window too, not only when one was saved at open."""
+        if self.dest_choice and not self.forget_btn.winfo_manager():
+            self.forget_btn.pack(side="left", padx=(6, 0))
 
     def _account_label(self, uuid):
         """email (id) when the email can be recovered, else just the id."""
@@ -3067,8 +3325,12 @@ class SyncApp:
         self.refresh_level(note=note)
 
     def forget_destination(self):
-        self.dest_choice = ""
-        save_pref("")
+        """'Change destination': ask, without erasing. It used to write the
+        empty value first - so a cancelled pick lost the saved destination,
+        and on a machine with one other store the next plan went straight
+        into it with no pick at all. Now the next plan runs with no
+        destination through the pick flow, and only a pick changes the file."""
+        self._ask_destination = True
         self.refresh()
 
     def _on_update_toggle(self):
