@@ -1364,13 +1364,25 @@ by one refusal test each in `tests/test_plan_move.py`, `tests/test_undo.py` and
 
 #### Amendment 2026-10-19 — the user data moved, and the helper did not
 
-**Status: implemented on a branch for the maintainer's review; not yet ruled on.** The
-precedence between the old and moved roots, the marker note, and leaving the journaled-path
-gap (Residuals) to a follow-up are the implementation's choices. Revised the same evening after
-three rounds of independent review by four models: the layout now lists data folders rather than
-stores, names what it does not read, and fails closed when it cannot look (below). The fixes from
-the third round, the marker read beside a found store and the corrections to where the notes
-appear, were not reviewed again.
+**Status: the maintainer's ruling of 2026-10-19, implemented.** The change was revised the same
+evening after three rounds of independent review by four models: the layout now lists data
+folders rather than stores, names what it does not read, and fails closed when it cannot look
+(below). The fixes from the third round, the marker read beside a found store and the corrections
+to where the notes appear, were not reviewed again. The maintainer then ruled on three points,
+each as recommended:
+
+1. When a package's moved root exists, its old root is never read, and an old store that still
+   holds rows is named in `doctor`'s detail. Not taken: refusing every mutation while such a
+   store exists; requiring the app's marker before the moved root takes precedence; reading both
+   roots.
+2. The marker note stays advisory: it explains and never decides. Not taken: making a marker
+   that names an unknown location a discovery error, which a stale marker could turn into a
+   permanent refusal.
+3. The version bump to 0.16.3 lands with the release, under the release procedure; the README
+   names 0.16.3 ahead of it. Not taken: bumping on this branch; wording the README as "the next
+   release".
+
+Leaving the journaled-path gap (Residuals) to a follow-up is the implementation's choice.
 
 **What changed (observed 2026-10-19, read-only).** Claude Desktop 2.42304.2.0, installed by an
 automatic update, moved the app's whole user-data folder out of the package, from
@@ -1464,8 +1476,8 @@ and the old store reappearing would show as "not read: ..." in the detail. A str
 the same way; the detail then names the unread store, and with no store under the moved root
 nothing is planned. A moved root whose folder name differed from its package's would not
 supersede the old root, so both would be read. On the observed move the old store folder is
-gone, so none of these arises there. Whether a superseded store that still holds rows should
-refuse mutations outright is left to the maintainer.
+gone, so none of these arises there. Refusing mutations while a superseded store still holds
+rows was considered and not taken (ruling 1 above).
 
 **What was measured with the change (2026-10-19, read-only).** A wheel was built from the fix
 commit after each review round, last after round 3, installed into a fresh virtual environment,
