@@ -54,14 +54,19 @@ class Env:
     # store, which moved without it in Desktop 2.42304.2 (see _windows_helper_roots).
     # Empty recognises no helper, so an Env that names none fails closed.
     helper_roots: list = dataclasses.field(default_factory=list)
+    # Old store paths deliberately NOT read, because their package's user data
+    # moved (_windows_store_layout). Discovery names any that still exists and
+    # reads the app's marker in its folder; it never reads rows from one.
+    superseded_stores: list = dataclasses.field(default_factory=list)
 
 
 def default_env():
     home = os.path.expanduser("~")
+    superseded = []
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA", "")
         appdata = os.environ.get("APPDATA", "")
-        candidates = _windows_store_candidates(local, appdata)
+        candidates, superseded = _windows_store_layout(local, appdata)
         helper_roots = _windows_helper_roots(local, appdata)
     elif sys.platform == "darwin":
         support = os.path.join(home, "Library", "Application Support")
@@ -82,6 +87,7 @@ def default_env():
         process_lister=_default_process_lister,
         now=time.time,
         helper_roots=helper_roots,
+        superseded_stores=superseded,
     )
 
 
@@ -94,40 +100,75 @@ _MOVED_DATA_DIR = "Claude-Data"
 _MOVED_MARKER_PREFIX = ".user-data-left."
 
 
-def _windows_store_candidates(localappdata, appdata):
-    """Where the store may be on Windows, in the order it is read.
+def _windows_store_layout(localappdata, appdata):
+    """(candidates, superseded): where the store may be on Windows, in the order
+    it is read, and the old stores deliberately left unread.
 
-    1. Each moved data root, %LOCALAPPDATA%\\Claude-Data\\claude_<pkg>\\. Listed
-       whenever the root exists, store or not, as the classic candidate is
-       listed whether or not it exists: discovery then proves a missing store
-       there, and the identity checks read that root's own config.json.
-    2. Each packaged root from before the move, listed when its store exists -
+    Candidates:
+    1. Each moved data root, %LOCALAPPDATA%\\Claude-Data\\claude_<pkg>\\: every
+       entry of that name that is not a plain file. Listed whenever it exists,
+       store or not, as the classic candidate always was: discovery then proves
+       a missing store there, reads the app's marker beside it, and the identity
+       checks read that root's own config.json. When Claude-Data exists but
+       cannot be listed, nobody can say which packages moved, so the folder
+       itself goes in as a candidate's parent: discovery fails to list it the
+       same way and reports "error" rather than reading an old store as though
+       nothing had moved.
+    2. Each packaged data folder from before the move,
+       ...\\Packages\\Claude_<pkg>\\LocalCache\\Roaming\\Claude\\, listed whenever
+       it exists, store or not, so the marker the app leaves there is read -
        UNLESS the same package's moved root exists. Then the moved root is the
        store: the updated app was seen writing there, and the old folder is what
        it left. Reading both would list every row twice and hand the identity
-       checks a pre-move config.json. Packages match by folder name, case
+       checks a pre-move config.json. Such a store goes in `superseded`, which
+       discovery reports and never reads. Packages match by folder name, case
        folded: Claude_<pkg> and claude_<pkg>.
     3. The classic %APPDATA%\\Claude\\claude-code-sessions, whether or not it
        exists, as before.
 
-    Only an absolute LOCALAPPDATA is globbed: a relative pattern searches the
-    working directory, where a look-alike tree would become a store.
+    Only an absolute LOCALAPPDATA is globbed and only an absolute APPDATA is
+    used: a relative one resolves against the working directory, where a
+    look-alike tree would become a store. Glob metacharacters in either are
+    escaped, so a folder name holding "[" is read as written.
     """
-    moved, old = [], []
+    moved, old, superseded = [], [], []
     if localappdata and os.path.isabs(localappdata):
-        moved = sorted(p for p in _glob.glob(os.path.join(
-            localappdata, _MOVED_DATA_DIR, "claude_*")) if os.path.isdir(p))
-        moved_pkgs = {os.path.basename(p).lower() for p in moved}
-        for cand in sorted(_glob.glob(os.path.join(
-                localappdata, "Packages", "Claude_*", "LocalCache", "Roaming",
-                "Claude", "claude-code-sessions"))):
-            pkg_dir = cand
-            for _ in range(4):        # ...\Claude_<pkg>\LocalCache\Roaming\Claude\<store>
+        moved_parent = os.path.join(localappdata, _MOVED_DATA_DIR)
+        moved_pkgs = set()
+        try:
+            names = os.listdir(moved_parent)
+        except FileNotFoundError:
+            names = []
+        except OSError:
+            names = None
+        if names is None:
+            moved = [moved_parent]       # discovery reports it as unreadable
+            moved_pkgs = None
+        else:
+            moved = sorted(os.path.join(moved_parent, n) for n in names
+                           if n.lower().startswith("claude_")
+                           and not os.path.isfile(os.path.join(moved_parent, n)))
+            moved_pkgs = {os.path.basename(p).lower() for p in moved}
+        for claude_dir in sorted(_glob.glob(os.path.join(
+                _glob.escape(os.path.join(localappdata, "Packages")),
+                "Claude_*", "LocalCache", "Roaming", "Claude"))):
+            cand = os.path.join(claude_dir, "claude-code-sessions")
+            pkg_dir = claude_dir
+            for _ in range(3):        # ...\Claude_<pkg>\LocalCache\Roaming\Claude
                 pkg_dir = os.path.dirname(pkg_dir)
-            if os.path.basename(pkg_dir).lower() not in moved_pkgs:
+            if moved_pkgs is not None and os.path.basename(pkg_dir).lower() in moved_pkgs:
+                superseded.append(cand)
+            else:
                 old.append(cand)
-    return ([os.path.join(p, "claude-code-sessions") for p in moved] + old
-            + [os.path.join(appdata, "Claude", "claude-code-sessions")])
+    classic = ([os.path.join(appdata, "Claude", "claude-code-sessions")]
+               if appdata and os.path.isabs(appdata) else [])
+    return ([os.path.join(p, "claude-code-sessions") for p in moved] + old + classic,
+            superseded)
+
+
+def _windows_store_candidates(localappdata, appdata):
+    """The store candidates alone; see _windows_store_layout."""
+    return _windows_store_layout(localappdata, appdata)[0]
 
 
 def _windows_helper_roots(localappdata, appdata):
@@ -136,21 +177,23 @@ def _windows_helper_roots(localappdata, appdata):
 
     The helper did not move with the user data in 2.42304.2: it stays at
     <package>\\LocalCache\\Roaming\\Claude-NativeHost\\<version>\\. So these are
-    each package's LocalCache\\Roaming that exists, plus %APPDATA% for the
-    classic install - the folders the store candidates gave, two folders up,
-    before the move - and never a moved data root. Two folders up from the
-    moved store is %LOCALAPPDATA%\\Claude-Data, where no helper lives.
+    each package's LocalCache\\Roaming that is a folder, plus an absolute
+    %APPDATA% for the classic install, whether or not it exists - the folders
+    the store candidates gave, two folders up, before the move - and never a
+    moved data root. Two folders up from the moved store is
+    %LOCALAPPDATA%\\Claude-Data, where no helper lives.
 
-    Only real folders are listed, and only an absolute LOCALAPPDATA is globbed.
-    %APPDATA% is listed as it is; when it is unset the empty root is relative
-    and derives nothing (_expected_helper_paths).
+    Only an absolute LOCALAPPDATA is globbed, metacharacters escaped, and only
+    an absolute APPDATA is listed (_expected_helper_paths also skips relative
+    roots, as a second line).
     """
     roots = []
     if localappdata and os.path.isabs(localappdata):
         roots = sorted(p for p in _glob.glob(os.path.join(
-            localappdata, "Packages", "Claude_*", "LocalCache", "Roaming"))
+            _glob.escape(os.path.join(localappdata, "Packages")),
+            "Claude_*", "LocalCache", "Roaming"))
             if os.path.isdir(p))
-    return roots + [appdata]
+    return roots + ([appdata] if appdata and os.path.isabs(appdata) else [])
 
 
 # Fail-closed sentinel: returned (with pid -1) whenever the process list
@@ -375,23 +418,66 @@ def discover_stores(env):
             errors.append("{0}: {1}".format(cand, exc))
             continue
         # The marker the app leaves in a folder its user data moved out of. It
-        # only explains an absence; nothing decides on it.
+        # only explains; nothing decides on it.
         markers.update(os.path.join(parent, n) for n in names
                        if n.startswith(_MOVED_MARKER_PREFIX))
+    # Old stores left unread because their package's data moved. Never a root:
+    # they are only named when one is still there, and their folder's marker read.
+    left_behind = []
+    for old in getattr(env, "superseded_stores", ()) or ():
+        try:
+            names = os.listdir(os.path.dirname(old))
+        except OSError:
+            continue                               # advisory: nothing decides on it
+        markers.update(os.path.join(os.path.dirname(old), n) for n in names
+                       if n.startswith(_MOVED_MARKER_PREFIX))
+        if "claude-code-sessions" in names:
+            left_behind.append(old)
     if errors:
         return StoreDiscovery("error", roots, "; ".join(errors))
+    notes = _discovery_notes(env, roots, markers, left_behind)
     if roots:
-        return StoreDiscovery("found", roots, "{0} root(s)".format(len(roots)))
-    detail = "no store under any known candidate"
-    if markers:
-        # 0.16.2 said only the line above after Desktop 2.42304.2 moved the store,
-        # which read as "this machine has no sessions". The app had said where
-        # they went; this passes that on, so the next move names itself.
-        detail += ("; found {0}, the marker the desktop app leaves when its user "
-                   "data has moved out of that folder. This version does not know "
-                   "where it moved; a newer claude-code-sessions may"
-                   .format(", ".join(sorted(markers))))
-    return StoreDiscovery("absent", [], detail)
+        return StoreDiscovery("found", roots, "; ".join(
+            ["{0} root(s)".format(len(roots))] + notes))
+    return StoreDiscovery("absent", [], "; ".join(
+        ["no store under any known candidate"] + notes))
+
+
+def _discovery_notes(env, roots, markers, left_behind):
+    """What discovery saw beside the store, for the detail line. Advisory only.
+
+    0.16.2 reported a bare "no store" after Desktop 2.42304.2 moved the data,
+    which read as "this machine has no sessions" although the app had left a
+    marker naming the folder it moved to. A marker names that folder:
+    .user-data-left.<folder>. One naming a folder a store was found in records
+    the move this version followed and is left out. One naming a data folder
+    this version looked in says that folder holds no store. Any other names a
+    location this version does not know - the next move - and is reported
+    whether or not some other store was found, so a stale leftover store
+    cannot hide it.
+    """
+    found = {os.path.basename(os.path.dirname(r)).lower() for r in roots}
+    looked = {}
+    for cand in env.store_candidates:
+        folder = os.path.dirname(cand)
+        looked.setdefault(os.path.basename(folder).lower(), folder)
+    notes = []
+    for old in left_behind:
+        notes.append("not read: {0}, a store left behind when its package's user "
+                     "data moved; the moved root is the store".format(old))
+    for marker in sorted(markers):
+        dest = os.path.basename(marker)[len(_MOVED_MARKER_PREFIX):].lower()
+        if dest in found:
+            continue
+        if dest in looked:
+            notes.append("found {0}: the desktop app's user data moved to {1}, "
+                         "which holds no store".format(marker, looked[dest]))
+        else:
+            notes.append("found {0}, the marker the desktop app leaves when its "
+                         "user data has moved out of a folder; it names {1}, a "
+                         "location this version does not know - a newer "
+                         "claude-code-sessions may".format(marker, dest))
+    return notes
 
 
 # ----------------------------------------------------------- listing rows
@@ -908,11 +994,15 @@ class MoveFlags:
 # process guard below would see this very tool and refuse to run.
 OUR_COMMANDS = ("claude-code-sessions", "ccs")
 
-# The app-spawned CLI's home after Desktop 2.42304.2 moved the user data
-# (2026-10-19): ...\appdata\local\claude-data\claude_<pkg>\claude-code\. Whole
-# segments, anchored at appdata\local like the Roaming marker below.
+# The app-spawned CLI after Desktop 2.42304.2 moved the user data (2026-10-19):
+# ...\appdata\local\claude-data\claude_<pkg>\claude-code\<version>\<hash>\claude.exe,
+# as measured, to the end of the entry. Whole segments, anchored at appdata\local
+# like the Roaming marker below; <pkg> as observed, lowercase letters and digits.
+# A near miss - another file, another depth, a relocated LOCALAPPDATA - counts as
+# the desktop app, the fail-closed direction.
 _MOVED_CLI_HOME_RE = re.compile(
-    r"\\appdata\\local\\claude-data\\claude_[a-z0-9]+\\claude-code\\")
+    r"\\appdata\\local\\claude-data\\claude_[a-z0-9]+\\claude-code"
+    r"\\[0-9]+(?:\.[0-9]+)*\\[0-9a-f]+\\claude\.exe$")
 
 
 def _is_cli_process(text):

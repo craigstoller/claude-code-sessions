@@ -90,9 +90,10 @@ if sys.platform == "win32":
     real_env = ccs.default_env()
     found = []
     for p in ccs._expected_helper_paths(real_env):
-        found += glob.glob(p)
+        if os.path.isfile(p):
+            found.append(p)
     for d in ccs._expected_native_host_dirs(real_env):
-        found += glob.glob(os.path.join(d, "*", "chrome-native-host.exe"))
+        found += glob.glob(os.path.join(glob.escape(d), "*", "chrome-native-host.exe"))
     found = sorted({p.lower() for p in found
                     if ccs._looks_like_chrome_helper(p, real_env)})
     if found:
