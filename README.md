@@ -613,7 +613,7 @@ and a `converge` dry run) were checked against the moved store the same day. 0.1
 known gap: rows this tool created before the move are journaled at their old paths, so
 `doctor` reports them as "no longer on disk" although they moved with the store, and advises
 running `new-row` again; for the same reason `undo` cannot reverse an operation from before
-the move. The release after 0.16.3 reads those paths under the moved store: `doctor` checks
+the move. 0.16.4 reads those paths under the moved store: `doctor` checks
 the rows where they now are, and `undo` and `recover` treat such an operation as they did
 before the move. A row in a store the tool cannot read at all is listed by `doctor` apart, not
 counted in its exit code, and `undo` refuses it.
