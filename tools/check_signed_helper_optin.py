@@ -81,19 +81,18 @@ finally:
 # ------------------------------------------------- the real signature reader
 if sys.platform == "win32":
     import glob
-    # Look wherever the guard looks: both layouts, under every store candidate
-    # the guard derives from (packaged and classic). A glob of one packaged path
-    # skipped this check without failing when Desktop 2.42304 moved the helper.
-    # Only paths the guard itself recognises are kept.
+    # Look wherever the guard looks: both layouts, under every helper root the
+    # guard derives from (packaged and classic), through the guard's own
+    # derivations. A glob of one packaged path skipped this check without
+    # failing when Desktop 2.42304 moved the helper; deriving from the store
+    # candidates would have done the same when 2.42304.2 moved the store
+    # without the helper. Only paths the guard itself recognises are kept.
     real_env = ccs.default_env()
     found = []
-    for cand in real_env.store_candidates:
-        claude_dir = os.path.dirname(cand)
-        found += glob.glob(os.path.join(claude_dir, "ChromeNativeHost",
-                                        "chrome-native-host.exe"))
-        found += glob.glob(os.path.join(os.path.dirname(claude_dir),
-                                        "Claude-NativeHost", "*",
-                                        "chrome-native-host.exe"))
+    for p in ccs._expected_helper_paths(real_env):
+        found += glob.glob(p)
+    for d in ccs._expected_native_host_dirs(real_env):
+        found += glob.glob(os.path.join(d, "*", "chrome-native-host.exe"))
     found = sorted({p.lower() for p in found
                     if ccs._looks_like_chrome_helper(p, real_env)})
     if found:
@@ -107,8 +106,8 @@ if sys.platform == "win32":
             check("  and names the expected publisher",
                   ccs._signed_helper_state(p) == "signed")
     else:
-        print("--  no helper under any of the %d store candidate(s); live signature "
-              "check skipped" % len(real_env.store_candidates))
+        print("--  no helper under any of the %d helper root(s); live signature "
+              "check skipped" % len(real_env.helper_roots))
     # a file that is certainly not signed
     unsigned = os.path.join(root, "not-signed.exe")
     with open(unsigned, "wb") as fh:

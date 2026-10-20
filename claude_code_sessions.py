@@ -50,19 +50,27 @@ class Env:
     is_windows: bool
     process_lister: object
     now: object
+    # The folders the browser helper's own folders sit in - NOT derived from the
+    # store, which moved without it in Desktop 2.42304.2 (see _windows_helper_roots).
+    # Empty recognises no helper, so an Env that names none fails closed.
+    helper_roots: list = dataclasses.field(default_factory=list)
 
 
 def default_env():
     home = os.path.expanduser("~")
     if sys.platform == "win32":
-        candidates = sorted(
-            __import__("glob").glob(os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                "Packages", "Claude_*", "LocalCache", "Roaming", "Claude", "claude-code-sessions"))
-        ) + [os.path.join(os.environ.get("APPDATA", ""), "Claude", "claude-code-sessions")]
+        local = os.environ.get("LOCALAPPDATA", "")
+        appdata = os.environ.get("APPDATA", "")
+        candidates = _windows_store_candidates(local, appdata)
+        helper_roots = _windows_helper_roots(local, appdata)
     elif sys.platform == "darwin":
-        candidates = [os.path.join(home, "Library", "Application Support", "Claude", "claude-code-sessions")]
+        support = os.path.join(home, "Library", "Application Support")
+        candidates = [os.path.join(support, "Claude", "claude-code-sessions")]
+        helper_roots = [support]
     else:
-        candidates = [os.path.join(home, ".config", "Claude", "claude-code-sessions")]
+        config = os.path.join(home, ".config")
+        candidates = [os.path.join(config, "Claude", "claude-code-sessions")]
+        helper_roots = [config]
     import time
     return Env(
         home=home,
@@ -73,7 +81,76 @@ def default_env():
         is_windows=(sys.platform == "win32"),
         process_lister=_default_process_lister,
         now=time.time,
+        helper_roots=helper_roots,
     )
+
+
+# Desktop 2.42304.2 (2026-10-19) moved the app's user data, store included, out of
+# the package: from %LOCALAPPDATA%\Packages\Claude_<pkg>\LocalCache\Roaming\Claude\
+# to %LOCALAPPDATA%\Claude-Data\claude_<pkg>\, leaving only a 0-byte
+# .user-data-left.claude_<pkg> in the old folder. The browser helper stayed in the
+# package. See docs/internals.md, "Amendment 2026-10-19".
+_MOVED_DATA_DIR = "Claude-Data"
+_MOVED_MARKER_PREFIX = ".user-data-left."
+
+
+def _windows_store_candidates(localappdata, appdata):
+    """Where the store may be on Windows, in the order it is read.
+
+    1. Each moved data root, %LOCALAPPDATA%\\Claude-Data\\claude_<pkg>\\. Listed
+       whenever the root exists, store or not, as the classic candidate is
+       listed whether or not it exists: discovery then proves a missing store
+       there, and the identity checks read that root's own config.json.
+    2. Each packaged root from before the move, listed when its store exists -
+       UNLESS the same package's moved root exists. Then the moved root is the
+       store: the updated app was seen writing there, and the old folder is what
+       it left. Reading both would list every row twice and hand the identity
+       checks a pre-move config.json. Packages match by folder name, case
+       folded: Claude_<pkg> and claude_<pkg>.
+    3. The classic %APPDATA%\\Claude\\claude-code-sessions, whether or not it
+       exists, as before.
+
+    Only an absolute LOCALAPPDATA is globbed: a relative pattern searches the
+    working directory, where a look-alike tree would become a store.
+    """
+    moved, old = [], []
+    if localappdata and os.path.isabs(localappdata):
+        moved = sorted(p for p in _glob.glob(os.path.join(
+            localappdata, _MOVED_DATA_DIR, "claude_*")) if os.path.isdir(p))
+        moved_pkgs = {os.path.basename(p).lower() for p in moved}
+        for cand in sorted(_glob.glob(os.path.join(
+                localappdata, "Packages", "Claude_*", "LocalCache", "Roaming",
+                "Claude", "claude-code-sessions"))):
+            pkg_dir = cand
+            for _ in range(4):        # ...\Claude_<pkg>\LocalCache\Roaming\Claude\<store>
+                pkg_dir = os.path.dirname(pkg_dir)
+            if os.path.basename(pkg_dir).lower() not in moved_pkgs:
+                old.append(cand)
+    return ([os.path.join(p, "claude-code-sessions") for p in moved] + old
+            + [os.path.join(appdata, "Claude", "claude-code-sessions")])
+
+
+def _windows_helper_roots(localappdata, appdata):
+    """The <Roaming> folders the helper's folders sit in, listed independently of
+    the store.
+
+    The helper did not move with the user data in 2.42304.2: it stays at
+    <package>\\LocalCache\\Roaming\\Claude-NativeHost\\<version>\\. So these are
+    each package's LocalCache\\Roaming that exists, plus %APPDATA% for the
+    classic install - the folders the store candidates gave, two folders up,
+    before the move - and never a moved data root. Two folders up from the
+    moved store is %LOCALAPPDATA%\\Claude-Data, where no helper lives.
+
+    Only real folders are listed, and only an absolute LOCALAPPDATA is globbed.
+    %APPDATA% is listed as it is; when it is unset the empty root is relative
+    and derives nothing (_expected_helper_paths).
+    """
+    roots = []
+    if localappdata and os.path.isabs(localappdata):
+        roots = sorted(p for p in _glob.glob(os.path.join(
+            localappdata, "Packages", "Claude_*", "LocalCache", "Roaming"))
+            if os.path.isdir(p))
+    return roots + [appdata]
 
 
 # Fail-closed sentinel: returned (with pid -1) whenever the process list
@@ -115,7 +192,9 @@ def _default_process_lister():
     image name claude.exe - measured 2026-08-02: the MSIX desktop at
     ...\\WindowsApps\\Claude_...\\app\\Claude.exe and the CLI, a native
     binary since ~2.x, at ...\\AppData\\Roaming\\Claude\\claude-code\\...\\
-    claude.exe. The old docstring's claim that a node-hosted CLI was
+    claude.exe - since Desktop 2.42304.2 (measured 2026-10-19) at
+    ...\\AppData\\Local\\Claude-Data\\claude_<pkg>\\claude-code\\...\\claude.exe.
+    The old docstring's claim that a node-hosted CLI was
     invisible to tasklist is obsolete). If PowerShell/CIM yields nothing
     usable, fall back to name-only tasklist output - callers treat an
     unclassifiable claude-named entry as the desktop app (fail closed).
@@ -273,7 +352,7 @@ def discover_stores(env):
     # installed the desktop app has no %APPDATA%\Claude parent at all - that is
     # the normal CLI-only case, not an error). Any OTHER OSError means "couldn't
     # look", which is never "nothing there".
-    roots, errors, seen = [], [], set()
+    roots, errors, seen, markers = [], [], set(), set()
     for cand in env.store_candidates:
         try:
             os.listdir(cand)                       # store exists and is enumerable
@@ -289,16 +368,30 @@ def discover_stores(env):
             continue
         parent = os.path.dirname(cand)
         try:
-            os.listdir(parent)
+            names = os.listdir(parent)
         except FileNotFoundError:
-            pass                                   # parent absent too: proven absent
+            continue                               # parent absent too: proven absent
         except OSError as exc:
             errors.append("{0}: {1}".format(cand, exc))
+            continue
+        # The marker the app leaves in a folder its user data moved out of. It
+        # only explains an absence; nothing decides on it.
+        markers.update(os.path.join(parent, n) for n in names
+                       if n.startswith(_MOVED_MARKER_PREFIX))
     if errors:
         return StoreDiscovery("error", roots, "; ".join(errors))
     if roots:
         return StoreDiscovery("found", roots, "{0} root(s)".format(len(roots)))
-    return StoreDiscovery("absent", [], "no store under any known candidate")
+    detail = "no store under any known candidate"
+    if markers:
+        # 0.16.2 said only the line above after Desktop 2.42304.2 moved the store,
+        # which read as "this machine has no sessions". The app had said where
+        # they went; this passes that on, so the next move names itself.
+        detail += ("; found {0}, the marker the desktop app leaves when its user "
+                   "data has moved out of that folder. This version does not know "
+                   "where it moved; a newer claude-code-sessions may"
+                   .format(", ".join(sorted(markers))))
+    return StoreDiscovery("absent", [], detail)
 
 
 # ----------------------------------------------------------- listing rows
@@ -815,6 +908,12 @@ class MoveFlags:
 # process guard below would see this very tool and refuse to run.
 OUR_COMMANDS = ("claude-code-sessions", "ccs")
 
+# The app-spawned CLI's home after Desktop 2.42304.2 moved the user data
+# (2026-10-19): ...\appdata\local\claude-data\claude_<pkg>\claude-code\. Whole
+# segments, anchored at appdata\local like the Roaming marker below.
+_MOVED_CLI_HOME_RE = re.compile(
+    r"\\appdata\\local\\claude-data\\claude_[a-z0-9]+\\claude-code\\")
+
 
 def _is_cli_process(text):
     """True when TEXT (a lowercased lister entry) is the Claude Code CLI,
@@ -827,6 +926,9 @@ def _is_cli_process(text):
           and those still match)
       ...\\.local\\bin\\claude.exe / .../.local/bin/claude            (the PATH shim)
       any npm-style .../claude-code/... install
+    and, measured 2026-10-19 after Desktop 2.42304.2 moved it with the user data:
+      ...\\appdata\\local\\claude-data\\claude_<pkg>\\claude-code\\<ver>\\<hash>\\claude.exe
+          (the backend the desktop spawns - excluded for the same reason)
 
     Everything else claude-named - the MSIX desktop, a non-MSIX desktop
     install, or a bare image name the fallback lister could not resolve to
@@ -848,6 +950,7 @@ def _is_cli_process(text):
     """
     text = text.replace("/", "\\")
     return ("\\appdata\\roaming\\claude\\claude-code\\" in text  # measured CLI home
+            or _MOVED_CLI_HOME_RE.search(text) is not None       # and since 2.42304.2
             or "\\@anthropic-ai\\claude-code\\" in text          # npm install layout
             or text.endswith("\\.local\\bin\\claude.exe")
             or text.endswith("\\.local\\bin\\claude")    # POSIX shim, post-normalise
@@ -868,7 +971,7 @@ def _is_cli_process(text):
 # host, and why it still counts" and its 2026-08-07 amendment - including the
 # standing caveat that this is ONE clean trial.
 #
-# The binding is the helper's location derived from the store roots (see
+# The binding is the helper's location derived from the helper roots (see
 # _expected_helper_paths) AND the binary's hash, because the helper auto-updates
 # in place: it changed under this very investigation (744187C7... -> 711AD7E7...,
 # same path, same byte length). A path-only exclusion would therefore silently
@@ -880,10 +983,14 @@ _HELPER_SHA256 = "711ad7e7dec73aa58187479f5f99b13480df93ab1306bd171a61027d84fa81
 
 
 def _expected_helper_paths(env):
-    """The helper's real location(s), derived from the discovered store roots.
+    """The helper's real location(s) in the old layout, derived from the helper
+    roots: <Roaming>\\Claude\\ChromeNativeHost\\chrome-native-host.exe.
 
-    A store candidate is <...>\\Roaming\\Claude\\claude-code-sessions; the helper
-    is its sibling <...>\\Roaming\\Claude\\ChromeNativeHost\\chrome-native-host.exe.
+    Until 2026-10-19 this was derived from the store candidates, each
+    <Roaming>\\Claude\\claude-code-sessions, and the helper was the store's
+    sibling. Desktop 2.42304.2 moved the store out of <Roaming> and left the
+    helper there, so the roots are listed on their own (env.helper_roots) and
+    the store plays no part.
 
     Deriving this beats pattern-matching the path. An earlier version tested for
     the SEGMENTS "\\packages\\claude_" and "\\localcache\\roaming\\claude\\
@@ -893,28 +1000,29 @@ def _expected_helper_paths(env):
     chromenativehost\\chrome-native-host.exe would have been excused. The
     "out-of-path binaries still count" guarantee was not actually enforced.
 
-    A candidate that is not an absolute path derives nothing. With APPDATA unset
-    the classic candidate is the relative Claude\\claude-code-sessions, and abspath
-    resolved its helper location against whatever the working directory was.
+    A root that is not an absolute path derives nothing. With APPDATA unset the
+    classic root is the empty string, and abspath resolved its helper location
+    against whatever the working directory was.
     """
     out = set()
-    for cand in getattr(env, "store_candidates", ()) or ():
-        if not os.path.isabs(cand):
+    for root in getattr(env, "helper_roots", ()) or ():
+        if not os.path.isabs(root):
             continue
-        parent = os.path.dirname(cand)
         out.add(os.path.normcase(os.path.abspath(
-            os.path.join(parent, "ChromeNativeHost", "chrome-native-host.exe"))))
+            os.path.join(root, "Claude", "ChromeNativeHost", "chrome-native-host.exe"))))
     return out
 
 
 # Amendment 2026-10-17 (docs/internals.md). Desktop 2.42304 moved the helper to
 # <Roaming>\Claude-NativeHost\<version>\chrome-native-host.exe, <Roaming> being the
-# folder that holds the store's Claude folder. The guard stopped recognising it, so
-# neither ruling was reached and the signed-helper opt-in silently stopped working.
-# The version folder is constrained to the naming the app was seen to use - dotted
-# ASCII digits, matched whole; \d would also accept other scripts' digits. That is a
-# narrowing, not a boundary: the folder carries the store's own ACL, so whoever can
-# plant a binary there can already plant one at the old location.
+# folder that then held the store's Claude folder - a helper root since the
+# 2026-10-19 amendment, when the store left <Roaming> and the helper did not. The
+# guard stopped recognising it, so neither ruling was reached and the signed-helper
+# opt-in silently stopped working. The version folder is constrained to the naming
+# the app was seen to use - dotted ASCII digits, matched whole; \d would also accept
+# other scripts' digits. That is a narrowing, not a boundary: the folder carries the
+# store's own ACL, so whoever can plant a binary there can already plant one at the
+# old location.
 _HELPER_NAME = "chrome-native-host.exe"
 _NATIVE_HOST_DIR = "Claude-NativeHost"
 _HELPER_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
@@ -922,20 +1030,19 @@ _HELPER_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 
 def _expected_native_host_dirs(env):
     """The versioned layout's Claude-NativeHost folder(s), derived from the same
-    store candidates as _expected_helper_paths and skipping relative ones for the
+    helper roots as _expected_helper_paths and skipping relative ones for the
     same reason."""
     out = set()
-    for cand in getattr(env, "store_candidates", ()) or ():
-        if not os.path.isabs(cand):
+    for root in getattr(env, "helper_roots", ()) or ():
+        if not os.path.isabs(root):
             continue
-        roaming = os.path.dirname(os.path.dirname(cand))
         out.add(os.path.normcase(os.path.abspath(
-            os.path.join(roaming, _NATIVE_HOST_DIR))))
+            os.path.join(root, _NATIVE_HOST_DIR))))
     return out
 
 
 def _looks_like_chrome_helper(text, env):
-    """True when TEXT is the helper's own image path at a REAL store root.
+    """True when TEXT is the helper's own image path under a REAL helper root.
 
     The old location is an exact match against _expected_helper_paths. The
     versioned one is exact but for the version: the grandparent must equal a

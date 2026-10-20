@@ -112,11 +112,13 @@ d = tempfile.mkdtemp(prefix="wc-")
 root = os.path.join(d, "packages", "claude_x", "localcache", "roaming", "claude",
                     "claude-code-sessions")
 roaming = os.path.dirname(os.path.dirname(root))
+# The helper root is named on its own: since Desktop 2.42304.2 moved the store out
+# of <Roaming>, the guard no longer derives the helper from the store.
 genv = ccs.Env(home=d, projects_root=d, store_candidates=[root], ops_dir=d,
                moved_log=d, is_windows=True, process_lister=lambda: [],
-               now=lambda: 0.0)
+               now=lambda: 0.0, helper_roots=[roaming])
 paths = {
-    1: os.path.join(os.path.dirname(root), "ChromeNativeHost", "chrome-native-host.exe"),
+    1: os.path.join(roaming, "Claude", "ChromeNativeHost", "chrome-native-host.exe"),
     2: os.path.join(roaming, "Claude-NativeHost", "2.42304.0", "chrome-native-host.exe"),
     3: os.path.join(d, "tmp", "packages", "claude_x", "localcache", "roaming",
                     "Claude-NativeHost", "2.42304.0", "chrome-native-host.exe"),
