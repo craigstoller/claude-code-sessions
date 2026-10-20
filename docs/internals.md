@@ -1367,8 +1367,10 @@ by one refusal test each in `tests/test_plan_move.py`, `tests/test_undo.py` and
 **Status: implemented on a branch for the maintainer's review; not yet ruled on.** The
 precedence between the old and moved roots, the marker note, and leaving the journaled-path
 gap (Residuals) to a follow-up are the implementation's choices. Revised the same evening after
-two rounds of independent review by four models: the layout now lists data folders rather than
-stores, names what it does not read, and fails closed when it cannot look (below).
+three rounds of independent review by four models: the layout now lists data folders rather than
+stores, names what it does not read, and fails closed when it cannot look (below). The fixes from
+the third round, the marker read beside a found store and the corrections to where the notes
+appear, were not reviewed again.
 
 **What changed (observed 2026-10-19, read-only).** Claude Desktop 2.42304.2.0, installed by an
 automatic update, moved the app's whole user-data folder out of the package, from
@@ -1410,7 +1412,7 @@ the 2026-10-17 amendment fixed.
   old one is what it left; after the observed move it holds only the marker. Reading both would
   list every row twice and give the identity checks a pre-move `config.json`. A superseded
   store that still exists is named in the discovery detail ("not read: ..."), which `doctor`
-  and `alignment` print. Packages match by folder name, case folded.
+  prints. Packages match by folder name, case folded.
 - Couldn't look is never "nothing moved": when `Claude-Data` exists but cannot be listed,
   nobody can say which packages moved. The failure is carried on the Env (`layout_errors`),
   and discovery reports an error every time, which refuses every mutation, even if a later
@@ -1427,9 +1429,10 @@ the 2026-10-17 amendment fixed.
   `\appdata\local\claude-data\claude_<pkg>\claude-code\<version>\<hash>\claude.exe`, whole
   segments, `<pkg>` lowercase letters and digits as observed, `<version>` dotted digits,
   `<hash>` hex. The existing markers are unchanged.
-- The marker note. A `.user-data-left.<folder>` file in a folder discovery looked in names the
-  folder the data moved to. Discovery's detail, which `doctor` and `alignment` print and the
-  window shows when no store is found, says per marker: nothing, when a store was found in the
+- The marker note. A `.user-data-left.<folder>` file in a folder discovery looked in, beside a
+  store it found or in place of one, names the folder the data moved to. Discovery's detail,
+  which `doctor` prints and `alignment` and the window show only when no store is found, says
+  per marker: nothing, when a store was found in the
   folder it names (the move this version followed); that the folder holds no store, when this
   version looked there; otherwise that it names a location this version does not know. That last
   one is in the detail beside a found store too, so a stale leftover store cannot hide the next
@@ -1465,7 +1468,7 @@ gone, so none of these arises there. Whether a superseded store that still holds
 refuse mutations outright is left to the maintainer.
 
 **What was measured with the change (2026-10-19, read-only).** A wheel was built from the fix
-commit after each review round, last after round 2, installed into a fresh virtual environment,
+commit after each review round, last after round 3, installed into a fresh virtual environment,
 and run from a process without
 package identity, the installed 0.16.2 run through the same checks as a control. Results, 30
 checks, all passing:
@@ -1491,7 +1494,10 @@ helper.
   320 rows in 10 operations, and every one was present at the same relative path under the moved
   root. `undo` refuses such an operation and changes nothing: for `converge` because the
   recorded paths fall outside every discovered root (a layout error), for `new-row` with "that
-  row is already gone", which is false, since the row moved with the store. `recover --back` of
+  row is already gone", which is false, since the row moved with the store. `undo` of a pre-move
+  `move` would fail with an unhandled error, since it reads each recorded row before any
+  containment check, again changing nothing; the probed machine's journal held only the 10
+  `converge` operations. `recover --back` of
   a pre-move `converge` left unfinished would skip its rows as absent and close the operation
   with the rows still in place; none was unfinished on the probed machine. (The `undo` and
   `recover` behaviour is read from the code, not run.) Not fixed here, because it needs a
@@ -1501,8 +1507,9 @@ helper.
   With no store left there they stop with "no store root found"; where a superseded old store
   still holds rows they would measure that store, not the live one.
 - Where the notes do not reach: `move`'s "no desktop store found" refusal and `converge`'s
-  report do not carry the discovery detail, and the window's Level tab drops it once a store is
-  found. `doctor` is where they are read.
+  report do not carry the discovery detail, and `alignment` and the window's Level tab drop it
+  once a store is found; when discovery reports an error, the error replaces the notes. `doctor`
+  is where they are read.
 - The CLI marker is a run of segments, not a path derived from `LOCALAPPDATA`: the same run under
   another prefix still matches, as with the Roaming marker, and a relocated `LOCALAPPDATA`
   counts the CLI as the desktop app (fail-closed).
@@ -1514,7 +1521,8 @@ package name's case folded, a superseded store named and not read (whatever its 
 unlistable `Claude-Data` as an error, including when the failure clears before discovery, an
 unreadable moved store, a file named like a moved root, relative `LOCALAPPDATA` and `APPDATA`,
 glob metacharacters, the helper roots, the identity check reading the moved root's `config.json`
-and not a superseded folder's, the `default_env` wiring, and each form of the marker note.
+and not a superseded folder's, the `default_env` wiring, and each form of the marker note,
+including one beside a store that was found, for a moved, an old and the classic folder.
 And by `TestClaudeRunningNarrowing` in `tests/test_plan_move.py`, whose tests check that:
 
 - a store candidate alone derives no helper;

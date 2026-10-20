@@ -613,8 +613,9 @@ and a `converge` dry run) were checked against the moved store the same day. One
 remains: rows this tool created before the move are journaled at their old paths, so `doctor`
 reports them as "no longer on disk" although they moved with the store. Those lines are false,
 and so is their advice to run `new-row` again. For the same reason `undo` cannot reverse an
-operation from before the move: it refuses and changes nothing, and for `new-row` its "that
-row is already gone" is false too.
+operation from before the move, and changes nothing trying: it refuses a `converge`, refuses a
+`new-row` with "that row is already gone", which is false too, and fails with an unhandled
+error on a `move`.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
