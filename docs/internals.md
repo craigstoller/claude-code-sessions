@@ -1737,7 +1737,8 @@ into the picker.
   restart, as discovery's own view is.
 - A saved path spelled with `/`, like one typed after `--to` at the CLI, still matches nothing:
   `resolve_sync_endpoints` does not fold separators. The window points at "Change destination"
-  for it.
+  for it. *Superseded by "Amendment 2026-10-20 (separators)" below: the core now folds
+  separators, so a `/`-spelled saved path that names a listed store plans into it.*
 
 **Pinned by** `tests/test_gui_destination.py`: the candidate path for every label form, the saved
 ids, proven-gone with its controls, the mark, the findings on a real `Env`, and the core's
@@ -1749,6 +1750,73 @@ over zero, one and two other stores, "Change destination" over a saved destinati
 fine, two roots holding the same ids, and, unchanged, no saved destination, an unlisted path, a
 fragment, the signed-in store itself, an identity disagreement, a discovery error and a saved
 value that went ambiguous.
+
+#### Amendment 2026-10-20 (separators) — store paths in either spelling
+
+**Status: the maintainer's ruling of 2026-10-20, implemented.** Four points, each as recommended
+after three rounds of independent review: `--to` and store-scope `--live` fold path separators,
+beside today's test rather than in place of it; on every platform; a trailing separator may match
+the end of a store path, in all four matchers; a `--live` value made only of separators is refused
+like a blank one. Not taken: folding the whole value, as `converge --live` does; no change;
+folding in the window only; a refusal that names the spelling; testing each field separately;
+Windows only; the trailing-separator rule at two sites, or nowhere; stripping trailing separators
+from the value; leaving a separator-only `--live` as it was.
+
+**What broke.** `sync --to`, and the store-scope branch of `_resolve_live_assertion` (`--live` for
+`sync`, `repoint`, `new-row` and `retitle`), tested `value.lower()` against a store's joined
+account, org, email and path text with separators left as they were, while `--store` and
+`converge --live` already folded both sides through `_path_match_key`. On Windows a store path
+spelled with `/` - what Git Bash hands Python for `/c/Users/...` - matched nothing, and under
+`--live` drew the warning that an account named by neither file is evidence of something else
+being wrong. Git Bash also keeps a Tab-completed folder's trailing `/`, and no store path ends in
+a separator, so even the folding matchers refused that. And `--live \` certified a sole candidate
+on Windows: every store path holds the native separator, so the value matched as a blank one
+would, the bare override RULING 5 refuses.
+
+**What the matchers do now.**
+
+- `_store_matches` serves `--to` and store-scope `--live`: today's joined-text test, or the value
+  through `_path_match_key` as a substring of the store path alone, through `_path_hay`. Being an
+  OR, it can only add stores: a value that named one store still names it, or now matches more and
+  gets the ambiguity refusal that lists them. A value with no separator in it matches exactly as
+  before.
+- `_path_hay` folds a path and appends one `/`, so a value ending in a separator can match the
+  path's end. All four matchers use it on their path side (`_store_matches` for two of them,
+  `_repoint_store`, `_principal_matches`). Nothing is stripped from the value, so `Vendor/` still stops short of
+  `Vendor-Data`. The `/` is withheld when the value without its trailing separators is the printed
+  account form, so `0003/<org id>/` cannot match at the end of a path whose account id merely ends
+  in `0003`.
+- The printed account form is still parsed first and matched as two anchored prefixes. Its `\`
+  twin is not pair-shaped and stays a substring, as it always was on Windows.
+- `_resolve_live_assertion`'s first check refuses a value made only of separators and whitespace,
+  in both scopes, and its sentence now says so.
+- No sentence the window routes on changed. A `/`-spelled saved path naming a listed store of
+  another account now plans into it; one naming several stores reaches the existing "no longer
+  unique" picker, whose "probably because an account was added" is the wrong reason for a
+  hand-edited value, left as it is.
+
+**Residuals.**
+
+- `converge --live` keeps its whole-value fold, so there a value holding `\` would stop matching an
+  email that holds one, as a quoted address may. Rare; not changed.
+- On POSIX a `\` is a legal filename character, so a value newly accepted there may not name the
+  folder its author meant. These commands cannot write the desktop store off Windows, so it shows
+  only in a plan. Worth revisiting if POSIX writes are enabled.
+- A value that resolved before can now be refused as ambiguous, but only if it holds a separator
+  and its folded form also matches another store's path: on Windows that needs an email holding
+  `/`, or a match spanning two fields of the joined text.
+- Doubled separators (`C://x`) are not handled.
+
+**Pinned by** `tests/test_sync.py`: the other spelling through `--to`, `plan_sync` and `--live`;
+a trailing separator; a fragment; a broad fragment with one other store and with two; the
+signed-in store's exact refusal in every spelling; the mid-uuid pair with and without a trailing
+separator, and its `\` twin; values that matched before; two roots whose names share a prefix; a
+separator-only `--live` in both scopes; `repoint --live`. By `tests/test_retitle.py` and
+`tests/test_converge.py`: `--store` and `converge --live` with a trailing separator, and the
+mid-uuid pair with one. Each builds its value in the separator the platform does not use, so both
+CI legs exercise the fold. And by `tools/check_gui_stale_destination.py`, section 8: a
+`/`-spelled saved store with and without a trailing `/`, an account folder naming two stores,
+and, unchanged, an unlisted folder and the signed-in store.
 
 
 ### The lister, and its two deliberate costs
