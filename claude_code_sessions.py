@@ -411,6 +411,15 @@ def discover_stores(env):
             if real not in seen:
                 seen.add(real)
                 roots.append(real)
+            # A later move that copies rather than moves leaves the store AND
+            # the app's marker in this folder. Look for it - advisory, so a
+            # folder that cannot be listed here is no error about the store.
+            try:
+                beside = os.listdir(os.path.dirname(cand))
+            except OSError:
+                beside = []
+            markers.update(os.path.join(os.path.dirname(cand), n) for n in beside
+                           if n.startswith(_MOVED_MARKER_PREFIX))
             continue
         except FileNotFoundError:
             pass                                   # candidate missing; prove the parent
