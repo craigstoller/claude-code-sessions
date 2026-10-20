@@ -1548,6 +1548,66 @@ And by `TestClaudeRunningNarrowing` in `tests/test_plan_move.py`, whose tests ch
 2026-10-19 it found both helper versions under the packaged root and under the classic one, and
 read each as signed.
 
+#### Amendment 2026-10-20 — the window's saved destination, after the move
+
+**Status: the maintainer's ruling of 2026-10-20, implemented.** Three points, each as recommended
+after three rounds of independent review of the design: no write target changes without a pick;
+a saved destination proven gone is set aside, and the window asks; a saved store whose account is
+now signed in is named rather than asked about, and the candidate with the saved ids is marked.
+Not taken: keeping "Change destination" as it was; a pointer alone, with no set-aside; re-rooting
+the saved path through the move's package pairs now, a follow-up once the journal's pairing
+lands; re-resolving by the saved ids under any root.
+
+**What broke.** The window saves its chosen sync destination as a full store path in
+`~/.claude-code-sessions-gui.json`. One saved before the move names a folder under the old root.
+Every plan passed it as `--to`, which matched no moved store, and the window showed the refusal
+bare, with Apply off; only the "Change destination" button got out, and nothing pointed at it.
+That button had a fault of its own: it erased the saved value first, so a cancelled pick lost it,
+and on a machine with one other store the next plan went straight into that store with no pick.
+A third fault predates the move: a pick saved `_resolve_pair(p) or p`, and where two roots hold
+the same `<account>/<org>` that is the bare pair, which the next plan refused as ambiguous, back
+into the picker.
+
+**What the window does now.**
+
+- Before each plan the worker classifies the saved value (`_destination_findings`). It is proven
+  gone when it lies at or under a superseded store (ruling 1 above), or looking at it raises
+  `FileNotFoundError` or `NotADirectoryError`; both sides go through `realpath` and
+  `_path_match_key`. A path that exists but no root holds is not gone: a newer build may know it.
+  Its account is checked against `live_account`, and no claim is made when that returns nothing
+  or discovery fails.
+- A set-aside, or a press of "Change destination", plans with no destination through the pick
+  flow. More than one other store opens the picker; exactly one opens a one-candidate picker with
+  no plan installed, so Apply and the bulk-copy tick have nothing to act on; none, or another
+  refusal, shows that refusal with the reason. A pick saves the path its candidate line prints.
+  The preference file changes only on a pick, and a cancel leaves it as it was.
+- A saved store whose account is signed in is named on the detail line, and no picker opens on
+  the window's own; "Change destination" still opens one. The candidate whose path ends in the
+  saved ids gets a note line under its button; two matches mark nothing.
+- A saved value left in place that the plan refuses with "matched no other account store" gets a
+  pointer to "Change destination", which now shows whenever a destination is saved.
+
+**Residuals.**
+
+- `FileNotFoundError` can also come from an unavailable network or removable path. The set-aside
+  then gives a reason that is not quite true, and erases nothing.
+- The window builds its `Env` once, at open, so a move made while it is open is seen after a
+  restart, as discovery's own view is.
+- A saved path spelled with `/`, like one typed after `--to` at the CLI, still matches nothing:
+  `resolve_sync_endpoints` does not fold separators. The window points at "Change destination"
+  for it.
+
+**Pinned by** `tests/test_gui_destination.py`: the candidate path for every label form, the saved
+ids, proven-gone with its controls, the mark, the findings on a real `Env`, and the core's
+sentences and candidate-line format the window routes on. And by
+`tools/check_gui_stale_destination.py`, which drives the window over synthetic moved layouts:
+the set-aside with candidates of one account and of two, a cancel and the next plan asking
+again, one other store of the saved account and of another, the move with an account switch
+over zero, one and two other stores, "Change destination" over a saved destination that is
+fine, two roots holding the same ids, and, unchanged, no saved destination, an unlisted path, a
+fragment, the signed-in store itself, an identity disagreement, a discovery error and a saved
+value that went ambiguous.
+
 ### The lister, and its two deliberate costs
 
 `_default_process_lister()` resolves full executable paths on Windows via
