@@ -6121,8 +6121,42 @@ def _principal_matches(query, pair, uuid, email, own_dirs):
     want = _path_match_key(query)
     hay = " ".join([uuid, email or ""]
                    + [o for _a, o, _p in own_dirs]
-                   + [_path_match_key(p) for _a, _o, p in own_dirs]).lower()
+                   + [_path_hay(p, query) for _a, _o, p in own_dirs]).lower()
     return want in hay
+
+
+def _path_hay(path, query):
+    """PATH as a substring test sees it: folded by _path_match_key, then one
+    '/' appended, so a QUERY ending in a separator - the way a Tab-completed
+    folder does, and Git Bash hands one over as 'C:/.../org/' - can match the
+    path's own end, which never carries one. Nothing is stripped from the
+    query: 'Vendor/' must still stop short of 'Vendor-Data'.
+
+    The '/' is withheld when QUERY without its trailing separators is the
+    printed account form. '0003/<org id>/' would otherwise match at the end
+    of a path whose account id merely ENDS in 0003 - the mid-uuid match
+    _pair_query exists to refuse.
+    """
+    key = _path_match_key(path)
+    if _pair_query(query.rstrip("/\\")) is None:
+        key += "/"
+    return key
+
+
+def _store_matches(query, c):
+    """Whether QUERY - a --to or store-scope --live value that is not the
+    printed account form - names the store of Account C.
+
+    Today's test, unchanged: a substring of C's joined account, org, email
+    and path text. Beside it, never in place of it, the path field alone with
+    both sides through _path_match_key, so a store path spelled with the
+    other separator matches too. Being an OR, it can only add stores: a value
+    that named one store still names it, or now matches more and gets the
+    ambiguity refusal that lists them - never a different store, quietly.
+    """
+    return (query.lower() in (c.account_uuid + " " + c.org_uuid + " " +
+                              c.email + " " + c.path).lower()
+            or _path_match_key(query) in _path_hay(c.path, query))
 
 
 def _principal_listing(principals):
@@ -6255,13 +6289,16 @@ def _resolve_live_assertion(env, live, dirs, account_scope=False):
     with one addition: an empty or whitespace-only value is refused
     outright - substring containment would make it match every candidate,
     which on a one-candidate machine is exactly the bare force flag this
-    design refuses to be.
+    design refuses to be. A value made only of separators is that value in
+    another form: every store path holds one, so '\\' certified a sole
+    candidate on Windows before paths were folded, and '/' would after.
     """
-    if not live.strip():
+    if not live.replace("/", "").replace("\\", "").strip():
         raise Refusal(
             "--live must name the account - an id, org, store-path or email "
-            "substring. An empty value would match every candidate, which is the "
-            "bare override this flag refuses to be.")
+            "substring. An empty value, or one made only of separators, would "
+            "match every candidate, which is the bare override this flag refuses "
+            "to be.")
     dis = _identity_disagreement(env)
     if dis is None:
         res = live_account(env)
@@ -6327,9 +6364,7 @@ def _resolve_live_assertion(env, live, dirs, account_scope=False):
         matched = [c for c in cands
                    if _pair_matches(pair, c.account_uuid, c.org_uuid)]
     else:
-        matched = [c for c in cands if live.lower() in
-                   (c.account_uuid + " " + c.org_uuid + " " + c.email + " " +
-                    c.path).lower()]
+        matched = [c for c in cands if _store_matches(live, c)]
     if len(matched) > 1:
         listing = _candidate_listing((c.account_uuid, c.org_uuid, c.path)
                                      for c in matched)
@@ -6448,9 +6483,7 @@ def resolve_sync_endpoints(env, to=None, live=None):
             matched = [c for c in others
                        if _pair_matches(pair, c.account_uuid, c.org_uuid)]
         else:
-            matched = [c for c in others if to.lower() in
-                       (c.account_uuid + " " + c.org_uuid + " " + c.email +
-                        " " + c.path).lower()]
+            matched = [c for c in others if _store_matches(to, c)]
         if not matched:
             raise Refusal("--to {0!r} matched no other account store".format(to))
         if len(matched) > 1:
@@ -9833,7 +9866,7 @@ def _repoint_store(env, flags, what="repoint"):
             hits = [(a, o, p) for a, o, p in dirs
                     if want in a.lower() or want in o.lower()
                     or want in (_email_of(env, a, live) or "").lower()
-                    or want_path in _path_match_key(p)]
+                    or want_path in _path_hay(p, flags.store)]
         if not hits:
             raise Refusal("--store {0!r} matched no store on this machine:\n{1}"
                           .format(flags.store, _candidate_listing(dirs)))
