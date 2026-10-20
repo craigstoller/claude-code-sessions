@@ -590,6 +590,7 @@ window.
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03; sync-undo drift refusal live 2026-08-04 | read-only + mutations |
+| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store; no `--apply` on this build yet. 0.16.2 and earlier find no store | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
@@ -603,6 +604,14 @@ already re-saved by the new app. Later on 2026-10-14 a `converge --apply` ran ag
 present and `doctor` reported none vanished. On 2026-10-17 two more `converge --apply` runs
 went through against 2.42304.0.0 with the app closed, with the same result. That build moved
 the browser-extension helper, which the running-app guard follows from 0.16.1 (see Roadmap).
+On 2026-10-19, 2.42304.2.0 moved the app's whole user-data folder, session store included,
+from the package's `LocalCache\Roaming\Claude` to `%LOCALAPPDATA%\Claude-Data\claude_<pkg>`,
+and left the helper where it was. 0.16.2 and earlier report the store absent there. 0.16.3
+reads the moved store and still finds the helper. Its read-only paths (`doctor`, `alignment`
+and a `converge` dry run) were checked against the moved store the same day. One known gap
+remains: rows this tool created before the move are journaled at their old paths, so `doctor`
+reports them as "no longer on disk" although they moved with the store. Those lines are false,
+and so is their advice to run `new-row` again.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
