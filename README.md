@@ -975,6 +975,25 @@ window into `journaled`/`completed`/`rolled_back`.
   opt-in is on and a helper still counts, the note says why; and the opt-in's wording, in this
   README, the window's checkbox and the command's help, says Chrome or Edge, since either can
   launch the helper. Three constants left unused since the August anti-fabrication fix are gone.
+- **0.16.3 finds the session store where Desktop 2.42304.2 moved it.** That build moved the
+  app's whole user-data folder out of the Microsoft Store package, from
+  `%LOCALAPPDATA%\Packages\Claude_<pkg>\LocalCache\Roaming\Claude` to
+  `%LOCALAPPDATA%\Claude-Data\claude_<pkg>`, and left a 0-byte file in the old folder naming
+  the new one. 0.16.2 looked only in the old places, so `doctor` and `alignment` reported no
+  store and `converge` planned nothing. This release reads the moved folder first. When a
+  package's data has moved, its old folder is never read, and a store still sitting there is
+  named in `doctor` rather than read beside the new one. The browser-extension helper did not
+  move. The guard had found it two folders up from the store, which after the move is a
+  folder where no helper lives, so the signed-helper opt-in would have stopped working again
+  without a word. Helper locations are now listed on their own. The CLI the app spawns moved
+  with the data, and the guard recognises it at its new path. When no store is found and the
+  app's marker names a folder this version does not know, `doctor` says so instead of
+  reporting a bare absence, and when the folder the data moved to cannot be listed, discovery
+  reports an error rather than falling back to the old store. One gap remains: operations
+  from before the move are journaled at their old paths, so `doctor` lists the rows this tool
+  created then as no longer on disk although they moved with the store, and `undo` cannot
+  reverse those operations (see the compatibility matrix). Until that is fixed, judge a
+  `converge --apply` by `alignment`.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
