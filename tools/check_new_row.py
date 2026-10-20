@@ -891,8 +891,11 @@ check("back closes even when the row path escapes the store",
       ccs.recover_op(env, ccs.nonterminal_ops(env)[0], "back") == "rolled_back")
 check("  WITHOUT deleting the outside file", os.path.exists(outside))
 left = [o for o in ccs.list_ops(env) if o.manifest.get("op_id") == m["op_id"]][0]
-check("  recording that it could not remove it",
-      "could not remove" in (left.manifest.get("rollback_residue") or ""),
+# Since the 2026-10-19 journal ruling the resolution gate stops it before the
+# delete is attempted, and the residue says why: the escaped path is in no
+# store this version reads.
+check("  recording that it left it alone, and why",
+      "not one this version reads" in (left.manifest.get("rollback_residue") or ""),
       str(left.manifest.get("rollback_residue"))[:90])
 shutil.rmtree(root, ignore_errors=True)
 

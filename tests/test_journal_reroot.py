@@ -670,6 +670,19 @@ def test_back_closes_an_unresolved_operation_with_residue(
     assert rep["exit_code"] == 0
 
 
+def test_back_records_an_unresolved_row_whose_written_flag_never_saved(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A hard kill can land a row and lose its flag; with the row in a store
+    nobody can look in, 'never written' is not something back can know."""
+    env, la, claude, old, op = new_rowed(mkenv, tmp_path, write_transcript, write_row)
+    op.manifest["rows"][0]["written"] = False
+    ct.set_status(op, "writing")
+    strand(env, tmp_path)
+    pending = ct.nonterminal_ops(env)[0]
+    assert ct.recover_op(env, pending, "back") == "rolled_back"
+    assert UNREAD in pending.manifest["rollback_residue"]
+
+
 def test_forward_refuses_an_unresolved_row_and_writes_nothing(
         mkenv, tmp_path, write_transcript, write_row):
     env = _monotonic_now(mkenv(tmp_path))

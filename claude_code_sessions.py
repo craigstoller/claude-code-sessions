@@ -3001,10 +3001,11 @@ def recover_op(env, op, direction):
             residue = None
             if stray:
                 # A row in a store this version does not read: never read,
-                # never touched - recorded, if this op says it wrote it.
-                if r.get("written"):
-                    _add_residue(m, *_unresolved_residue(stray))
-                    save_manifest(op)
+                # never touched, and recorded whether or not the flag says it
+                # was written - a hard kill can land the row and lose the flag,
+                # and nobody can look.
+                _add_residue(m, *_unresolved_residue(stray))
+                save_manifest(op)
                 set_status(op, "rolled_back")
                 rotate_ops(env)
                 return "rolled_back"
@@ -3147,10 +3148,9 @@ def recover_op(env, op, direction):
                     "operation wrote, so there was nothing to take back. The "
                     "op is closed; re-run retitle if the rename is still "
                     "wanted.")
-            # Written rows in a store this version does not read: left alone,
-            # and recorded where doctor looks, so the close is not silent.
-            _add_residue(m, *_unresolved_residue(
-                [(r, p) for r, p in stray if r.get("written")]))
+            # Rows in a store this version does not read: left alone, and
+            # recorded where doctor looks, so the close is not silent.
+            _add_residue(m, *_unresolved_residue(stray))
             set_status(op, "rolled_back")
             rotate_ops(env)
             return "rolled_back"
@@ -3239,8 +3239,10 @@ def recover_op(env, op, direction):
                         residue_paths.append(r["dest_path"])
             if residue:
                 _add_residue(m, "; ".join(residue), residue_paths)
+            # Every unresolved row but a skipped one, which was never
+            # attempted: a hard kill can land a row and lose its flag.
             _add_residue(m, *_unresolved_residue(
-                [(r, p) for r, p in stray if r.get("written")]))
+                [(r, p) for r, p in stray if not r.get("skipped")]))
             if m.get("rollback_residue"):
                 save_manifest(op)
             set_status(op, "rolled_back")
@@ -3257,9 +3259,8 @@ def recover_op(env, op, direction):
             if stray:
                 # Only 'back' is on offer (classify_op), and it touches nothing
                 # here: the row is in a store this version does not read.
-                if r.get("written"):
-                    _add_residue(m, *_unresolved_residue(stray))
-                    save_manifest(op)
+                _add_residue(m, *_unresolved_residue(stray))
+                save_manifest(op)
                 set_status(op, "rolled_back")
                 rotate_ops(env)
                 return "rolled_back"
@@ -9421,9 +9422,9 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
     for r in m["rows"]:
         written = bool(r.get("written"))
         if not _row_resolved(disc, r.get("dest_path"), m.get("dest_path")):
-            # Never read. A row this op never wrote is not ours, as below.
-            if written:
-                stray.append((r, r.get("dest_path")))
+            # Never read. Undo refuses on one this op wrote; back records
+            # every one, since a hard kill can land a row and lose its flag.
+            stray.append((r, r.get("dest_path"), written))
             continue
         # Containment BEFORE the row is classified, because classifying opens
         # its dest_path: a hand-edited manifest must not be able to get this
@@ -9522,12 +9523,14 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
             drifted.append(r["title"])
         else:                              # "unreadable"
             unreadable.append(r["title"])
-    if stray:
-        if unresolved is None:
+    if unresolved is None:
+        refuse = [(r, p) for r, p, w in stray if w]
+        if refuse:
             raise Refusal("cannot undo {0}: {1}. This version can neither check "
                           "nor change them, so nothing was changed."
-                          .format(m.get("op_id"), _unresolved_clause(stray)))
-        unresolved.extend(stray)
+                          .format(m.get("op_id"), _unresolved_clause(refuse)))
+    else:
+        unresolved.extend((r, p) for r, p, _ in stray)
     return drifted, unreadable, removable, restorable, claimed
 
 
