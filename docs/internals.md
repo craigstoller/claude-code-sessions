@@ -1367,8 +1367,8 @@ by one refusal test each in `tests/test_plan_move.py`, `tests/test_undo.py` and
 **Status: implemented on a branch for the maintainer's review; not yet ruled on.** The
 precedence between the old and moved roots, the marker note, and leaving the journaled-path
 gap (Residuals) to a follow-up are the implementation's choices. Revised the same evening after
-an independent review by four models: the layout now lists data folders rather than stores,
-names what it does not read, and fails closed when it cannot look (below).
+two rounds of independent review by four models: the layout now lists data folders rather than
+stores, names what it does not read, and fails closed when it cannot look (below).
 
 **What changed (observed 2026-10-19, read-only).** Claude Desktop 2.42304.2.0, installed by an
 automatic update, moved the app's whole user-data folder out of the package, from
@@ -1398,7 +1398,9 @@ the 2026-10-17 amendment fixed.
   1. each moved data root, every entry of `Claude-Data` named `claude_*` that is not a plain
      file, as `<root>\claude-code-sessions`, listed whether or not the store folder exists, as
      the classic candidate always was. Discovery then proves an absence there, reads the app's
-     marker beside it, and the identity checks read that root's own `config.json`;
+     marker beside it, and the identity checks read that root's own `config.json` (measured
+     2026-10-19: the moved root's `config.json` carries `lastKnownAccountUuid`, and the old
+     folder has no `config.json` at all);
   2. each old packaged data folder, `...\Roaming\Claude\`, that exists, store or not, so the
      marker the app leaves there is read, unless the same package's moved root exists;
   3. the classic `%APPDATA%\Claude\claude-code-sessions`, when `APPDATA` is absolute.
@@ -1407,12 +1409,13 @@ the 2026-10-17 amendment fixed.
   lookups follow the candidates). The updated app was seen writing to the moved root, and the
   old one is what it left; after the observed move it holds only the marker. Reading both would
   list every row twice and give the identity checks a pre-move `config.json`. A superseded
-  store that still exists is named in the discovery detail ("not read: ..."), so the state is
-  visible rather than silent. Packages match by folder name, case folded.
+  store that still exists is named in the discovery detail ("not read: ..."), which `doctor`
+  and `alignment` print. Packages match by folder name, case folded.
 - Couldn't look is never "nothing moved": when `Claude-Data` exists but cannot be listed,
-  nobody can say which packages moved, so the folder goes in as a candidate's parent and
-  discovery reports an error, which refuses every mutation, instead of reading an old store as
-  though nothing had moved. An unreadable moved root does the same.
+  nobody can say which packages moved. The failure is carried on the Env (`layout_errors`),
+  and discovery reports an error every time, which refuses every mutation, even if a later
+  listing would succeed, instead of reading an old store as though nothing had moved. An
+  unreadable moved store is an error in discovery itself.
 - Helper roots: `Env.helper_roots`, listed apart from the store. On Windows they are each
   package's `LocalCache\Roaming` that is a folder, plus `%APPDATA%` when it is absolute. Both
   layouts derive from them exactly as they did from the store candidates' `<Roaming>`: the old
@@ -1425,11 +1428,12 @@ the 2026-10-17 amendment fixed.
   segments, `<pkg>` lowercase letters and digits as observed, `<version>` dotted digits,
   `<hash>` hex. The existing markers are unchanged.
 - The marker note. A `.user-data-left.<folder>` file in a folder discovery looked in names the
-  folder the data moved to. Discovery's detail, which reaches `doctor`, `alignment` and the
-  window, says per marker: nothing, when a store was found in the folder it names (the move this
-  version followed); that the folder holds no store, when this version looked there; otherwise
-  that it names a location this version does not know. That last one is reported beside a found
-  store too, so a stale leftover store cannot hide the next move. It only explains, and no
+  folder the data moved to. Discovery's detail, which `doctor` and `alignment` print and the
+  window shows when no store is found, says per marker: nothing, when a store was found in the
+  folder it names (the move this version followed); that the folder holds no store, when this
+  version looked there; otherwise that it names a location this version does not know. That last
+  one is in the detail beside a found store too, so a stale leftover store cannot hide the next
+  move from `doctor`. It only explains, and no
   decision depends on it. 0.16.2's bare "store absent" read as "no sessions on this machine",
   although the app had left a marker naming the folder its data went to.
 - One narrowing rides along: only an absolute `LOCALAPPDATA` is globbed and only an absolute
@@ -1460,8 +1464,9 @@ supersede the old root, so both would be read. On the observed move the old stor
 gone, so none of these arises there. Whether a superseded store that still holds rows should
 refuse mutations outright is left to the maintainer.
 
-**What was measured with the change (2026-10-19, read-only).** A wheel was built from the
-revised fix commit, installed into a fresh virtual environment, and run from a process without
+**What was measured with the change (2026-10-19, read-only).** A wheel was built from the fix
+commit after each review round, last after round 2, installed into a fresh virtual environment,
+and run from a process without
 package identity, the installed 0.16.2 run through the same checks as a control. Results, 30
 checks, all passing:
 
@@ -1495,6 +1500,9 @@ helper.
   `attribute_store_writers.py`, `resolver_positive_control.py`) still list only the old roots.
   With no store left there they stop with "no store root found"; where a superseded old store
   still holds rows they would measure that store, not the live one.
+- Where the notes do not reach: `move`'s "no desktop store found" refusal and `converge`'s
+  report do not carry the discovery detail, and the window's Level tab drops it once a store is
+  found. `doctor` is where they are read.
 - The CLI marker is a run of segments, not a path derived from `LOCALAPPDATA`: the same run under
   another prefix still matches, as with the Roaming marker, and a relocated `LOCALAPPDATA`
   counts the CLI as the desktop app (fail-closed).
@@ -1502,9 +1510,11 @@ helper.
 
 **Pinned by** `tests/test_data_root.py`, which goes through `_windows_store_layout` and
 `discover_stores` end to end: the candidates and their order, per-package precedence with the
-package name's case folded, a superseded store named and not read, an unlistable `Claude-Data`
-as an error, a file named like a moved root, relative `LOCALAPPDATA` and `APPDATA`, glob
-metacharacters, the helper roots, the `default_env` wiring, and each form of the marker note.
+package name's case folded, a superseded store named and not read (whatever its case), an
+unlistable `Claude-Data` as an error, including when the failure clears before discovery, an
+unreadable moved store, a file named like a moved root, relative `LOCALAPPDATA` and `APPDATA`,
+glob metacharacters, the helper roots, the identity check reading the moved root's `config.json`
+and not a superseded folder's, the `default_env` wiring, and each form of the marker note.
 And by `TestClaudeRunningNarrowing` in `tests/test_plan_move.py`, whose tests check that:
 
 - a store candidate alone derives no helper;
