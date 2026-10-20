@@ -782,7 +782,11 @@ def test_undo_sync_refuses_row_dest_path_outside_destination_root(two_account_en
     with open(outside, "w") as fh:
         fh.write("do not delete me")
     op.manifest["rows"][0]["dest_path"] = outside
-    with pytest.raises(ct.LayoutError):
+    # Since the 2026-10-19 journal ruling the resolution gate refuses it first,
+    # before the row is read: a written row outside every discovered store is
+    # one this version does not read. A Refusal (exit 1) now, where the
+    # containment check's LayoutError (exit 2) used to answer.
+    with pytest.raises(ct.Refusal, match="not one this version reads"):
         ct.undo_sync(env, op)
     assert os.path.exists(outside)
 
@@ -1542,8 +1546,11 @@ def test_stalled_sync_after_a_containment_error_can_still_go_back(two_account_en
         ct.run_sync(env, m)
     op = ct.nonterminal_ops(env)[0]
     assert op.manifest["status"] == "writing"
-    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
-    with pytest.raises(ct.LayoutError):
+    # The pending row is outside every discovered store, so forward - which
+    # could only fail on it, every time - is no longer offered (the 2026-10-19
+    # journal ruling's resolution gate); back still is.
+    assert ct.classify_op(env, op)["resolutions"] == ["back"]
+    with pytest.raises(ct.Refusal, match="not a safe resolution"):
         ct.recover_op(env, op, "forward")
     assert ct.recover_op(env, op, "back") == "rolled_back"
     assert ct.nonterminal_ops(env) == []

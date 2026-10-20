@@ -752,6 +752,32 @@ def _dirty_hold_count(models):
     return sum(1 for m in models if _is_dirty_hold(m))
 
 
+def _sync_undo_lines(report):
+    """(status, note) for a finished sync undo, from its tally.
+
+    It used to say "Undone - the copied rows were removed" after every sync
+    undo, whatever was removed - including the one that reversed nothing
+    (decision 7 of the 2026-10-19 journal ruling). The tally is undo_sync's
+    `undo_report`; a report missing from an older record says only "Undone".
+    """
+    rep = report or {}
+    removed, restored = rep.get("removed", 0), rep.get("restored", 0)
+    gone, kept = rep.get("already_gone", 0), rep.get("not_restored", 0)
+    tail = ""
+    if gone:
+        tail += "; {0} already gone".format(gone)
+    if kept:
+        tail += ("; {0} refreshed row(s) not restored - that account deleted "
+                 "them since".format(kept))
+    if not report:
+        return "Undone", "Undone."
+    if removed or restored:
+        status = "Undone - removed {0} row(s), restored {1}".format(removed, restored)
+        return status, status + tail + "."
+    return ("Undone - nothing was left to reverse",
+            "Undone - nothing was left to reverse" + tail + ".")
+
+
 def _changes_noun(n):
     return "{0} unapplied naming change{1}".format(n, "" if n == 1 else "s")
 
@@ -3291,11 +3317,11 @@ class SyncApp:
             self.refresh_level()
             return
         if kind == "sync":
-            self.status.set("Undone - the copied rows were removed")
-            self.detail.set("The other account's sidebar is back to how it was. "
-                            "Press Refresh to plan again.")
+            status, note = _sync_undo_lines(report)
+            self.status.set(status)
+            self.detail.set("Press Refresh to see the other account's sidebar as "
+                            "it is now, and to plan again.")
             self.show([])
-            note = "Undone - the copied rows were removed."
         elif kind == "retitle":
             # The sync tab said "Undoing..." at press time; every kind has
             # to land that line somewhere, or a finished undo reads as

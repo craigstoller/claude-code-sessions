@@ -62,16 +62,23 @@ class Env:
     # each as an error, every time: a failure that later clears must not be read
     # as "nothing there".
     layout_errors: list = dataclasses.field(default_factory=list)
+    # (old store, moved store) for each package whose user data moved. A path
+    # the journal recorded under an old store is read under the moved one
+    # (_windows_store_moves, list_ops). Empty when the layout had errors.
+    store_moves: list = dataclasses.field(default_factory=list)
 
 
 def default_env():
     home = os.path.expanduser("~")
-    superseded, layout_errors = [], []
+    superseded, layout_errors, moves = [], [], []
     if sys.platform == "win32":
         local = os.environ.get("LOCALAPPDATA", "")
         appdata = os.environ.get("APPDATA", "")
         candidates, superseded, layout_errors = _windows_store_layout(local, appdata)
         helper_roots = _windows_helper_roots(local, appdata)
+        # No pairs when the layout could not be read: discovery is then an
+        # error, and the journal routes refuse rather than map.
+        moves = [] if layout_errors else _windows_store_moves(local)
     elif sys.platform == "darwin":
         support = os.path.join(home, "Library", "Application Support")
         candidates = [os.path.join(support, "Claude", "claude-code-sessions")]
@@ -93,6 +100,7 @@ def default_env():
         helper_roots=helper_roots,
         superseded_stores=superseded,
         layout_errors=layout_errors,
+        store_moves=moves,
     )
 
 
@@ -176,6 +184,38 @@ def _windows_store_layout(localappdata, appdata):
 def _windows_store_candidates(localappdata, appdata):
     """The store candidates alone; see _windows_store_layout."""
     return _windows_store_layout(localappdata, appdata)[0]
+
+
+def _windows_store_moves(localappdata):
+    """[(old store, moved store)] for each package whose user data moved.
+
+    Taken from the Claude-Data listing alone, by the package name ruling 1
+    already pairs on: Claude-Data\\claude_<pkg>\\claude-code-sessions is where
+    Packages\\Claude_<pkg>\\LocalCache\\Roaming\\Claude\\claude-code-sessions
+    went. Not from the layout's superseded list, which names an old store only
+    while its vacated folder still exists - the folder holds nothing but the
+    app's 0-byte marker, and deleting it must not strand the journal. A
+    listing failure gives no pairs; the layout carries that failure as an
+    error. See docs/internals.md, "Amendment 2026-10-19 (journal)".
+    """
+    if not (localappdata and os.path.isabs(localappdata)):
+        return []
+    parent = os.path.join(localappdata, _MOVED_DATA_DIR)
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return []
+    pairs = []
+    for name in sorted(names):
+        if not name.lower().startswith("claude_"):
+            continue
+        moved_root = os.path.join(parent, name)
+        if os.path.isfile(moved_root):
+            continue
+        old = os.path.join(localappdata, "Packages", "Claude_" + name[len("claude_"):],
+                           "LocalCache", "Roaming", "Claude", "claude-code-sessions")
+        pairs.append((old, os.path.join(moved_root, "claude-code-sessions")))
+    return pairs
 
 
 def _windows_helper_roots(localappdata, appdata):
@@ -771,6 +811,11 @@ class Op:
     op_dir: str
     manifest: dict
     now: object = time.time
+    # [(key path, recorded string, mapped string)] for each path list_ops read
+    # under a moved store. Kept here, never in the manifest: save_manifest
+    # writes the recorded strings back. After `now`, because new_op builds
+    # an Op positionally.
+    rerooted: list = dataclasses.field(default_factory=list)
 
 
 def manifest_path(op):
@@ -778,7 +823,98 @@ def manifest_path(op):
 
 
 def save_manifest(op):
-    atomic_write(manifest_path(op), json.dumps(op.manifest, indent=1).encode("utf-8"))
+    data = op.manifest
+    if op.rerooted:
+        # A COPY, with every path list_ops mapped put back as the journal
+        # recorded it - op.manifest itself keeps the mapped paths, because the
+        # operation saving mid-run goes on reading them. A field something has
+        # since set to another value keeps that value.
+        data = json.loads(json.dumps(op.manifest))
+        for keys, recorded, mapped in op.rerooted:
+            holder = data
+            try:
+                for k in keys[:-1]:
+                    holder = holder[k]
+            except (KeyError, IndexError, TypeError):
+                continue
+            try:
+                if holder[keys[-1]] == mapped:
+                    holder[keys[-1]] = recorded
+            except (KeyError, IndexError, TypeError):
+                continue
+    atomic_write(manifest_path(op), json.dumps(data, indent=1).encode("utf-8"))
+
+
+# The manifest keys a decision reads back that can hold a path under the
+# store, by where they sit; `rollback_residue_paths` is mapped too, item by
+# item. Deliberately not mapped: `row_path`, `source_path` and
+# `destinations[].path` (written, printed, never decided on) and
+# `live_override.config_path` (audit data beside the store, not in it). Every
+# tagged release used these same key names (checked 2026-10-19).
+_REROOT_TOP_KEYS = ("store_path", "dest_path")
+_REROOT_ROW_KEYS = ("path", "dest_path", "store_path")
+
+
+def _reroot_pairs(env):
+    """[(recorded-prefix forms, moved store)] for env.store_moves: each old
+    store as written and through realpath, normcased, so a path the journal
+    recorded through discovery's realpath matches either way; the moved store
+    through realpath, the form discovery's roots take."""
+    out = []
+    for old, new in getattr(env, "store_moves", ()) or ():
+        forms = set()
+        for p in (old, os.path.realpath(old)):
+            forms.add(os.path.normcase(os.path.normpath(p)))
+        out.append((sorted(forms, key=len, reverse=True), os.path.realpath(new)))
+    return out
+
+
+def _rerooted_path(value, pairs):
+    """VALUE under a moved store, or None when no old store holds it. Equal to
+    an old store, or below it at a separator boundary - never a sibling such
+    as claude-code-sessions-bak."""
+    if not pairs or not isinstance(value, str) or not value:
+        return None
+    form = os.path.normpath(value)
+    norm = os.path.normcase(form)
+    for olds, new in pairs:
+        for old in olds:
+            if norm == old:
+                return new
+            if norm.startswith(old + os.sep):
+                return os.path.join(new, form[len(old) + 1:])
+    return None
+
+
+def _reroot_manifest(op, pairs):
+    """Map every read-back key of OP's manifest that a moved store holds,
+    in place, recording each on op.rerooted (see save_manifest)."""
+    m = op.manifest
+    if not pairs or not isinstance(m, dict):
+        return
+    for k in _REROOT_TOP_KEYS:
+        new = _rerooted_path(m.get(k), pairs)
+        if new is not None:
+            op.rerooted.append(((k,), m[k], new))
+            m[k] = new
+    named = m.get("rollback_residue_paths")
+    if isinstance(named, list):
+        for i, p in enumerate(named):
+            new = _rerooted_path(p, pairs)
+            if new is not None:
+                op.rerooted.append((("rollback_residue_paths", i), p, new))
+                named[i] = new
+    rows = m.get("rows")
+    if not isinstance(rows, list):
+        return
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            continue
+        for k in _REROOT_ROW_KEYS:
+            new = _rerooted_path(r.get(k), pairs)
+            if new is not None:
+                op.rerooted.append((("rows", i, k), r[k], new))
+                r[k] = new
 
 
 def new_op(env, manifest):
@@ -805,11 +941,17 @@ def list_ops(env):
     if not os.path.isdir(env.ops_dir):
         return out
     ops = []
+    # The one place a manifest is loaded, so the one place a path recorded
+    # before the data moved is read under the moved store - every consumer,
+    # and every comparison between operations, then sees the same path.
+    pairs = _reroot_pairs(env)
     for name in os.listdir(env.ops_dir):
         mp = os.path.join(env.ops_dir, name, "manifest.json")
         if os.path.isfile(mp):
             m = read_json(mp)
-            ops.append((m, Op(os.path.join(env.ops_dir, name), m)))
+            op = Op(os.path.join(env.ops_dir, name), m)
+            _reroot_manifest(op, pairs)
+            ops.append((m, op))
     # Sort by creation time (history[0]["at"]) then op_id for stability
     for m, op in sorted(ops, key=lambda x: (x[0].get("history", [{}])[0].get("at", 0), x[0]["op_id"])):
         out.append(op)
@@ -963,6 +1105,138 @@ def ensure_contained(path, allowed_roots):
         if real == rreal or real.startswith(rreal + os.sep):
             return real
     raise LayoutError("path {0} resolves outside every recognized root".format(path))
+
+
+# ------------------------------------------------- the journal's resolution gate
+# A journaled row is RESOLVED when discovery found the store and the row's
+# path (mapped by list_ops if it was recorded before the data moved) lies in a
+# discovered root at <root>\<acct>\<org>\<file> - and, for an operation that
+# records a store, that store is the folder the row sits in. Otherwise it is
+# UNRESOLVED, which is not "absent": nobody can say whether it is there. Every
+# route that reads a journaled row's file, or acts on it, asks this first.
+# See docs/internals.md, "Amendment 2026-10-19 (journal)".
+
+UNRESOLVED_WHY = "its store is not one this version reads"
+
+
+def _row_resolved(disc, path, store=None):
+    """Whether PATH is a journaled row this version can check. Never raises."""
+    if disc is None or disc.status != "found" or not isinstance(path, str) or not path:
+        return False
+    try:
+        real = os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):
+        return False
+    for root in disc.roots:
+        nroot = os.path.normcase(root)            # discovery's roots are realpaths
+        if not real.startswith(nroot + os.sep):
+            continue
+        parts = real[len(nroot) + 1:].split(os.sep)
+        if len(parts) != 3 or not all(parts):
+            return False
+        if store is None:
+            return True
+        if not isinstance(store, str) or not store:
+            return False
+        try:
+            return os.path.normcase(os.path.realpath(store)) == os.path.dirname(real)
+        except (OSError, ValueError):
+            return False
+    return False
+
+
+def _store_resolved(disc, store):
+    """Whether STORE is an <acct>\\<org> folder in a discovered root."""
+    if disc is None or disc.status != "found" or not isinstance(store, str) or not store:
+        return False
+    try:
+        real = os.path.normcase(os.path.realpath(store))
+    except (OSError, ValueError):
+        return False
+    for root in disc.roots:
+        nroot = os.path.normcase(root)
+        if real.startswith(nroot + os.sep):
+            parts = real[len(nroot) + 1:].split(os.sep)
+            return len(parts) == 2 and all(parts)
+    return False
+
+
+def _journal_discovery(env, what):
+    """discover_stores, refusing outright when it reports an error. On a layout
+    error the old packaged stores come back as discovery's roots, so an
+    'inside a root' test would accept them; and a discovery error is often
+    transient. Undo and recover change nothing until it clears."""
+    disc = discover_stores(env)
+    if disc.status == "error":
+        raise LayoutError(
+            "store discovery failed: {0}. 'Couldn't look' is never 'nothing "
+            "there' - refusing to {1} until it succeeds. Nothing was changed."
+            .format(disc.detail, what))
+    return disc
+
+
+def _journal_rows(m):
+    """(row, path, store) for each row of manifest M, by where its operation
+    type keeps them. A move, and an undo of one, records no store. Never
+    raises: a damaged record yields what it can and the shape checks name it."""
+    rows = m.get("rows") if isinstance(m, dict) else None
+    if not isinstance(rows, list):
+        return []
+    kind = m.get("op_type", "move")
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if kind in ("move", "undo"):
+            out.append((r, r.get("path"), None))
+        elif kind == "sync":
+            out.append((r, r.get("dest_path"), m.get("dest_path")))
+        elif kind in ("new-row", "repoint"):
+            out.append((r, r.get("dest_path"), m.get("store_path")))
+        else:
+            out.append((r, r.get("dest_path"), r.get("store_path")))
+    return out
+
+
+def _unresolved_rows(disc, m, written_only=False):
+    """[(row, path)] for every row of M this version cannot check. With
+    WRITTEN_ONLY, only rows the operation recorded writing (a move's rows all
+    count: it rewrites every one)."""
+    out = []
+    moveish = m.get("op_type", "move") in ("move", "undo")
+    for r, path, store in _journal_rows(m):
+        if written_only and not moveish and not r.get("written"):
+            continue
+        if not _row_resolved(disc, path, store):
+            out.append((r, path))
+    return out
+
+
+def _unresolved_clause(items):
+    """'N row(s) ... (paths)' for a refusal or a note."""
+    paths = [p if isinstance(p, str) and p else "(no path recorded)" for _, p in items]
+    return "{0} row(s) whose store is not one this version reads ({1})".format(
+        len(paths), ", ".join(paths))
+
+
+def _unresolved_residue(items):
+    """(residue text, paths) recording unresolved rows a 'back' left alone."""
+    paths = [p for _, p in items if isinstance(p, str) and p]
+    text = "; ".join("left {0!r} alone - {1} ({2})".format(
+        r.get("name") or os.path.basename(p or "") or "?", UNRESOLVED_WHY, p)
+        for r, p in items)
+    return text, paths
+
+
+def _add_residue(m, text, paths):
+    """Append to a manifest's rollback residue, keeping the paths it names."""
+    if not text:
+        return
+    prior = m.get("rollback_residue")
+    m["rollback_residue"] = (prior + "; " + text) if prior else text
+    named = list(m.get("rollback_residue_paths") or [])
+    named.extend(p for p in paths if p not in named)
+    m["rollback_residue_paths"] = named
 
 
 def _is_reparse(path):
@@ -1745,6 +2019,20 @@ def _abort(env, op, delete_dest=True, trigger=None):
     set_status(op, "aborting")
     _maybe_crash("after-aborting")
 
+    # A row in a store this version does not read cannot be checked, so it is
+    # neither restored nor counted as drifted - counting it refused the
+    # rollback and left the op at 'aborting' with no resolution. It is left
+    # alone and recorded, and BOTH transcript copies are kept: such a row may
+    # already point at the destination copy, so deleting it could leave a row
+    # opening nothing. The same keep-both outcome C1(b) persists below.
+    stray = []
+    if m["rows"]:
+        stray = _unresolved_rows(_journal_discovery(env, "roll back"), m)
+    stray_ids = {id(r) for r, _ in stray}
+    if stray:
+        delete_dest = False
+        m["abort_keep_dest"] = True
+
     # Classify everything FIRST, as pure reads - no row is rewritten and no
     # destination file is deleted until we know the WHOLE rollback can
     # complete cleanly. Interleaving classification with mutation meant a
@@ -1754,6 +2042,8 @@ def _abort(env, op, delete_dest=True, trigger=None):
     row_restores = []
     drifted_rows = []
     for r in m["rows"]:
+        if id(r) in stray_ids:
+            continue
         state = _row_state(r)
         if state == "post":
             row_restores.append((r, unb64(r["pre_b64"])))
@@ -1795,8 +2085,15 @@ def _abort(env, op, delete_dest=True, trigger=None):
     for r, pre_bytes in row_restores:
         atomic_write(r["path"], pre_bytes)
     for r in m["rows"]:
-        r["rewritten"] = False
+        if id(r) not in stray_ids:
+            r["rewritten"] = False
     m["drifted_rows"] = []
+    if stray:
+        _add_residue(m, *_unresolved_residue(stray))
+        note = ("rows in a store this version does not read were left alone, "
+                "and both transcript copies were kept")
+        m["abort_reason"] = (m["abort_reason"] + "; " + note) \
+            if m.get("abort_reason") else note
     save_manifest(op)
 
     if source_unverifiable:
@@ -1827,13 +2124,18 @@ def _abort(env, op, delete_dest=True, trigger=None):
     set_status(op, "rolled_back")
 
 
-def _validate_manifest_paths(env, m):
+def _validate_manifest_paths(env, m, leave_unresolved=False):
     """Structural + containment validation for every path a manifest could
     direct a write or delete to. Must run before ANY mutation - a
     tampered/foreign manifest (or one whose target has since moved behind a
     symlink/junction) must be rejected before a single file is touched.
     Shared by execute_op (fresh runs) and recover_op (resumed runs, I4) so a
     resumed op gets exactly the same up-front check a fresh one does.
+
+    LEAVE_UNRESOLVED exempts rows in a store this version does not read - for
+    the two recover routes that never touch them: 'back', which leaves them
+    alone and records them, and finishing a committed move, which touches no
+    row at all. Every other path is still checked.
     """
     # C2(a): a tampered/foreign manifest's rel paths must be structurally
     # safe before they are ever joined onto a filesystem path.
@@ -1854,9 +2156,14 @@ def _validate_manifest_paths(env, m):
         ensure_contained(os.path.join(m["sidecar_dest"], *e["rel"].split("/")),
                          [env.projects_root])
 
-    roots = _engine_roots(env, m)
-    for r in m["rows"]:
-        ensure_contained(r["path"], roots)
+    rows = m["rows"]
+    if leave_unresolved and rows:
+        stray = {id(r) for r, _ in _unresolved_rows(_journal_discovery(env, "recover"), m)}
+        rows = [r for r in rows if id(r) not in stray]
+    if rows:
+        roots = _engine_roots(env, m)
+        for r in rows:
+            ensure_contained(r["path"], roots)
 
 
 def execute_op(env, op):
@@ -2124,10 +2431,32 @@ def plan_undo(env, prior_op):
                           "move ({0}); refusing - resolve manually."
                           .format(", ".join(extra)))
 
+    # Every row is checked against the discovered roots, then read, BEFORE an
+    # undo operation is journaled. Reading first, unguarded, let a missing row
+    # escape main() as a traceback; and with an old store left behind after
+    # the data moved, a row there read fine, the undo was journaled, and
+    # execute_op's validator then refused it - a journaled undo that recover
+    # could take in neither direction, for good.
+    if pm["rows"]:
+        disc = _journal_discovery(env, "undo")
+        stray = _unresolved_rows(disc, pm)
+        if stray:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(pm["op_id"], _unresolved_clause(stray)))
     rows = []
     for r in pm["rows"]:
-        with open(r["path"], "rb") as fh:
-            cur = fh.read()
+        try:
+            with open(r["path"], "rb") as fh:
+                cur = fh.read()
+        except FileNotFoundError:
+            raise Refusal("listing row {0} is missing, so this move cannot be "
+                          "undone - nothing was changed.".format(r["path"]))
+        except OSError as exc:
+            # "Couldn't look" is never "nothing there": name what happened.
+            raise Refusal("listing row {0} could not be read ({1}), so this move "
+                          "cannot be undone - nothing was changed."
+                          .format(r["path"], exc))
         if cur != unb64(r["post_b64"]):
             raise Refusal("listing row {0} has changed since the move (the app may "
                           "have updated it); refusing.".format(r["path"]))
@@ -2245,6 +2574,32 @@ def classify_op(env, op):
     """
     m = op.manifest
     status = m["status"]
+
+    # The resolution gate, before any row's file is read. A discovery error
+    # offers nothing - recover refuses until it clears. Rows in a store this
+    # version does not read leave 'back' alone on offer: it reverses what it
+    # can check and records the rest, and forward cannot run on them. A
+    # damaged record keeps its own verdict below. A move is handled in its
+    # own branch, where a committed one may still finish.
+    disc = discover_stores(env)
+    if disc.status == "error":
+        return {"status": status, "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "store discovery failed ({0}); recover refuses until it "
+                        "succeeds, and nothing was changed".format(disc.detail)}
+    stray = _unresolved_rows(disc, m)
+    kind = m.get("op_type", "move")
+    if stray and kind not in ("move", "undo"):
+        shape = {"new-row": _new_row_shape_error, "repoint": _repoint_shape_error,
+                 "retitle": _retitle_shape_error,
+                 "converge": _converge_shape_error}.get(kind)
+        if not (shape and shape(m)):
+            return {"status": status, "source": m.get("store_label", "n/a"),
+                    "dest": m.get("store_label", "n/a"), "resolutions": ["back"],
+                    "drifted_rows": [],
+                    "note": "{0}: {1}; back reverses what it can check and records "
+                            "the rest for doctor, and forward is not offered"
+                            .format(kind, _unresolved_clause(stray))}
 
     if m.get("op_type") == "repoint":
         # "There is no partial state to roll forward" was wrong, and it left
@@ -2425,7 +2780,25 @@ def classify_op(env, op):
     # row before the user even picks a direction; the actual write-vs-refuse
     # decision for a "copied"/"rewriting" forward happens in
     # _forward_rewrite_and_commit, not here.
-    drifted_rows = [r["path"] for r in m["rows"] if _row_state(r) == "drifted"]
+    # An unresolved row is never read here, and never counted as drifted.
+    stray_ids = {id(r) for r, _ in stray}
+    drifted_rows = [r["path"] for r in m["rows"]
+                    if id(r) not in stray_ids and _row_state(r) == "drifted"]
+    if stray and status != "committed":
+        # Finishing a committed move touches no row, so it falls through and
+        # stays on offer. Anything else rewrites rows, so only 'back' remains:
+        # _abort leaves the unresolved rows alone and keeps both copies.
+        if drifted_rows:
+            return {"status": status, "source": src, "dest": dest, "resolutions": [],
+                    "drifted_rows": drifted_rows,
+                    "note": "row(s) changed unexpectedly ({0}), and {1} - resolve "
+                            "manually".format(", ".join(drifted_rows),
+                                              _unresolved_clause(stray))}
+        return {"status": status, "source": src, "dest": dest, "resolutions": ["back"],
+                "drifted_rows": [],
+                "note": "{0}; back leaves them alone, keeps both transcript copies "
+                        "and records them for doctor, and forward is not offered"
+                        .format(_unresolved_clause(stray))}
 
     if status in ("journaled", "copying"):
         dest_label = "partial-scratch" if dest != "absent" else "absent"
@@ -2550,6 +2923,12 @@ def recover_op(env, op, direction):
     # (or a recover racing a live move) must not interleave.
     acquire_lock(env, "recover-" + op.manifest["op_id"])
     try:
+        # The resolution gate: a discovery error refuses both directions, and
+        # rows in a store this version does not read are left to classify_op,
+        # which offers 'back' alone for them (a committed move may still
+        # finish - it touches no row). See _row_resolved.
+        disc = _journal_discovery(env, "recover")
+        stray = _unresolved_rows(disc, op.manifest)
         # I4: validate containment before ANY mutation, including the
         # scratch-dest unlink below - not just on execute_op's fresh runs.
         # A sync manifest carries no source_transcript/sidecar_inventory/
@@ -2562,7 +2941,7 @@ def recover_op(env, op, direction):
         # that exists to get them unstuck.
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row",
                                               "retitle", "converge"):
-            _validate_manifest_paths(env, op.manifest)
+            _validate_manifest_paths(env, op.manifest, leave_unresolved=bool(stray))
         elif op.manifest.get("op_type") == "new-row":
             # The allowlist above skips the move-shaped validator, so this op
             # type brings its own. Without it the branch below dereferences
@@ -2620,6 +2999,15 @@ def recover_op(env, op, direction):
             # vanished-row check reads only 'completed' ops, so a rolled_back op
             # with a surviving row is invisible everywhere. Record it instead.
             residue = None
+            if stray:
+                # A row in a store this version does not read: never read,
+                # never touched - recorded, if this op says it wrote it.
+                if r.get("written"):
+                    _add_residue(m, *_unresolved_residue(stray))
+                    save_manifest(op)
+                set_status(op, "rolled_back")
+                rotate_ops(env)
+                return "rolled_back"
             state = _sync_row_drift(r)
             if state == "match":
                 # The running-app guard (RULING 4) belongs HERE, not at the top
@@ -2654,7 +3042,7 @@ def recover_op(env, op, direction):
                             .format(state))
                 residue = "left {0!r} in place - {1}".format(r["name"], why)
             if residue:
-                m["rollback_residue"] = residue
+                _add_residue(m, residue, [r["dest_path"]])
                 save_manifest(op)
             set_status(op, "rolled_back")
             rotate_ops(env)
@@ -2699,7 +3087,10 @@ def recover_op(env, op, direction):
             # the same window _sync_delete_targets documents.
             roots = _retitle_roots(env)
             restorable, skipped = [], []
+            stray_ids = {id(r) for r, _ in stray}
             for r in m["rows"]:
+                if id(r) in stray_ids:
+                    continue                 # recorded below, never read
                 try:
                     _retitle_contained(r, roots)
                 except LayoutError:
@@ -2756,6 +3147,10 @@ def recover_op(env, op, direction):
                     "operation wrote, so there was nothing to take back. The "
                     "op is closed; re-run retitle if the rename is still "
                     "wanted.")
+            # Written rows in a store this version does not read: left alone,
+            # and recorded where doctor looks, so the close is not silent.
+            _add_residue(m, *_unresolved_residue(
+                [(r, p) for r, p in stray if r.get("written")]))
             set_status(op, "rolled_back")
             rotate_ops(env)
             return "rolled_back"
@@ -2802,8 +3197,11 @@ def recover_op(env, op, direction):
             # leaves a row holding this op's bytes with the flag unset (the
             # same window the retitle arm documents). The rows are pointers;
             # the conversations keep their rows elsewhere.
-            deletable, residue = [], []
+            deletable, residue, residue_paths = [], [], []
+            stray_ids = {id(r) for r, _ in stray}
             for r in m["rows"]:
+                if id(r) in stray_ids:
+                    continue                  # recorded below, never read
                 state = _sync_row_drift(r)
                 if state == "match":
                     deletable.append(r)
@@ -2816,6 +3214,7 @@ def recover_op(env, op, direction):
                                 .format(state))
                     residue.append("left {0!r} in place - {1}".format(
                         r.get("name"), why))
+                    residue_paths.append(r["dest_path"])
                 # not written and not holding our bytes: not ours to touch
             if deletable:
                 # Guard only when something will actually be deleted - on
@@ -2837,8 +3236,12 @@ def recover_op(env, op, direction):
                     except (OSError, LayoutError) as exc:
                         residue.append("could not remove {0!r}: {1}".format(
                             r.get("name"), exc))
+                        residue_paths.append(r["dest_path"])
             if residue:
-                m["rollback_residue"] = "; ".join(residue)
+                _add_residue(m, "; ".join(residue), residue_paths)
+            _add_residue(m, *_unresolved_residue(
+                [(r, p) for r, p in stray if r.get("written")]))
+            if m.get("rollback_residue"):
                 save_manifest(op)
             set_status(op, "rolled_back")
             rotate_ops(env)
@@ -2851,6 +3254,15 @@ def recover_op(env, op, direction):
                     "can be run from it. Nothing was changed."
                     .format(m.get("op_id"), bad))
             r = m["rows"][0]
+            if stray:
+                # Only 'back' is on offer (classify_op), and it touches nothing
+                # here: the row is in a store this version does not read.
+                if r.get("written"):
+                    _add_residue(m, *_unresolved_residue(stray))
+                    save_manifest(op)
+                set_status(op, "rolled_back")
+                rotate_ops(env)
+                return "rolled_back"
             state = _sync_row_drift(r)
             if direction == "forward":
                 if state == "match":
@@ -2917,7 +3329,7 @@ def recover_op(env, op, direction):
                             "back could discard something it never wrote")
                 residue = "left {0!r} alone - {1}".format(r.get("name"), why)
             if residue:
-                m["rollback_residue"] = residue
+                _add_residue(m, residue, [r["dest_path"]])
             if declined:
                 m["rollback_declined"] = declined
             if residue or declined:
@@ -2945,9 +3357,14 @@ def recover_op(env, op, direction):
                 # blocking pending row is still never considered, because
                 # its state is drifted/deleted/unreadable rather than the
                 # "match" that would prove this op wrote it.
+                left_alone = []
                 (drifted, unreadable, removable,
-                 restorable, claimed) = _sync_delete_targets(env, m)
+                 restorable, claimed) = _sync_delete_targets(env, m,
+                                                             unresolved=left_alone)
                 _sync_reverse_all(removable, restorable)
+                # Rows in a store this version does not read were never read;
+                # recorded where doctor looks, so this close is not silent.
+                _add_residue(m, *_unresolved_residue(left_alone))
                 # `claimed` rows belong to another op's journal, so back leaves
                 # them alone - the same skip-rather-than-refuse rule the other
                 # unverifiable states get here, for the same reason: back must
@@ -3374,7 +3791,7 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "orphan_ids", "orphans", "overrode_tombstone", "pairs", "path",
     "per_account", "post_b64", "pre_activity", "pre_b64", "present",
     "reachable", "reason", "regresses", "regressing", "relation",
-    "removed",
+    "removed", "rerooted_ops", "residue",
     "reset", "result", "resurrected", "retitle", "rollback_declined",
     "rollback_residue", "roots", "row", "row_count", "row_errors",
     "row_path", "rows", "safe", "scope", "scoped", "session",
@@ -3392,7 +3809,7 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "transcript_mtime", "transcript_paths", "transcript_size",
     "transcripts", "turns", "unchanged", "unknown_layout",
     "unlisted_ranked", "unlisted_recent", "unlisted_transcripts",
-    "unmeasured", "unreadable", "unreadable_rows", "update",
+    "unmeasured", "unreadable", "unreadable_rows", "unresolved_rows", "update",
     "vanished_new_rows", "verbatim", "written",
 )) | frozenset(_ANON_FIELDS) | frozenset(_ANON_EMAIL_FIELDS)
 
@@ -3769,8 +4186,19 @@ def gather_doctor(env):
     # operations and was surfaced by nothing. The retention hold was write-only,
     # protecting a record no reader existed for. This is that reader.
     rollback_residue = []
+    # Rows the journal names in a store this version does not read: a removed
+    # package, a relocated LOCALAPPDATA, a downgrade. Listed, NOT counted in
+    # the exit code (the 2026-10-19 journal ruling, 3.1): nothing this tool
+    # can see would ever clear one, so counting it would hold doctor at exit 1
+    # for as long as that store stays out of reach - which may be for good.
+    unresolved_rows = []
+    # Operations recorded before the user data moved, read under the moved
+    # store (list_ops). Advisory, like the line it prints.
+    rerooted_ops = 0
     for _op in list_ops(env):
         _m = _op.manifest
+        if _op.rerooted:
+            rerooted_ops += 1
         _res = _m.get("rollback_residue")
         if _res:
             _rows = _m.get("rows")
@@ -3783,14 +4211,34 @@ def gather_doctor(env):
             # and an alert that could never clear would be a permanent exit 1
             # over a resolved condition. A path that cannot be checked is
             # reported, never hidden - "couldn't look" is never "nothing there".
-            _dest, _left = _r0.get("dest_path"), True
-            if isinstance(_dest, str) and _dest:
+            #
+            # EVERY row the residue names, not the first row's: a 'back' that
+            # reversed the first row and left a later one recorded a residue
+            # this reader then dropped, because the first row was gone. The
+            # paths are recorded beside the residue; one written before they
+            # were names its first row, by `dest_path` or, for a move, `path`.
+            _named = _m.get("rollback_residue_paths")
+            if not (isinstance(_named, list) and _named):
+                _named = [_r0.get("dest_path") or _r0.get("path")]
+            _named = [p for p in _named if isinstance(p, str) and p]
+            _left, _unchecked = not _named, []
+            for _p in _named:
+                if not _row_resolved(disc, _p):
+                    _unchecked.append(_p)
+                    continue
                 try:
-                    os.stat(_dest)
+                    os.stat(_p)
+                    _left = True
                 except FileNotFoundError:
-                    _left = False
+                    pass
                 except OSError:
                     _left = True
+            if not _left:
+                for _p in _unchecked:
+                    unresolved_rows.append({
+                        "op_id": _m.get("op_id"), "op_type": _m.get("op_type"),
+                        "status": _m.get("status"), "name": os.path.basename(_p),
+                        "path": _p, "residue": True})
             if _left:
                 rollback_residue.append({
                     "op_id": _m.get("op_id"), "op_type": _m.get("op_type"),
@@ -3838,7 +4286,17 @@ def gather_doctor(env):
         else:
             continue
         for _r, _store, _sid, _title, _slabel in _watch:
-            if not (_r.get("written") and _sync_row_drift(_r) == "absent"):
+            if not _r.get("written"):
+                continue
+            # The resolution gate before the file is read: a row in a store
+            # this version does not read is not "vanished" - nobody can say.
+            if not _row_resolved(disc, _r.get("dest_path"), _store):
+                unresolved_rows.append({
+                    "op_id": _m.get("op_id"), "op_type": _m.get("op_type"),
+                    "status": _m.get("status"), "name": _r.get("name") or "",
+                    "path": _r.get("dest_path"), "residue": False})
+                continue
+            if _sync_row_drift(_r) != "absent":
                 continue
             # ONE PATH BEING ABSENT IS NOT THE QUESTION. The question is whether
             # the account can still open the conversation, and those come apart
@@ -3889,6 +4347,8 @@ def gather_doctor(env):
         "duplicate_titles": duplicate_titles,
         "vanished_new_rows": vanished_new,
         "rollback_residue": rollback_residue,
+        "unresolved_rows": unresolved_rows,
+        "rerooted_ops": rerooted_ops,
     }
     if disc.status == "error" or row_errors or unknown_layout:
         report["exit_code"] = 2
@@ -4248,6 +4708,22 @@ def cmd_doctor(env, ns):
             "operation wrote. Nothing else looks for that row - delete the "
             "session from the app if it is not wanted, or leave it if it is, "
             "and this clears.")
+    unresolved = rep.get("unresolved_rows") or []
+    if unresolved:
+        say("[observed] {0} journaled row(s) cannot be checked: their store is not "
+            "one this version reads".format(len(unresolved)))
+        for u in unresolved:
+            say_ids("[observed]   {0} (op {1}, {2}{3}): {4}".format(
+                u.get("name") or "?", u.get("op_id"), u.get("op_type") or "move",
+                ", left by a rollback" if u.get("residue") else "", u.get("path")))
+        say("[hypothesis]   a removed package, a relocated LOCALAPPDATA or a "
+            "downgrade can leave the journal naming a store this version no "
+            "longer reads. These are listed, not counted in the exit code: "
+            "nothing this tool can see would clear them, and undo refuses "
+            "them rather than guess.")
+    if rep.get("rerooted_ops"):
+        say("[observed] journal: {0} operation(s) recorded before the data moved; "
+            "their paths are read under the moved root".format(rep["rerooted_ops"]))
     dupes = rep.get("duplicate_titles") or []
     # Split before printing. These are two different conditions that happen to
     # look alike, and reporting them together produced a cleanup list that told
@@ -4735,6 +5211,13 @@ def cmd_undo(env, ns):
     # skips what became load-bearing - so a bare "undone" would hide exactly
     # the rows it deliberately left. Print the tally the spec requires:
     # deleted / skipped-by-reason / already-gone.
+    if prior.manifest.get("op_type") == "sync" and prior.manifest.get("undo_report"):
+        rep = prior.manifest["undo_report"]
+        line = ("removed {0} row(s), restored {1}; {2} already gone; {3} refreshed "
+                "row(s) not restored - that account deleted them since".format(
+                    rep.get("removed", 0), rep.get("restored", 0),
+                    rep.get("already_gone", 0), rep.get("not_restored", 0)))
+        print(line if ns.verbose else redact(env, line))
     if prior.manifest.get("op_type") == "converge" \
             and prior.manifest.get("undo_report"):
         rep = prior.manifest["undo_report"]
@@ -7207,6 +7690,9 @@ def _new_row_preflight(env, m):
     """
     _guard_mutation(env, "create a row in", NEW_ROW_STORE,
                     because=NEW_ROW_GUARD_WHY)
+    if not _store_resolved(_journal_discovery(env, "create a row"), m["store_path"]):
+        raise LayoutError("the store this operation names is not one this version "
+                          "reads ({0}); nothing was written".format(m["store_path"]))
     if not os.path.isdir(m["store_path"]):
         raise LayoutError("store vanished: " + m["store_path"])
     # The transcript must still be THE one this row was planned against - not
@@ -7458,6 +7944,11 @@ def undo_new_row(env, op):
         r = m["rows"][0]
         if not r.get("written"):
             raise Refusal("this op never wrote the row; nothing to undo")
+        disc = _journal_discovery(env, "undo")
+        if not _row_resolved(disc, r["dest_path"], m["store_path"]):
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change it, so nothing was changed.".format(
+                              m["op_id"], _unresolved_clause([(r, r["dest_path"])])))
         real = ensure_contained(r["dest_path"], [m["store_path"]])
         if os.path.dirname(real) != os.path.realpath(m["store_path"]):
             raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
@@ -8141,6 +8632,10 @@ def execute_sync_op(env, op):
                 .format(live.email or live.account_uuid),
         _certified_live_account(env, m))
     _guard_mutation(env, "write to")
+    if not _store_resolved(_journal_discovery(env, "write rows"), m["dest_path"]):
+        raise LayoutError("the destination store this operation names is not one "
+                          "this version reads ({0}); nothing was written"
+                          .format(m["dest_path"]))
     if not os.path.isdir(m["dest_path"]):
         raise LayoutError("destination store vanished: " + m["dest_path"])
 
@@ -8859,8 +9354,15 @@ def _sync_paths_claimed_elsewhere(env, m):
     return out
 
 
-def _sync_delete_targets(env, m):
+def _sync_delete_targets(env, m, unresolved=None, tally=None):
     """Rows THIS sync op actually wrote, classified for safe deletion.
+
+    The resolution gate comes first, per row: a written row in a store this
+    version does not read is never read. UNRESOLVED is back's list to collect
+    them in; undo passes none, and refuses - before anything is changed - if
+    there are any. TALLY, when given, counts the written rows found absent:
+    `already_gone` for an added row, `not_restored` for a refreshed one whose
+    pre-image is deliberately not put back.
     Shared by undo_sync and recover_op's 'back' path, which react
     differently to a non-empty drifted/unreadable result: undo_sync refuses
     the whole operation (a surprise during a user-initiated reversal of a
@@ -8914,8 +9416,15 @@ def _sync_delete_targets(env, m):
     _guard_mutation(env, "delete from")
     drifted, unreadable, removable, restorable, claimed = [], [], [], [], []
     elsewhere = _sync_paths_claimed_elsewhere(env, m)
+    disc = discover_stores(env)
+    stray = []
     for r in m["rows"]:
         written = bool(r.get("written"))
+        if not _row_resolved(disc, r.get("dest_path"), m.get("dest_path")):
+            # Never read. A row this op never wrote is not ours, as below.
+            if written:
+                stray.append((r, r.get("dest_path")))
+            continue
         # Containment BEFORE the row is classified, because classifying opens
         # its dest_path: a hand-edited manifest must not be able to get this
         # helper to read a file outside the destination store.
@@ -8994,6 +9503,9 @@ def _sync_delete_targets(env, m):
             # Nothing to undo. For a REFRESH this also means the destination
             # deleted the session after we rewrote it - putting the old bytes
             # back would resurrect it, so absent is skipped there too.
+            if tally is not None:
+                key = "not_restored" if _row_is_refresh(r) else "already_gone"
+                tally[key] = tally.get(key, 0) + 1
             continue
         elif state == "match":
             # "match" means the row still holds exactly what this op wrote. For
@@ -9010,6 +9522,12 @@ def _sync_delete_targets(env, m):
             drifted.append(r["title"])
         else:                              # "unreadable"
             unreadable.append(r["title"])
+    if stray:
+        if unresolved is None:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(m.get("op_id"), _unresolved_clause(stray)))
+        unresolved.extend(stray)
     return drifted, unreadable, removable, restorable, claimed
 
 
@@ -9105,8 +9623,10 @@ def undo_sync(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
+        _journal_discovery(env, "undo")
+        tally = {"already_gone": 0, "not_restored": 0}
         (drifted, unreadable, removable,
-         restorable, claimed) = _sync_delete_targets(env, m)
+         restorable, claimed) = _sync_delete_targets(env, m, tally=tally)
         if drifted or unreadable:
             raise Refusal("these synced rows {0}; the other account may have opened "
                           "them. Refusing to change any of them."
@@ -9127,6 +9647,12 @@ def undo_sync(env, op):
         # One pass, both halves always attempted - a locked added row must not
         # leave every refreshed row stranded in its overwritten state.
         _sync_reverse_all(removable, restorable)
+        # What happened, not just that it ended: a bare "undone" read the
+        # same whether every row was reversed or none was (decision 7 of the
+        # 2026-10-19 journal ruling). cmd_undo and the window print it.
+        m["undo_report"] = {"removed": len(removable), "restored": len(restorable),
+                            "already_gone": tally["already_gone"],
+                            "not_restored": tally["not_restored"]}
         set_status(op, "undone")
         rotate_ops(env)
         return "undone"
@@ -9432,6 +9958,11 @@ def execute_repoint_op(env, op):
                           "'writing'; this one is " + str(m.get("status")))
     # The guard that was missing when this row was repointed by something else.
     _guard_mutation(env, "repoint")
+    if not _row_resolved(_journal_discovery(env, "repoint"), m["rows"][0]["dest_path"],
+                         m["store_path"]):
+        raise LayoutError("the row this operation names is in a store this version "
+                          "does not read ({0}); nothing was written"
+                          .format(m["rows"][0]["dest_path"]))
     if not os.path.isdir(m["store_path"]):
         raise LayoutError("store vanished: " + m["store_path"])
     # Re-check the target HERE, not only at plan time. Between a dry run and
@@ -9510,6 +10041,11 @@ def undo_repoint(env, op):
         r = m["rows"][0]
         if not r.get("written"):
             raise Refusal("this repoint never wrote the row; nothing to undo")
+        disc = _journal_discovery(env, "undo")
+        if not _row_resolved(disc, r["dest_path"], m["store_path"]):
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change it, so nothing was changed.".format(
+                              m["op_id"], _unresolved_clause([(r, r["dest_path"])])))
         real = ensure_contained(r["dest_path"], [m["store_path"]])
         if os.path.dirname(real) != os.path.realpath(m["store_path"]):
             raise LayoutError("row {0!r} is not a direct child of {1!r}; refusing"
@@ -10330,6 +10866,11 @@ def undo_retitle(env, op):
                 "was changed.".format(m.get("op_id"), bad))
         _guard_mutation(env, "restore retitled rows in", NEW_ROW_STORE,
                         because=RETITLE_GUARD_WHY)
+        stray = _unresolved_rows(_journal_discovery(env, "undo"), m, written_only=True)
+        if stray:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(m["op_id"], _unresolved_clause(stray)))
         roots = _retitle_roots(env)
         blocked, pairs = [], []
         for r in m["rows"]:
@@ -12072,6 +12613,15 @@ def undo_converge(env, op):
                 "was changed.".format(m.get("op_id"), bad))
         _guard_mutation(env, "remove rows from", NEW_ROW_STORE,
                         because=NEW_ROW_GUARD_WHY)
+        # Every written row is checked BEFORE any is deleted. The loop below
+        # checks containment row by row, after earlier rows are already gone,
+        # so an uncontained later row refused with the op left 'completed' and
+        # part of it undone. One unresolved row stops the whole undo.
+        stray = _unresolved_rows(_journal_discovery(env, "undo"), m, written_only=True)
+        if stray:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(m["op_id"], _unresolved_clause(stray)))
         roots = _retitle_roots(env)
         # The pointer census the last-pointer rule reads. load_rows is
         # best-effort (it collects unreadable rows instead of raising), and
