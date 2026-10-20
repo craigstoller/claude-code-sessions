@@ -1255,6 +1255,32 @@ def test_non_hex_slash_query_stays_substring(mkenv, tmp_path,
     assert acc.account_uuid == LA
 
 
+def test_live_store_path_with_a_trailing_separator_resolves(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The 2026-10-20 separator ruling: a trailing separator may match the end
+    of a store path, so a Tab-completed path names its account here too, in
+    either spelling."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    store = os.path.join(env.store_candidates[0], LA, LOA)
+    other = "/" if os.sep == "\\" else "\\"
+    for value in (store + os.sep, store.replace(os.sep, other) + other):
+        acc = ct._resolve_live_assertion(env, value, ct._account_dirs(env),
+                                         account_scope=True)
+        assert acc.account_uuid == LA, value
+
+
+def test_mid_uuid_pair_with_a_trailing_separator_is_still_refused(
+        mkenv, tmp_path, write_transcript, write_row):
+    """'1111/<LOA>' is the printed account form with a mid-uuid left half, and
+    LA's folded store path ends in exactly that; with a trailing separator it
+    must still be refused, never matched at the path's end."""
+    env = live_pair_env(mkenv, tmp_path, write_transcript, write_row)
+    for value in ("1111/" + LOA + "/", "1111/" + LOA + "\\"):
+        with pytest.raises(ct.Refusal, match="matched neither account"):
+            ct._resolve_live_assertion(env, value, ct._account_dirs(env),
+                                       account_scope=True)
+
+
 def test_email_live_accepted_at_account_scope(mkenv, tmp_path,
                                               write_transcript, write_row):
     """The measured refusal this change deletes: an email - the natural way

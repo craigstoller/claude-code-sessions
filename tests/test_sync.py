@@ -3278,3 +3278,221 @@ def test_plan_sync_dup_flags_are_reporting_only(two_account_env, tmp_path):
     # equal to one must not rename the key.
     assert "dup_conversation" in ct._ANON_STRUCTURAL_KEYS
     assert "dup_title" in ct._ANON_STRUCTURAL_KEYS
+
+
+# ---------------------------------------------- separator folding (2026-10-20)
+#
+# The maintainer's ruling (docs/internals.md, "Amendment 2026-10-20 -
+# separators"): --to and store-scope --live fold '/' and '\' in the path field,
+# beside today's test; a trailing separator may match the end of a store path,
+# except on a value that is the printed account form without it; a --live value
+# made only of separators is refused like a blank one. Each value is built in
+# the separator this platform does NOT use - '/' on Windows, '\' on POSIX - so
+# both CI legs exercise the fold.
+
+OTHER_SEP = "/" if os.sep == "\\" else "\\"
+DORMANT_ORG = "dddddddd-0000-0000-0000-000000000004"
+
+
+def _other_spelling(path):
+    return path.replace(os.sep, OTHER_SEP)
+
+
+def _second_dormant_store(env):
+    second = os.path.join(env.store_candidates[0],
+                          "eeeeeeee-0000-0000-0000-000000000005",
+                          "ffffffff-0000-0000-0000-000000000006")
+    os.makedirs(second)
+    return second
+
+
+def test_to_matches_a_store_path_in_the_other_spelling(two_account_env,
+                                                       tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _second_dormant_store(env)
+    _, dest = ct.resolve_sync_endpoints(env, to=_other_spelling(dst))
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+
+
+def test_plan_sync_takes_a_store_path_in_the_other_spelling(two_account_env,
+                                                            tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _second_dormant_store(env)
+    m = ct.plan_sync(env, ct.SyncFlags(to=_other_spelling(dst)))
+    assert os.path.normcase(m["dest_path"]) == os.path.normcase(dst)
+
+
+def test_to_matches_a_store_path_with_a_trailing_separator(two_account_env,
+                                                           tmp_path):
+    """What Git Bash hands over for a Tab-completed folder: '/' spelling and a
+    trailing '/'. No store path ends in a separator, so the '/' appended to
+    the path side is what lets it match, in either spelling."""
+    env, src, dst = two_account_env(tmp_path)
+    _second_dormant_store(env)
+    for value in (dst + os.sep, _other_spelling(dst) + OTHER_SEP):
+        _, dest = ct.resolve_sync_endpoints(env, to=value)
+        assert os.path.normcase(dest.path) == os.path.normcase(dst), value
+
+
+def test_to_matches_a_path_fragment_in_the_other_spelling(two_account_env,
+                                                          tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _second_dormant_store(env)
+    _, dest = ct.resolve_sync_endpoints(
+        env, to="claude-code-sessions" + OTHER_SEP + "cccccccc")
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+
+
+def test_a_broad_fragment_in_the_other_spelling_is_a_broad_fragment(
+        two_account_env, tmp_path):
+    """It names every other store: that one store when there is one, the
+    ambiguity refusal listing them when there are two - as any broad fragment
+    already does. Before the fold it matched nothing."""
+    env, src, dst = two_account_env(tmp_path)
+    broad = "claude-code-sessions" + OTHER_SEP
+    _, dest = ct.resolve_sync_endpoints(env, to=broad)
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+    second = _second_dormant_store(env)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.resolve_sync_endpoints(env, to=broad)
+    msg = str(exc.value)
+    assert "matched 2 accounts" in msg
+    assert _line_containing(msg, dst) and _line_containing(msg, second)
+
+
+def test_the_signed_in_store_in_any_spelling_keeps_the_exact_refusal(
+        two_account_env, tmp_path):
+    """The window routes on this sentence (tests/test_gui_destination.py).
+    Every store of the signed-in account is removed before matching, so no
+    spelling of one can become the destination."""
+    env, src, dst = two_account_env(tmp_path)
+    for value in (_other_spelling(src), _other_spelling(src) + OTHER_SEP,
+                  src + os.sep):
+        with pytest.raises(ct.Refusal) as exc:
+            ct.resolve_sync_endpoints(env, to=value)
+        assert str(exc.value) == \
+            "--to {0!r} matched no other account store".format(value)
+
+
+def test_a_mid_uuid_pair_is_refused_with_or_without_a_trailing_separator(
+        two_account_env, tmp_path):
+    """DORMANT's id ends in 0003 and its org starts dddd, so '0003/dddd' and
+    '0003/<its whole org id>' both sit inside its folded store path. The pair
+    form anchors both halves and refuses them, and a trailing separator must
+    not turn either into a path substring: the '/' appended to the path side
+    is withheld from a value that is the printed account form without its
+    trailing separators."""
+    env, src, dst = two_account_env(tmp_path)
+    for value in ("0003/dddd", "0003/dddd/", "0003/dddd\\",
+                  "0003/" + DORMANT_ORG, "0003/" + DORMANT_ORG + "/",
+                  "0003/" + DORMANT_ORG + "\\"):
+        with pytest.raises(ct.Refusal,
+                           match="matched no other account store"):
+            ct.resolve_sync_endpoints(env, to=value)
+
+
+def test_the_backslash_twin_of_a_mid_uuid_pair_stays_a_substring(
+        two_account_env, tmp_path):
+    """'0003\\dddd' is not pair-shaped, so it is matched as a substring and
+    names the store whose account id ends in 0003 - as it already does on
+    Windows, whose store paths hold that backslash. Pair precedence is
+    untouched in both directions."""
+    env, src, dst = two_account_env(tmp_path)
+    _, dest = ct.resolve_sync_endpoints(env, to="0003\\dddd")
+    assert os.path.normcase(dest.path) == os.path.normcase(dst)
+
+
+def test_values_that_matched_before_still_match_the_same_store(
+        two_account_env, tmp_path):
+    """The guarantee the ruling rests on: the folded test is added beside
+    today's, never in place of it."""
+    env, src, dst = two_account_env(tmp_path)
+    second = _second_dormant_store(env)
+    _agent_mode_config(env, DORMANT, {"accountUuid": DORMANT,
+                                      "emailAddress": "other@example.com"})
+    for value in (dst, "cccccccc", "dddddddd", "other@example.com"):
+        _, dest = ct.resolve_sync_endpoints(env, to=value)
+        assert os.path.normcase(dest.path) == os.path.normcase(dst), value
+    _, dest = ct.resolve_sync_endpoints(env, to="ffffffff")
+    assert os.path.normcase(dest.path) == os.path.normcase(second)
+
+
+def test_a_trailing_separator_keeps_its_folder_boundary(mkenv, tmp_path):
+    """Two roots whose folder names share a prefix, holding the same ids. A
+    folder name plus a separator still names one root, in either spelling:
+    nothing is stripped from the value, so 'Vendor/' never reaches
+    'Vendor-Data'."""
+    env = mkenv(tmp_path)
+    roots = [str(tmp_path / name / "claude-code-sessions")
+             for name in ("Vendor", "Vendor-Data")]
+    for r in roots:
+        os.makedirs(os.path.join(r, SOURCE_ACCT,
+                                 "bbbbbbbb-0000-0000-0000-000000000002"))
+        os.makedirs(os.path.join(r, DORMANT, DORMANT_ORG))
+    env.store_candidates = roots
+    with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {
+            "accountUuid": SOURCE_ACCT,
+            "organizationUuid": "bbbbbbbb-0000-0000-0000-000000000002"}}, fh)
+    want = os.path.join(roots[0], DORMANT, DORMANT_ORG)
+    folder = str(tmp_path / "Vendor")
+    for value in (folder + os.sep, _other_spelling(folder) + OTHER_SEP):
+        _, dest = ct.resolve_sync_endpoints(env, to=value)
+        assert os.path.normcase(dest.path) == os.path.normcase(want), value
+
+
+def test_live_matches_the_dormant_store_path_in_any_spelling(two_account_env,
+                                                             tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _write_desktop_config(env, DORMANT)
+    for value in (_other_spelling(dst), dst + os.sep,
+                  _other_spelling(dst) + OTHER_SEP):
+        source, _ = ct.resolve_sync_endpoints(env, live=value)
+        assert source.account_uuid == DORMANT, value
+        assert os.path.normcase(source.path) == os.path.normcase(dst), value
+
+
+def test_live_fragment_naming_both_accounts_stores_is_ambiguous(
+        two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _write_desktop_config(env, DORMANT)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.resolve_sync_endpoints(env, live="claude-code-sessions" + OTHER_SEP)
+    assert "matched 2 stores" in str(exc.value)
+
+
+def test_live_mid_uuid_pair_with_a_trailing_separator_is_refused(
+        two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _write_desktop_config(env, DORMANT)
+    for value in ("0003/dddd/", "0003/" + DORMANT_ORG + "/"):
+        with pytest.raises(ct.Refusal, match="matched no store"):
+            ct.resolve_sync_endpoints(env, live=value)
+
+
+def test_live_made_only_of_separators_is_refused_like_a_blank_one(
+        two_account_env, tmp_path):
+    """RULING 5 refuses a blank value because it matches every candidate - on
+    a one-candidate machine, the bare force flag. A value of nothing but
+    separators is that value in another form: '\\' matched every Windows store
+    path before the fold, '/' every POSIX one. Here only the config-named
+    account has a store, so either would certify it, in either scope."""
+    env, src, dst = two_account_env(tmp_path)
+    os.rmdir(src)
+    os.rmdir(os.path.dirname(src))        # the oauth-named account: no store
+    _write_desktop_config(env, DORMANT)
+    dirs = ct._account_dirs(env)
+    for value in ("/", "\\", " / ", "\\\\", "/\\"):
+        for scope in (False, True):
+            with pytest.raises(ct.Refusal, match="name the account"):
+                ct._resolve_live_assertion(env, value, dirs,
+                                           account_scope=scope)
+
+
+def test_repoint_live_takes_the_other_spelling_too(two_account_env, tmp_path):
+    """repoint, new-row and retitle reach the same store-scope assertion."""
+    env, src, dst = two_account_env(tmp_path)
+    _write_desktop_config(env, DORMANT)
+    hits = ct._repoint_store(env, ct.RepointFlags(live=_other_spelling(dst)))
+    assert [os.path.normcase(p) for _a, _o, p in hits] == \
+        [os.path.normcase(dst)]

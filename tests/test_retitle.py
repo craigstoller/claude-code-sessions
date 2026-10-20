@@ -288,6 +288,38 @@ def test_pair_form_resolves_store(mkenv, tmp_path, write_row):
                                              store="0001/bbbbbbbb"))
 
 
+def test_store_path_with_a_trailing_separator_resolves(mkenv, tmp_path,
+                                                       write_row):
+    """What Git Bash hands over for a Tab-completed folder ends in a separator,
+    and no store path does; the '/' appended to the path side lets it match,
+    in either spelling (the 2026-10-20 separator ruling)."""
+    env = mkenv(tmp_path)
+    three_accounts(env, write_row)
+    store = os.path.join(env.store_candidates[0], A1, O1)
+    other = "/" if os.sep == "\\" else "\\"
+    for value in (store + os.sep, store.replace(os.sep, other) + other):
+        m = ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8],
+                                                 title="ACME-REVIEW",
+                                                 store=value))
+        assert len(m["rows"]) == 1, value
+        assert A1 in m["rows"][0]["dest_path"]
+
+
+def test_store_mid_uuid_pair_with_a_trailing_separator_is_refused(
+        mkenv, tmp_path, write_row):
+    """'0001/<O1>' is the printed account form with a mid-uuid left half, and
+    A1's folded store path ends in exactly that. A trailing separator must not
+    let it match at the path's end: the appended '/' is withheld from a value
+    that is the account form without its trailing separators."""
+    env = mkenv(tmp_path)
+    three_accounts(env, write_row)
+    for value in ("0001/" + O1 + "/", "0001/" + O1 + "\\"):
+        with pytest.raises(ct.Refusal, match="matched no store"):
+            ct.plan_retitle(env, ct.RetitleFlags(only=SID[:8],
+                                                 title="ACME-REVIEW",
+                                                 store=value))
+
+
 def test_store_sibling_divergence_warning_iff_siblings_would_differ(
         mkenv, tmp_path, write_row):
     env = mkenv(tmp_path)

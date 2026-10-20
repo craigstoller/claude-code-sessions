@@ -437,6 +437,55 @@ check("a saved value that went ambiguous: its picker as today",
 check("  and a pick saves the full path", same(s.pref(), P["moved"](A, O2)), s.pref())
 s.close()
 
+# ------------------------------------------------------------------ 8
+# The 2026-10-20 separator ruling: the core folds '/' and '\' and lets a
+# trailing separator match a store path's end. This check runs on Windows
+# (default_env takes the platform), where '/' is the spelling that differs;
+# the POSIX coverage is tests/test_sync.py's.
+print("-- a saved path spelled with '/'")
+
+
+def slashed(p):
+    return p.replace("\\", "/")
+
+
+env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2))
+for name, saved in (("a '/'-spelled saved store", slashed(P["moved"](A, O1))),
+                    ("  with a trailing '/'", slashed(P["moved"](A, O1)) + "/")):
+    s = Session(env, P, saved)
+    check("%s: plans into it, no picker" % name,
+          not s.dialogs and same(s.dest(), P["moved"](A, O1)), str(s.dest()))
+    check("  no pointer", POINTER not in s.app.detail.get(), s.app.detail.get())
+    check("  the file unchanged", s.pref() == saved, s.pref())
+    s.close()
+
+acct = slashed(os.path.dirname(P["moved"](A, O1)))
+s = Session(env, P, acct, ["cancel"])
+d = s.dialogs[0] if s.dialogs else {}
+check("a '/'-spelled account folder naming two stores: the no-longer-unique picker",
+      len(s.dialogs) == 1 and "no longer unique" in d.get("status", ""),
+      d.get("status"))
+check("  the file unchanged", s.pref() == acct, s.pref())
+s.close()
+
+env, P = layout([(A, O1), (B, O2)], live=(B, O2))
+elsewhere = os.path.join(P["root"], "elsewhere", A, O1)
+os.makedirs(elsewhere)
+s = Session(env, P, slashed(elsewhere))
+check("a '/'-spelled existing folder no root holds: refused, with the pointer",
+      not s.dialogs and s.app.status.get() == "Refused"
+      and POINTER in s.app.detail.get() and SIGNED not in s.app.detail.get(),
+      s.app.detail.get())
+check("  the file unchanged", s.pref() == slashed(elsewhere))
+s.close()
+
+s = Session(env, P, slashed(P["moved"](B, O2)))
+check("a '/'-spelled signed-in store: refused, named, no picker",
+      not s.dialogs and SIGNED in s.app.detail.get()
+      and "matched no other account store" in s.text(),
+      s.app.detail.get())
+s.close()
+
 for r in ROOTS:
     shutil.rmtree(r, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
