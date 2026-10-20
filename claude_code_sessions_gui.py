@@ -143,12 +143,16 @@ def load_pref():
 
 
 def save_pref(value):
+    """True when the value was written. A preference that cannot be saved is
+    not an error - but the save after a re-rooted Apply says so rather than
+    claim it took."""
     try:
         import json
         with open(PREF_PATH, "w", encoding="utf-8") as fh:
             json.dump({"to": value}, fh)
     except OSError:
-        pass                    # a preference that cannot be saved is not an error
+        return False
+    return True
 
 
 # ------------------------------------------------- the saved destination
@@ -157,10 +161,14 @@ def save_pref(value):
 # destination saved before that names a folder under the old root: every plan
 # refused it with a bare "Refused". The maintainer's ruling of 2026-10-20
 # (docs/internals.md, "Amendment 2026-10-20"): no write target changes without
-# a pick, and the preference file changes only on one; a saved value proven
-# gone is set aside and the window asks; a saved store whose account is now
-# signed in is named; the candidate with the saved ids is marked. Pure
-# helpers, importable without tkinter (tests/test_gui_destination.py).
+# a pick, and the preference file changes only on one - or, after a
+# successful Apply into a re-rooted saved destination, to that same store's
+# new path ("Amendment 2026-10-20 (re-root)"); a saved value proven gone is
+# first re-rooted through the journal's package pairs and planned into when
+# discovery lists that store, and otherwise set aside while the window asks;
+# a saved store whose account is now signed in is named; the candidate with
+# the saved ids is marked. Pure helpers, importable without tkinter
+# (tests/test_gui_destination.py).
 
 # The core's sentences the window routes on, pinned in the tests above.
 NO_MATCH = "matched no other account store"
@@ -177,6 +185,20 @@ DEST_POINTER = ("Your saved destination, {0}, matches no other account's store. 
 DEST_MARK = ("same account and org ids as your saved destination - the path "
              "above says where this one lives")
 ONE_OTHER_STORE = "One other account store on this machine."
+# The re-root's two sentences, used apart: the location on every route where
+# a re-root was found, the plan clause only over an installed re-rooted plan
+# - so no picker, refusal or empty plan claims a plan is in use.
+DEST_MOVED = ("Your saved destination moved with the desktop app's data "
+              "folder, from {0} to {1}.")
+DEST_SAVE_ON_APPLY = "Applying saves its new path as your destination."
+DEST_SAVE_BY_PICK = ("There is nothing to copy now, so Apply is off: pick it "
+                     "under Change destination to save its new path, or apply "
+                     "once there is something to copy.")
+DEST_SAVED = "Your destination is saved at its new path."
+DEST_NOT_SAVED = ("Its new path could not be saved, so the next plan finds it "
+                  "again.")
+DEST_ELSEWHERE = ("Its new path was not saved: a destination chosen in another "
+                  "window, {0}, stands.")
 
 # A candidate line is `<acct8>/<org8>   <label padded to 17>   <path>`, but
 # the padding does not hold: "(row count unreadable)" is 22 characters and
@@ -249,24 +271,72 @@ def _mark_index(paths, ids):
     return hits[0] if len(hits) == 1 else None
 
 
-def _destination_findings(env, value):
+def _reroot_destination(env, value):
+    """The store discovery lists for VALUE re-rooted through the journal's
+    package pairs (ccs._reroot_pairs / ccs._rerooted_path - no second pairing
+    rule), in the listing's own spelling; '' when no pair holds VALUE, when
+    the listing cannot be read, or when not exactly one listed store is it."""
+    value = (value or "").strip()
+    if not value or not os.path.isabs(value):
+        return ""
+    moved = ccs._rerooted_path(value, ccs._reroot_pairs(env))
+    if not moved:
+        return ""
+    try:
+        listed = [p for _a, _o, p in ccs._account_dirs(env)]
+    except Exception:
+        return ""
+    key = _dest_key(moved)
+    hits = [p for p in listed if _dest_key(p) == key]
+    return hits[0] if len(hits) == 1 else ""
+
+
+def _save_after_reroot(saved_from, new_path):
+    """After a successful Apply into a re-rooted saved destination: save the
+    store's new path, but only over the value this plan re-rooted from - a
+    pick made meanwhile in another window is left and adopted. The read and
+    the write are two steps, so that race is narrowed, not closed.
+    ("saved", path), ("elsewhere", the file's value), or ("failed", None)
+    when the file cannot be read or the write does not take."""
+    try:
+        import json
+        with open(PREF_PATH, encoding="utf-8") as fh:
+            current = ((json.load(fh) or {}).get("to", "") or "").strip()
+    except (OSError, ValueError, AttributeError):
+        return ("failed", None)
+    if current and _dest_key(current) == _dest_key(new_path):
+        return ("saved", current)        # another window saved it already
+    if current != (saved_from or "").strip():
+        return ("elsewhere", current)
+    return ("saved", new_path) if save_pref(new_path) else ("failed", None)
+
+
+def _destination_findings(env, value, live=""):
     """What the plan worker knows about the saved destination before it
-    plans: whether it is proven gone, its ids, and whether its account is
-    the signed-in one - asked of the core's live_account, never inferred from
-    which candidates are missing. No answer, files that disagree, or a
+    plans: whether it is proven gone, its ids, whether its account is the
+    signed-in one, and - when it is gone - the store a re-root lands on.
+    Signed in is asked of the core, never inferred from which candidates are
+    missing: the held identity answer LIVE when there is one
+    (_resolve_live_assertion, the account plan_sync will use), else
+    live_account. No answer, files that disagree, a lookup that raises, or a
     discovery error make no signed-in claim."""
     value = (value or "").strip()
     ids = _saved_ids(value)
     signed_in = False
     if ids:
         try:
-            live = ccs.live_account(env)
+            if live:
+                acct = ccs._resolve_live_assertion(
+                    env, live, ccs._account_dirs(env)).account_uuid
+            else:
+                found = ccs.live_account(env)
+                acct = found.account_uuid if found is not None else ""
         except Exception:
-            live = None
-        signed_in = live is not None and live.account_uuid.lower() == ids[0]
-    return {"value": value,
-            "gone": _destination_gone(value, getattr(env, "superseded_stores", ())),
-            "ids": ids, "signed_in": signed_in}
+            acct = ""
+        signed_in = bool(acct) and acct.lower() == ids[0]
+    gone = _destination_gone(value, getattr(env, "superseded_stores", ()))
+    return {"value": value, "gone": gone, "ids": ids, "signed_in": signed_in,
+            "rerooted": _reroot_destination(env, value) if gone else ""}
 
 
 def short(path, home):
@@ -1498,6 +1568,10 @@ class SyncApp:
         # through the pick flow, and the saved value stays until a pick
         # replaces it (Amendment 2026-10-20). One plan's worth.
         self._ask_destination = False
+        # (saved value, re-rooted store) while the installed plan is a
+        # re-rooted one: a successful Apply into it saves the store's new path
+        # over that value (Amendment 2026-10-20 (re-root)). Else None.
+        self._reroot_from = None
         # The ONE identity answer (GUI polish, Change 2): never persisted,
         # unlike dest_choice - the destination is a stable fact about this
         # machine, while "which account is the desktop app signed into"
@@ -2258,6 +2332,7 @@ class SyncApp:
         # this plan.
         dest, ask = self.dest_choice, self._ask_destination
         self._ask_destination = False
+        self._reroot_from = None
         self.busy(True)
         self._sync_apply_ok = False
         self.apply_btn.configure(state="disabled")
@@ -2428,17 +2503,26 @@ class SyncApp:
         # `pick` is "change" for a "Change destination" press and "gone" for a
         # saved value set aside as proven gone - either way this plan runs
         # with no destination and _plan_done routes it through the pick flow.
-        # A value blank once stripped is no saved destination at all.
+        # `rerooted` is the store a value proven gone re-roots onto: the same
+        # destination, moved whole by the app, so it is planned into with no
+        # pick - never when its account is the signed-in one (Amendment
+        # 2026-10-20 (re-root)). A value blank once stripped is no saved
+        # destination at all.
         dest = (dest or "").strip()
-        ctx = {"dest": dest, "pick": None, "findings": None}
+        ctx = {"dest": dest, "pick": None, "findings": None, "rerooted": ""}
         try:
             if dest:
-                ctx["findings"] = _destination_findings(self.env, dest)
+                ctx["findings"] = _destination_findings(self.env, dest, live)
+            find = ctx["findings"] or {}
             if ask:
                 ctx["pick"] = "change"
-            elif ctx["findings"] and ctx["findings"]["gone"]:
-                ctx["pick"] = "gone"
-            flags = ccs.SyncFlags(to="" if ctx["pick"] else dest, live=live,
+            elif find.get("gone"):
+                if find.get("rerooted") and not find.get("signed_in"):
+                    ctx["rerooted"] = find["rerooted"]
+                else:
+                    ctx["pick"] = "gone"
+            to = "" if ctx["pick"] else (ctx["rerooted"] or dest)
+            flags = ccs.SyncFlags(to=to, live=live,
                                   only=only, update=update,
                                   newer_only=newer_only,
                                   allow_orphan=allow_orphan)
@@ -2469,20 +2553,33 @@ class SyncApp:
         pick = ctx.get("pick")
         find = ctx.get("findings") or {}
         dest = ctx.get("dest") or ""
-        shown = short(dest, self.env.home)
-        reason = (DEST_SIGNED_IN.format(shown) if find.get("signed_in") else
+        rerooted = ctx.get("rerooted") or ""
+        home = self.env.home
+        shown = short(dest, home)
+        # A store the saved value re-roots onto is named at its new path on
+        # every route, the signed-in one included - the location sentence
+        # only, which claims no plan.
+        moved_to = find.get("rerooted") or ""
+        moved = DEST_MOVED.format(shown, short(moved_to, home)) if moved_to else ""
+        reason = (DEST_SIGNED_IN.format(short(moved_to or dest, home))
+                  if find.get("signed_in") else
+                  moved if moved_to else
                   DEST_GONE.format(shown) if find.get("gone") else "")
+        lead = (reason + " ") if reason and (pick or rerooted) else ""
         kind, msg = problem or (None, "")
+        self._reroot_from = None
         if pick:
             self._clear_plan()
         if pick == "gone" and find.get("signed_in") and kind != "error":
             # The move and an account switch together: the saved store's
             # account is the signed-in one, and sync never writes it - so no
             # picker of the OTHER accounts' stores opens on the window's own
-            # account. "Change destination" still reaches a pick.
+            # account. "Change destination" still reaches a pick. The banner
+            # is redrawn: a held identity answer may be what says signed in.
             self.status.set("Your saved destination's account is signed in")
             self.detail.set(reason)
             self.show([msg] if msg else [])
+            self._render_sync_banner()
             return
         if pick and manifest is not None:
             # Exactly one other store: never planned into without a pick. The
@@ -2516,7 +2613,7 @@ class SyncApp:
                 # around the refusal, never a rewrite of it.
                 self.status.set("Which account is the Claude desktop app "
                                 "signed into?")
-                self.detail.set(((reason + " ") if pick and reason else "") +
+                self.detail.set(lead +
                                 "The two files that record this disagree, and either can "
                                 "be the stale one - so the tool refuses to guess. "
                                 "Answer above the plan; Level shares the answer.")
@@ -2527,10 +2624,14 @@ class SyncApp:
                 # The values a set-aside leaves in place - a store whose
                 # account is now signed in, a path that exists but no root
                 # holds, an id fragment - get a pointer, not a bare refusal.
+                # The banner is redrawn: a held identity answer may be what
+                # says signed in.
                 self.status.set("Refused")
                 self.detail.set(reason if find.get("signed_in") else
-                                DEST_POINTER.format(shown))
+                                lead + DEST_POINTER.format(
+                                    short(rerooted or dest, home)))
                 self.show([msg])
+                self._render_sync_banner()
                 return
             # A SAVED destination can go stale: an 8-char id that identified one
             # store stops being unique the moment another account/org pair appears,
@@ -2549,7 +2650,7 @@ class SyncApp:
                 return
             if kind == "refusal" and MORE_THAN_ONE in msg:
                 self.status.set("Which account should these sessions go to?")
-                self.detail.set(((reason + " ") if pick and reason else "") +
+                self.detail.set(lead +
                                 "More than one other account store exists on this "
                                 "machine. Pick the destination, then Refresh.")
                 self.show([msg])
@@ -2560,8 +2661,7 @@ class SyncApp:
                     self._pick_cancelled(pick, find, reason)
                 return
             self.status.set("Refused" if kind == "refusal" else "Something went wrong")
-            self.detail.set(((reason + " ") if pick and reason and kind == "refusal"
-                             else "") +
+            self.detail.set((lead if kind == "refusal" else "") +
                             ("Nothing was written. The tool's own explanation:"
                              if kind == "refusal" else
                              "This is a bug in the launcher, not a refusal."))
@@ -2746,6 +2846,15 @@ class SyncApp:
                             "Clear the filter to see everything.")
         else:
             self.detail.set("")
+        if rerooted:
+            # The plan clause, only here over an installed plan: what saves
+            # the new path - an Apply, or with nothing to copy a pick
+            # (Amendment 2026-10-20 (re-root)). _apply_done saves over the
+            # value this plan re-rooted from.
+            self._reroot_from = (dest, manifest["dest_path"])
+            self.detail.set(" ".join(p for p in (
+                moved, DEST_SAVE_ON_APPLY if rows else DEST_SAVE_BY_PICK,
+                self.detail.get()) if p))
 
     def _bind_consent(self, rows):
         """Bind the bulk-copy consent box to the rendered row set: a tick
@@ -2897,16 +3006,18 @@ class SyncApp:
         """Nothing installed for Apply or the bulk-copy tick to act on: the
         pick flow opens over no plan (Amendment 2026-10-20)."""
         self.manifest = None
+        self._reroot_from = None
         self._sync_apply_ok = False
         self._bind_consent([])
         self._apply_gate_to_buttons()
 
     def _pick_cancelled(self, pick, find, reason):
         """A pick-flow picker closed without a pick. After "Change
-        destination" over a saved destination that is still there, its plan
-        comes back as it was; otherwise the pane says no destination is
-        chosen and keeps the reason - and the saved value stays, untouched."""
-        if pick == "change" and not find.get("gone"):
+        destination" over a saved destination that is still there, or that
+        re-roots onto a store that is, its plan comes back as it was;
+        otherwise the pane says no destination is chosen and keeps the reason
+        - and the saved value stays, untouched."""
+        if pick == "change" and (not find.get("gone") or find.get("rerooted")):
             self.refresh()
             return
         self._clear_plan()
@@ -4093,6 +4204,22 @@ class SyncApp:
         self.detail.set("Sign into the other account (or restart the app) to see them. "
                         "Changed your mind? Undo is the button below - a GUI should not "
                         "send you to a terminal to reverse what it just did.")
+        rr, self._reroot_from = self._reroot_from, None
+        if rr and _dest_key(manifest.get("dest_path") or "") == _dest_key(rr[1]):
+            # The re-root ruling's one write without a pick: the same store's
+            # new path, after an explicit Apply into it - over the value this
+            # plan re-rooted from only (Amendment 2026-10-20 (re-root)). The
+            # outcome shows once; a value not saved re-roots again next plan.
+            outcome, value = _save_after_reroot(rr[0], manifest["dest_path"])
+            if outcome == "saved":
+                self.dest_choice = value
+                note = DEST_SAVED
+            elif outcome == "elsewhere":
+                self.dest_choice = value
+                note = DEST_ELSEWHERE.format(short(value, self.env.home) or "none")
+            else:
+                note = DEST_NOT_SAVED
+            self.detail.set(note + " " + self.detail.get())
         self.manifest = None
         self._update_undo_button()
         self._render_sync_banner()
