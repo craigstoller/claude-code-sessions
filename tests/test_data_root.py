@@ -178,8 +178,8 @@ def test_default_env_on_windows_lists_both(monkeypatch, roots):
     monkeypatch.setenv("APPDATA", str(appdata))
     monkeypatch.setattr(ct.sys, "platform", "win32")
     env = ct.default_env()
-    assert (env.store_candidates, env.superseded_stores) == ct._windows_store_layout(
-        str(local), str(appdata))
+    assert (env.store_candidates, env.superseded_stores,
+            env.layout_errors) == ct._windows_store_layout(str(local), str(appdata))
     assert env.store_candidates == ct._windows_store_candidates(str(local), str(appdata))
     assert env.helper_roots == ct._windows_helper_roots(str(local), str(appdata))
     assert env.helper_roots[0] == str(_old_claude_dir(local).parent)
@@ -251,8 +251,8 @@ def test_doctor_and_alignment_carry_the_marker_note(mkenv, tmp_path, capsys):
 
 def _env_from_layout(mkenv, tmp_path, local, appdata):
     env = mkenv(tmp_path, n_store_roots=0)
-    env.store_candidates, env.superseded_stores = ct._windows_store_layout(
-        str(local), str(appdata))
+    (env.store_candidates, env.superseded_stores,
+     env.layout_errors) = ct._windows_store_layout(str(local), str(appdata))
     return env
 
 
@@ -358,7 +358,7 @@ def test_a_file_named_like_a_moved_root_is_not_one(roots):
     (local / "Claude-Data").mkdir()
     (local / "Claude-Data" / "claude_abc123").write_bytes(b"not a folder")
     _row(_old_claude_dir(local) / "claude-code-sessions", "local_old")
-    cands, superseded = ct._windows_store_layout(str(local), str(appdata))
+    cands, superseded, _errors = ct._windows_store_layout(str(local), str(appdata))
     assert str(_old_claude_dir(local) / "claude-code-sessions") in cands
     assert superseded == []
 
@@ -368,7 +368,7 @@ def test_precedence_folds_the_case_of_the_whole_package_name(roots):
     old = _old_claude_dir(local, pkg="AbC123") / "claude-code-sessions"
     old.mkdir(parents=True)
     (_moved_root(local, pkg="abc123") / "claude-code-sessions").mkdir(parents=True)
-    cands, superseded = ct._windows_store_layout(str(local), str(appdata))
+    cands, superseded, _errors = ct._windows_store_layout(str(local), str(appdata))
     assert str(old) not in cands and superseded == [str(old)]
 
 
@@ -395,3 +395,83 @@ def test_glob_metacharacters_in_localappdata_are_literal(tmp_path):
     cands = ct._windows_store_candidates(str(local), str(appdata))
     assert str(moved) in cands and str(old) in cands
     assert ct._windows_helper_roots(str(local), str(appdata))[0] == str(old.parent.parent)
+
+
+def test_a_listing_failure_that_clears_is_still_an_error(
+        mkenv, tmp_path, roots, monkeypatch):
+    # Review round 2: the failure has to be kept, not turned into a path that a
+    # later, successful listing quietly answers. Here Claude-Data refuses once,
+    # while the layout is built, and lists fine for discovery - and a populated
+    # old store sits beside a populated moved one.
+    local, appdata = roots
+    _row(_moved_root(local) / "claude-code-sessions", "local_moved")
+    _row(_old_claude_dir(local) / "claude-code-sessions", "local_stale")
+    real_listdir = os.listdir
+    refused = []
+
+    def once(p):
+        if (os.path.basename(os.path.normpath(str(p))) == "Claude-Data"
+                and not refused):
+            refused.append(p)
+            raise PermissionError(13, "denied", str(p))
+        return real_listdir(p)
+
+    monkeypatch.setattr(os, "listdir", once)
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    assert refused
+    d = ct.discover_stores(env)
+    assert d.status == "error"
+    assert "Claude-Data" in d.detail
+
+
+def test_an_unreadable_moved_root_is_an_error(mkenv, tmp_path, roots, monkeypatch):
+    # Claude-Data lists fine, but the moved store itself cannot be read.
+    local, appdata = roots
+    _row(_moved_root(local) / "claude-code-sessions", "local_moved")
+    _row(_old_claude_dir(local) / "claude-code-sessions", "local_stale")
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    real_listdir = os.listdir
+
+    def denied(p):
+        p = str(p)
+        if "Claude-Data" in p and os.path.basename(os.path.normpath(p)) == "claude-code-sessions":
+            raise PermissionError(13, "denied", p)
+        return real_listdir(p)
+
+    monkeypatch.setattr(os, "listdir", denied)
+    d = ct.discover_stores(env)
+    assert d.status == "error"
+
+
+def test_identity_checks_read_the_moved_roots_config_not_the_old_one(
+        mkenv, tmp_path, roots):
+    # Measured 2026-10-19: the moved root holds the app's config.json, with
+    # lastKnownAccountUuid; the old folder holds none. A pre-move config.json
+    # left in a superseded folder must not be read in its place.
+    local, appdata = roots
+    live = "aaaaaaaa-0000-0000-0000-000000000001"
+    other = "cccccccc-0000-0000-0000-000000000003"
+    moved = _moved_root(local)
+    (moved / "claude-code-sessions").mkdir(parents=True)
+    old = _old_claude_dir(local)
+    old.mkdir(parents=True)
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    with open(os.path.join(env.home, ".claude.json"), "w", encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": live}}, fh)
+    (moved / "config.json").write_text(json.dumps({"lastKnownAccountUuid": live}),
+                                       encoding="utf-8")
+    (old / "config.json").write_text(json.dumps({"lastKnownAccountUuid": other}),
+                                     encoding="utf-8")
+    assert ct._identity_disagreement(env) is None
+    (moved / "config.json").write_text(json.dumps({"lastKnownAccountUuid": other}),
+                                       encoding="utf-8")
+    assert ct._identity_disagreement(env) == (live, other)
+
+
+def test_a_superseded_store_is_named_whatever_its_case(mkenv, tmp_path, roots):
+    local, appdata = roots
+    (_moved_root(local) / "claude-code-sessions").mkdir(parents=True)
+    (_old_claude_dir(local) / "Claude-Code-Sessions").mkdir(parents=True)
+    env = _env_from_layout(mkenv, tmp_path, local, appdata)
+    d = ct.discover_stores(env)
+    assert "not read" in d.detail
