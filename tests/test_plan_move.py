@@ -302,6 +302,34 @@ class TestClaudeRunningNarrowing:
         env.process_lister = lambda: [(99999, exe)]
         assert ct.claude_running(env) == [exe]
 
+    # Desktop 2.42304.2 (2026-10-19) moved the app-spawned CLI with the user data,
+    # to %LOCALAPPDATA%\Claude-Data\claude_<pkg>\claude-code\<ver>\<hash>\.
+    MOVED_CLI = ("c:\\users\\u\\appdata\\local\\claude-data\\claude_abc123xyz\\"
+                 "claude-code\\2.1.299\\0123456789ab\\claude.exe")
+
+    def test_moved_cli_home_is_the_cli(self, mkenv, tmp_path):
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, self.MOVED_CLI)]
+        assert ct._is_cli_process(self.MOVED_CLI)
+        assert ct._is_cli_process(self.MOVED_CLI.replace("\\", "/"))
+        assert ct.claude_running(env) == []
+
+    @pytest.mark.parametrize("exe", [
+        "d:\\claude-data\\claude_abc123xyz\\claude-code\\claude.exe",      # no appdata\local
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_abc123xyz\\claude.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude-code\\claude.exe",  # no pkg folder
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_\\claude-code\\claude.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_abc\\x\\claude-code\\claude.exe",
+        "c:\\users\\u\\appdata\\local\\claude-data\\claude_ab-c\\claude-code\\claude.exe",
+    ])
+    def test_moved_cli_marker_is_exact_segments(self, mkenv, tmp_path, exe):
+        # A near miss of the new CLI home stays a desktop match: the marker is a
+        # run of whole path segments, anchored at appdata\local, like the old one.
+        env = mkenv(tmp_path)
+        env.process_lister = lambda: [(99999, exe)]
+        assert not ct._is_cli_process(exe)
+        assert ct.claude_running(env) == [exe]
+
 
     def test_chrome_native_host_still_counts(self, mkenv, tmp_path):
         # RULING 6 excludes the helper only when the binary on disk hashes to the
@@ -329,25 +357,21 @@ class TestClaudeRunningNarrowing:
     @staticmethod
     def _helper_on_disk(env, tmp_path, content=b"measured-helper-bytes"):
         """A real file where the helper actually lives, DERIVED from the env's
-        store root rather than fabricated.
+        helper root rather than fabricated.
 
         The guard no longer accepts a path merely containing the expected
         segments - that let any fabricated path pose as the helper - so a test
         fixture must sit at the real derived location too.
 
-        Lowercase throughout on purpose: the guard lowercases lister entries and
-        then stats that string, harmless on Windows but not on the Linux CI legs,
-        where a mixed-case path would not exist once lowercased.
-
-        The store root is re-pointed under a "claude" parent so the derived helper
-        path CONTAINS "claude", as the real one does (...\\Roaming\\Claude\\
-        ChromeNativeHost\\...). The shared fixture's plain "store0" parent does
-        not, which made these tests pass for the wrong reason: the entry was
-        dropped by the claude-named filter before any helper logic ran.
+        The helper root sits under a lowercase "claude_x" folder so the derived
+        helper path CONTAINS "claude" on every platform, as the real one does
+        (...\\Packages\\Claude_<pkg>\\...). Without it these tests passed for the
+        wrong reason: the entry was dropped by the claude-named filter before any
+        helper logic ran. The "Claude" folder the old layout adds is mixed case,
+        and the claude-named filter is case-sensitive off Windows.
         """
-        root = tmp_path / "claude" / "claude-code-sessions"
-        root.mkdir(parents=True, exist_ok=True)
-        env.store_candidates = [str(root).lower()]
+        env.helper_roots = [str(tmp_path / "packages" / "claude_x" / "localcache" /
+                                "roaming").lower()]
         p = sorted(ct._expected_helper_paths(env))[0]
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as fh:
@@ -412,10 +436,11 @@ class TestClaudeRunningNarrowing:
             self, mkenv, tmp_path, monkeypatch):
         # A FABRICATED path carrying every segment the old test looked for, with
         # the measured bytes at it. The helper is recognised by its location
-        # derived from the real store root, not by path fragments - so this must
+        # derived from the real helper root, not by path fragments - so this must
         # still count. Regression guard: the segment test this replaced would have
         # excused any binary copied under a directory tree named to match.
         env = mkenv(tmp_path)
+        self._helper_on_disk(env, tmp_path)      # a real root exists beside it
         fake = (tmp_path / "tmp" / "packages" / "claude_x" / "localcache" /
                 "roaming" / "claude" / "chromenativehost")
         fake.mkdir(parents=True)
@@ -457,22 +482,24 @@ class TestClaudeRunningNarrowing:
     #
     # The app moved the helper from <Roaming>\Claude\ChromeNativeHost\ to
     # <Roaming>\Claude-NativeHost\<version>\. RULINGS 6 and 7 must reach it
-    # there, and only there: the location is still derived from the real store
+    # there, and only there: the location is still derived from a real helper
     # root, and the version segment must be dotted ASCII digits.
 
     MEASURED = b"measured-helper-bytes"
 
     @staticmethod
     def _packaged_root(env, tmp_path):
-        """A store root shaped like the packaged app's, so every helper path
-        derived from it contains "claude" the way the real ones do - the
-        versioned folder sits BESIDE the store's claude folder, not under it,
-        and without a claude-named ancestor a test entry would be dropped by
-        the claude-named filter before any helper logic ran."""
+        """A store root shaped like the packaged app's before 2.42304.2, with
+        its <Roaming> folder as the helper root, so every helper path derived
+        from it contains "claude" the way the real ones do - the versioned
+        folder sits BESIDE the store's claude folder, not under it, and without
+        a claude-named ancestor a test entry would be dropped by the
+        claude-named filter before any helper logic ran."""
         root = (tmp_path / "packages" / "claude_x" / "localcache" / "roaming" /
                 "claude" / "claude-code-sessions")
         root.mkdir(parents=True, exist_ok=True)
         env.store_candidates = [str(root).lower()]
+        env.helper_roots = [os.path.dirname(os.path.dirname(env.store_candidates[0]))]
         return env.store_candidates[0]
 
     @classmethod
@@ -618,7 +645,7 @@ class TestClaudeRunningNarrowing:
         # cost them the exclusion.
         env = mkenv(tmp_path)
         new = self._versioned_helper(env, tmp_path)
-        old = os.path.join(os.path.dirname(env.store_candidates[0]),
+        old = os.path.join(env.helper_roots[0], "Claude",
                            "ChromeNativeHost", "chrome-native-host.exe")
         os.makedirs(os.path.dirname(old))
         with open(old, "wb") as fh:
@@ -639,24 +666,112 @@ class TestClaudeRunningNarrowing:
         assert "Chrome or Edge" in note
         assert "Closing Chrome" not in note
 
-    def test_relative_candidate_derives_no_helper_location(
-            self, mkenv, tmp_path, measured_hash, monkeypatch):
-        # With APPDATA unset the classic candidate is relative; abspath then
-        # resolved its helper location against the working directory. Neither
-        # layout may be derived from such a candidate.
+    @pytest.mark.parametrize("root", ["", "roaming"])
+    def test_relative_helper_root_derives_no_helper_location(
+            self, mkenv, tmp_path, measured_hash, monkeypatch, root):
+        # With APPDATA unset the classic helper root is "" (relative); abspath
+        # then resolved its helper location against the working directory.
+        # Neither layout may be derived from a relative root.
         env = mkenv(tmp_path)
         cwd = tmp_path / "claude_cwd"
         cwd.mkdir()
         monkeypatch.chdir(cwd)
-        env.store_candidates = [os.path.join("claude", "claude-code-sessions")]
-        old = cwd / "claude" / "ChromeNativeHost" / "chrome-native-host.exe"
-        new = cwd / "Claude-NativeHost" / "2.42304.0" / "chrome-native-host.exe"
+        env.helper_roots = [root]
+        base = cwd / root if root else cwd
+        old = base / "Claude" / "ChromeNativeHost" / "chrome-native-host.exe"
+        new = base / "Claude-NativeHost" / "2.42304.0" / "chrome-native-host.exe"
         for p in (old, new):
             p.parent.mkdir(parents=True)
             p.write_bytes(self.MEASURED)
         entries = [str(old), str(new)]
         env.process_lister = lambda: [(99999 - i, e) for i, e in enumerate(entries)]
         assert ct.claude_running(env) == entries
+
+    # ----- the helper roots are not the store's (Desktop 2.42304.2, 2026-10-19)
+    #
+    # The app moved its user data, store included, to %LOCALAPPDATA%\Claude-Data\
+    # claude_<pkg>\, and left the helper under the package's LocalCache\Roaming.
+    # Two folders up from the moved store is %LOCALAPPDATA%\Claude-Data, where no
+    # helper lives: deriving the helper from the store would have silently
+    # disabled the signed-helper opt-in again, the 2026-10-15 failure's shape.
+
+    def test_a_store_candidate_alone_derives_no_helper_location(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        env = mkenv(tmp_path)
+        root = self._packaged_root(env, tmp_path)
+        env.helper_roots = []
+        exe = os.path.join(os.path.dirname(os.path.dirname(root)),
+                           "Claude-NativeHost", "2.42304.0", "chrome-native-host.exe")
+        os.makedirs(os.path.dirname(exe))
+        with open(exe, "wb") as fh:
+            fh.write(self.MEASURED)
+        self._opt_in_and_sign(env, monkeypatch)
+        assert ct._measured_helper_state(exe, env) is None
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
+
+    @staticmethod
+    def _moved_layout(env, tmp_path):
+        """The 2.42304.2 layout, built by the same functions default_env uses:
+        the store under Claude-Data, the old Claude folder holding only the
+        marker, and the package's Roaming still there for the helper. The
+        lowercase "claude_local" keeps every entry claude-named off Windows,
+        where the claude-named filter is case-sensitive."""
+        local = tmp_path / "claude_local"
+        store = local / "Claude-Data" / "claude_x" / "claude-code-sessions"
+        store.mkdir(parents=True)
+        roaming = local / "Packages" / "Claude_x" / "LocalCache" / "Roaming"
+        (roaming / "Claude").mkdir(parents=True)
+        (roaming / "Claude" / ".user-data-left.claude_x").write_bytes(b"")
+        appdata = tmp_path / "appdata"
+        appdata.mkdir()
+        env.store_candidates = ct._windows_store_candidates(str(local), str(appdata))
+        env.helper_roots = ct._windows_helper_roots(str(local), str(appdata))
+        return local, roaming
+
+    @classmethod
+    def _helper_at(cls, folder, content):
+        p = os.path.join(str(folder), "chrome-native-host.exe")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(content)
+        return p
+
+    def test_moved_layout_finds_the_store_and_the_helper(
+            self, mkenv, tmp_path, measured_hash):
+        env = mkenv(tmp_path)
+        local, roaming = self._moved_layout(env, tmp_path)
+        assert ct.discover_stores(env).status == "found"
+        exe = self._helper_at(roaming / "Claude-NativeHost" / "2.42304.2", self.MEASURED)
+        assert ct._measured_helper_state(exe, env) == "measured"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    def test_signed_opt_in_reaches_the_helper_after_the_data_moved(
+            self, mkenv, tmp_path, measured_hash, monkeypatch):
+        env = mkenv(tmp_path)
+        _local, roaming = self._moved_layout(env, tmp_path)
+        exe = self._helper_at(roaming / "Claude-NativeHost" / "2.42304.2",
+                              b"a-newer-build")
+        self._opt_in_and_sign(env, monkeypatch)
+        assert ct._measured_helper_state(exe, env) == "changed"
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == []
+
+    @pytest.mark.parametrize("where", [
+        ("Claude-Data", "Claude-NativeHost", "2.42304.2"),           # two up from the store
+        ("Claude-Data", "claude_x", "Claude-NativeHost", "2.42304.2"),  # beside the store
+        ("Claude-Data", "claude_x", "ChromeNativeHost"),                # old name, new root
+    ])
+    def test_moved_data_root_is_not_a_helper_location(
+            self, mkenv, tmp_path, measured_hash, monkeypatch, where):
+        env = mkenv(tmp_path)
+        local, _roaming = self._moved_layout(env, tmp_path)
+        exe = self._helper_at(local.joinpath(*where), self.MEASURED)
+        self._opt_in_and_sign(env, monkeypatch)
+        assert ct._measured_helper_state(exe, env) is None
+        env.process_lister = lambda: [(99999, exe)]
+        assert ct.claude_running(env) == [exe]
 
     def test_helper_note_names_the_helper_when_the_app_is_listed_first(
             self, mkenv, tmp_path, measured_hash):
