@@ -1700,6 +1700,11 @@ Not taken: keeping "Change destination" as it was; a pointer alone, with no set-
 the saved path through the move's package pairs now, a follow-up once the journal's pairing
 lands; re-resolving by the saved ids under any root.
 
+*(Amended the same day by "Amendment 2026-10-20 (re-root)" below: a saved value proven gone is
+first re-rooted through the journal's package pairs, and the preference file also changes, after
+a successful Apply into a re-rooted saved destination, to that same store's new path. The text
+here is otherwise unchanged.)*
+
 **What broke.** The window saves its chosen sync destination as a full store path in
 `~/.claude-code-sessions-gui.json`. One saved before the move names a folder under the old root.
 Every plan passed it as `--to`, which matched no moved store, and the window showed the refusal
@@ -1817,6 +1822,71 @@ mid-uuid pair with one. Each builds its value in the separator the platform does
 CI legs exercise the fold. And by `tools/check_gui_stale_destination.py`, section 8: a
 `/`-spelled saved store with and without a trailing `/`, an account folder naming two stores,
 and, unchanged, an unlisted folder and the signed-in store.
+
+#### Amendment 2026-10-20 (re-root) — the saved destination, re-rooted through the package pairs
+
+**Status: the maintainer's ruling of 2026-10-20, implemented.** The follow-up "Amendment 2026-10-20"
+above named, once the journal's pair helper was on `main`. Three points, as recommended after three
+rounds of independent review: a re-rooted store is the same destination, moved whole by the app,
+so the window plans into it with no pick; the preference file changes only on a pick, or, after a
+successful Apply into a re-rooted saved destination, to that same store's new path; and the
+behaviour below. Not taken: re-rooting in memory on every plan and never saving the new path;
+saving it as soon as a re-rooted plan is shown, which would make a Refresh write a file.
+
+**Why save after an Apply.** Kept in memory only, a saved old path stays in the file. If
+`Claude-Data` later disappears while an old leftover copy is still on disk, that path is no longer
+proven gone, and the window would plan into the leftover with no pick. A saved moved path is
+proven gone in the same state, and the window asks. The Apply is an explicit act on that store,
+and it ends the notice; a store with nothing to copy keeps the notice until the user picks it.
+
+**What the window does now.**
+
+- When a saved value is proven gone, `_destination_findings` also asks `_reroot_destination`:
+  `_rerooted_path` over `_reroot_pairs(env)` (the journal's own helpers; no second pairing rule),
+  then the one store `_account_dirs` lists whose key equals it, in the listing's spelling. No
+  pair, no listed store, more than one, or a listing that raises: no re-root, and the set-aside
+  above. A leftover old copy changes nothing; the moved root wins, as ruling 1 says.
+- Signed in now means the account a held identity answer resolves to
+  (`_resolve_live_assertion`, the account `plan_sync` will use) when the window holds one, else
+  `live_account`; a lookup that raises makes no claim. A signed-in saved store is named, at its new
+  path when it re-roots, and is never planned into. The signed-in and pointer routes redraw the
+  identity banner, so a held answer shows as in force instead of the question it answered.
+- A re-rooted, not signed-in store is planned into with its listed path as `--to`, no pick. The
+  detail line carries two sentences, used apart: the location (moved with the app's data folder,
+  from the old path to the new) on every route where a re-root was found, a picker's reason
+  included; and the plan clause only over an installed re-rooted plan: applying saves the new path,
+  or, with nothing to copy, picking it under "Change destination" does.
+- After a successful Apply into that plan, `_save_after_reroot` re-reads the file. Still the value
+  the plan re-rooted from: it writes the manifest's `dest_path`, the discovery form the picker's
+  candidate line also prints, and `dest_choice` follows only when `save_pref` reports it wrote.
+  Changed by another window's pick: left as it is, adopted, and named. Unreadable, or a write that
+  did not take: reported, and the next plan re-roots again. The outcome shows once, on the Apply's
+  own detail line. `save_pref` now returns whether it wrote; a pick still ignores it.
+- A cancel after "Change destination" over a re-rootable value plans again with the saved
+  destination, so the re-rooted plan comes back.
+
+**Residuals.**
+
+- The re-read and the write are two steps, so a pick saved by another window between them is
+  overwritten. A lock across processes is out of proportion for a preference file.
+- The pairs, like the superseded list, come from the `Env` built at window open. A move made while
+  the window is open is not re-rooted until a restart, and a copied old folder stays the store the
+  window plans into, as on every route, Apply's write-time checks included.
+- A failed save on a pick is still silent, as before; only the new save after an Apply reports.
+- A second app move needs discovery to learn the new root first, and a pair from one moved root to
+  the next.
+
+**Pinned by** `tests/test_gui_destination.py`: the re-root lookup (the listed store, the vacated
+folder deleted, a leftover copy, a store that did not move, a classic-root path, the moved store
+itself, no pairs, a listing that raises, upper-case ids, a lower-case drive with forward slashes
+on Windows, values that are not paths), the findings carrying it and taking a held answer, the
+save's outcomes and `save_pref`'s result, and the two sentences. And by
+`tools/check_gui_stale_destination.py`, section 9, whose `Env` now takes its pairs from the
+synthetic layout:
+a re-rooted plan installed with Apply available and a real Apply saving the new path and ending
+the notice, a refused Apply, an unwritable file, another window's pick, a level store, one other
+store, a held answer naming the saved account, and "Change destination" with a cancel. Its
+set-aside scenarios now save a path under a package no pair re-roots.
 
 
 ### The lister, and its two deliberate costs
