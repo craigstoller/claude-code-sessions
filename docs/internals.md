@@ -1739,7 +1739,8 @@ into the picker.
 - `FileNotFoundError` can also come from an unavailable network or removable path. The set-aside
   then gives a reason that is not quite true, and erases nothing.
 - The window builds its `Env` once, at open, so a move made while it is open is seen after a
-  restart, as discovery's own view is.
+  restart, as discovery's own view is. *Superseded by "Amendment 2026-10-20 (Env rebuild)" below:
+  the window now rebuilds its `Env` at every read and before every engine call.*
 - A saved path spelled with `/`, like one typed after `--to` at the CLI, still matches nothing:
   `resolve_sync_endpoints` does not fold separators. The window points at "Change destination"
   for it. *Superseded by "Amendment 2026-10-20 (separators)" below: the core now folds
@@ -1871,7 +1872,9 @@ and it ends the notice; a store with nothing to copy keeps the notice until the 
   overwritten. A lock across processes is out of proportion for a preference file.
 - The pairs, like the superseded list, come from the `Env` built at window open. A move made while
   the window is open is not re-rooted until a restart, and a copied old folder stays the store the
-  window plans into, as on every route, Apply's write-time checks included.
+  window plans into, as on every route, Apply's write-time checks included. *Superseded by
+  "Amendment 2026-10-20 (Env rebuild)" below: every read builds a fresh `Env`, so the next plan
+  re-roots through the pairs as they are then.*
 - A failed save on a pick is still silent, as before; only the new save after an Apply reports.
 - A second app move needs discovery to learn the new root first, and a pair from one moved root to
   the next.
@@ -1887,6 +1890,116 @@ a re-rooted plan installed with Apply available and a real Apply saving the new 
 the notice, a refused Apply, an unwritable file, another window's pick, a level store, one other
 store, a held answer naming the saved account, and "Change destination" with a cancel. Its
 set-aside scenarios now save a path under a package no pair re-roots.
+
+#### Amendment 2026-10-20 (Env rebuild) — the window's Env, rebuilt at each read and before each engine call
+
+**Status: the maintainer's ruling of 2026-10-20, implemented.** The residual both amendments above
+named. As recommended after three rounds of independent review: the window rebuilds its `Env` at
+every read and before every engine call that writes or plans a write; a press whose store roots
+changed since its plan stops before the next engine call and replans; the held identity answer is
+bound to the layout it was given under and dropped when a clean fresh `Env` shows another; and the
+behaviour below. Not taken: keeping the `Env` built once and documenting a restart; rebuilding only
+on the Refresh buttons; detecting a change and asking for a restart; handing a stale plan a fresh
+`Env` and letting the core refuse; writing on the plan's own `Env`; re-rooting the held answer's
+path through the pairs.
+
+**What was wrong.** Measured on synthetic layouts with fake ids. Under an `Env` built before the
+move, a move that took the data folder out whole left the window refusing every route ("cannot
+identify the signed-in account") until a restart. A move that copied it instead left discovery
+finding the old root only, and `run_sync` wrote into the old copy, which the app no longer reads.
+The identity checks read the old `config.json`. Handing the old plan a fresh `Env` instead made
+`run_sync` raise `LayoutError` after it had journaled the op, so the window showed a traceback and a
+`journaled` op held the red line until `recover`. A layout error, once in the `Env`, refused every
+route until a restart.
+
+**What the window does now.**
+
+- Where each `Env` comes from. A read (`refresh`, `refresh_level`, `on_doctor`, and every automatic
+  replan) builds one on the UI thread and hands it to its worker. A press builds one at its start,
+  for its layout check, its gate scan and rule (b). Each engine call in a press's worker runs on one
+  built just before it: `run_sync`; each rename's `plan_retitle` and `run_retitle`; both of stage
+  2's `plan_converge` calls and its `run_converge`; each `_TkLevelUI.gate` scan; the undo call and
+  its re-check of the target; and Level's post-Apply re-measure. A done-callback hands the `Env` its
+  worker last used to `self.env`, after its staleness check, so `self.env` is always the `Env` the
+  current display was rendered from. Banners, pickers and the stage-2 question list stores from it.
+  Every rebuild goes through `_fresh_env`, which never raises: a raise becomes a copy of the
+  previous `Env` carrying a layout error.
+- The layout is `_layout_key`: the store roots discovery finds, normcased and sorted, or None when
+  discovery reports an error. Raw candidates are not compared, so an empty
+  `Claude-Data\claude_<pkg>` folder changes nothing. Each tab keeps its installed plan's layout
+  beside the plan, never in the manifest, which is journaled.
+- A press checks its `Env` against its tab's plan before any dialog, and the worker checks again
+  before each engine call. A changed layout stops the press before that call, so nothing more is
+  written and nothing is journaled for it. The tab then replans, with "The desktop app's data folder
+  changed since this plan, so it was planned again." A Level sequence stopped that way re-measures
+  even when nothing was written, and its status names any renames that landed. A layout error
+  stops a press too, with no sentence of its own: the replan shows discovery's error.
+- Undo has no plan, so it only takes a fresh `Env`, built in the worker after its confirmation. The
+  journal re-roots the op's paths through that `Env`'s pairs, and the undo's own checks run on it.
+- The held answer records the layout of `self.env` when it is given, from a banner or the stage-2
+  question (`_live_answer_next`'s `layout_changed`). A read, a press or Level's re-measure whose
+  `Env` is clean and shows other roots drops it. Both banners are then redrawn, both tabs' Apply
+  goes off until each replans, and the next render of each tab says "The desktop app's data folder
+  changed, so your answer about the signed-in account was set aside." An `Env` with a layout error
+  drops nothing.
+- A `LayoutError` reads as a refusal, its text with no traceback, on every read, write and undo
+  route, the Health check included. That also changes how every other `LayoutError` looks.
+- `refresh` takes a note, as `refresh_level` does. A note shows on its tab's next render, success
+  or failure, and is then cleared; the Level note used to wait for a successful render.
+- A layout error is a state, not a change. The `Env` built during it refuses everything, and the
+  next clean read is a new look, as the next CLI command is.
+
+**Residuals.**
+
+- The core's own interval between its discovery and its write remains, as for any CLI command.
+  RULING 4's guard refuses any write while the app runs.
+- A plan made while the app is mid-move reads a partial store under the new layout, which no layout
+  check sees. The write loop refuses an add whose row has since appeared with other bytes, and
+  leaves the op at `writing` for `recover`, as for any plan made while the app runs.
+- `_windows_store_moves` lists `Claude-Data` a second time and swallows a failure into no pairs and
+  no error. That can now happen at any read: a saved destination is then set aside rather than
+  re-rooted, and the window asks. Deriving the pairs from the layout's one listing would close it.
+- A pick made in a picker opened before the move saves a pre-move path. The next plan re-roots it.
+- An op that a window wrote into a copied old folder before this change re-roots to the moved
+  store, where its undo finds the rows already gone. They stay in the old copy, which the app does
+  not read.
+- Other refusals inside `execute_sync_op`, for a destination that vanished or became the signed-in
+  account, still come after `new_op` and leave a `journaled` op. Moving the journaling after those
+  checks is a separate core change.
+- A note queued on a replan whose own render opens a picker can be lost when that picker's pick
+  replans again.
+- The rebuild was measured at a median of 2.2 ms on an idle local profile. During a move, or on a
+  redirected profile, it is unmeasured.
+- Four harnesses still take their one fixed `Env` from a real `default_env()` and override its
+  paths (`check_gui_filter_doctor`, `check_gui_undo`, `check_live_picker`, `check_gui_level`). A
+  real listing failure on the machine running them would now stop their presses. The two that
+  built a fresh one on every call now build it whole.
+
+**Pinned by** `tests/test_gui_env_rebuild.py`:
+- the layout key across a renaming move, a copying move, an empty package folder, no store, a
+  layout error and discovery that raises;
+- `_fresh_env`, and a rebuild that raises;
+- the answer's `layout_changed`;
+- the Level sequence: an `Env` per engine call and gate scan; its stops before a rename, during
+  stage 2's dialog, during its identity question and on a layout error; and its run on the given
+  `Env` without `fresh`;
+- a `LayoutError` from a rename as a refusal;
+- the re-measure after a stop, with and without an answer given under another layout, and its
+  `LayoutError`;
+- the status lines and the two sentences.
+
+And by `tools/check_gui_env_rebuild.py`, a real window over synthetic layouts that move while it
+is open:
+- a copying move, then Apply;
+- a move while the confirmation is open;
+- a renaming move, then Refresh;
+- an empty package folder appearing;
+- a layout error, and a rebuild that raises, at the press;
+- Undo after a copying move, and with a move while its confirmation is open;
+- the held answer across a move;
+- Level with a move during stage 2's confirmation, and with one before the press.
+
+`tools/check_gui_stale_destination.py` now expects a discovery error shown as a refusal.
 
 
 ### The lister, and its two deliberate costs
