@@ -995,6 +995,23 @@ window into `journaled`/`completed`/`rolled_back`.
   created then as no longer on disk although they moved with the store, and `undo` cannot
   reverse those operations (see the compatibility matrix). Until that is fixed, judge a
   `converge --apply` by `alignment`.
+- **0.16.4 follows the journal and the window's saved destination across the data move.**
+  Every operation journals the rows it touched by absolute path, so an entry written before
+  Desktop 2.42304.2 moved its data names a folder that now holds only the app's marker. 0.16.3
+  read those paths as written: `doctor` reported every row this tool had created as no longer
+  on disk and exited 1, 320 rows on the machine where this was found, and `undo` and `recover`
+  of those operations refused, misreported, or for a `move` ended in an unhandled error. This
+  release maps a recorded path under the old store to the same place under the moved one as it
+  reads the journal, and writes nothing back to it. On that machine `doctor` now finds all 320
+  rows and exits 0. Before `undo` or `recover` acts on a journaled row, the row must resolve
+  inside a store that discovery found; a row in a store the tool cannot read is listed by
+  `doctor` apart, not counted in its exit code, and `undo` refuses it. `undo` of a `sync` now
+  says what it reversed instead of a bare "undone". The window had the same trouble with its
+  saved sync destination, a full store path, so every plan was refused with Apply off. It now
+  sets a saved destination that is proven gone aside and asks for a new one. "Change
+  destination" keeps the saved value until another is picked, so a cancelled pick loses
+  nothing, and no plan goes into a different store without a pick. A saved store whose account
+  is now signed in is named as such, and the candidate holding the saved ids is marked.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
