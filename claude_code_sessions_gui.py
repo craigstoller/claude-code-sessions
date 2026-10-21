@@ -45,6 +45,7 @@ Two rules it holds to:
 """
 
 import argparse
+import dataclasses
 import os
 import re
 import subprocess
@@ -961,6 +962,11 @@ def _sync_box_title(n_add, n_upd):
 #                          else None - agreement, a different pair, or the
 #                          same accounts with the roles swapped all drop it
 #   explicit_change     -> None   "Change signed-in account"
+#   layout_changed(key) -> held while a fresh Env's store roots are the
+#                          ones the answer was given under, or the Env has
+#                          no layout (an error) - else None. An answer given
+#                          with no layout recorded is never dropped by it
+#                          (Amendment 2026-10-20 (Env rebuild))
 #   anything else       -> held   refused, cancelled, the zero-rows empty
 #                                  outcome, truncated, a tab switch
 #
@@ -971,9 +977,10 @@ def _sync_box_title(n_add, n_upd):
 # files healing themselves into a plan-time refusal on both tabs.
 
 def _live_answer_next(held, event, payload=None):
-    """The next held answer - None or {"path", "pair", "label"} - after
-    EVENT (see the table above); PAYLOAD is the answer for `answered`, the
-    fresh pair (or None) for `files_read`, the outcome for `mutation_ran`."""
+    """The next held answer - None or {"path", "pair", "label", "layout"} -
+    after EVENT (see the table above); PAYLOAD is the answer for `answered`,
+    the fresh pair (or None) for `files_read`, a fresh Env's _layout_key for
+    `layout_changed`, the outcome for `mutation_ran`."""
     if event == "answered":
         return payload
     if event in ("mutation_ran", "explicit_change"):
@@ -983,6 +990,13 @@ def _live_answer_next(held, event, payload=None):
             return None
         pair = tuple(payload) if payload else None
         return held if pair == tuple(held.get("pair") or ()) else None
+    if event == "layout_changed":
+        if held is None:
+            return None
+        bound = held.get("layout")
+        if payload is None or bound is None:
+            return held
+        return held if tuple(payload) == tuple(bound) else None
     return held
 
 
@@ -1009,6 +1023,75 @@ def _current_pair(env):
     except Exception:
         return None
     return tuple(dis) if dis else None
+
+
+# ------------------------------------------------- the Env, rebuilt
+#
+# The window used to build its Env once, at open, so a move of the desktop
+# app's data made while it was open was seen only after a restart, and a
+# copied old folder stayed the store it planned into and wrote to. The
+# maintainer's ruling of 2026-10-20 (docs/internals.md, "Amendment 2026-10-20
+# (Env rebuild)"): every read builds a fresh Env and hands it to its worker;
+# every engine call in a press's worker runs on one built just before it; a
+# press whose store roots changed since its plan stops before the next engine
+# call and replans; the held identity answer is bound to the layout it was
+# given under. self.env changes only in a done-callback, so it is always the
+# Env the window's current display was rendered from.
+
+ENV_FOLDER_CHANGED = ("The desktop app's data folder changed since this plan, "
+                      "so it was planned again.")
+ENV_ANSWER_SET_ASIDE = ("The desktop app's data folder changed, so your answer "
+                        "about the signed-in account was set aside.")
+
+
+def _fresh_env(prev):
+    """A fresh ccs.default_env(). Never raises: a build that does becomes a
+    copy of PREV carrying the failure as a layout error, with no pairs - the
+    state discovery reports as an error every time, so every route refuses
+    until a clean rebuild, and no rebuild can escape a worker."""
+    try:
+        return ccs.default_env()
+    except Exception as exc:
+        return dataclasses.replace(
+            prev, store_moves=[],
+            layout_errors=list(getattr(prev, "layout_errors", ()) or ())
+            + ["the store layout could not be read: {0}".format(exc)])
+
+
+def _layout_key(env):
+    """The store roots discovery finds on ENV, normcased and sorted - the
+    claude-code-sessions folders reads and writes go under - or None when
+    discovery reports an error or cannot run. Raw candidates are not
+    compared: an empty Claude-Data\\claude_<pkg> folder that holds no store
+    changes nothing."""
+    try:
+        disc = ccs.discover_stores(env)
+    except Exception:
+        return None
+    if disc.status == "error":
+        return None
+    return tuple(sorted(os.path.normcase(r) for r in disc.roots))
+
+
+def _layout_stop(env, layout):
+    """Why an engine call must not run on ENV for a plan made under LAYOUT:
+    'layout_error' when ENV has no layout, 'layout_changed' when its store
+    roots differ from LAYOUT, else None. LAYOUT None asserts no roots."""
+    key = _layout_key(env)
+    if key is None:
+        return "layout_error"
+    if layout is not None and key != tuple(layout):
+        return "layout_changed"
+    return None
+
+
+def _join_note(*parts):
+    """Notes and a detail line, joined once each."""
+    out = []
+    for p in parts:
+        if p and p not in out:
+            out.append(p)
+    return "  ".join(out)
 
 
 # The one wording, on both tabs and in the stage-2 picker (the identity
@@ -1063,12 +1146,17 @@ STAGE1_ASK_NOTE = ("The identity files disagree; the copy step will ask "
 # a raise in a daemon worker cannot strand busy(True) with every control
 # disabled.
 
-def _run_level_sequence(env, steps, live, ui, pair=None):
+def _run_level_sequence(env, steps, live, ui, pair=None, fresh=None, layout=None):
     """Stage 1 (each ticked rename, its own journalled op) then stage 2 (a
     FRESH plan_converge, confirmed as itself, then run_converge on that fresh
     manifest only). LIVE is the held identity answer ("" for none) and PAIR
-    the (oauth, config) pair it was given for (None: unbound). Returns a
-    dict:
+    the (oauth, config) pair it was given for (None: unbound).
+
+    FRESH, when given, builds the Env for each engine call and each gate
+    scan just before it (fresh(previous Env) -> Env, never raising), and the
+    sequence stops before that call when the Env shows store roots other
+    than LAYOUT's - the plan's - or none at all (Amendment 2026-10-20 (Env
+    rebuild)). Without it every call runs on ENV, as before. Returns a dict:
 
       planned   how many renames were asked for
       landed    how many completed (each individually undoable)
@@ -1076,7 +1164,8 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
                       sequence - remaining renames and stage 2 do not run
       rename_error    True when the stopper was a bug, not a Refusal
       stage2    'gate' | 'truncated' | 'plan_failed' | 'empty' | 'cancelled'
-                | 'refused' | 'error' | 'completed' | 'unchanged'
+                | 'refused' | 'error' | 'completed' | 'unchanged' | 'layout'
+      layout_stop  'layout_changed' | 'layout_error' when stage2 is 'layout'
       plan_problem / converge_problem   ('refusal'|'error', text)
       fresh     the stage-2 plan manifest, when one was made
       gate      what the press-time re-scan found, when it aborted the press
@@ -1091,7 +1180,28 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
            "plan_problem": None, "converge_problem": None, "fresh": None,
            "gate": None, "mutated": False, "asked": None,
            "live_pair": tuple(pair) if pair else None, "live_dropped": False}
+    rebuild = fresh            # the parameter; `fresh` names stage 2's plan below
+
+    def step(env):
+        """The Env for the next engine call or gate scan, and why the
+        sequence stops before it instead (None to go on)."""
+        if rebuild is None:
+            return env, None
+        env = rebuild(env)
+        ui.env = env                       # the gate scan's Env
+        return env, _layout_stop(env, layout)
+
+    def stopped(why):
+        seq["stage2"] = "layout"
+        seq["layout_stop"] = why
+        if hasattr(ui, "current_key"):
+            ui.current_key = None
+        return seq
+
     ui.remaining = len(steps) + 1
+    env, why = step(env)
+    if why:
+        return stopped(why)
     blocked = ui.gate()
     if blocked:
         seq["gate"] = blocked
@@ -1108,11 +1218,17 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
         # is what a confirmed close loses.
         if hasattr(ui, "current_key"):
             ui.current_key = st["key"]
+        env, why = step(env)
+        if why:
+            return stopped(why)
         try:
             pm = ccs.plan_retitle(env, ccs.RetitleFlags(
                 only=st["target_sid"], title=st["new_title"]))
+            env, why = step(env)
+            if why:
+                return stopped(why)
             ccs.run_retitle(env, pm)
-        except ccs.Refusal as exc:
+        except (ccs.Refusal, ccs.LayoutError) as exc:
             seq["rename_refusal"] = (i + 1, str(exc))
             return seq
         except Exception:
@@ -1130,6 +1246,9 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
         seq["stage2"] = "truncated"
         return seq
     ui.remaining = 1
+    env, why = step(env)
+    if why:
+        return stopped(why)
     # Rule (b), drop-before-plan: the answer is bound to the pair it was
     # given for; re-read the files NOW and drop it if they no longer show
     # that pair, so this plan can never receive an answer the files have
@@ -1142,7 +1261,7 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
     ui.status("Planning the copy...")
     try:
         fresh = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
-    except ccs.Refusal as exc:
+    except (ccs.Refusal, ccs.LayoutError) as exc:
         seq["stage2"] = "plan_failed"
         seq["plan_problem"] = ("refusal", str(exc))
         return seq
@@ -1176,10 +1295,13 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
         seq["asked"] = answer
         seq["live_pair"] = (dis.get("oauth") or "", dis.get("config") or "")
         live = answer
+        env, why = step(env)
+        if why:
+            return stopped(why)
         ui.status("Planning the copy under your assertion...")
         try:
             fresh = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
-        except ccs.Refusal as exc:
+        except (ccs.Refusal, ccs.LayoutError) as exc:
             seq["stage2"] = "plan_failed"
             seq["plan_problem"] = ("refusal", str(exc))
             return seq
@@ -1191,6 +1313,9 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
         if not fresh.get("rows"):
             seq["stage2"] = "empty"
             return seq
+    env, why = step(env)
+    if why:
+        return stopped(why)
     blocked = ui.gate()
     if blocked:
         seq["gate"] = blocked
@@ -1209,10 +1334,13 @@ def _run_level_sequence(env, steps, live, ui, pair=None):
         # away.
         seq["stage2"] = "truncated"
         return seq
+    env, why = step(env)
+    if why:
+        return stopped(why)
     ui.status("Creating rows...")
     try:
         final = ccs.run_converge(env, fresh)
-    except ccs.Refusal as exc:
+    except (ccs.Refusal, ccs.LayoutError) as exc:
         seq["stage2"] = "refused"
         seq["converge_problem"] = ("refusal", str(exc))
         return seq
@@ -1279,12 +1407,31 @@ def _sequence_status(seq, half=""):
         # The mid-sequence gate hit: renames stand, the copy never ran.
         return (landed_clause + "; the copy did not run - interrupted "
                 "operation(s) need attention (see Health).")
+    if s2 == "layout":
+        # Stopped before an engine call on a store layout other than the
+        # plan's (Amendment 2026-10-20 (Env rebuild)): renames that landed
+        # stand, nothing more ran, and the pane was measured again.
+        why = ("the store layout could not be read"
+               if seq.get("layout_stop") == "layout_error" else
+               "the desktop app's data folder changed, so the pane was "
+               "measured again")
+        if landed:
+            return "{0}; the copy did not run - {1}.".format(landed_clause, why)
+        return "Nothing was written - {0}.".format(why)
     return ""                                   # press-abort / truncated
 
 
-def _run_level_apply(env, steps, live, ui, pair=None):
+def _run_level_apply(env, steps, live, ui, pair=None, fresh=None, layout=None,
+                     answer_layout=None):
     """The whole Apply press, worker side: the sequence, then the
     post-mutation refresh. Returns (seq, refresh).
+
+    FRESH and LAYOUT go to the sequence (see _run_level_sequence). With
+    FRESH, the refresh is a read on an Env of its own, recorded in seq as
+    `env` and its `layout_key` for the done-callback; a held answer given
+    under ANSWER_LAYOUT is planned without when that Env shows other store
+    roots (`live_layout_dropped`), and a layout stop re-measures even when
+    nothing was written (Amendment 2026-10-20 (Env rebuild)).
 
     The refresh is UNCONDITIONAL for every sequence that got past its gate -
     a finally, not a success step: whether renames landed and stage 2 was
@@ -1306,7 +1453,8 @@ def _run_level_apply(env, steps, live, ui, pair=None):
     REFRESH is ("ok", alignment_report, manifest, running) or
     ("refusal"|"error", text), or None when skipped.
     """
-    seq = _run_level_sequence(env, steps, live, ui, pair)
+    seq = _run_level_sequence(env, steps, live, ui, pair, fresh=fresh,
+                              layout=layout)
     if seq["stage2"] == "truncated" or (seq["stage2"] == "gate"
                                         and not seq["mutated"]):
         # A truncated sequence is a window on its way closed. A gate abort
@@ -1319,6 +1467,16 @@ def _run_level_apply(env, steps, live, ui, pair=None):
         keep = ""
     else:
         keep = seq.get("asked") or ("" if seq.get("live_dropped") else live)
+    if fresh is not None:
+        env = fresh(env)
+        key = _layout_key(env)
+        seq["env"], seq["layout_key"] = env, key
+        if (keep and answer_layout is not None and key is not None
+                and key != tuple(answer_layout)):
+            # Decision 3(i): an answer given under other store roots is
+            # not planned with; the done-callback drops it too.
+            keep = ""
+            seq["live_layout_dropped"] = True
     if keep and seq.get("live_pair") and _current_pair(env) != seq["live_pair"]:
         keep = ""
     ui.status("Re-measuring...")
@@ -1327,7 +1485,7 @@ def _run_level_apply(env, steps, live, ui, pair=None):
         man = ccs.plan_converge(env, ccs.ConvergeFlags(live=keep))
         running = ccs.claude_running(env)
         refresh = ("ok", rep, man, running)
-    except ccs.Refusal as exc:
+    except (ccs.Refusal, ccs.LayoutError) as exc:
         refresh = ("refusal", str(exc))
     except Exception:
         refresh = ("error", traceback.format_exc())
@@ -1432,13 +1590,17 @@ class _TkLevelUI(object):
         self.truncate = False
         self.landed_keys = []            # rows whose rename has landed
         self.current_key = None          # the row whose rename is in flight
+        # The Env the sequence built for its next gate scan (Amendment
+        # 2026-10-20 (Env rebuild)); the window's own until it builds one.
+        self.env = None
 
     def status(self, text):
         self.app.root.after(0, self.app.level_status.set, text)
 
     def gate(self):
         try:
-            ops = ccs.nonterminal_ops(self.app.env)
+            ops = ccs.nonterminal_ops(self.env if self.env is not None
+                                      else self.app.env)
         except Exception:
             return "the journal could not be read"
         return [o.manifest.get("op_id") for o in ops] or None
@@ -1561,7 +1723,17 @@ class _Dialog(object):
 class SyncApp:
     def __init__(self, root):
         self.root = root
+        # The Env the window's current display was rendered from: built here
+        # at open, then replaced only by done-callbacks, with the Env their
+        # worker last used. Every read and press builds its own (Amendment
+        # 2026-10-20 (Env rebuild)).
         self.env = ccs.default_env()
+        # The store roots (_layout_key) each tab's installed plan was made
+        # under, kept beside the plan and never in its manifest, which is
+        # journaled. A press on other roots replans instead of running.
+        self._sync_layout = None
+        self._level_layout = None
+        self._sync_note = ""             # shown on the next One-session render
         self.manifest = None
         self.dest_choice = load_pref()
         # "Change destination" pressed: the next plan runs with no destination,
@@ -1585,6 +1757,7 @@ class SyncApp:
         self.live_choice = ""            # the store path, or ""
         self._live_pair = None           # the (oauth, config) it answers
         self._live_label = ""            # the email (or id) for the line
+        self._live_layout = None         # the store roots it was given under
         # Bumped on every plan; a callback whose generation is stale is dropped
         # rather than allowed to install a superseded manifest.
         self.generation = 0
@@ -2293,7 +2466,11 @@ class SyncApp:
                 pass                     # the window is already gone
 
     # ---------------------------------------------------------------- planning
-    def refresh(self, reset_live=False):
+    def refresh(self, reset_live=False, note=""):
+        # NOTE, when given, joins the next render's detail line - the
+        # stopped-press sentence of Amendment 2026-10-20 (Env rebuild) - and
+        # is shown once, on success or failure alike.
+        #
         # The identity answer survives a replan (a replan reads, and reads
         # consume nothing) and is dropped only by a run of the mutation
         # path, by the files no longer showing its pair, or by the user
@@ -2316,9 +2493,12 @@ class SyncApp:
         # than writing the wrong store. It is also shown on both tabs while
         # it is in force and changeable from the button beside the line -
         # visible state, not remembered state.
+        if note:
+            self._sync_note = _join_note(self._sync_note, note)
         if reset_live:
             self._apply_live("explicit_change")
-        self._settle_live()              # rule (b): drop BEFORE the plan
+        env = self._read_env()           # this read's own Env
+        self._settle_live(env)           # rule (b): drop BEFORE the plan
         # Snapshot the filter on the UI thread and carry it through. Reading
         # only_var again inside the worker or the callback let a quick A-then-B
         # change install an A-selected manifest while the window described it as
@@ -2343,29 +2523,60 @@ class SyncApp:
         threading.Thread(
             target=self._plan_worker,
             args=(gen, only, self.live_choice, self.update_var.get(),
-                  self.newer_var.get(), self.orphan_var.get(), dest, ask),
+                  self.newer_var.get(), self.orphan_var.get(), dest, ask, env),
             daemon=True).start()
+
+    # ------------------------------------------------ the Env, rebuilt
+    def _read_env(self):
+        """A fresh Env for a read or a press, built on the UI thread, with
+        the held identity answer checked against its store roots first
+        (Amendment 2026-10-20 (Env rebuild), Decision 3(i)). Never raises."""
+        env = _fresh_env(self.env)
+        self._check_answer_layout(_layout_key(env))
+        return env
+
+    def _check_answer_layout(self, key):
+        """Drop a held answer given under store roots other than KEY (an Env
+        with no layout drops nothing). A drop turns both tabs' Apply off
+        until each replans, redraws both banners, and queues the sentence
+        for each tab's next render. True when an answer was dropped."""
+        had = bool(self.live_choice)
+        self._apply_live("layout_changed", key)
+        if not had or self.live_choice:
+            return False
+        self._sync_apply_ok = False
+        self._level_apply_ok = False
+        self._sync_note = _join_note(self._sync_note, ENV_ANSWER_SET_ASIDE)
+        self._level_note = _join_note(self._level_note, ENV_ANSWER_SET_ASIDE)
+        self._render_sync_banner()
+        self._render_banner(self.level_manifest)
+        self._apply_gate_to_buttons()
+        return True
 
     # ------------------------------------------------ the identity answer
     def _apply_live(self, event, payload=None):
         """Advance the held answer by _live_answer_next's rules."""
         held = ({"path": self.live_choice, "pair": self._live_pair,
-                 "label": self._live_label} if self.live_choice else None)
+                 "label": self._live_label, "layout": self._live_layout}
+                if self.live_choice else None)
         nxt = _live_answer_next(held, event, payload) or {}
         self.live_choice = nxt.get("path") or ""
         pair = nxt.get("pair")
         self._live_pair = tuple(pair) if pair else None
         self._live_label = nxt.get("label") or ""
+        layout = nxt.get("layout")
+        self._live_layout = tuple(layout) if layout is not None else None
 
-    def _read_pair(self):
-        return _current_pair(self.env)
+    def _read_pair(self, env=None):
+        return _current_pair(env if env is not None else self.env)
 
-    def _settle_live(self):
-        """Rule (b), before use: re-read the identity files and drop the
-        answer if they no longer show the pair it was given for. True when
-        an answer was dropped - the caller replans instead of running."""
+    def _settle_live(self, env=None):
+        """Rule (b), before use: re-read the identity files - through ENV,
+        a read's or a press's own, else the window's - and drop the answer
+        if they no longer show the pair it was given for. True when an
+        answer was dropped - the caller replans instead of running."""
         had = bool(self.live_choice)
-        self._apply_live("files_read", self._read_pair())
+        self._apply_live("files_read", self._read_pair(env))
         return had and not self.live_choice
 
     def _assertion_text(self):
@@ -2452,9 +2663,13 @@ class SyncApp:
         self._wrap_to(lbl, box)
         for a, _o, p, text in self._identity_choices(pair):
             def pick(path=p, acct=a):
+                # Bound to the store roots of self.env, the Env these
+                # buttons listed the stores from (Amendment 2026-10-20 (Env
+                # rebuild), Decision 3(i)).
                 self._apply_live("answered", {
                     "path": path, "pair": tuple(pair),
-                    "label": self._account_email(acct)})
+                    "label": self._account_email(acct),
+                    "layout": _layout_key(self.env)})
                 replan()
             b = ttk.Button(box, command=pick, text=text)
             b.pack(fill="x", pady=2)
@@ -2488,7 +2703,8 @@ class SyncApp:
             def pick(path=p, acct=a):
                 self._apply_live("answered", {
                     "path": path, "pair": pair,
-                    "label": self._account_email(acct)})
+                    "label": self._account_email(acct),
+                    "layout": _layout_key(self.env)})
                 dlg.finish(path)
             ttk.Button(dlg.body, text=text, command=pick).pack(
                 fill="x", padx=PAD, pady=3)
@@ -2498,7 +2714,12 @@ class SyncApp:
         return dlg.run()
 
     def _plan_worker(self, gen, only, live, update, newer_only, allow_orphan,
-                     dest="", ask=False):
+                     dest="", ask=False, env=None):
+        # ENV is this read's own, built on the UI thread when it started; its
+        # store roots are taken before planning and travel with the result,
+        # beside the plan, for the press to compare (Amendment 2026-10-20
+        # (Env rebuild)). A move during the plan then reads as a change.
+        #
         # What is known about the saved destination travels with the result:
         # `pick` is "change" for a "Change destination" press and "gone" for a
         # saved value set aside as proven gone - either way this plan runs
@@ -2509,10 +2730,12 @@ class SyncApp:
         # 2026-10-20 (re-root)). A value blank once stripped is no saved
         # destination at all.
         dest = (dest or "").strip()
-        ctx = {"dest": dest, "pick": None, "findings": None, "rerooted": ""}
+        env = env if env is not None else self.env
+        ctx = {"dest": dest, "pick": None, "findings": None, "rerooted": "",
+               "env": env, "layout": _layout_key(env)}
         try:
             if dest:
-                ctx["findings"] = _destination_findings(self.env, dest, live)
+                ctx["findings"] = _destination_findings(env, dest, live)
             find = ctx["findings"] or {}
             if ask:
                 ctx["pick"] = "change"
@@ -2526,9 +2749,11 @@ class SyncApp:
                                   only=only, update=update,
                                   newer_only=newer_only,
                                   allow_orphan=allow_orphan)
-            manifest = ccs.plan_sync(self.env, flags)
+            manifest = ccs.plan_sync(env, flags)
             self.root.after(0, self._plan_done, gen, only, manifest, None, ctx)
-        except ccs.Refusal as exc:
+        except (ccs.Refusal, ccs.LayoutError) as exc:
+            # A LayoutError reads as a refusal - its text, no traceback
+            # (Amendment 2026-10-20 (Env rebuild), default 1).
             self.root.after(0, self._plan_done, gen, only, None,
                             ("refusal", str(exc)), ctx)
         except Exception:
@@ -2545,11 +2770,25 @@ class SyncApp:
         self.busy(False)
         if gen != self.generation:
             return                       # superseded by a newer plan
+        ctx = ctx or {}
+        # This read's Env becomes the window's, after the staleness check,
+        # so a superseded plan's never does; a queued note joins whatever
+        # the render puts on the detail line (Amendment 2026-10-20 (Env
+        # rebuild)).
+        if ctx.get("env") is not None:
+            self.env = ctx["env"]
+        note, self._sync_note = self._sync_note, ""
+        try:
+            self._show_plan(only, manifest, problem, ctx)
+        finally:
+            if note:
+                self.detail.set(_join_note(note, self.detail.get()))
+
+    def _show_plan(self, only, manifest, problem, ctx):
         # The saved destination (Amendment 2026-10-20). `pick` set means
         # this plan ran with no destination on the user's behalf, and every
         # route below ends in an explicit pick or says why none is offered:
         # nothing is planned into, and nothing is saved, without one.
-        ctx = ctx or {}
         pick = ctx.get("pick")
         find = ctx.get("findings") or {}
         dest = ctx.get("dest") or ""
@@ -2669,6 +2908,7 @@ class SyncApp:
             return
 
         self.manifest = manifest
+        self._sync_layout = ctx.get("layout")    # beside the plan, never in it
         home = self.env.home
         tally = manifest.get("tally") or {}
         rows = manifest.get("rows") or []
@@ -3190,29 +3430,36 @@ class SyncApp:
         dips every action button for the length of the scan, and disables
         the hold rows' entries too (typed text is kept - they are disabled,
         not rebuilt); on the first visit that happens once per window."""
+        env = self._read_env()           # this read's own Env
         self.busy(True)
         self.health_status.set("Checking...")
-        threading.Thread(target=self._doctor_worker, daemon=True).start()
+        threading.Thread(target=self._doctor_worker, args=(env,),
+                         daemon=True).start()
 
-    def _doctor_worker(self):
+    def _doctor_worker(self, env=None):
         # The scan fails closed independently of the doctor gather: a
         # doctor that errors must not leave the gate wherever the last
         # successful scan put it - this Refresh is the designed way back
         # after `ccs recover`, and it has to report the journal it could
         # not read as exactly that.
+        env = env if env is not None else self.env
         try:
-            entries = _scan_interrupted(self.env)
+            entries = _scan_interrupted(env)
         except Exception:
             entries = None
         try:
-            rep = ccs.gather_doctor(self.env)
-            self.root.after(0, self._doctor_done, rep, entries, None)
+            rep = ccs.gather_doctor(env)
+            self.root.after(0, self._doctor_done, rep, entries, None, env)
+        except ccs.LayoutError as exc:
+            self.root.after(0, self._doctor_done, None, entries, str(exc), env)
         except Exception:
             self.root.after(0, self._doctor_done, None, entries,
-                            traceback.format_exc())
+                            traceback.format_exc(), env)
 
-    def _doctor_done(self, rep, entries, err):
+    def _doctor_done(self, rep, entries, err, env=None):
         self.busy(False)
+        if env is not None:
+            self.env = env
         self._set_gate(entries, error=entries is None)
         if err:
             self.health_status.set("Health check failed")
@@ -3229,9 +3476,11 @@ class SyncApp:
         self.show_health(lines)
 
     # ------------------------------------------------------------------- undo
-    def _find_undoable_op(self):
+    def _find_undoable_op(self, env=None):
         """The most recent completed op, described, IF its type is one this
-        window reverses - sync, retitle or converge. None otherwise.
+        window reverses - sync, retitle or converge. None otherwise. ENV is
+        the journal's reader - the undo worker's own - else the window's
+        (a harness calls this unbound on a stand-in with only .env).
 
         Deliberately only the MOST RECENT completed op `ccs undo` would pick -
         so the button and the CLI can never disagree about which operation
@@ -3257,7 +3506,7 @@ class SyncApp:
         target no identity file arbitrates).
         """
         try:
-            ops = [o for o in ccs.list_ops(self.env)
+            ops = [o for o in ccs.list_ops(env if env is not None else self.env)
                    if o.manifest.get("status") == "completed"
                    and o.manifest.get("op_type", "move") in ("move", "sync",
                                                              "repoint", "new-row",
@@ -3345,7 +3594,11 @@ class SyncApp:
     def on_undo(self):
         if not self.undo_target:
             return
-        if self._press_gate():
+        # The press's own Env for its gate scan; the undo itself runs on one
+        # built in the worker, after the confirmation (Amendment 2026-10-20
+        # (Env rebuild)). An undo has no plan, so nothing is compared.
+        env = self._read_env()
+        if self._press_gate(env):
             return                       # the red line is the explanation
         t = self.undo_target
         title, prompt = self._undo_prompt(t)
@@ -3373,41 +3626,46 @@ class SyncApp:
         self.level_status.set("Undoing...")
         self._mutation_ui = _MutationMarker()
         threading.Thread(target=self._undo_worker,
-                         args=(t["op_id"], t["type"]), daemon=True).start()
+                         args=(t["op_id"], t["type"], env), daemon=True).start()
 
-    def _undo_worker(self, op_id, kind):
+    def _undo_worker(self, op_id, kind, prev=None):
+        # Built here, after the confirmation: the journal re-roots the op's
+        # paths through this Env's pairs, and the undo's own checks run on it.
+        env = _fresh_env(prev if prev is not None else self.env)
         try:
             # Re-check that this is STILL the latest eligible operation, not just
             # that it exists. Another CLI move or sync can complete between the
             # button being drawn and the confirmation being accepted; undoing the
             # captured id then reaches behind a newer operation and disagrees with
             # what `ccs undo` would pick.
-            current = self._find_undoable_op()
+            current = self._find_undoable_op(env)
             if not current or current["op_id"] != op_id:
                 raise ccs.Refusal(
                     "another operation completed since this window last looked, so "
                     "{0} is no longer the most recent one to undo. Nothing was "
                     "touched - press Refresh to see the current state.".format(op_id))
-            ops = [o for o in ccs.list_ops(self.env)
+            ops = [o for o in ccs.list_ops(env)
                    if o.manifest.get("op_id") == op_id]
             if not ops:
                 raise ccs.Refusal("operation {0} is no longer in the journal".format(op_id))
             undo = {"sync": ccs.undo_sync, "retitle": ccs.undo_retitle,
                     "converge": ccs.undo_converge}[kind]
-            result = undo(self.env, ops[0])
+            result = undo(env, ops[0])
             report = ops[0].manifest.get("undo_report")
-            self.root.after(0, self._undo_done, kind, result, report, None)
-        except ccs.Refusal as exc:
+            self.root.after(0, self._undo_done, kind, result, report, None, env)
+        except (ccs.Refusal, ccs.LayoutError) as exc:
             self.root.after(0, self._undo_done, kind, None, None,
-                            ("refusal", str(exc)))
+                            ("refusal", str(exc)), env)
         except Exception:
             self.root.after(0, self._undo_done, kind, None, None,
-                            ("error", traceback.format_exc()))
+                            ("error", traceback.format_exc()), env)
 
-    def _undo_done(self, kind, result, report, problem):
+    def _undo_done(self, kind, result, report, problem, env=None):
         if self._mutation_over():
             return                       # the window was closing; it may now
         self.busy(False)                 # the recompute re-arms Undo itself
+        if env is not None:
+            self.env = env
         if problem:
             kind_p, msg = problem
             # NOT "nothing was removed": a refusal can follow some rows having
@@ -3489,10 +3747,13 @@ class SyncApp:
         plan_converge - plus the environment weather (claude_running,
         read-only) and the unresolved-op scan. NOTE, when given, survives
         into the next render's detail line so an undo's outcome is not
-        instantly overwritten by the replan it triggers."""
+        instantly overwritten by the replan it triggers - and, like every
+        note, it shows on a failed render too (Amendment 2026-10-20 (Env
+        rebuild))."""
         if note:
-            self._level_note = note
-        self._settle_live()              # rule (b): drop BEFORE the plan
+            self._level_note = _join_note(self._level_note, note)
+        env = self._read_env()           # this read's own Env
+        self._settle_live(env)           # rule (b): drop BEFORE the plan
         self.level_gen += 1
         gen = self.level_gen
         self.busy(True)
@@ -3500,25 +3761,27 @@ class SyncApp:
         self.level_apply_btn.configure(state="disabled")
         self.level_status.set("Measuring...")
         threading.Thread(target=self._level_plan_worker,
-                         args=(gen, self.live_choice), daemon=True).start()
+                         args=(gen, self.live_choice, env), daemon=True).start()
 
-    def _level_plan_worker(self, gen, live):
+    def _level_plan_worker(self, gen, live, env=None):
         # The gate scan gets its own try, OUTSIDE the read block, and its
         # result survives a read failure: an early version passed a bare []
         # through the except path, so a Refresh whose gather/plan refused
         # ERASED a standing red line - "couldn't look" (or "looked, then the
         # read failed") rendered as "nothing there", lifting the mutation
         # gate on the strength of a scan whose findings were discarded.
+        env = env if env is not None else self.env
+        layout = _layout_key(env)        # taken before the read, as for sync
         try:
-            entries = _scan_interrupted(self.env)
+            entries = _scan_interrupted(env)
         except Exception:
             entries = None               # gates closed until Health can look
         try:
-            running = ccs.claude_running(self.env)
-            rep = ccs.gather_alignment(self.env)
-            man = ccs.plan_converge(self.env, ccs.ConvergeFlags(live=live))
+            running = ccs.claude_running(env)
+            rep = ccs.gather_alignment(env)
+            man = ccs.plan_converge(env, ccs.ConvergeFlags(live=live))
             problem = None
-        except ccs.Refusal as exc:
+        except (ccs.Refusal, ccs.LayoutError) as exc:
             rep = man = None
             running = []
             problem = ("refusal", str(exc))
@@ -3527,13 +3790,16 @@ class SyncApp:
             running = []
             problem = ("error", traceback.format_exc())
         self.root.after(0, self._level_plan_done, gen, rep, man, running,
-                        entries, problem)
+                        entries, problem, env, layout)
 
-    def _level_plan_done(self, gen, rep, man, running, entries, problem):
+    def _level_plan_done(self, gen, rep, man, running, entries, problem,
+                         env=None, layout=None):
         # Decrement before the staleness check - see _plan_done.
         self.busy(False)
         if gen != self.level_gen:
             return                       # superseded by a newer plan
+        if env is not None:
+            self.env = env               # after the staleness check
         self._set_gate(entries, error=entries is None)
         if entries:
             self._render_health_entries(entries)
@@ -3544,10 +3810,12 @@ class SyncApp:
             kind, msg = problem
             self.level_status.set("Refused" if kind == "refusal"
                                   else "Something went wrong")
-            self.level_detail.set(
+            self.level_detail.set(_join_note(
+                self._level_note,
                 "Nothing was written; Refresh retries. The tool's own "
                 "explanation:" if kind == "refusal" else
-                "This is a bug in the launcher, not a refusal.")
+                "This is a bug in the launcher, not a refusal."))
+            self._level_note = ""
             self.show_level([msg])
             self.level_footer.set("")
             self._apply_gate_to_buttons()
@@ -3555,6 +3823,7 @@ class SyncApp:
             # failed read must still derive it.
             self._update_undo_button()
             return
+        self._level_layout = layout      # beside the plan, never in it
         self._render_level(rep, man, running)
 
     def _render_level(self, rep, man, running):
@@ -3794,14 +4063,15 @@ class SyncApp:
         elif not busy:
             self.undo_btn.configure(state="normal")
 
-    def _press_gate(self):
+    def _press_gate(self, env=None):
         """The press-time re-scan, run before EVERY mutation - stage 1's
         confirm, stage 2's confirm (inside the worker), sync's Apply, Undo.
         A scan at window-open goes stale the moment another process dies
         mid-write; an op found here renders the red line and aborts the
-        press. True when the press must abort."""
+        press. ENV is the press's own, else the window's. True when the
+        press must abort."""
         try:
-            entries = _scan_interrupted(self.env)
+            entries = _scan_interrupted(env if env is not None else self.env)
         except Exception:
             self._set_gate(None, error=True)
             return True
@@ -3828,9 +4098,18 @@ class SyncApp:
     def on_level_apply(self):
         if self.level_manifest is None:
             return
-        if self._press_gate():
+        # The press's own Env, before the gate: a pane measured under other
+        # store roots, or a layout that cannot be read, is measured again
+        # instead of applied (Amendment 2026-10-20 (Env rebuild)).
+        env = self._read_env()
+        stop = _layout_stop(env, self._level_layout)
+        if stop:
+            self.refresh_level(note=ENV_FOLDER_CHANGED
+                               if stop == "layout_changed" else "")
+            return
+        if self._press_gate(env):
             return                       # the red line is the explanation
-        if self._settle_live():
+        if self._settle_live(env):
             # Rule (b) at press time: the files no longer show the pair the
             # answer was given for - drop it and replan instead of running.
             self.refresh_level()
@@ -3871,7 +4150,7 @@ class SyncApp:
         self._mutation_ui = ui
         threading.Thread(target=self._level_apply_worker,
                          args=(gen, steps, self.live_choice, self._live_pair,
-                               ui),
+                               ui, self._level_layout, env, self._live_layout),
                          daemon=True).start()
 
     def _confirm_stage1(self, steps, note=""):
@@ -3898,8 +4177,14 @@ class SyncApp:
         tsb.pack(side="right", fill="y")
         return bool(dlg.run())
 
-    def _level_apply_worker(self, gen, steps, live, pair, ui):
-        seq, refresh = _run_level_apply(self.env, steps, live, ui, pair=pair)
+    def _level_apply_worker(self, gen, steps, live, pair, ui, layout=None,
+                            prev=None, answer_layout=None):
+        # Every engine call, gate scan and the re-measure run on an Env built
+        # just before them, and the sequence stops on store roots other than
+        # LAYOUT, the pane's (Amendment 2026-10-20 (Env rebuild)).
+        seq, refresh = _run_level_apply(
+            prev if prev is not None else self.env, steps, live, ui, pair=pair,
+            fresh=_fresh_env, layout=layout, answer_layout=answer_layout)
         self.root.after(0, self._level_apply_done, gen, seq, refresh)
 
     def _level_apply_done(self, gen, seq, refresh):
@@ -3908,6 +4193,8 @@ class SyncApp:
         self.busy(False)
         if gen != self.level_gen:
             return
+        if seq.get("env") is not None:
+            self.env = seq["env"]        # the re-measure's, after the check
         if seq.get("gate") is not None:
             # Render the red line first - the pane below must never look
             # more willing than the gate.
@@ -3930,11 +4217,19 @@ class SyncApp:
         # files. The refresh planned the same way; if the files still
         # disagree and no answer is held, that replan re-raises the banner.
         self._apply_live(_live_event_for(seq.get("stage2")), seq.get("stage2"))
+        if "layout_key" in seq:
+            # Decision 3(i) on the re-measure's own Env (Amendment
+            # 2026-10-20 (Env rebuild)).
+            self._check_answer_layout(seq["layout_key"])
         self._settle_live()
+        if seq.get("stage2") == "layout" and seq.get("layout_stop") == "layout_changed":
+            self._level_note = _join_note(self._level_note, ENV_FOLDER_CHANGED)
         half = ""
         keep_stale_status = False
         if refresh is not None and refresh[0] == "ok":
             _kind, rep, man, running = refresh
+            if "layout_key" in seq:
+                self._level_layout = seq["layout_key"]   # the re-measure's
             self._render_level(rep, man, running)
             half = _scoreboard_half(rep)
             if seq.get("plan_problem"):
@@ -3961,8 +4256,10 @@ class SyncApp:
                            or (refresh if refresh is not None else None))
                 if problem is not None:
                     self.show_level([problem[1]])
-                self.level_detail.set("The pane could not be re-measured; "
-                                      "Refresh retries.")
+                self.level_detail.set(_join_note(
+                    self._level_note,
+                    "The pane could not be re-measured; Refresh retries."))
+                self._level_note = ""
             self._update_undo_button()
         status = _sequence_status(seq, half)
         if status and not keep_stale_status:
@@ -4053,14 +4350,23 @@ class SyncApp:
     def on_apply(self):
         if not self.manifest:
             return
+        # The press's own Env, before the gate: a plan made under other store
+        # roots, or a layout that cannot be read, is planned again instead
+        # of run - before any dialog, so nobody confirms a plan that will not
+        # run (Amendment 2026-10-20 (Env rebuild)).
+        env = self._read_env()
+        stop = _layout_stop(env, self._sync_layout)
+        if stop:
+            self.refresh(note=ENV_FOLDER_CHANGED if stop == "layout_changed" else "")
+            return
         # Carve-out 1 of this pane's "unchanged" contract: the press-time
         # unresolved-op re-scan. A scan at window-open goes stale the moment
         # another process dies mid-write; a mutation launched over an
         # unresolved journal op would change the state `recover` is about to
         # reason over, so the window refuses to be the second writer.
-        if self._press_gate():
+        if self._press_gate(env):
             return
-        if self._settle_live():
+        if self._settle_live(env):
             # Rule (b) at press time: the files no longer show the pair the
             # answer was given for - drop it and replan instead of running.
             self.refresh()
@@ -4145,26 +4451,47 @@ class SyncApp:
         self.busy(True)
         self.status.set("Copying...")
         self._mutation_ui = _MutationMarker()
-        threading.Thread(target=self._apply_worker, args=(self.manifest,),
+        threading.Thread(target=self._apply_worker,
+                         args=(self.manifest, self._sync_layout, env),
                          daemon=True).start()
 
-    def _apply_worker(self, manifest):
+    def _apply_worker(self, manifest, layout=None, prev=None):
         # The manifest is passed in, not read from self, so a callback that runs
         # concurrently cannot pull it out from under a copy that already wrote
         # rows. (The health check used to do exactly that by clearing it.)
+        #
+        # run_sync runs on an Env built here, just before it, and not at all
+        # when that Env shows store roots other than LAYOUT, the plan's - so
+        # a move while the confirmation sat open writes and journals nothing
+        # (Amendment 2026-10-20 (Env rebuild)).
+        env = _fresh_env(prev if prev is not None else self.env)
         try:
-            result = ccs.run_sync(self.env, manifest)
-            self.root.after(0, self._apply_done, manifest, result, None)
-        except ccs.Refusal as exc:
-            self.root.after(0, self._apply_done, manifest, None, ("refusal", str(exc)))
+            stop = _layout_stop(env, layout)
+            if stop:
+                self.root.after(0, self._apply_done, manifest, None,
+                                ("stopped", stop), env)
+                return
+            result = ccs.run_sync(env, manifest)
+            self.root.after(0, self._apply_done, manifest, result, None, env)
+        except (ccs.Refusal, ccs.LayoutError) as exc:
+            self.root.after(0, self._apply_done, manifest, None,
+                            ("refusal", str(exc)), env)
         except Exception:
             self.root.after(0, self._apply_done, manifest, None,
-                            ("error", traceback.format_exc()))
+                            ("error", traceback.format_exc()), env)
 
-    def _apply_done(self, manifest, result, problem):
+    def _apply_done(self, manifest, result, problem, env=None):
         if self._mutation_over():
             return                       # the window was closing; it may now
         self.busy(False)
+        if env is not None:
+            self.env = env
+        if problem and problem[0] == "stopped":
+            # Stopped before run_sync: nothing was written or journaled, so
+            # no modal - the pane plans again and says why.
+            self.refresh(note=ENV_FOLDER_CHANGED
+                         if problem[1] == "layout_changed" else "")
+            return
         if problem:
             kind, msg = problem
             self.status.set("Refused - nothing was copied" if kind == "refusal"
