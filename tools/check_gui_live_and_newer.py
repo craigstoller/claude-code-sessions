@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -56,20 +57,24 @@ with open(os.path.join(root_dir, "Claude", "config.json"), "w") as fh:
 
 
 # Captured BEFORE patching: gp2.ccs is the same module object as ccs, so
-# assigning gp2.ccs.default_env rebinds the very function this calls.
-_real_default_env = ccs.default_env
+# assigning gp2.ccs.plan_sync rebinds the very function this calls.
 _real_plan_sync = ccs.plan_sync
 
 
 def fake_env():
-    env = _real_default_env()
-    env.home = home
-    env.projects_root = os.path.join(home, ".claude", "projects")
-    env.store_candidates = [store]
-    env.ops_dir = os.path.join(root_dir, "journal", "ops")
-    env.moved_log = os.path.join(root_dir, "journal", "moved-log.jsonl")
-    env.process_lister = lambda: []
-    return env
+    # Built whole, no field taken from this machine's own default_env: the
+    # window rebuilds its Env at every read and press (Amendment 2026-10-20
+    # (Env rebuild)), and an inherited layout field would make a press here
+    # depend on the machine the check runs on.
+    return ccs.Env(
+        home=home,
+        projects_root=os.path.join(home, ".claude", "projects"),
+        store_candidates=[store],
+        ops_dir=os.path.join(root_dir, "journal", "ops"),
+        moved_log=os.path.join(root_dir, "journal", "moved-log.jsonl"),
+        is_windows=(sys.platform == "win32"),
+        process_lister=lambda: [],
+        now=time.time)
 
 
 gp2.ccs.default_env = fake_env

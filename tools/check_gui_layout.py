@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -76,18 +77,20 @@ with open(os.path.join(home, ".claude.json"), "w", encoding="utf-8") as fh:
     fh.write('{"oauthAccount": {"accountUuid": "%s", "organizationUuid": '
              '"%s", "emailAddress": "alice@example.com"}}' % (ALICE, ORG_C))
 
-REAL_DEFAULT_ENV = ccs.default_env
-
-
 def fake_env():
-    env = REAL_DEFAULT_ENV()
-    env.home = home
-    env.projects_root = os.path.join(home, ".claude", "projects")
-    env.store_candidates = [store]
-    env.ops_dir = os.path.join(root_dir, "journal", "ops")
-    env.moved_log = os.path.join(root_dir, "journal", "moved-log.jsonl")
-    env.process_lister = lambda: []
-    return env
+    # Built whole, no field taken from this machine's own default_env: the
+    # window rebuilds its Env at every read and press (Amendment 2026-10-20
+    # (Env rebuild)), and an inherited layout field would make a press here
+    # depend on the machine the check runs on.
+    return ccs.Env(
+        home=home,
+        projects_root=os.path.join(home, ".claude", "projects"),
+        store_candidates=[store],
+        ops_dir=os.path.join(root_dir, "journal", "ops"),
+        moved_log=os.path.join(root_dir, "journal", "moved-log.jsonl"),
+        is_windows=(sys.platform == "win32"),
+        process_lister=lambda: [],
+        now=time.time)
 
 
 def alignment():

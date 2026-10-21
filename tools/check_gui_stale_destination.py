@@ -468,8 +468,9 @@ s.close()
 env, P = layout([(A, O1), (A, O2), (B, O2)], live=(B, O2))
 env.layout_errors = ["a store folder: Access is denied"]
 s = Session(env, P, P["old"](A, O1))
-check("a discovery error: shown as today, no picker, no claim",
-      not s.dialogs and s.app.status.get() == "Something went wrong"
+check("a discovery error: shown as a refusal, no picker, no claim",
+      not s.dialogs and s.app.status.get() == "Refused"
+      and "bug in the launcher" not in s.app.detail.get()
       and SIGNED not in s.app.detail.get(), s.app.status.get())
 check("  the file unchanged", s.pref() == P["old"](A, O1))
 s.close()
