@@ -1012,6 +1012,22 @@ window into `journaled`/`completed`/`rolled_back`.
   destination" keeps the saved value until another is picked, so a cancelled pick loses
   nothing, and no plan goes into a different store without a pick. A saved store whose account
   is now signed in is named as such, and the candidate holding the saved ids is marked.
+- **0.16.5 finishes the window's side of the data move, and lets a store path use either
+  slash.** On Windows, `sync --to` and the store-scope `--live` of `sync`, `repoint`, `new-row`
+  and `retitle` compared a store path with its separators as typed, so a path spelled with `/`,
+  which is what Git Bash hands Python for `/c/Users/...`, matched nothing, and a Tab-completed
+  folder's trailing `/` never matched either. Both now fold separators beside the exact test,
+  and a trailing separator may match a store path's end. A `--live` value made only of
+  separators is refused like a blank one; on Windows `--live \` used to certify a sole
+  candidate. In the window, a saved sync destination from before the move is now re-rooted
+  through the same package pairs the journal uses. It is the same store, moved whole by the
+  app, so the window plans into it without asking and saves the new path only after an Apply
+  into it succeeds; 0.16.4 set such a destination aside and asked. The window also builds its
+  view of the stores afresh at every read and before every engine call that writes or plans a
+  write, where it used to build it once when opened. A move made while the window was open had
+  left every route refusing until a restart, or, when the app copied its data instead of moving
+  it, left the window writing into the old copy. A press whose store layout changed since its
+  plan now stops and replans before its next write.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
