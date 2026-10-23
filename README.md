@@ -590,13 +590,14 @@ window.
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03; sync-undo drift refusal live 2026-08-04 | read-only + mutations |
-| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store. 0.16.2 and earlier find no store | read-only + mutations, `--apply` not yet verified on this build |
+| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store. 0.16.2 and earlier find no store | read-only + mutations, `--apply` never run on this build (the app updated to 3.x first) |
+| Windows 11 + Claude Desktop 3.6556.2 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: read-only paths and `converge --apply` verified 2026-10-23, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds - most recently Claude Desktop
-2.42304.2.0 (Microsoft Store MSIX install) for the read-only paths, and 2.42304.0.0 with Claude
-Code CLI 2.1.302 for the last `--apply` runs. On 2026-10-14 the
+3.6556.2.0 (Microsoft Store MSIX install) with Claude Code CLI 2.1.308, for both the read-only
+paths and the last `--apply` run. On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
 `doctor`, `alignment`, `recover` without `--apply`, and a `converge` dry run): the row format
 had only gained keys, and every row this tool had written under 1.x was still present, some
@@ -617,6 +618,11 @@ the move. 0.16.4 reads those paths under the moved store: `doctor` checks
 the rows where they now are, and `undo` and `recover` treat such an operation as they did
 before the move. A row in a store the tool cannot read at all is listed by `doctor` apart, not
 counted in its exit code, and `undo` refuses it.
+On 2026-10-23, under 3.6556.2.0, the data folder had not moved again, and rows written by the
+3.x builds had only gained two keys. A `converge --apply` on 0.16.5 ran with the app closed while the browser
+helper kept running, and the running-app guard excused the helper under the
+`trust-signed-helper` opt-in. After the app restarted, every row the apply had written was
+present and byte-identical to what it wrote, and `doctor` reported none vanished.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
