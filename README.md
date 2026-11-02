@@ -628,8 +628,9 @@ On 2026-11-01, under 4.4212.0.0, the data folder had not moved again. A `converg
 0.16.5 ran with the app closed and the browser helper running, and the guard excused the
 helper as it had under 3.x. After the app restarted, every row the apply had written was
 present and `doctor` reported none vanished. Within a few minutes the app had re-saved six of
-those rows, and each had only gained keys. Whether rows
-the 4.x app writes for itself have only gained keys was not checked.
+those rows, and each had only gained keys. By 2026-11-02 the 4.x app had created 36 rows for
+itself. None lacked a key that every older row carries, and four had gained one new key,
+`isStarred`.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
