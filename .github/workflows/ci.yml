@@ -14,6 +14,13 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
         python: ["3.9", "3.12"]
+        # ubuntu-latest is moving to Ubuntu 26.04, and setup-python has no 3.9
+        # build for it, so the 3.9 leg stays on 24.04 while 3.9 is the floor in
+        # pyproject.toml. Revisit when GitHub retires the 24.04 image.
+        exclude:
+          - {os: ubuntu-latest, python: "3.9"}
+        include:
+          - {os: ubuntu-24.04, python: "3.9"}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
