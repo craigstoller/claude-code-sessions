@@ -18,6 +18,21 @@ fully transparent, as a tool window (no taskbar button), off-screen, and
 update() is pumped - the layout is real and nothing is visible. Workers run
 inline (the check_gui_live_and_newer.py pattern). Touches nothing real;
 every title is the fake cast.
+
+Two runs, two processes (DPI awareness spec, Change 6 - awareness is
+one-way per process):
+
+    python tools/check_gui_layout.py           the plain run: unaware,
+                                               factor 1.0, the 100 % case
+    python tools/check_gui_layout.py --aware   system-DPI-aware: every
+                                               pixel pin at the window's
+                                               own factor
+
+Every size below is written in logical pixels and checked as P(n), the
+window's own px at its factor, so the plain run's numbers are the old
+ones exactly. Counts of lines (_sash_px(2), the height of 7) stay counts.
+The aware run ends "aware run verified at factor <f>"; where DPI
+behaviour is unsupported it says "aware run not applicable" and exits 0.
 """
 import os
 import shutil
@@ -45,6 +60,34 @@ def check(name, cond, extra=""):
     print("%s %s%s" % ("OK " if cond else "BAD", name,
                        ("  " + extra) if extra else ""))
     ok.append(bool(cond))
+
+
+# Before any Tk window exists: the aware run declares awareness through the
+# window's own function; the plain run refuses a process that is already
+# aware, which would read as a broken layout rather than as the
+# environment problem it is.
+AWARE = "--aware" in sys.argv[1:]
+if AWARE:
+    if not gp._dpi_supported():
+        print("aware run not applicable: %s" % (
+            "not Windows" if sys.platform != "win32"
+            else "Tk %s is not in the measured set %s"
+            % (tk.TkVersion, gp._DPI_TK_VERSIONS)))
+        sys.exit(0)
+    gp._declare_dpi_awareness()
+else:
+    _declared = gp._dpi_awareness()
+    if _declared in (1, 2):
+        print("plain run needs an unaware process; this one reports %d"
+              % _declared)
+        sys.exit(1)
+
+SC = {"scale": 1.0}       # the factor of the window open now
+
+
+def P(n):
+    """N logical pixels at the open window's factor."""
+    return gp._px(n, SC["scale"])
 
 
 # ------------------------------------------------------------- the fake cast
@@ -229,7 +272,10 @@ class Modals(object):
 gp.messagebox = Modals()
 
 WORK = {"area": (1536, 912)}     # the simulated display's work area
-gp._work_area = lambda root: WORK["area"]
+# The simulated work area is written logical and handed to the window in
+# the process's own pixels, as SPI_GETWORKAREA answers.
+gp._work_area = lambda root, scale=1.0: tuple(gp._px(v, scale)
+                                              for v in WORK["area"])
 
 
 def invisible_root():
@@ -248,6 +294,7 @@ def invisible_root():
 def open_app():
     tkroot = invisible_root()
     app = gp.SyncApp(tkroot)
+    SC["scale"] = app.scale
 
     def settle():
         for _ in range(30):
@@ -275,17 +322,76 @@ app, tkroot, settle = open_app()
 # fixed state.
 app.nb.select(app.sync_tab)
 settle()
-check("the window opens at 940x640",
-      (tkroot.winfo_width(), tkroot.winfo_height()) == (940, 640),
+check("the window opens at 940x640 logical",
+      (tkroot.winfo_width(), tkroot.winfo_height()) == (P(940), P(640)),
       "%dx%d" % (tkroot.winfo_width(), tkroot.winfo_height()))
-check("tab inner width 916", app.sync_tab.winfo_width() == 916,
+# The notebook's two 2-px side borders stay 4 px at any DPI (measured).
+check("tab inner width 916 logical",
+      app.sync_tab.winfo_width() == P(940) - 2 * P(10) - 4,
       str(app.sync_tab.winfo_width()))
-check("filter frame 896", app.only_entry.master.winfo_width() == 896,
+check("filter frame 896 logical",
+      app.only_entry.master.winfo_width() == P(940) - 4 * P(10) - 4,
       str(app.only_entry.master.winfo_width()))
 check("the identity banner offers two buttons", len(app._banner_widgets) == 2,
       str(len(app._banner_widgets)))
 check("the running-app notice is packed on Level",
       bool(app.level_notice.winfo_manager()))
+
+# ------------------------------- the factor and the awareness (DPI, F8)
+VERIFIED_FACTOR = app.scale
+if AWARE:
+    declared = gp._dpi_awareness()
+    check("the process is DPI-aware (awareness %s)" % declared,
+          declared in (1, 2))
+    os_dpi = gp._system_dpi() or tkroot.winfo_pixels("1i")
+    check("the window's factor is the process's DPI over 96 (%s = %s / 96)"
+          % (app.scale, os_dpi), app.scale == os_dpi / 96.0)
+    # The spec's precondition (Change 2), not the same chain read twice:
+    # the factor must agree with the DPI Tk realized the fonts at, or the
+    # constants and the text would scale apart.
+    tk_dpi = tkroot.winfo_pixels("1i")
+    check("the factor agrees with the DPI Tk realized the fonts at "
+          "(%s x 96 vs %s)" % (app.scale, tk_dpi),
+          abs(app.scale * 96 - tk_dpi) <= 1)
+    # The precondition for fonts scaling by themselves: every named font is
+    # point-sized (a pixel-sized one would stay small at any DPI).
+    import tkinter.font as tkfont
+    pixel_fonts = [n for n in tkfont.names(tkroot)
+                   if int(tkfont.Font(root=tkroot, name=n,
+                                      exists=True).cget("size")) < 0]
+    check("every named font is point-sized", not pixel_fonts,
+          ", ".join(pixel_fonts))
+else:
+    check("the plain run's factor is 1.0, whatever the display",
+          app.scale == 1.0, str(app.scale))
+
+
+def tab_label_inset(nb):
+    """(x, y) of the first tab label's first pixel, from the notebook's
+    top-left, by Notebook.identify over a window that holds only the first
+    tab - or None when no label pixel is found there."""
+    xs, ys = [], []
+    for y in range(P(40)):
+        for x in range(P(30)):
+            if nb.identify(x, y) == "label":
+                xs.append(x)
+                ys.append(y)
+    return (min(xs), min(ys)) if xs else None
+
+
+if gp.ttk.Style(tkroot).theme_use() == "vista":
+    app.nb.select(app.level_tab)         # vista draws the selected tab 2 px
+    settle()                             # larger; measure it selected
+    inset = tab_label_inset(app.nb)
+    if AWARE and app.scale > 1.0:
+        check("the tab label sits at least P(4) - 1 px inside its tab on both "
+              "axes, as at 100 %", inset is not None
+              and min(inset) >= P(gp.VISTA_TAB_INSET) - 1, str(inset))
+    elif not AWARE and gp._dpi_supported():
+        # Only where the constant applies: on an unsupported Tk this change
+        # does nothing, and its inset was never measured.
+        check("the vista tab label's own inset is still VISTA_TAB_INSET on "
+              "both axes", inset == (gp.VISTA_TAB_INSET,) * 2, str(inset))
 
 
 def rect(w):
@@ -379,7 +485,7 @@ def audit(app, tkroot, settle, size, names=None, identity=True):
           "at %s" % label, not wide, "; ".join(wide))
 
 
-audit(app, tkroot, settle, (940, 640))
+audit(app, tkroot, settle, (P(940), P(640)))
 app.nb.select(app.sync_tab)
 settle()
 filt = app.only_entry.master
@@ -407,7 +513,7 @@ check("  and 'only where mine is newer' is allocated its full request",
       app.newer_chk.winfo_width() == app.newer_chk.winfo_reqwidth(),
       "%d of %d" % (app.newer_chk.winfo_width(), app.newer_chk.winfo_reqwidth()))
 check("no label carries the 880 px wraplength constant",
-      not any(int(lbl.cget("wraplength")) == 880 for lbl, _c, _m in app._wrapped)
+      not any(int(lbl.cget("wraplength") or 0) == 880 for lbl, _c, _m in app._wrapped)
       and len(app._wrapped) >= 8, str(len(app._wrapped)))
 
 # The bars are bottom-pinned on every tab: packed first against the bottom
@@ -459,7 +565,7 @@ check("  the 130-character title wraps inside its row instead of overflowing",
 # ------------------------------------------------------------ the fit floor
 # The identity buttons are required at every size: the sash (Change 4) lets
 # the scoreboard yield to two lines so the banner keeps its room.
-audit(app, tkroot, settle, gp.FIT_FLOOR)
+audit(app, tkroot, settle, (P(gp.FIT_FLOOR[0]), P(gp.FIT_FLOOR[1])))
 app.nb.select(app.level_tab)
 settle()
 # With the two-button question up, the floor leaves the rows no viewport
@@ -483,7 +589,7 @@ check("  and the 130-character title still wraps inside its row",
       "%s" % ([(r.winfo_reqwidth(), r.winfo_width()) for r in long_row]))
 
 # ------------------------------------- 871x432: a 1366x768 panel at 150 %
-audit(app, tkroot, settle, (871, 432))
+audit(app, tkroot, settle, (P(871), P(432)))
 tkroot.destroy()
 
 # ---------------------------- 15b. a work area smaller than the fit floor
@@ -491,10 +597,11 @@ WORK["area"] = (683, 384)
 app, tkroot, settle = open_app()
 size = (tkroot.winfo_width(), tkroot.winfo_height())
 check("on a 683x384 work area the window opens at 643x336 - the area minus "
-      "chrome", size == (643, 336), "%dx%d" % size)
+      "chrome", size == (P(683) - P(40), P(384) - P(48)), "%dx%d" % size)
 mins = tkroot.minsize()
 check("  and the computed minsize is no larger than the work area",
-      mins[0] <= 683 and mins[1] <= 384 and tuple(mins) == (643, 336),
+      mins[0] <= P(683) and mins[1] <= P(384)
+      and tuple(mins) == (P(683) - P(40), P(384) - P(48)),
       str(mins))
 FIXED = {"filter_label", "only_entry", "filter_btn", "clear_btn",
          "refresh_label", "update_chk", "newer_chk", "orphan_chk",
@@ -528,9 +635,11 @@ tkroot.destroy()
 WORK["area"] = (911, 480)
 app, tkroot, settle = open_app()
 size = (tkroot.winfo_width(), tkroot.winfo_height())
-check("on a 911x480 work area the window opens at 871x432", size == (871, 432),
+check("on a 911x480 work area the window opens at 871x432",
+      size == (P(911) - P(40), P(480) - P(48)),
       "%dx%d" % size)
-check("  with the fit floor as its minsize", tuple(tkroot.minsize()) == (760, 420),
+check("  with the fit floor as its minsize",
+      tuple(tkroot.minsize()) == (P(760), P(420)),
       str(tkroot.minsize()))
 tkroot.destroy()
 
@@ -562,7 +671,7 @@ app._banner_widgets[0].invoke()
 settle()
 check("  the answered banner collapses to its in-force line",
       len(app._banner_widgets) == 1, str(len(app._banner_widgets)))
-dragged = app._sash_px(7) + 60
+dragged = app._sash_px(7) + P(60)
 pw.sashpos(0, dragged)
 pw.event_generate("<ButtonRelease-1>")
 settle()
@@ -575,7 +684,7 @@ check("  and the dragged position survives a replan", pw.sashpos(0) == dragged,
 rows = [w for w in app.hold_frame.winfo_children()
         if isinstance(w, gp.ttk.Frame)]
 row_h = max(r.winfo_reqheight() for r in rows) if rows else 0
-tkroot.geometry("940x%d" % gp.FIT_FLOOR[1])
+tkroot.geometry("%dx%d" % (P(940), P(gp.FIT_FLOOR[1])))
 settle()
 check("after a shrink to the floor the holds pane keeps at least one row's "
       "height - the sash yields first",
@@ -587,7 +696,7 @@ check("  and the scoreboard keeps at least two lines",
       pw.sashpos(0) >= app._sash_px(2), str(pw.sashpos(0)))
 # (Below the floor is unreachable here: the window's own minsize is the
 # floor. The small-work-area case above is where that state is pinned.)
-tkroot.geometry("940x640")
+tkroot.geometry("%dx%d" % (P(940), P(640)))
 settle()
 check("  a re-enlargement restores the dragged offset", pw.sashpos(0) == dragged,
       str(pw.sashpos(0)))
@@ -601,7 +710,7 @@ WORK["area"] = (1536, 912)
 app, tkroot, settle = open_app()
 app.nb.select(app.level_tab)
 settle()
-app.hold_canvas.configure(scrollregion=(0, 0, 800, 4000))
+app.hold_canvas.configure(scrollregion=(0, 0, P(800), P(4000)))
 app._page_holds(1)
 check("Next pages the holds canvas down",
       app.hold_canvas.yview()[0] > 0, str(app.hold_canvas.yview()))
@@ -702,4 +811,6 @@ shutil.rmtree(root_dir, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)
 print()
 print("ALL PASS" if all(ok) else "SOME CHECKS FAILED")
+if AWARE and all(ok):
+    print("aware run verified at factor %s" % VERIFIED_FACTOR)
 sys.exit(0 if all(ok) else 1)

@@ -530,6 +530,159 @@ def test_window_geometry_clamps_to_the_work_area():
     assert all(v >= 240 for v in gui._min_size((100, 100)))
 
 
+# ------------------------------------------------ DPI awareness (F8)
+#
+# docs/specs/2026-11-02-gui-dpi-awareness-design.md. The constants stay in
+# logical (96-dpi) pixels; the factor scales them where they enter Tk. The
+# work area is already in the process's own pixels and is never scaled.
+
+def test_window_geometry_scales_with_the_factor():
+    # The operator's 250 % display: today's stretched window, 940x640 x 2.5.
+    assert gui._initial_geometry((3840, 2280), 2.5) == (2350, 1600)
+    assert gui._min_size((3840, 2280), 2.5) == (1900, 1050)
+    # The 683x384 logical work area above, at 2.5 (1708x960 physical): both
+    # clamp to the area minus the scaled chrome, as the logical case does.
+    assert gui._initial_geometry((1708, 960), 2.5) == (1608, 840)
+    assert gui._min_size((1708, 960), 2.5) == (1608, 840)
+    # The same panel at 150 %: 1366x720 physical after the taskbar.
+    assert gui._initial_geometry((1366, 720), 1.5) == (1306, 648)
+    assert gui._min_size((1366, 720), 1.5) == (1140, 630)
+    # Above the floor plus chrome the result never exceeds the area; below
+    # it the _ABSOLUTE_MIN floor wins, as at 1.0.
+    for scale in (1.0, 1.25, 1.5, 2.0, 2.5):
+        cw, ch = gui._px(40, scale), gui._px(48, scale)
+        floor = gui._px(240, scale)
+        work = (floor + cw, floor + ch)
+        for size in (gui._initial_geometry(work, scale),
+                     gui._min_size(work, scale)):
+            assert size[0] <= work[0] and size[1] <= work[1]
+        assert all(v == floor for v in gui._min_size((100, 100), scale))
+
+
+def test_px_is_identity_at_one():
+    """At 1.0 every logical value comes back unchanged, so the 100 % layout
+    cannot move by a pixel."""
+    for n in (0, 1, 2, 3, 4, 6, 8, 10, 12, 24, 40, 48, 60, 96, 120, 240,
+              420, 560, 600, 620, 640, 680, 760, 940):
+        assert gui._px(n, 1.0) == n
+    # Half to even, as round() does: 7.5 -> 8, 2177.5 -> 2178.
+    assert gui._px(3, 2.5) == 8 and gui._px(871, 2.5) == 2178
+    assert gui._px(1, 2.5) == 2
+
+
+class _FakeUser32(object):
+    def __init__(self, system_dpi=None):
+        self.released = []
+        if system_dpi is not None:
+            self.GetDpiForSystem = lambda: system_dpi
+
+    def GetDC(self, _hwnd):
+        return 7
+
+    def ReleaseDC(self, hwnd, hdc):
+        self.released.append(hdc)
+        return 1
+
+
+class _FakeGdi32(object):
+    def __init__(self, caps):
+        self.caps = caps
+
+    def GetDeviceCaps(self, hdc, index):
+        assert hdc == 7 and index == 88          # LOGPIXELSX
+        return self.caps
+
+
+class _FakeWindll(object):
+    def __init__(self, system_dpi=None, caps=0):
+        self.user32 = _FakeUser32(system_dpi)
+        self.gdi32 = _FakeGdi32(caps)
+
+
+def test_system_dpi_reads_the_os_in_order():
+    # GetDpiForSystem first.
+    assert gui._system_dpi(_FakeWindll(system_dpi=240, caps=96)) == 240
+    # Absent (before Windows 10 1607), or zero: GetDeviceCaps, and the
+    # screen DC is released.
+    w = _FakeWindll(system_dpi=None, caps=144)
+    assert gui._system_dpi(w) == 144 and w.user32.released == [7]
+    w = _FakeWindll(system_dpi=0, caps=120)
+    assert gui._system_dpi(w) == 120 and w.user32.released == [7]
+    # Neither answers: 0, meaning no answer.
+    assert gui._system_dpi(_FakeWindll(system_dpi=0, caps=0)) == 0
+
+
+class _FakeRoot(object):
+    def __init__(self, inch):
+        self.inch = inch
+
+    def winfo_pixels(self, what):
+        assert what == "1i"
+        return self.inch
+
+
+def test_scale_factor_is_the_process_dpi_over_96(monkeypatch):
+    monkeypatch.setattr(gui, "_dpi_supported", lambda: True)
+    for dpi, factor in ((96, 1.0), (120, 1.25), (144, 1.5), (240, 2.5),
+                        (72, 0.75)):                 # no floor
+        monkeypatch.setattr(gui, "_system_dpi", lambda windll=None, d=dpi: d)
+        assert gui._scale_factor(_FakeRoot(96)) == factor
+    # Both OS reads silent: Tk's own reading, never a bare 1.0 in a process
+    # that may be aware.
+    monkeypatch.setattr(gui, "_system_dpi", lambda windll=None: 0)
+    assert gui._scale_factor(_FakeRoot(240)) == 2.5
+
+
+def test_scale_factor_unsupported_is_one_without_reading(monkeypatch):
+    monkeypatch.setattr(gui, "_dpi_supported", lambda: False)
+
+    def boom(windll=None):
+        raise AssertionError("read the OS on an unsupported setup")
+    monkeypatch.setattr(gui, "_system_dpi", boom)
+    assert gui._scale_factor(_FakeRoot(240)) == 1.0
+
+
+def test_dpi_supported_only_on_windows_with_a_measured_tk(monkeypatch):
+    import types
+    monkeypatch.setattr(gui.sys, "platform", "win32")
+    for version, ok in ((9.0, True), (8.6, False), (9.1, False)):
+        monkeypatch.setattr(gui, "tk", types.SimpleNamespace(TkVersion=version))
+        assert gui._dpi_supported() is ok
+    monkeypatch.setattr(gui, "tk", None)                 # no tkinter
+    assert gui._dpi_supported() is False
+    monkeypatch.setattr(gui, "tk", types.SimpleNamespace(TkVersion=9.0))
+    monkeypatch.setattr(gui.sys, "platform", "linux")
+    assert gui._dpi_supported() is False
+
+
+class _FakeShcore(object):
+    def __init__(self, calls, fail=False):
+        self.calls, self.fail = calls, fail
+
+    def SetProcessDpiAwareness(self, value):
+        self.calls.append(value)
+        if self.fail:
+            raise OSError("E_ACCESSDENIED")
+
+
+def test_declare_dpi_awareness_is_guarded(monkeypatch):
+    import ctypes
+    calls = []
+    monkeypatch.setattr(ctypes, "OleDLL", lambda name: _FakeShcore(calls),
+                        raising=False)
+    monkeypatch.setattr(gui, "_dpi_supported", lambda: False)
+    gui._declare_dpi_awareness()
+    assert calls == []                                  # unsupported: no call
+    monkeypatch.setattr(gui, "_dpi_supported", lambda: True)
+    gui._declare_dpi_awareness()
+    assert calls == [1]                                 # PROCESS_SYSTEM_DPI_AWARE
+    # Already set by a manifest or an earlier call: absorbed, never raised.
+    monkeypatch.setattr(ctypes, "OleDLL",
+                        lambda name: _FakeShcore(calls, fail=True), raising=False)
+    gui._declare_dpi_awareness()
+    assert calls == [1, 1]
+
+
 # ------------------------------------------- the One-session tab's gate
 
 def _sync_row(name, sid, is_update=False):

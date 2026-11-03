@@ -66,6 +66,13 @@ except ImportError as _exc:            # tkinter is stdlib but packaged separate
 
 PAD = 10
 
+# Every pixel constant in this file is a LOGICAL pixel - the 96-dpi unit
+# the specs and the layout harness speak - and is scaled where it enters
+# Tk, by the window's one factor (_px, SyncApp.px). Fonts are in points and
+# the theme's parts come back at the process's DPI, so both follow on their
+# own; the constants are what would otherwise stay small. See
+# docs/specs/2026-11-02-gui-dpi-awareness-design.md.
+#
 # The window's size comes from the display, not from constants alone
 # (GUI polish, Change 1): the initial size is min(DEFAULT_SIZE, work area
 # minus window chrome) and the minsize is min(FIT_FLOOR, the same). The
@@ -84,12 +91,115 @@ WINDOW_CHROME = (40, 48)
 NON_WINDOWS_MARGIN = 96
 _ABSOLUTE_MIN = 240
 
+# px, physical: the vista tab label's own inset on both axes, measured
+# unscaled at 96 and 240 dpi on Tk 9.0.4, 2026-11-02 (re-measured by the
+# layout harness). The one physical constant here; see the tab style in
+# SyncApp.__init__.
+VISTA_TAB_INSET = 4
 
-def _work_area(root):
-    """(width, height) of the display's work area in logical pixels - on
-    Windows from SystemParametersInfo(SPI_GETWORKAREA), which excludes the
-    taskbar (winfo_screenwidth/height do not); elsewhere the screen minus a
-    fixed margin. Stubbed by the layout harness to simulate a display."""
+# The Tk versions the DPI behaviour was measured on (Tk 9.0: point-sized
+# named fonts and theme paddings). Anything else - Tk 8.6 under Python
+# 3.9-3.13 included - behaves exactly as before: no awareness call, factor
+# 1.0. A version joins only after the probes and both layout-harness runs
+# are repeated on it (spec, decision D3).
+_DPI_TK_VERSIONS = (9.0,)
+
+
+def _px(n, scale):
+    """N logical pixels at SCALE, in the process's own pixels."""
+    return int(round(n * scale))
+
+
+def _dpi_supported():
+    """True on Windows with a measured Tk - the one gate for every DPI
+    behaviour (the awareness call, the factor, the tab style)."""
+    try:
+        return (sys.platform == "win32" and tk is not None
+                and float(tk.TkVersion) in _DPI_TK_VERSIONS)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _declare_dpi_awareness():
+    """Declare system DPI awareness, before the first Tk window exists -
+    the stdlib's own pattern (idlelib.util.fix_win_hidpi). Never raises:
+    an already-declared awareness (E_ACCESSDENIED) is absorbed, and the
+    factor then reads whatever took effect."""
+    if not _dpi_supported():
+        return
+    try:
+        import ctypes
+        ctypes.OleDLL("shcore").SetProcessDpiAwareness(1)  # SYSTEM_DPI_AWARE
+    except (ImportError, AttributeError, OSError):
+        pass
+
+
+def _dpi_awareness():
+    """The process's effective DPI awareness - 0 unaware, 1 system, 2 per
+    monitor - or None where it cannot be read (off Windows, say)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        value = ctypes.c_int(-1)
+        ctypes.OleDLL("shcore").GetProcessDpiAwareness(None,
+                                                       ctypes.byref(value))
+        return value.value if value.value in (0, 1, 2) else None
+    except (ImportError, AttributeError, OSError):
+        return None
+
+
+def _system_dpi(windll=None):
+    """The DPI Windows reports to this process, or 0 for no answer:
+    GetDpiForSystem (Windows 10 1607 and later), else GetDeviceCaps on the
+    screen DC. An unaware process is told 96 on any display."""
+    try:
+        if windll is None:
+            import ctypes
+            windll = ctypes.windll
+        user32 = windll.user32
+        try:
+            dpi = int(user32.GetDpiForSystem())
+        except AttributeError:
+            dpi = 0
+        if dpi > 0:
+            return dpi
+        hdc = user32.GetDC(None)
+        if hdc:
+            try:
+                dpi = int(windll.gdi32.GetDeviceCaps(hdc, 88))  # LOGPIXELSX
+            finally:
+                user32.ReleaseDC(None, hdc)
+        return dpi if dpi > 0 else 0
+    except (ImportError, AttributeError, OSError):
+        return 0
+
+
+def _scale_factor(root):
+    """The window's one factor: the process's own DPI over 96. 1.0 where
+    DPI behaviour is unsupported. Every source is the process's view, so
+    the factor is 1.0 exactly when Windows stretches the window; the last
+    source is Tk's own reading, so an aware process never gets a factor
+    that disagrees with its fonts. No floor, for the same reason."""
+    if not _dpi_supported():
+        return 1.0
+    dpi = _system_dpi()
+    if dpi <= 0:
+        try:
+            dpi = int(root.winfo_pixels("1i"))
+        except Exception:
+            dpi = 0
+    return dpi / 96.0 if dpi > 0 else 1.0
+
+
+def _work_area(root, scale=1.0):
+    """(width, height) of the display's work area in the process's own
+    pixels - physical when DPI-aware, logical when not. On Windows from
+    SystemParametersInfo(SPI_GETWORKAREA), which excludes the taskbar
+    (winfo_screenwidth/height do not) and already answers in those
+    pixels; elsewhere the screen minus a fixed margin, scaled. Never
+    scaled again by its callers. Stubbed by the layout harness to simulate
+    a display."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -106,24 +216,29 @@ def _work_area(root):
                     return (w, h)
         except Exception:
             pass
-    return (root.winfo_screenwidth() - NON_WINDOWS_MARGIN,
-            root.winfo_screenheight() - NON_WINDOWS_MARGIN)
+    margin = _px(NON_WINDOWS_MARGIN, scale)
+    return (root.winfo_screenwidth() - margin,
+            root.winfo_screenheight() - margin)
 
 
-def _fit(size, work):
-    return tuple(max(_ABSOLUTE_MIN, min(s, w - c))
+def _fit(size, work, scale=1.0):
+    """SIZE (logical) at SCALE, clamped to WORK (the process's pixels)
+    minus the scaled chrome, and never below the scaled _ABSOLUTE_MIN -
+    the floor wins over a work area too small for it, as at 1.0."""
+    return tuple(max(_px(_ABSOLUTE_MIN, scale),
+                     min(_px(s, scale), w - _px(c, scale)))
                  for s, w, c in zip(size, work, WINDOW_CHROME))
 
 
-def _initial_geometry(work):
+def _initial_geometry(work, scale=1.0):
     """The opening size: the default, clamped to the work area minus chrome."""
-    return _fit(DEFAULT_SIZE, work)
+    return _fit(DEFAULT_SIZE, work, scale)
 
 
-def _min_size(work):
+def _min_size(work, scale=1.0):
     """The minsize: the fit floor, clamped the same way - never larger than
     the work area can hold."""
-    return _fit(FIT_FLOOR, work)
+    return _fit(FIT_FLOOR, work, scale)
 
 # Remembering the destination is the difference between answering the
 # "which store?" question once and answering it on every single run - this
@@ -1668,10 +1783,11 @@ class _Dialog(object):
         win.transient(app.root)
         self.win = win
         ttk.Label(win, text=headline, font=("Segoe UI", 11, "bold"),
-                  justify="left", wraplength=wrap,
-                  padding=(PAD, PAD, PAD, 4)).pack(anchor="w")
+                  justify="left", wraplength=app.px(wrap),
+                  padding=(app.px(PAD), app.px(PAD), app.px(PAD),
+                           app.px(4))).pack(anchor="w")
         self.bar = ttk.Frame(win)
-        self.bar.pack(side="bottom", fill="x", padx=PAD, pady=PAD)
+        self.bar.pack(side="bottom", fill="x", padx=app.px(PAD), pady=app.px(PAD))
         self.body = ttk.Frame(win)
         self.body.pack(fill="both", expand=True)
         self.cancel_btn = ttk.Button(self.bar, text="Cancel",
@@ -1723,6 +1839,11 @@ class _Dialog(object):
 class SyncApp:
     def __init__(self, root):
         self.root = root
+        # The window's one DPI factor, read once: the process's own DPI
+        # over 96 (1.0 unaware, or where unsupported). Every logical pixel
+        # constant below goes through px(); fonts and theme parts follow
+        # the DPI on their own.
+        self.scale = _scale_factor(root)
         # The Env the window's current display was rendered from: built here
         # at open, then replaced only by done-callbacks, with the Env their
         # worker last used. Every read and press builds its own (Amendment
@@ -1777,16 +1898,25 @@ class SyncApp:
         self._close_after_worker = False
         root.title("Claude sessions")
         # Sized for the display, not by constants alone: see _work_area.
-        work = _work_area(root)
-        root.geometry("{0}x{1}".format(*_initial_geometry(work)))
-        root.minsize(*_min_size(work))
+        work = _work_area(root, self.scale)
+        root.geometry("{0}x{1}".format(
+            *_initial_geometry(work, self.scale)))
+        root.minsize(*_min_size(work, self.scale))
+        # The vista tab label keeps its own 4-px inset at any DPI, so above
+        # 1.0 the labels would sit flush against their tab edges; add the
+        # difference so the tab strip looks as it does at 100 %.
+        if self.scale > 1.0:
+            style = ttk.Style(root)
+            if style.theme_use() == "vista":
+                extra = self.px(VISTA_TAB_INSET) - VISTA_TAB_INSET
+                style.configure("TNotebook.Tab", padding=(extra, extra))
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._set_icon()
         # Every label that wraps to its container's width, as (label,
         # container, margin) - the layout harness walks this list.
         self._wrapped = []
 
-        outer = ttk.Frame(root, padding=PAD)
+        outer = ttk.Frame(root, padding=self.px(PAD))
         outer.pack(fill="both", expand=True)
         # One window-level bar outside the notebook: Close, and the SHARED
         # Undo button - there is one journal, so there is one "last
@@ -1796,7 +1926,7 @@ class SyncApp:
         # bar listed after the expanding notebook is what a short window
         # drops (GUI polish, Change 1 - the layout harness caught it).
         winbar = ttk.Frame(outer)
-        winbar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        winbar.pack(side="bottom", fill="x", pady=(self.px(PAD), 0))
         self.winbar = winbar
         # Undo at the left, the Chrome-helper setting in the centre, Close
         # at the right (GUI polish, Change 5): the button that ends the
@@ -1824,9 +1954,9 @@ class SyncApp:
         self._open_dialog = None
         self.nb = ttk.Notebook(outer)
         self.nb.pack(fill="both", expand=True)
-        self.level_tab = ttk.Frame(self.nb, padding=PAD)
-        self.sync_tab = ttk.Frame(self.nb, padding=PAD)
-        self.health_tab = ttk.Frame(self.nb, padding=PAD)
+        self.level_tab = ttk.Frame(self.nb, padding=self.px(PAD))
+        self.sync_tab = ttk.Frame(self.nb, padding=self.px(PAD))
+        self.health_tab = ttk.Frame(self.nb, padding=self.px(PAD))
         # Level | Health | One session: the exception goes last and the
         # diagnostic sits next to the home, so the gate line's "see Health"
         # points one tab over (GUI polish, Change 3). Level stays selected.
@@ -1844,11 +1974,11 @@ class SyncApp:
         # the bar sixth in line behind a fixed-height scoreboard (GUI
         # polish, Change 1).
         lbar = ttk.Frame(lt)
-        lbar.pack(side="bottom", fill="x", pady=(6, 0))
+        lbar.pack(side="bottom", fill="x", pady=(self.px(6), 0))
         self.level_bar = lbar
         self.level_role = ttk.Label(lt, text=ROLE_LEVEL, foreground="#555",
                                     justify="left")
-        self.level_role.pack(anchor="w", pady=(0, 4))
+        self.level_role.pack(anchor="w", pady=(0, self.px(4)))
         self._wrap_to(self.level_role, lt)
         self.level_status = tk.StringVar(value="Measuring...")
         lb_status = ttk.Label(lt, textvariable=self.level_status,
@@ -1859,7 +1989,7 @@ class SyncApp:
         self.level_detail = tk.StringVar(value="")
         lb_detail = ttk.Label(lt, textvariable=self.level_detail,
                               justify="left", foreground="#555")
-        lb_detail.pack(anchor="w", pady=(4, 2))
+        lb_detail.pack(anchor="w", pady=(self.px(4), self.px(2)))
         self._wrap_to(lb_detail, lt)
         # The passive environment notice - weather, not a gate: the guard
         # stays in the engine at mutation time; this line exists so nobody
@@ -1883,7 +2013,7 @@ class SyncApp:
         # available height that the box itself feeds back into the pack
         # negotiation can oscillate on resize; a sash has no such loop.
         pane = ttk.PanedWindow(lt, orient="vertical")
-        pane.pack(fill="both", expand=True, pady=(4, 0))
+        pane.pack(fill="both", expand=True, pady=(self.px(4), 0))
         self.level_pane = pane
         self._sash_user = None           # the user's dragged offset, if any
         self._sash_auto = 0              # the content-derived target
@@ -1899,7 +2029,7 @@ class SyncApp:
         self.level_body = body
         self.level_text = tk.Text(body, wrap="none", height=8,
                                   font=("Consolas", 9), state="disabled",
-                                  borderwidth=1, relief="solid")
+                                  borderwidth=self.px(1), relief="solid")
         lsb = ttk.Scrollbar(body, orient="vertical",
                             command=self.level_text.yview)
         self.level_text.configure(yscrollcommand=lsb.set)
@@ -1916,7 +2046,7 @@ class SyncApp:
         # The identity banner sits between the plan summary and the holds -
         # the pane's stated top-to-bottom order.
         self.level_banner = ttk.Frame(bottom)
-        self.level_banner.pack(fill="x", pady=(4, 0))
+        self.level_banner.pack(fill="x", pady=(self.px(4), 0))
         # The holds heading is a FIXED header above the canvas, outside the
         # scrolled frame, so it never scrolls away with the first rows; it
         # still follows the ticks live through holds_heading.
@@ -1933,7 +2063,7 @@ class SyncApp:
         # takefocus: the paging keys need a focus target, and clicks land
         # in entries - the rows carry the same bindings (Change 6).
         self.hold_canvas = tk.Canvas(holds_wrap, highlightthickness=0,
-                                     takefocus=1, yscrollincrement=24)
+                                     takefocus=1, yscrollincrement=self.px(24))
         hsb = ttk.Scrollbar(holds_wrap, orient="vertical",
                             command=self.hold_canvas.yview)
         self.hold_canvas.configure(yscrollcommand=hsb.set)
@@ -1959,7 +2089,7 @@ class SyncApp:
         self.level_apply_btn.pack(side="right")
         self.level_refresh_btn = ttk.Button(lbar, text="Refresh",
                                             command=self.refresh_level)
-        self.level_refresh_btn.pack(side="right", padx=(0, 6))
+        self.level_refresh_btn.pack(side="right", padx=(0, self.px(6)))
         # The footer says when the snapshot was taken; converge's own
         # apply-time re-checks are the guard against drift between the two
         # reads, not this label.
@@ -1973,7 +2103,7 @@ class SyncApp:
         # squeezes the plan text (which scrolls) and never the buttons - the
         # a32798b rule Level already followed (GUI polish, Change 1).
         bar = ttk.Frame(st)
-        bar.pack(side="bottom", fill="x", pady=(6, 0))
+        bar.pack(side="bottom", fill="x", pady=(self.px(6), 0))
         self.sync_bar = bar
         # The role line replaces the 0.15.1 guidance line: what this tab is
         # FOR, said before the plan and above the status, so the invitation
@@ -2001,7 +2131,7 @@ class SyncApp:
         self.sync_head = head
         self.sync_role = ttk.Label(head, text=ROLE_SYNC, foreground="#555",
                                    justify="left")
-        self.sync_role.grid(row=0, column=0, sticky="w", pady=(0, 2))
+        self.sync_role.grid(row=0, column=0, sticky="w", pady=(0, self.px(2)))
         self._wrap_to(self.sync_role, head)
         self.status = tk.StringVar(value="Planning...")
         sb_status = ttk.Label(head, textvariable=self.status,
@@ -2013,7 +2143,7 @@ class SyncApp:
         self.detail = tk.StringVar(value="")
         sb_detail = ttk.Label(head, textvariable=self.detail, justify="left",
                               foreground="#555")
-        sb_detail.grid(row=3, column=0, sticky="w", pady=(2, 4))
+        sb_detail.grid(row=3, column=0, sticky="w", pady=(self.px(2), self.px(4)))
         head.rowconfigure(3, weight=1)
         self._wrap_to(sb_detail, head)
         # Row 4 is the running-app notice, weighted like the detail line -
@@ -2044,35 +2174,35 @@ class SyncApp:
         # said yes to - was not drawn at all until the window was about
         # 1150 px wide.
         filt = ttk.Frame(head)
-        filt.grid(row=5, column=0, sticky="we", pady=(0, 2))
+        filt.grid(row=5, column=0, sticky="we", pady=(0, self.px(2)))
         self.filter_label = ttk.Label(filt,
                                       text="Only sessions whose title contains:")
         self.filter_label.pack(side="left")
         self.only_var = tk.StringVar(value="")
         self.only_entry = ttk.Entry(filt, textvariable=self.only_var, width=34)
-        self.only_entry.pack(side="left", padx=6)
+        self.only_entry.pack(side="left", padx=self.px(6))
         self.only_entry.bind("<Return>", lambda _e: self.refresh())
         self.filter_btn = ttk.Button(filt, text="Apply filter", command=self.refresh)
         self.filter_btn.pack(side="left")
         self.clear_btn = ttk.Button(filt, text="Clear", command=self._clear_filter)
-        self.clear_btn.pack(side="left", padx=(4, 0))
+        self.clear_btn.pack(side="left", padx=(self.px(4), 0))
         # The group label says that everything on these lines is the
         # overwrite path - the opt-in for this run, never remembered. The
         # one piece of advice the 0.15.1 guidance line carried sits beside
         # it, next to the boxes it describes.
         group = ttk.Frame(head)
-        group.grid(row=6, column=0, sticky="we", pady=(0, 6))
+        group.grid(row=6, column=0, sticky="we", pady=(0, self.px(6)))
         self.refresh_group = group
         self.refresh_label = ttk.Label(group,
                                        text="Refresh (opt-in for this run):")
-        self.refresh_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.refresh_label.grid(row=0, column=0, sticky="w", padx=(0, self.px(8)))
         self.refresh_hint = ttk.Label(
             group, foreground="#555", justify="left",
             text="for one session, keep \"only where mine is newer\" ticked "
                  "- it can only hold rows back, never send more")
         self.refresh_hint.grid(row=0, column=1, columnspan=3, sticky="w")
         self._wrap_to(self.refresh_hint, group,
-                      margin=self.refresh_label.winfo_reqwidth() + 8)
+                      margin=self.refresh_label.winfo_reqwidth() + self.px(8))
         # RULING 8. Unticked every time the window opens: this is the only
         # control here that overwrites rather than adds, so it is a decision
         # for one run, never a remembered preference.
@@ -2080,7 +2210,7 @@ class SyncApp:
         self.update_chk = ttk.Checkbutton(
             group, text="Also refresh rows already there", variable=self.update_var,
             command=self._on_update_toggle)
-        self.update_chk.grid(row=1, column=0, sticky="w", padx=(0, 12))
+        self.update_chk.grid(row=1, column=0, sticky="w", padx=(0, self.px(12)))
         # Ticked BY DEFAULT, and the one default in this window that is not
         # "do nothing". Refreshing everything is almost never what someone
         # means: each account's rows are a snapshot of when THAT account last
@@ -2093,7 +2223,7 @@ class SyncApp:
         self.newer_chk = ttk.Checkbutton(
             group, text="only where mine is newer", variable=self.newer_var,
             command=self.refresh, state="disabled")
-        self.newer_chk.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        self.newer_chk.grid(row=1, column=1, sticky="w", padx=(0, self.px(12)))
         # Off by default and never remembered. A row is a POINTER to a
         # conversation, and two accounts can point at different ones, so a
         # refresh can leave the displaced conversation reachable from nowhere.
@@ -2136,7 +2266,8 @@ class SyncApp:
         body = ttk.Frame(st)
         body.pack(fill="both", expand=True)
         self.text = tk.Text(body, wrap="none", height=8, font=("Consolas", 9),
-                            state="disabled", borderwidth=1, relief="solid")
+                            state="disabled", borderwidth=self.px(1),
+                            relief="solid")
         sb = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
         self.text.pack(side="left", fill="both", expand=True)
@@ -2146,22 +2277,22 @@ class SyncApp:
                                     state="disabled")
         self.apply_btn.pack(side="right")
         self.refresh_btn = ttk.Button(bar, text="Refresh", command=self.refresh)
-        self.refresh_btn.pack(side="right", padx=(0, 6))
-        self.consent_chk.pack(side="right", padx=(0, 12))
+        self.refresh_btn.pack(side="right", padx=(0, self.px(6)))
+        self.consent_chk.pack(side="right", padx=(0, self.px(12)))
         self.forget_btn = ttk.Button(bar, text="Change destination",
                                      command=self.forget_destination)
         if self.dest_choice:
-            self.forget_btn.pack(side="left", padx=(6, 0))
+            self.forget_btn.pack(side="left", padx=(self.px(6), 0))
 
         # ------------------------------------------------ Tab 2: Health
         ht = self.health_tab
         # Bottom-pinned first, like the other two bars.
         hbar = ttk.Frame(ht)
-        hbar.pack(side="bottom", fill="x", pady=(PAD, 0))
+        hbar.pack(side="bottom", fill="x", pady=(self.px(PAD), 0))
         self.health_bar = hbar
         self.health_role = ttk.Label(ht, text=ROLE_HEALTH, foreground="#555",
                                      justify="left")
-        self.health_role.pack(anchor="w", pady=(0, 4))
+        self.health_role.pack(anchor="w", pady=(0, self.px(4)))
         self._wrap_to(self.health_role, ht)
         # The doctor runs on this tab's first selection (GUI polish,
         # Change 6) - a read - so the blank "Press Refresh" pane, the
@@ -2174,10 +2305,10 @@ class SyncApp:
         self.health_status_label = hb_status
         self._wrap_to(hb_status, ht)
         hbody = ttk.Frame(ht)
-        hbody.pack(fill="both", expand=True, pady=(6, 0))
+        hbody.pack(fill="both", expand=True, pady=(self.px(6), 0))
         self.health_text = tk.Text(hbody, wrap="none", height=8,
                                    font=("Consolas", 9), state="disabled",
-                                   borderwidth=1, relief="solid")
+                                   borderwidth=self.px(1), relief="solid")
         hsb2 = ttk.Scrollbar(hbody, orient="vertical",
                              command=self.health_text.yview)
         self.health_text.configure(yscrollcommand=hsb2.set)
@@ -2293,6 +2424,10 @@ class SyncApp:
             self._first_visit(key)
 
     # ---------------------------------------------------------------- helpers
+    def px(self, n):
+        """N logical pixels in this window's own pixels."""
+        return _px(n, self.scale)
+
     @staticmethod
     def _set_text(widget, lines, append=False):
         """The one enable/edit/disable dance for every read-only Text pane -
@@ -2326,7 +2461,8 @@ class SyncApp:
         def fit(event):
             if event.width > 1:
                 try:
-                    label.configure(wraplength=max(120, event.width - margin))
+                    label.configure(
+                        wraplength=max(self.px(120), event.width - margin))
                 except tk.TclError:
                     pass                 # the label was rebuilt away
         container.bind("<Configure>", fit, add="+")
@@ -2366,11 +2502,11 @@ class SyncApp:
         what the holds pane must keep on a shrink."""
         rows = [w for w in self.hold_frame.winfo_children()
                 if isinstance(w, ttk.Frame)]
-        row = max((r.winfo_reqheight() for r in rows), default=40)
+        row = max((r.winfo_reqheight() for r in rows), default=self.px(40))
         fixed = (self.level_banner.winfo_reqheight()
                  + (self.holds_head.winfo_reqheight()
                     if self.holds_head.winfo_manager() else 0))
-        return row + fixed + 8
+        return row + fixed + self.px(8)
 
     def _clamp_sash(self):
         """Place the sash: the user's dragged offset when there is one,
@@ -2388,7 +2524,7 @@ class SyncApp:
         target = (self._sash_user if self._sash_user is not None
                   else self._sash_auto)
         lo = self._sash_min_px()
-        hi = max(lo, total - self._holds_min_px() - 8)
+        hi = max(lo, total - self._holds_min_px() - self.px(8))
         pos = max(lo, min(target, hi))
         try:
             if pane.sashpos(0) != pos:
@@ -2642,14 +2778,14 @@ class SyncApp:
         del registry[:]
         if self.live_choice:
             row = ttk.Frame(frame)
-            row.pack(fill="x", pady=(0, 4))
+            row.pack(fill="x", pady=(0, self.px(4)))
             lbl = ttk.Label(row, foreground="#a00000", justify="left",
                             text=IN_FORCE_LINE.format(self._assertion_text()))
             lbl.pack(side="left")
             b = ttk.Button(row, text="Change signed-in account",
                            command=lambda: self._change_live(replan))
-            b.pack(side="left", padx=(6, 0))
-            self._wrap_to(lbl, row, margin=b.winfo_reqwidth() + 12)
+            b.pack(side="left", padx=(self.px(6), 0))
+            self._wrap_to(lbl, row, margin=b.winfo_reqwidth() + self.px(12))
             registry.append(b)
             return
         if not pair:
@@ -2659,7 +2795,7 @@ class SyncApp:
         box.pack(fill="x")
         lbl = ttk.Label(box, foreground="#a00000", justify="left",
                         text=IDENTITY_QUESTION.format(oauth[:8], config[:8]))
-        lbl.pack(anchor="w", pady=(0, 2))
+        lbl.pack(anchor="w", pady=(0, self.px(2)))
         self._wrap_to(lbl, box)
         for a, _o, p, text in self._identity_choices(pair):
             def pick(path=p, acct=a):
@@ -2672,7 +2808,7 @@ class SyncApp:
                     "layout": _layout_key(self.env)})
                 replan()
             b = ttk.Button(box, command=pick, text=text)
-            b.pack(fill="x", pady=2)
+            b.pack(fill="x", pady=self.px(2))
             registry.append(b)
 
     def _render_sync_banner(self, ask=False):
@@ -2695,8 +2831,9 @@ class SyncApp:
             return None
         dlg = _Dialog(self, "Which account is signed in?",
                       "Which account is the desktop app signed into?")
-        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
-                  wraplength=600,
+        ttk.Label(dlg.body, justify="left",
+                  padding=(self.px(PAD), 0, self.px(PAD), self.px(4)),
+                  wraplength=self.px(600),
                   text=IDENTITY_QUESTION.format(pair[0][:8], pair[1][:8])
                   ).pack(anchor="w")
         for a, _o, p, text in choices:
@@ -2707,9 +2844,9 @@ class SyncApp:
                     "layout": _layout_key(self.env)})
                 dlg.finish(path)
             ttk.Button(dlg.body, text=text, command=pick).pack(
-                fill="x", padx=PAD, pady=3)
-        ttk.Label(dlg.body, padding=(PAD, 4), foreground="#555",
-                  wraplength=560, justify="left",
+                fill="x", padx=self.px(PAD), pady=self.px(3))
+        ttk.Label(dlg.body, padding=(self.px(PAD), self.px(4)), foreground="#555",
+                  wraplength=self.px(560), justify="left",
                   text=IDENTITY_CANCEL).pack(anchor="w")
         return dlg.run()
 
@@ -3132,7 +3269,7 @@ class SyncApp:
                 # Bottom-pinned right after the bar in the pack list, so it
                 # sits directly above the buttons whatever the height.
                 self.sync_warning.pack(side="bottom", anchor="w", fill="x",
-                                       pady=(6, 0), after=self.sync_bar)
+                                       pady=(self.px(6), 0), after=self.sync_bar)
         elif self.sync_warning.winfo_manager():
             self.sync_warning.pack_forget()
 
@@ -3201,8 +3338,9 @@ class SyncApp:
                       ONE_OTHER_STORE if single else
                       "More than one other account store on this machine.")
         if reason:
-            ttk.Label(dlg.body, padding=(PAD, 0, PAD, 6), justify="left",
-                      wraplength=620, text=reason).pack(anchor="w")
+            ttk.Label(dlg.body, justify="left",
+                      padding=(self.px(PAD), 0, self.px(PAD), self.px(6)),
+                      wraplength=self.px(620), text=reason).pack(anchor="w")
         text = ("Pick it to make it the destination; nothing is planned into "
                 "it until you do." if single else
                 "Pick the one whose sidebar should get these sessions.")
@@ -3216,8 +3354,9 @@ class SyncApp:
                      "apart. The reliable way:\nsend one message in the new "
                      "account, close the app, then press Refresh - the store\n"
                      "that gained a row is the right one.")
-        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
-                  wraplength=620, text=text).pack(anchor="w")
+        ttk.Label(dlg.body, justify="left",
+                  padding=(self.px(PAD), 0, self.px(PAD), self.px(4)),
+                  wraplength=self.px(620), text=text).pack(anchor="w")
         paths = [_candidate_path(line) for _t, line, _n in cands]
         marked = _mark_index(paths, mark)
         for i, (pair, line, note) in enumerate(cands):
@@ -3236,7 +3375,7 @@ class SyncApp:
                 self._show_forget()
                 dlg.finish(p)
             ttk.Button(dlg.body, text=label, command=pick).pack(
-                fill="x", padx=PAD, pady=2)
+                fill="x", padx=self.px(PAD), pady=self.px(2))
         picked = dlg.run()
         if picked:
             self.refresh()
@@ -3273,7 +3412,7 @@ class SyncApp:
         """'Change destination' shows whenever a destination is saved - after
         a first pick in this window too, not only when one was saved at open."""
         if self.dest_choice and not self.forget_btn.winfo_manager():
-            self.forget_btn.pack(side="left", padx=(6, 0))
+            self.forget_btn.pack(side="left", padx=(self.px(6), 0))
 
     def _account_label(self, uuid):
         """email (id) when the email can be recovered, else just the id."""
@@ -3557,7 +3696,7 @@ class SyncApp:
         if self.undo_target:
             self.undo_btn.configure(text=self.undo_target["label"])
             if not self.undo_btn.winfo_manager():
-                self.undo_btn.pack(side="left", padx=(0, 6),
+                self.undo_btn.pack(side="left", padx=(0, self.px(6)),
                                    before=self.trust_chk)
         else:
             self.undo_btn.pack_forget()
@@ -3855,11 +3994,11 @@ class SyncApp:
         measurement (GUI polish, Change 6) - weather, not a gate."""
         if running:
             if not self.level_notice.winfo_manager():
-                self.level_notice.pack(anchor="w", pady=(0, 2),
+                self.level_notice.pack(anchor="w", pady=(0, self.px(2)),
                                        before=self.level_pane)
             if not self.sync_notice.winfo_manager():
                 self.sync_notice.grid(row=4, column=0, sticky="w",
-                                      pady=(0, 4))
+                                      pady=(0, self.px(4)))
         else:
             if self.level_notice.winfo_manager():
                 self.level_notice.pack_forget()
@@ -3895,11 +4034,12 @@ class SyncApp:
         # above the canvas, so it never scrolls away with the first rows.
         self.holds_heading.set(_holds_heading(self.hold_models))
         if not self.holds_head.winfo_manager():
-            self.holds_head.pack(anchor="w", fill="x", pady=(2, 4),
+            self.holds_head.pack(anchor="w", fill="x",
+                                 pady=(self.px(2), self.px(4)),
                                  before=self.holds_wrap)
         for m in self.hold_models:
             row = ttk.Frame(self.hold_frame)
-            row.pack(fill="x", pady=(0, 6), anchor="w")
+            row.pack(fill="x", pady=(0, self.px(6)), anchor="w")
             if m["editable"]:
                 m["_tick_var"] = tk.BooleanVar(value=bool(m["ticked"]))
                 m["_entry_var"] = tk.StringVar(value=m["entry"])
@@ -3907,11 +4047,11 @@ class SyncApp:
                     "write", lambda *_a: self._update_holds_heading())
                 chk = ttk.Checkbutton(row, text="Rename",
                                       variable=m["_tick_var"])
-                chk.grid(row=0, column=0, sticky="nw", padx=(0, 6))
+                chk.grid(row=0, column=0, sticky="nw", padx=(0, self.px(6)))
                 # Column 1 starts after the checkbox; both labels wrap to
                 # the row's width minus that, so a 130-character title
                 # wraps instead of overflowing the row (Change 1).
-                col = chk.winfo_reqwidth() + 6
+                col = chk.winfo_reqwidth() + self.px(6)
                 title = ttk.Label(row, text=m["title"], justify="left",
                                   font=("Segoe UI", 9, "bold"))
                 title.grid(row=0, column=1, sticky="w")
@@ -3920,7 +4060,7 @@ class SyncApp:
                 # character width is a minimum, not the row's width.
                 entry = ttk.Entry(row, textvariable=m["_entry_var"],
                                   width=40)
-                entry.grid(row=1, column=1, sticky="we", pady=(2, 0))
+                entry.grid(row=1, column=1, sticky="we", pady=(self.px(2), 0))
                 evidence = ttk.Label(row, text=m["evidence"],
                                      foreground="#555", justify="left")
                 evidence.grid(row=2, column=1, sticky="w")
@@ -4160,13 +4300,14 @@ class SyncApp:
         head, mappings, footer = _stage1_dialog_parts(
             steps, note, self._assertion_text())
         dlg = _Dialog(self, head, head)
-        ttk.Label(dlg.body, padding=(PAD, 0, PAD, 4), justify="left",
-                  wraplength=680, text=footer).pack(anchor="w")
+        ttk.Label(dlg.body, justify="left",
+                  padding=(self.px(PAD), 0, self.px(PAD), self.px(4)),
+                  wraplength=self.px(680), text=footer).pack(anchor="w")
         ttk.Button(dlg.bar, text="Rename",
                    command=lambda: dlg.finish(True)).pack(side="right",
-                                                          padx=(0, 6))
+                                                          padx=(0, self.px(6)))
         body = ttk.Frame(dlg.body)
-        body.pack(fill="both", expand=True, padx=PAD)
+        body.pack(fill="both", expand=True, padx=self.px(PAD))
         txt = tk.Text(body, wrap="none", height=min(len(mappings), 14),
                       width=100, font=("Consolas", 9))
         tsb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
