@@ -1,8 +1,9 @@
 # GUI DPI awareness - the window renders crisp at the display's scale (design)
 
 **Status: draft, 2026-11-02. A three-round panel review has been applied; see "Review" near
-the end. Spec only - nothing here is implemented. The implementation waits on the
-maintainer's go-ahead and on decisions D1-D6 at the end.**
+the end. Decisions D1-D6 were ruled by the maintainer on 2026-11-02, each as recommended.
+Spec only - nothing here is implemented. The implementation waits on the maintainer's
+go-ahead.**
 This is finding F8 of the 2026-09-01 UX/UI audit of the "Claude sessions" window
 (`ccs-gui`), the one item the GUI polish release (0.16.0) deliberately left for its own
 spec. Every other audit finding shipped in 0.16.0.
@@ -20,7 +21,8 @@ session`, `Northwind`). Line numbers are at `main` `47cec4b` (0.16.5 plus README
   `idlelib` and `ctypes` documentation, Tk 9.0.4's theme scripts, or Microsoft's
   documentation.
 - **[infer]** reasoned from the above, not measured.
-- **[open]** not settled. Each [open] maps to a decision at the end.
+- **[open]** not settled. Each [open] fed a decision at the end, and the maintainer has
+  since ruled on all of them; the facts themselves stay unmeasured.
 
 ## Why, and why now
 
@@ -611,8 +613,8 @@ size functions are different. They involve no Tk, so the unit tests can call the
 | A2 | Crisp at 250 % at today's size | `--aware` harness run on the operator's display: green, ending `aware run verified at factor 2.5`, opening client 2350x1600. The harness stubs the work area at P(1536)xP(912) = 3840x2280, which is the measured real one; A4 is the unstubbed check | measurable here; the prototype passed [meas] |
 | A3 | Text and widgets render without bitmap stretching | before/after screenshots of the harness's fake-cast fixture at 250 %, kept hub-side; the tab strip checked against Change 4 | measurable here; the prototype passed [meas, visual] |
 | A4 | The installed window is aware after release | an outside per-monitor-aware observer reads the real window process: effective awareness 1, client 2350x1600 physical. The window plans at open and is closed unpressed. An unpressed open writes nothing: the only write outside an action button is the preference file, which changes on a destination pick (L3235) or after an Apply into a re-rooted destination (L312) [doc] | hub-side measurement after install |
-| A5 | 150 % | the `--aware` run and a screenshot in a real 150 % session | [open] - decision D4 |
-| A6 | Tk 8.6 | not supported (D3's recommendation), so unchanged from today, and the aware run reports itself not applicable | [open] - decision D3 |
+| A5 | 150 % | the `--aware` run and a screenshot in a real 150 % session, with the precondition probe before signing out (D4's four steps) | required before release, run by the maintainer (D4, ruled A) |
+| A6 | Tk 8.6 | not supported, so unchanged from today, and the aware run reports itself not applicable | settled (D3, ruled A) |
 | A7 | No code path breaks under awareness | the other GUI harnesses, once each, in an aware process | measurable here |
 | A8 | The guards hold | the pure tests, the Change 5 source guard and its `main()`-order rule included, pass in CI on every leg | runs in CI |
 
@@ -631,8 +633,8 @@ A1-A3 cover three of them. A5 is the one this machine cannot provide.
     bitmap-scaled on any display whose DPI differs from the system DPI].
   - Neither moving the window nor restarting it changes this, since the system DPI is fixed
     at sign-in. Only per-monitor awareness would, and that is a non-goal.
-  - One monitor was connected at measurement, and whether the operator docks to a
-    lower-scale external monitor is [open].
+  - One monitor was connected at measurement. Whether the operator docks to a lower-scale
+    external monitor is not known, and D1 accepted the trade either way.
 - **A secondary monitor at a higher scale than the primary.** It is stretched (soft), as
   today on every high-DPI monitor [doc].
 - **Signed in on one primary, using another.** For example, signed in docked to a 100 %
@@ -683,7 +685,7 @@ A1-A3 cover three of them. A5 is the one this machine cannot provide.
     crisp.
 - **The polish spec's non-goal** ("DPI awareness. Its own spec, ...") gets a dated pointer
   to this spec at implementation, the way earlier notes were added in place.
-- **Version: 0.16.6** proposed (decision D6). The window draws differently and does
+- **Version: 0.16.6** (D6, ruled). The window draws differently and does
   nothing differently. That is the polish spec's own line between a patch and a minor: it
   went to 0.16.0, "not a patch: two of the changes alter what the window does before and
   between engine calls".
@@ -736,13 +738,17 @@ Harness coverage (`tools/check_gui_layout.py`):
    factor, and new pins (b), (c) and (d).
 8. The aware smoke of the other GUI harnesses (A7).
 
-## Decisions for the maintainer
+## Decisions taken (maintainer, 2026-11-02)
 
-In dependency order. Each has a recommended default; the ones that need an explicit yes
-say so.
+The maintainer ruled on all six on 2026-11-02: "D1 A, D2 A, D3 A, D4 A, D5 yes, D6
+0.16.6". Each ruling is the maintainer's own call, given explicitly, and each matches the
+default this spec recommended. Every decision below keeps its options and the evidence
+they were weighed on, so that the options not taken stay on record. They are in
+dependency order.
 
-**D1. Accept that a lower-scale second monitor gets softer - the go/no-go; needs an explicit
-answer.**
+**D1. Accept that a lower-scale second monitor gets softer - the go/no-go.**
+**Ruling: Option A, accept it (the maintainer's call). Not taken: B, the opt-out switch;
+C, waiting for per-monitor awareness.**
 System awareness makes the window crisp on the display it was signed in on. It gets
 softer on a secondary monitor whose scale is *lower* than the primary's, where today's
 unaware window happens to be crisp (residuals, first bullet).
@@ -755,10 +761,12 @@ unaware window happens to be crisp (residuals, first bullet).
 - Option C: hold the change for per-monitor awareness. That is a larger design: re-layout
   on `WM_DPICHANGED`, which Tk would have to drive and which no probe here has measured.
 
-Whether the operator docks to a lower-scale monitor is the fact that decides between A and
-B [open].
+Whether the operator docks to a lower-scale monitor was the fact that would decide between
+A and B. The ruling accepts the trade without it, so no opt-out switch is built.
 
-**D2. Where the factor comes from - a correction to the audit; confirm.**
+**D2. Where the factor comes from - a correction to the audit.**
+**Ruling: Option A, the process's own DPI (the maintainer's call). Not taken: B, the
+audit's `winfo_fpixels` formula.**
 The audit proposed `winfo_fpixels("1i") / 96`. Measured, that is 1.00098 at 100 % and
 2.5025 at 250 %, because Tk derives DPI from a millimetre-rounded screen width. It would
 turn 940 into 941 at 100 %, moving every pin, and give 2352 rather than 2350 at 250 %.
@@ -769,7 +777,10 @@ turn 940 into 941 at 100 %, moving every pin, and give 2352 rather than 2350 at 
   unaware processes are told 96.
 - Option B: the audit's formula as written. Rejected on the measurement.
 
-**D3. Which Tk versions get any of this - needs an explicit answer.**
+**D3. Which Tk versions get any of this.**
+**Ruling: Option A, only the measured Tk 9.0 (the maintainer's call). Not taken: B, every
+Windows Tk; C, measuring Tk 8.6 first. C stays available as the route by which the
+supported set could widen later.**
 Tk 9.0.4 (Python 3.14) is measured: point-sized named fonts, point-sized theme paddings,
 the prototype green. Windows users on Python 3.9-3.13 get Tk 8.6 [infer], whose named-font
 and theme-padding units are [open]. One reviewer (Gemini, round 1) reports that Tk 8.6's
@@ -791,7 +802,10 @@ install, on 3.14, gets the change.
   the probes re-run. It turns B into a measured choice. A can ship meanwhile, and C widens
   it later.
 
-**D4. The 150 % criterion - needs an explicit answer (it costs the maintainer's time).**
+**D4. The 150 % criterion.**
+**Ruling: Option A, run the real 150 % session once before release (the maintainer's
+call). Not taken: B, waiving it; C, deferring it. A5 is therefore a release gate: the
+maintainer runs the four steps below, since they change a display setting and sign out.**
 This machine cannot simulate 150 % faithfully (measured, above). A real check is:
 
 1. Set the primary display to 150 %.
@@ -816,11 +830,14 @@ covers.
   note.
 - Option C: defer to the first real 150 % display that turns up.
 
-**D5. Ship the tab-inset style line (Change 4)? Unopposed default: yes.**
+**D5. Ship the tab-inset style line (Change 4)?**
+**Ruling: yes (the maintainer's call, matching the default). Not taken: shipping without
+it.**
 It is the one visible defect the prototype's screenshots showed, its fix is one style call
 gated on factor > 1 and the vista theme, and it was measured on both axes.
 
-**D6. Version - unopposed default 0.16.6.**
+**D6. Version.**
+**Ruling: 0.16.6 (the maintainer's call, matching the default). Not taken: 0.17.0.**
 The window draws differently and does nothing differently, which is the polish spec's own
 patch/minor line. 0.17.0 is the alternative if the maintainer wants the visible change
 marked.
