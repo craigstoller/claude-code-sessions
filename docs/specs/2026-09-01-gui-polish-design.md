@@ -689,6 +689,10 @@ Harness coverage:
 - **DPI awareness.** Its own spec, after Change 0 exists to measure it: system-DPI awareness
   only (`SetProcessDpiAwareness(1)`, guarded), one scale factor for the remaining pixel
   constants, acceptance at 100 %, 150 % and 250 %.
+  **Designed 2026-11-02 (`docs/specs/2026-11-02-gui-dpi-awareness-design.md`):** the
+  factor is the OS's DPI over 96 rather than `winfo_fpixels("1i") / 96`, which measured
+  1.00098 and 2.5025; the call is limited to the measured Tk 9.0; the 150 % run is a
+  release gate on a real display.
 - **Flipping "Also refresh rows already there" on.** RULING 8; see Defaults.
 - **Rows above the scoreboard on Level.** Reverses the design's order; the sash first,
   revisit after the next real use.

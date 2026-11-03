@@ -2,8 +2,8 @@
 
 **Status: draft, 2026-11-02. A three-round panel review has been applied; see "Review" near
 the end. Decisions D1-D6 were ruled by the maintainer on 2026-11-02, each as recommended.
-Spec only - nothing here is implemented. The implementation waits on the maintainer's
-go-ahead.**
+Implemented 2026-11-02 on the maintainer's go-ahead. The release (0.16.6) waits on A5, the
+maintainer's real 150 % session.**
 This is finding F8 of the 2026-09-01 UX/UI audit of the "Claude sessions" window
 (`ccs-gui`), the one item the GUI polish release (0.16.0) deliberately left for its own
 spec. Every other audit finding shipped in 0.16.0.
@@ -499,9 +499,9 @@ with `ast`. It fails on any of these:
   scaled at its use.
 
 The test also asserts that it finds the helper at least as many times as the
-implementation lands with: 86 call sites in widget code in the prototype. That floor is
-written into the test and only ever rises, so a refactor that hides sites from the walk
-cannot pass vacuously.
+implementation lands with: 86 call sites in widget code in the prototype, and 87 as landed,
+since Change 4's tab inset adds one (`PX_FLOOR = 87`). That floor is written into the test
+and only ever rises, so a refactor that hides sites from the walk cannot pass vacuously.
 
 Without the guard, the next patch that adds `pady=(0, 4)` reintroduces a defect visible
 only at 250 %, on a machine the CI never runs. The guard is narrower than "no unscaled
