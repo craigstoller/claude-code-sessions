@@ -4831,6 +4831,10 @@ def main(argv=None):
         print(msg, file=sys.stderr)
         return 2
 
+    # Before the first window exists: awareness is process-wide, one-way,
+    # and fixed by the time Tk creates a window. A no-op where DPI
+    # behaviour is unsupported, and never fatal.
+    _declare_dpi_awareness()
     root = tk.Tk()
     try:
         SyncApp(root)

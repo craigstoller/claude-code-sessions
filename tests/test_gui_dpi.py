@@ -150,3 +150,22 @@ def test_every_pixel_constant_goes_through_the_factor():
 
 def test_the_factor_reaches_every_landed_site():
     assert len(px_sites(_source())) >= PX_FLOOR
+
+
+def _call_line(fn, test):
+    lines = [n.lineno for n in ast.walk(fn)
+             if isinstance(n, ast.Call) and test(n.func)]
+    return min(lines) if lines else None
+
+
+def test_main_declares_awareness_before_the_first_window():
+    """The layout harness declares awareness itself, so without this rule a
+    launcher that never made the call would pass every other check."""
+    main = [n for n in ast.walk(ast.parse(_source()))
+            if isinstance(n, ast.FunctionDef) and n.name == "main"][0]
+    declare = _call_line(main, lambda f: isinstance(f, ast.Name)
+                         and f.id == "_declare_dpi_awareness")
+    first_root = _call_line(main, lambda f: isinstance(f, ast.Attribute)
+                            and f.attr == "Tk")
+    assert first_root is not None
+    assert declare is not None and declare < first_root, (declare, first_root)
