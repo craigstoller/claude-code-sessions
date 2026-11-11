@@ -590,15 +590,19 @@ window.
 | Platform | Status | Mutations |
 |---|---|---|
 | Windows 11 + Claude Desktop | verified 2026-07-31; sync end-to-end incl. live continuation 2026-08-03; sync-undo drift refusal live 2026-08-04 | read-only + mutations |
-| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store. 0.16.2 and earlier find no store | read-only + mutations, `--apply` never run on this build (the app updated to 3.x first) |
+| Windows 11 + Claude Desktop 2.42304.2 (user data moved to `%LOCALAPPDATA%\Claude-Data`) | from 0.16.3: read-only paths probed 2026-10-19 against the moved store. 0.16.2 and earlier find no store where the app moved the folder, and read the old copy where it copied the folder and left the original in place | read-only + mutations, `--apply` never run on this build (the app updated to 3.x first) |
 | Windows 11 + Claude Desktop 3.6556.2 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: read-only paths and `converge --apply` verified 2026-10-23, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 4.4212.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor`, `alignment` and `converge --apply` verified 2026-11-01, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
+| Windows 11 + Claude Desktop 5.1231.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor` and `alignment` verified read-only 2026-11-10. Needs 0.16.3 or later to find the store | read-only + mutations, `--apply` not yet run on this build |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
-The dates are measurements against specific builds - most recently Claude Desktop
-4.4212.0.0 (Microsoft Store MSIX install) with Claude Code CLI 2.1.309, for `doctor`,
-`alignment` and the last `--apply` run. On 2026-10-14 the
+The dates are measurements against specific builds of the MSIX that Anthropic signs and
+distributes itself from claude.ai - most recently Claude Desktop 5.1231.0.0 with Claude Code
+CLI 2.1.321 for `doctor` and `alignment`, and 4.4212.0.0 with CLI 2.1.309 for the last
+`--apply` run. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
+This tool does not look in that package's folder and has never been run against it.
+On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
 `doctor`, `alignment`, `recover` without `--apply`, and a `converge` dry run): the row format
 had only gained keys, and every row this tool had written under 1.x was still present, some
@@ -631,6 +635,18 @@ present and `doctor` reported none vanished. Within a few minutes the app had re
 those rows, and each had only gained keys. By 2026-11-02 the 4.x app had created 36 rows for
 itself. None lacked a key that every older row carries, and four had gained one new key,
 `isStarred`.
+On 2026-11-10, under 5.1231.0.0, the data folder had not moved again, and `doctor` and
+`alignment` on 0.16.5 found the store where 4.x left it. That build's release notes say
+Windows 10 21H2 or later and Windows Server 2022 now keep the app's data in
+`%LOCALAPPDATA%\Claude-Data` too, as the Windows 11 machine these measurements come from has
+since 2.42304.2, so on those systems the move happens at 5.1231.0. If the folder layout there
+matches that machine's, the same versions apply: 0.16.3 or later to find the store, 0.16.4 or
+later for operations from before the move. The notes also say the Microsoft Store build keeps
+its data where it was, and they mention moves that copied the folder instead of moving it.
+Where such a copy leaves the old store in place, run this tool from an ordinary terminal: from
+a shell the desktop app started, `%APPDATA%\Claude` is the app's view of its old folder, and
+0.16.5 can read the old copy through it. Not measured here: a Windows 10 machine, a Microsoft
+Store install, and an `--apply` under 5.1231.0.
 The on-disk format has changed once already during this tool's own development; treat a
 much newer build as unverified territory.
 
@@ -991,7 +1007,9 @@ window into `journaled`/`completed`/`rolled_back`.
   README, the window's checkbox and the command's help, says Chrome or Edge, since either can
   launch the helper. Three constants left unused since the August anti-fabrication fix are gone.
 - **0.16.3 finds the session store where Desktop 2.42304.2 moved it.** That build moved the
-  app's whole user-data folder out of the Microsoft Store package, from
+  app's whole user-data folder out of the Microsoft Store package (corrected 2026-11-10: out of
+  the MSIX package Anthropic distributes itself, not the Microsoft Store build, whose data the
+  5.1231.0 release notes say does not move), from
   `%LOCALAPPDATA%\Packages\Claude_<pkg>\LocalCache\Roaming\Claude` to
   `%LOCALAPPDATA%\Claude-Data\claude_<pkg>`, and left a 0-byte file in the old folder naming
   the new one. 0.16.2 looked only in the old places, so `doctor` and `alignment` reported no

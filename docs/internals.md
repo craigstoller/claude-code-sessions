@@ -52,7 +52,11 @@ package. See "Amendment 2026-10-19" under the running-app guard below. The text 
 the layout before that build.*
 
 Only processes carrying the package identity — the app, and shells it spawns — see the merged
-view where `%APPDATA%\Claude` appears to exist. From an ordinary terminal it is absent. Both
+view where `%APPDATA%\Claude` appears to exist. *(Corrected 2026-11-10: it is the app's process
+tree that sees it, not the package identity. A shell the app started reported no package
+identity (`GetCurrentPackageFullName` returned 15700, `APPMODEL_ERROR_NO_PACKAGE`) and still saw
+`%APPDATA%\Claude`, whose real path is the package's `LocalCache\Roaming\Claude`. A process
+started outside that tree did not see it.)* From an ordinary terminal it is absent. Both
 paths are the same bytes; resolving the real path on the virtual one lands on the `LocalCache`
 location. Resolve the `LocalCache` path first, fall back to `%APPDATA%`, and treat a missing
 store as a hard error rather than an empty result — a glob over a non-existent directory
@@ -1292,7 +1296,11 @@ or signature-checked; an unreadable one counts. So only a version whose binary e
 read can ever be excused. Listing the folder would add I/O and a new failure to handle without
 narrowing what can be excused. The browser launches the helper at the path its manifest names. A leftover
 version folder therefore matters only while a helper started before an update is still running
-from it (an inference; not observed). Binding to the manifest would make that helper count until
+from it (an inference; not observed). *(Observed 2026-11-10 under Desktop 5.1231.0: the
+browser's manifest named the new 5.1231.0 helper, while the 4.23118.1 helper, started the
+evening before the update, was still the one running. The guard recognised both version
+folders, and with the opt-in on it excused the running one.)*
+Binding to the manifest would make that helper count until
 the browser restarts it. It would also add a parse of an undocumented, user-writable file to
 every guard check, and it would move the fragility rather than remove it, because the manifest's
 name and folder are layout details too. Each recognised build is still judged on its own bytes:
@@ -1394,6 +1402,16 @@ moved, not rebuilt, and the live app writes to the new one. The store inside is 
 `Claude-Data\claude_<pkg>\claude-code\<version>\<hash>\claude.exe`. The browser helper did not
 move. It stays at `<package>\LocalCache\Roaming\Claude-NativeHost\<version>\chrome-native-host.exe`,
 and the browser's manifest names that path.
+
+*Desktop 5.1231.0 (observed 2026-11-10, read-only).* The data folder did not move again. The
+app's release notes say Windows 10 21H2 or later and Windows Server 2022 now keep their data in
+`%LOCALAPPDATA%\Claude-Data` as well. They also say the Microsoft Store build keeps its data where
+it was; that build is a separate package, `AnthropicPBC.Claude_<id>`, which discovery does not
+look in. The app rewrote the old folder's marker on the day of the update, so the marker's
+modification time no longer dates the move; its creation time still does. The update also wrote
+a small `.user-data-ids.claude_<pkg>` file in the package's `LocalCache\Roaming`, one level above
+the old `Claude` folder. Discovery never lists that folder and the file lacks the marker's
+prefix, so it is ignored (synthetic probe, run from both kinds of shell).
 
 **What that broke.** 0.16.2 listed only the old candidates, so every command started from
 "store absent": `converge` planned 0 of 0, and `doctor` and `alignment` reported the store
@@ -1528,7 +1546,9 @@ helper.
 - The CLI marker is a run of segments, not a path derived from `LOCALAPPDATA`: the same run under
   another prefix still matches, as with the Roaming marker, and a relocated `LOCALAPPDATA`
   counts the CLI as the desktop app (fail-closed).
-- No `--apply` has run against the moved store yet. macOS and Linux are untouched.
+- No `--apply` has run against the moved store yet. macOS and Linux are untouched. *(Superseded:
+  `converge --apply` ran against the moved store on 2026-10-23 under 3.6556.2 and on 2026-11-01
+  under 4.4212.0; see the README's compatibility matrix.)*
 
 **Pinned by** `tests/test_data_root.py`, which goes through `_windows_store_layout` and
 `discover_stores` end to end: the candidates and their order, per-package precedence with the
