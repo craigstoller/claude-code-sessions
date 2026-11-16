@@ -757,6 +757,179 @@ def _copies_advice(env, tc):
     return None
 
 
+# The folder an app-made worktree's transcripts go in is its main folder's
+# name, then this, then the worktree's name: `<repo>\.claude\worktrees\<name>`
+# encoded. Under both schemes, since neither keeps '.' or '\'.
+_WORKTREE_FOLDER_INFIX = "--claude-worktrees-"
+
+
+def _split_conversations(env, rows, transcripts):
+    """Conversations whose rows open different copies of one transcript -
+    'split rows'. Names and sizes only: no copy is opened here, so
+    `alignment` can count these, and `doctor` compares the bytes after.
+
+    A row names a project folder through its `cwd`, and the app opens the
+    copy of the transcript in that folder, even a stale one (measured
+    2026-11, one conversation, Desktop 5.11492.5). So two accounts whose rows
+    name different folders can show the same conversation at two lengths.
+    The folder a row opens is resolved in this order:
+
+      cwd        the folder its cwd encodes to, under the current scheme or
+                 the legacy one, holds a copy;
+      worktree   that folder holds none, and exactly one copy sits in one of
+                 its worktree folders - docs/internals.md's "Worktree
+                 transcript placement", which is the app working, not a
+                 fault;
+      none       neither: which copy opens is not known. Opening such a row
+                 has been seen to copy the transcript into its folder (same
+                 measurement), which makes a split of its own.
+
+    Only `cwd` is read. Rows also carry `originCwd`, `worktreePath` and
+    `folderPlace`, and which of them the app consults is untested.
+
+    Returns one entry per conversation with at least two copies on disk
+    whose rows open two or more of them, or include a row that opens none.
+    A conversation every row opens the same copy of is not here, whatever
+    other copies exist: that is converge's duplicated-transcript hold.
+    Folder names compare without case on Windows, where NTFS resolves them
+    that way.
+    """
+    def key(name):
+        return name.lower() if env.is_windows else name
+
+    by_sid = {}
+    for folder, path in transcripts:
+        sid = os.path.splitext(os.path.basename(path))[0]
+        by_sid.setdefault(sid, []).append((folder, path))
+    rows_by_sid = {}
+    for r in rows:
+        sid = r.cli_session_id
+        if isinstance(sid, str) and len(by_sid.get(sid, ())) > 1:
+            rows_by_sid.setdefault(sid, []).append(r)
+    labels = {}
+
+    def label(acct):
+        if acct not in labels:
+            labels[acct] = _email_of(env, acct) or acct[:8]
+        return labels[acct]
+
+    out = []
+    for sid in sorted(rows_by_sid):
+        copies = []
+        for folder, path in by_sid[sid]:
+            try:
+                n = os.path.getsize(path)
+            except OSError:
+                n = None
+            copies.append({"folder": folder, "bytes": n, "path": path})
+        # Longest first, so "copy 1" is the one the others are measured
+        # against. An unreadable size sorts last.
+        copies.sort(key=lambda c: (c["bytes"] is None, -(c["bytes"] or 0),
+                                   c["folder"]))
+        index = {key(c["folder"]): i for i, c in enumerate(copies)}
+        placed = []
+        for r in sorted(rows_by_sid[sid], key=lambda r: r.path):
+            data = r.data if isinstance(r.data, dict) else {}
+            cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else ""
+            named = []
+            for scheme in (SCHEME_CURRENT, SCHEME_LEGACY):
+                e = encode(cwd, scheme) if cwd else ""
+                if e and e not in named:
+                    named.append(e)
+            hit, via, under = None, "none", []
+            for e in named:
+                if key(e) in index:
+                    hit, via = index[key(e)], "cwd"
+                    break
+            if hit is None:
+                pre = tuple(key(e + _WORKTREE_FOLDER_INFIX) for e in named)
+                under = sorted({i for k, i in index.items()
+                                if pre and k.startswith(pre)})
+                if len(under) == 1:
+                    hit, via = under[0], "worktree"
+            acct = os.path.basename(os.path.dirname(os.path.dirname(r.path)))
+            placed.append({
+                "account": acct, "label": label(acct), "local_id": r.local_id,
+                "cwd": cwd, "via": via, "copy": hit,
+                "worktree_copies": len(under) if hit is None else 0,
+                "archived": data.get("isArchived") is True,
+                "_activity": r.last_activity, "_title": data.get("title"),
+            })
+        opened = sorted({p["copy"] for p in placed if p["copy"] is not None})
+        if len(opened) < 2 and all(p["copy"] is not None for p in placed):
+            continue
+        newest = max(placed, key=lambda p: (p["_activity"]
+                                            if isinstance(p["_activity"],
+                                                          (int, float)) else 0))
+        title = newest["_title"] if isinstance(newest["_title"], str) else ""
+        for p in placed:
+            del p["_activity"], p["_title"]
+        out.append({"session_id": sid, "title": title, "copies": copies,
+                    "opened": opened, "rows": placed})
+    return out
+
+
+# Worst first: what decides a conversation's relation when its pairs differ.
+_SPLIT_RANK = {"diverged": 4, "inconclusive": 3, "strict_prefix": 2,
+               "identical": 1}
+# The order doctor reports them in, after the ones that count.
+_SPLIT_ORDER = {"diverged": 0, "strict_prefix": 1, "inconclusive": 2,
+                "unplaced": 3, "identical": 4}
+
+
+def _classify_split(entry):
+    """Doctor's half: compare every pair of copies the rows open, with the
+    duplicated-transcript comparison, and say whether the split costs an
+    account anything now. Mutates and returns ENTRY.
+
+    `relation` is the worst pair's, or "unplaced" when fewer than two copies
+    are opened (a row opens none). `live` is the longest opened copy when
+    the relation is strict_prefix. `counted` - whether doctor exits 1 for it
+    - is true for diverged copies with any unarchived row, and for a strict
+    prefix with an unarchived row on a shorter copy: an account opens an old
+    history, and a reply there forks it. Identical copies cost nothing yet;
+    an unplaced row and an inconclusive comparison are listed, not counted.
+    """
+    copies, opened = entry["copies"], entry["opened"]
+    pairs = []
+    for x in range(len(opened)):
+        for y in range(x + 1, len(opened)):
+            a, b = opened[x], opened[y]
+            tc = _transcript_copies([copies[a]["path"], copies[b]["path"]])
+            pairs.append({"a": a, "b": b, "relation": tc["relation"],
+                          "reason": tc["reason"]})
+    entry["pairs"] = pairs
+    entry["live"] = None
+    if not pairs:
+        entry["relation"] = "unplaced"
+    else:
+        entry["relation"] = max((p["relation"] for p in pairs),
+                                key=lambda r: _SPLIT_RANK.get(r, 3))
+    active = [r for r in entry["rows"] if not r["archived"]]
+    counted = False
+    if entry["relation"] == "strict_prefix":
+        entry["live"] = opened[0]          # copies are sorted longest first
+        top = copies[opened[0]]["bytes"]
+        counted = any(r["copy"] is not None and copies[r["copy"]]["bytes"] < top
+                      for r in active)
+    elif entry["relation"] == "diverged":
+        counted = bool(active)
+    entry["counted"] = counted
+    return entry
+
+
+def _public_split(entry):
+    """The report form: the copies by folder and size, no path. A path
+    would carry the project folder's name under a key --anonymize does not
+    scrub; `folder` is one it does, and the path is the projects root, the
+    folder and the id."""
+    e = dict(entry)
+    e.pop("opened", None)
+    e["copies"] = [{"folder": c["folder"], "bytes": c["bytes"]}
+                   for c in entry["copies"]]
+    return e
+
+
 def iter_transcripts(projects_root):
     out = []
     try:
@@ -3767,15 +3940,16 @@ def _short_ids(text):
 # to a leak.
 _ANON_STRUCTURAL_KEYS = frozenset((
     "a", "a_in_b", "a_total", "a_unique", "account", "accounts",
-    "activity_unknown", "after", "age_days", "allow_orphan", "b",
+    "activity_unknown", "after", "age_days", "allow_orphan", "archived", "b",
     "b_in_a", "b_total", "b_unique", "blank_rows", "by_account_count",
     "bytes",
     "classification", "cli_session_id", "command_runnable", "complete",
-    "config", "consistent", "conversations", "copies", "created",
-    "current",
+    "config", "consistent", "conversations", "copies", "copy", "counted",
+    "created", "current",
     "dead_excluded", "dead_rows", "degrade_reason", "deleted",
     "dest_account", "dest_dropped", "dest_email_source", "dest_org",
     "dest_path", "dest_reset", "destinations", "detail",
+    "different_lengths",
     "disagreeing_rows", "displaced_orphan", "displaced_overlap",
     "displaced_session", "displaced_turns", "distinguishable",
     "dup_conversation", "dup_title",
@@ -3798,7 +3972,8 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "row_path", "rows", "safe", "scope", "scoped", "session",
     "session_id", "sessions", "shared", "short",
     "short_of_all_accounts", "sibling_divergence", "siblings",
-    "skip_detail", "skipped", "source_account", "source_org",
+    "skip_detail", "skipped", "source_account", "source_org", "split",
+    "split_rows",
     "source_path", "source_resolved_from", "stale", "stale_lock",
     "status",
     "store_is_a_guess", "store_label", "store_org", "store_path",
@@ -3810,8 +3985,9 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "transcript_mtime", "transcript_paths", "transcript_size",
     "transcripts", "turns", "unchanged", "unknown_layout",
     "unlisted_ranked", "unlisted_recent", "unlisted_transcripts",
-    "unmeasured", "unreadable", "unreadable_rows", "unresolved_rows", "update",
-    "vanished_new_rows", "verbatim", "written",
+    "unmeasured", "unplaced", "unreadable", "unreadable_rows",
+    "unresolved_rows", "update",
+    "vanished_new_rows", "verbatim", "via", "worktree_copies", "written",
 )) | frozenset(_ANON_FIELDS) | frozenset(_ANON_EMAIL_FIELDS)
 
 
@@ -4335,6 +4511,18 @@ def gather_doctor(env):
         duplicate_titles = _duplicate_title_groups(env, rows)
     except (LayoutError, OSError, ValueError):
         duplicate_titles = []
+    # Split rows: accounts whose rows open different copies of one
+    # transcript. Found 2026-11-16, when a sidebar showed a conversation two
+    # weeks old after a clean converge: its row named a folder whose copy had
+    # stopped growing, and nothing here looked at which copy a row opens.
+    # The ones that count first: on the store this was found on, 21 of 30
+    # were byte-identical, and an id order put them ahead of the six an
+    # account was opening an old history of.
+    split_rows = sorted(
+        (_public_split(_classify_split(e))
+         for e in _split_conversations(env, rows, transcripts)),
+        key=lambda s: (not s["counted"], _SPLIT_ORDER.get(s["relation"], 2),
+                       s["session_id"]))
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
@@ -4346,6 +4534,7 @@ def gather_doctor(env):
         "stale_lock": lock_is_stale(env),
         "unknown_layout": unknown_layout,
         "duplicate_titles": duplicate_titles,
+        "split_rows": split_rows,
         "vanished_new_rows": vanished_new,
         "rollback_residue": rollback_residue,
         "unresolved_rows": unresolved_rows,
@@ -4354,7 +4543,8 @@ def gather_doctor(env):
     if disc.status == "error" or row_errors or unknown_layout:
         report["exit_code"] = 2
     elif (blank or dead or nt or report["stale_lock"] or legacy_folders
-            or vanished_new or rollback_residue):
+            or vanished_new or rollback_residue
+            or any(s["counted"] for s in split_rows)):
         report["exit_code"] = 1
     else:
         report["exit_code"] = 0
@@ -4399,8 +4589,11 @@ def gather_alignment(env):
     "aligned: yes/no" would hide exactly the trade-off the reader has to make,
     so this reports five numbers and never averages them.
 
-    Reads only. No transcript CONTENT is opened - filenames and row files only -
-    so this stays fast on a store with gigabytes of history behind it.
+    Reads only. No transcript CONTENT is opened - filenames, file sizes and
+    row files only - so this stays fast on a store with gigabytes of history
+    behind it. That is why the split-rows line under `consistent` only
+    counts: telling a stale copy from a diverged one means reading both, and
+    `doctor` does that.
     """
     disc = discover_stores(env)
     rows, row_errors = load_rows(disc.roots)
@@ -4457,6 +4650,18 @@ def gather_alignment(env):
             "short_of_all_accounts": gap,
         })
     with_gap = [d for d in disagree if d["short_of_all_accounts"]]
+    # The same conversation, a different COPY of it: a row names a folder,
+    # and the app opens the copy in that folder. `complete` counts such a
+    # conversation as in every account although one of them shows an old
+    # history - the 2026-11-16 report.
+    split = {"conversations": 0, "different_lengths": 0, "unplaced": 0}
+    for e in _split_conversations(env, rows, transcripts):
+        sizes = {e["copies"][i]["bytes"] for i in e["opened"]}
+        if len(e["opened"]) > 1:
+            split["conversations"] += 1
+            split["different_lengths"] += len(sizes) > 1
+        if any(r["copy"] is None for r in e["rows"]):
+            split["unplaced"] += 1
 
     # ---- distinguishable -------------------------------------------------
     # PER ACCOUNT, never machine-wide. Grouping titles across all three stores
@@ -4499,7 +4704,8 @@ def gather_alignment(env):
                             "titles": dup_titles},
         "consistent": {"disagreeing_rows": len(disagree),
                        "leaving_a_gap": len(with_gap),
-                       "rows": disagree},
+                       "rows": disagree,
+                       "split": split},
         "complete": {"conversations": len(reach),
                      "in_all_accounts": by_count.get(n_acct, 0),
                      "short": short,
@@ -4577,6 +4783,13 @@ def cmd_alignment(env, ns):
                 "involved is still reachable")
             say("[hypothesis]   from every account by some other row. Untidy "
                 "bookkeeping, not lost history.")
+    sp = c.get("split") or {}
+    say("[observed]                   {0} conversation(s) open a different copy "
+        "of their transcript depending on the account, {1} of them at "
+        "different lengths{2} - 'doctor' compares the copies".format(
+            sp.get("conversations", 0), sp.get("different_lengths", 0),
+            "; in {0}, a row's folder holds no copy".format(
+                sp["unplaced"]) if sp.get("unplaced") else ""))
 
     m = rep["complete"]
     say("[observed] complete        {0} of {1} conversation(s) reachable from all "
@@ -4595,6 +4808,123 @@ def cmd_alignment(env, ns):
         say("[hypothesis]   'cleanupPeriodDays' defaults to 30; raising it stops "
             "the backlog rebuilding.")
     return rep["exit_code"]
+
+
+SPLIT_DETAIL_LIMIT = 5
+
+
+def _print_split_rows(env, splits, say, say_ids):
+    """Doctor's split-rows block: for each conversation, its copies longest
+    first, which copy each account's row opens and why, and how each pair of
+    opened copies relates. Copy paths go through say_ids so they can be
+    pasted back whole; every other line is redacted as usual.
+
+    Every split that counts toward the exit code is shown; of the rest, the
+    first SPLIT_DETAIL_LIMIT. SPLITS arrives counted-first (gather_doctor)."""
+    if not splits:
+        return
+    say("[observed] {0} conversation(s) open a DIFFERENT COPY of their "
+        "transcript depending on the account - a row opens the copy in the "
+        "project folder its cwd names, even a stale one".format(len(splits)))
+    # One clause per relation, so the clauses add up to the headline; the
+    # row with no copy of its own cuts across them and gets its own sentence,
+    # the number alignment's split line gives.
+    kinds = []
+    n = sum(1 for s in splits if s["counted"])
+    if n:
+        kinds.append("{0} show an account an older or a diverged history"
+                     .format(n))
+    n = sum(1 for s in splits if not s["counted"]
+            and s["relation"] in ("strict_prefix", "diverged"))
+    if n:
+        kinds.append("{0} only in archived rows".format(n))
+    for rel, words in (("inconclusive", "could not be compared"),
+                       ("unplaced", "with one copy that rows open"),
+                       ("identical", "are byte-identical for now")):
+        n = sum(1 for s in splits if s["relation"] == rel)
+        if n:
+            kinds.append("{0} {1}".format(n, words))
+    n = sum(1 for s in splits if any(r["copy"] is None for r in s["rows"]))
+    say("[observed]   " + "; ".join(kinds) + "." + (
+        " In {0}, a row's folder holds no copy of its own.".format(n)
+        if n else ""))
+
+    def size(n):
+        return "{0:,} bytes".format(n) if isinstance(n, int) else "size ?"
+
+    counted = [s for s in splits if s["counted"]]
+    shown = counted + [s for s in splits if not s["counted"]][:SPLIT_DETAIL_LIMIT]
+    for s in shown:
+        say("[observed]   {0!r}  {1}".format(s["title"] or "(untitled)",
+                                             s["session_id"]))
+        copies = s["copies"]
+        # The copies a row opens and the longest; a conversation seen with
+        # thirteen copies would otherwise print all of them. Numbering stays
+        # by length, so "copy 1" is always the longest.
+        listed = sorted({0} | {r["copy"] for r in s["rows"]
+                               if r["copy"] is not None})
+        for i in listed:
+            c = copies[i]
+            say_ids("[observed]     copy {0}  {1:>18}  {2}".format(
+                i + 1, size(c["bytes"]),
+                os.path.join(env.projects_root, c["folder"],
+                             s["session_id"] + ".jsonl")))
+        if len(copies) > len(listed):
+            say("[observed]     ... and {0} other copies no row opens"
+                .format(len(copies) - len(listed)))
+        top = copies[s["live"]]["bytes"] if s.get("live") is not None else None
+        for r in s["rows"]:
+            tail = " (archived)" if r["archived"] else ""
+            if r["copy"] is None:
+                under = (", and {0} of its worktree folders hold one".format(
+                    r["worktree_copies"]) if r["worktree_copies"] else "")
+                say("[observed]     {0}{1} opens no copy of its own - the "
+                    "folder its cwd names holds no copy{2}".format(
+                        r["label"], tail, under))
+                continue
+            how = ""
+            if r["via"] == "worktree":
+                how = (" - its cwd names the main folder and the copy sits "
+                       "in one of that folder's worktrees, the documented "
+                       "placement")
+            behind = ""
+            if top is not None and isinstance(copies[r["copy"]]["bytes"], int) \
+                    and copies[r["copy"]]["bytes"] < top:
+                behind = ", which is behind copy {0}".format(s["live"] + 1)
+            say("[observed]     {0}{1} opens copy {2}{3}{4}".format(
+                r["label"], tail, r["copy"] + 1, behind, how))
+        for p in s.get("pairs") or []:
+            a, b = p["a"] + 1, p["b"] + 1
+            if p["relation"] == "strict_prefix":
+                short, long_ = (b, a) if (copies[p["b"]]["bytes"] or 0) \
+                    < (copies[p["a"]]["bytes"] or 0) else (a, b)
+                say("[observed]     copy {0} is a strict byte-prefix of copy "
+                    "{1}: one history, and a row on copy {0} shows it as it "
+                    "was when that copy stopped growing".format(short, long_))
+            elif p["relation"] == "identical":
+                say("[observed]     copies {0} and {1} are byte-identical "
+                    "now - the next turn taken from one account leaves the "
+                    "other behind".format(a, b))
+            elif p["relation"] == "diverged":
+                say("[observed]     copies {0} and {1} have DIVERGED - each "
+                    "holds history the other lacks, and only you can choose "
+                    "between them or merge them".format(a, b))
+            else:
+                say("[observed]     copies {0} and {1} could not be compared: "
+                    "{2}".format(a, b, p.get("reason") or "no reason given"))
+    if len(splits) > len(shown):
+        say("[observed]   ... and {0} more (all of them in --json)".format(
+            len(splits) - len(shown)))
+    if any(r["copy"] is None for s in splits for r in s["rows"]):
+        say("[hypothesis]   a row that opens no copy of its own has been seen "
+            "to copy the transcript into its folder when opened (once, on "
+            "Desktop 5.11492.5); which copy it takes is untested")
+    say("[hypothesis]   removing a stale copy is a one-time catch-up, not a "
+        "fix: opening a row whose folder then holds no copy copies the "
+        "transcript back into it, so the split returns once the conversation "
+        "is worked from one account and opened from another. It lasts until "
+        "every account's row names the same folder, and no command changes a "
+        "row's folder yet")
 
 
 def cmd_doctor(env, ns):
@@ -4725,6 +5055,7 @@ def cmd_doctor(env, ns):
     if rep.get("rerooted_ops"):
         say("[observed] journal: {0} operation(s) recorded before the data moved; "
             "their paths are read under the moved root".format(rep["rerooted_ops"]))
+    _print_split_rows(env, rep.get("split_rows") or [], say, say_ids)
     dupes = rep.get("duplicate_titles") or []
     # Split before printing. These are two different conditions that happen to
     # look alike, and reporting them together produced a cleanup list that told

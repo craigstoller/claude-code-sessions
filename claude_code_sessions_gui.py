@@ -3529,6 +3529,16 @@ class SyncApp:
             blocking.append("{0} rolled-back operation(s) left a row in the store "
                             "that could not be removed. `ccs doctor` names the row "
                             "and the operation.".format(n))
+        # Split rows make `ccs doctor` exit 1 only when an account opens an
+        # older or a diverged copy of a conversation - the same rule as
+        # above: not routine, and doctor already counts it.
+        splits = rep.get("split_rows") or []
+        n = sum(1 for s in splits if isinstance(s, dict) and s.get("counted"))
+        if n:
+            blocking.append("{0} conversation(s) open an older or a diverged copy "
+                            "of their transcript in some account. `ccs doctor` "
+                            "names the copies and which account opens "
+                            "each.".format(n))
 
         st = rep.get("stores") or {}
         notes.append("store: {0}".format(st.get("status", "?")))
@@ -3544,6 +3554,9 @@ class SyncApp:
             v = rep.get(key)
             if v:
                 notes.append("{0}: {1}".format(label, len(v)))
+        if splits:
+            notes.append("conversations whose accounts open different transcript "
+                         "copies: {0}".format(len(splits)))
 
         out = []
         if blocking:
