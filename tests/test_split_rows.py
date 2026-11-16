@@ -473,6 +473,140 @@ def test_doctor_prints_every_split_that_counts_and_caps_the_rest(
     assert "7 are byte-identical for now" in out
 
 
+# ---------------------------------------------- bookkeeping past the prefix
+#
+# Measured 2026-11 (Desktop 5.11492.5): opening a conversation appends a
+# `tools-used` record to the copy it opens, and quitting the app appends a
+# `cost-state` record. Neither is conversation. So bytes alone mislabel two
+# shapes: a copy ahead only by those records holds the same conversation, and
+# a stale copy that was opened and quit is no longer a byte-prefix of the live
+# one although it holds none of its turns.
+
+def cost_state(n=1):
+    return [{"type": "cost-state", "costUSD": 0.01 * i, "sessionId": S1}
+            for i in range(1, n + 1)]
+
+
+def test_a_copy_ahead_only_by_bookkeeping_holds_the_same_conversation(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + cost_state(2))
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN))
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    rep = ct.gather_doctor(env)
+    s = only_split(rep)
+    assert s["relation"] == "same_history" and s["live"] is None
+    (p,) = s["pairs"]
+    assert p["relation"] == "same_history" and p["bytes_relation"] == "strict_prefix"
+    assert s["counted"] is False and rep["exit_code"] == 0
+
+
+def test_tools_used_is_bookkeeping_too(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN)
+                     + [{"type": "tools-used", "tools": ["Read"]}])
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN))
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    assert only_split(ct.gather_doctor(env))["relation"] == "same_history"
+
+
+def test_a_stale_copy_opened_and_quit_is_still_behind(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The 2026-11-16 sequence: the stale copy was opened, and quitting
+    appended cost-state to it. The bytes have diverged; the conversation has
+    not."""
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + later_turns())
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN) + cost_state())
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    rep = ct.gather_doctor(env)
+    s = only_split(rep)
+    assert s["relation"] == "strict_prefix"
+    assert s["copies"][s["live"]]["folder"] == F_MAIN
+    (p,) = s["pairs"]
+    assert p["bytes_relation"] == "diverged"
+    assert s["counted"] is True and rep["exit_code"] == 1
+
+
+def test_a_live_copy_shorter_in_bytes_is_still_the_live_one(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A stale copy opened and quit many times can outgrow the live one in
+    bytes. Copy 1 by length is then the stale one; the live one is the copy
+    holding the turns."""
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + later_turns())
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN) + cost_state(12))
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    s = only_split(ct.gather_doctor(env))
+    assert s["copies"][0]["folder"] == F_WT          # longer in bytes
+    assert s["relation"] == "strict_prefix"
+    assert s["copies"][s["live"]]["folder"] == F_MAIN
+    assert s["counted"] is True
+
+
+def test_an_unknown_record_type_counts_as_conversation(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Only the two measured types are bookkeeping. Anything else past the
+    prefix is treated as history, so a new record type errs toward reporting
+    a split rather than hiding one."""
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN)
+                     + [{"type": "some-new-record"}])
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN))
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    s = only_split(ct.gather_doctor(env))
+    assert s["relation"] == "strict_prefix" and s["counted"] is True
+
+
+def test_copies_parting_mid_line_are_read_from_that_line(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN)
+                     + [{"type": "cost-state", "costUSD": 0.11}])
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN)
+                     + [{"type": "cost-state", "costUSD": 0.12}])
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    assert only_split(ct.gather_doctor(env))["relation"] == "same_history"
+    # And two different turns parting mid-line stay diverged.
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + [
+        {"type": "user", "message": {"content": "and the board deck?"}}])
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN) + [
+        {"type": "user", "message": {"content": "and the board deck is late"}}])
+    assert only_split(ct.gather_doctor(env))["relation"] == "diverged"
+
+
+def test_doctor_says_when_copies_differ_only_in_bookkeeping(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + cost_state(2))
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN))
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    ct.cmd_doctor(env, ns())
+    out = capsys.readouterr().out
+    assert "same conversation" in out and "bookkeeping" in out
+    assert "1 differ only in bookkeeping records" in out
+
+
+def test_doctor_names_bookkeeping_on_a_stale_copy(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = mkenv(tmp_path)
+    write_transcript(env, F_MAIN, S1, t_entries(cwd=MAIN) + later_turns())
+    write_transcript(env, F_WT, S1, t_entries(cwd=MAIN) + cost_state())
+    write_row(env, 0, A1, O1, "local_1", row(S1, MAIN))
+    write_row(env, 0, A2, O2, "local_1", row(S1, WT))
+    ct.cmd_doctor(env, ns())
+    out = capsys.readouterr().out
+    assert "behind copy" in out and "only bookkeeping records" in out
+
+
 # ------------------------------------------------------------ alignment
 
 def test_alignment_counts_splits_from_sizes_without_reading_a_copy(
