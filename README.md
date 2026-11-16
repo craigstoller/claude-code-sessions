@@ -195,11 +195,16 @@ up in two project folders, usually after a session moves into a second worktree.
 row names a folder through its `cwd`, and the app opens the copy in that folder, even a stale
 one. So one sidebar can show a conversation as it was weeks ago while another shows it today,
 and `alignment` still counts it complete. `doctor` lists each such conversation, which
-copy each account's row opens, and how each pair of copies relates: one a strict byte-prefix of
-the other (one history, one copy stopped growing), byte-identical, or diverged (each holds
-turns the other lacks). It exits 1 when an unarchived row opens an older or a diverged copy.
-Identical copies are listed and do not change the exit code. Neither does a row whose folder
-holds no copy at all. A row whose `cwd` names a main repository while the transcript sits in
+copy each account's row opens, and how each pair of copies relates: one behind the other (one
+history, one copy stopped growing), the same conversation, byte-identical, or diverged (each
+holds turns the other lacks). It compares the bytes first and then reads what lies past the
+bytes two copies share, because the app writes bookkeeping records (`tools-used` when it opens
+a copy, `cost-state` when it quits) to whichever copy it has open, the stale one included. A
+copy ahead only by those records holds the same conversation; a stale copy the app has opened
+and quit is still behind, although its bytes no longer match. Any other record type counts as
+conversation. `doctor` exits 1 when an unarchived row opens an older or a diverged copy.
+Identical copies and copies that differ only in bookkeeping are listed and do not change the
+exit code. Neither does a row whose folder holds no copy at all. A row whose `cwd` names a main repository while the transcript sits in
 one of its worktree folders is the app's normal placement, not a fault.
 
 Deleting the stale copy is a catch-up, not a fix. On one conversation, measured on Desktop

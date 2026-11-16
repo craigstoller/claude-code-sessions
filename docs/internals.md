@@ -300,7 +300,14 @@ folder a row opens from `cwd` alone, in this order: the folder `cwd` encodes to 
 current scheme, then the legacy one, if it holds a copy; otherwise the one copy under that
 folder's `--claude-worktrees-` folders (the worktree placement above); otherwise none. It then
 compares each pair of copies the rows open with the duplicated-transcript comparison
-(`_transcript_copies`), and exits 1 when an unarchived row opens an older or a diverged copy.
+(`_transcript_copies`), and reads what each copy holds past the bytes the two share
+(`_history_pair`): nothing, only `BOOKKEEPING_RECORD_TYPES` records (`tools-used` and
+`cost-state`, the two seen written on open and on quit), or anything else, which counts as
+conversation. Bookkeeping alone does not make a copy ahead, so two copies that differ only in
+it hold the same conversation (`same_history`), and a stale copy that picked up a `cost-state`
+on quit is still behind the live one although the bytes have diverged. On the store this was
+found on, two of the six conversations the bytes called behind differed only in `cost-state`
+records. `doctor` exits 1 when an unarchived row opens an older or a diverged copy.
 Folder names compare without case on Windows. `alignment` counts the same conversations from
 names and sizes only.
 
