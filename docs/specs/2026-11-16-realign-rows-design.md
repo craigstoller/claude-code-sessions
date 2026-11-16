@@ -301,6 +301,11 @@ Byte-identical and same-conversation splits (21 and 2 on that store) are listed,
 no copy is listed, not counted, since which copy it would open is unknown. Recommended: all
 five as built.
 
+*Ruled 2026-11-16, the maintainer's call: as built, all five.* Not taken: (a) listing
+counted splits without changing the exit code; (b) comparing copies as bytes only; and,
+for (c) to (e), counting identical, same-conversation, archived-only or no-copy splits
+toward exit 1.
+
 **D1. Command shape.**
 (a) A new `realign` command, recommended: one job, its own journal type and undo. (b)
 `repoint --folder`: one less command, but `repoint` is one row in one account and changes
