@@ -869,52 +869,166 @@ def _split_conversations(env, rows, transcripts):
     return out
 
 
+# Records the app writes to whichever copy it has open that carry no
+# conversation. Measured 2026-11 on Desktop 5.11492.5: opening a conversation
+# appended `tools-used`, and quitting the app appended `cost-state`, to the
+# copy that was open - the stale one included. Only these two: any other type
+# past the shared bytes counts as history, so a record type this list does not
+# know errs toward reporting a split, never toward hiding one.
+BOOKKEEPING_RECORD_TYPES = frozenset(("cost-state", "tools-used"))
+
 # Worst first: what decides a conversation's relation when its pairs differ.
-_SPLIT_RANK = {"diverged": 4, "inconclusive": 3, "strict_prefix": 2,
-               "identical": 1}
+_SPLIT_RANK = {"diverged": 5, "inconclusive": 4, "strict_prefix": 3,
+               "same_history": 2, "identical": 1}
 # The order doctor reports them in, after the ones that count.
 _SPLIT_ORDER = {"diverged": 0, "strict_prefix": 1, "inconclusive": 2,
-                "unplaced": 3, "identical": 4}
+                "unplaced": 3, "same_history": 4, "identical": 5}
+
+
+def _common_prefix_len(p, q):
+    """How many bytes files P and Q share from the start. OSError
+    propagates."""
+    n = 0
+    with open(p, "rb") as a, open(q, "rb") as b:
+        while True:
+            x, y = a.read(_COPIES_CHUNK), b.read(_COPIES_CHUNK)
+            m = min(len(x), len(y))
+            if x[:m] != y[:m]:
+                return n + len(os.path.commonprefix([x[:m], y[:m]]))
+            n += m
+            if len(x) != len(y) or m == 0:
+                return n
+
+
+def _line_start(path, offset):
+    """The offset at which the line holding byte OFFSET begins."""
+    pos = offset
+    with open(path, "rb") as fh:
+        while pos > 0:
+            lo = max(0, pos - 65536)
+            fh.seek(lo)
+            i = fh.read(pos - lo).rfind(b"\n")
+            if i >= 0:
+                return lo + i + 1
+            pos = lo
+    return 0
+
+
+def _tail_kind(path, offset):
+    """What PATH holds from byte OFFSET (a line start) on: "none", only
+    BOOKKEEPING_RECORD_TYPES records ("bookkeeping"), or anything else
+    ("history") - a line that is not a JSON object included. Stops at the
+    first history record, so a long live tail costs one line."""
+    kind = "none"
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                return "history"
+            if isinstance(rec, dict) and rec.get("type") in BOOKKEEPING_RECORD_TYPES:
+                kind = "bookkeeping"
+                continue
+            return "history"
+    return kind
+
+
+def _history_pair(pa, pb, na, nb, byte_relation):
+    """How two copies relate as conversations, not as bytes: (relation,
+    which copy is ahead - "a", "b" or None, a's tail kind, b's tail kind).
+    Past the bytes they share, a copy holds nothing, only bookkeeping, or
+    history. Only history makes a copy ahead; history on both sides is a
+    real divergence."""
+    if byte_relation == "identical":
+        return "identical", None, "none", "none"
+    start = _line_start(pa, _common_prefix_len(pa, pb))
+    if byte_relation == "strict_prefix":
+        # The shorter copy holds nothing past the shared bytes by definition.
+        ka = "none" if na < nb else _tail_kind(pa, start)
+        kb = "none" if nb < na else _tail_kind(pb, start)
+    else:
+        ka, kb = _tail_kind(pa, start), _tail_kind(pb, start)
+    if ka == "history" and kb == "history":
+        return "diverged", None, ka, kb
+    if ka == "history":
+        return "strict_prefix", "a", ka, kb
+    if kb == "history":
+        return "strict_prefix", "b", ka, kb
+    return "same_history", None, ka, kb
 
 
 def _classify_split(entry):
-    """Doctor's half: compare every pair of copies the rows open, with the
-    duplicated-transcript comparison, and say whether the split costs an
-    account anything now. Mutates and returns ENTRY.
+    """Doctor's half: compare every pair of copies the rows open, and say
+    whether the split costs an account anything now. Mutates and returns
+    ENTRY.
 
-    `relation` is the worst pair's, or "unplaced" when fewer than two copies
-    are opened (a row opens none). `live` is the longest opened copy when
-    the relation is strict_prefix. `counted` - whether doctor exits 1 for it
-    - is true for diverged copies with any unarchived row, and for a strict
-    prefix with an unarchived row on a shorter copy: an account opens an old
-    history, and a reply there forks it. Identical copies cost nothing yet;
-    an unplaced row and an inconclusive comparison are listed, not counted.
+    Each pair is compared as bytes by the duplicated-transcript comparison
+    (`bytes_relation`), then as conversation by what lies past the bytes the
+    two share (`relation`): a copy ahead only by BOOKKEEPING_RECORD_TYPES
+    records holds the same conversation ("same_history"), and a stale copy
+    the app opened and quit is still behind although its bytes have
+    diverged. The entry's `relation` is the worst pair's, or "unplaced" when
+    fewer than two copies are opened (a row opens none). `live` is the
+    opened copy no other opened copy is ahead of, when the relation is
+    strict_prefix. Each row gets `behind`: its copy is one the live copy is
+    ahead of. `counted` - whether doctor exits 1 for it - is true for
+    diverged copies with any unarchived row, and for a strict prefix with an
+    unarchived row behind: an account opens an old history, and a reply
+    there forks it. Identical copies, same history, an unplaced row and an
+    inconclusive comparison are listed, not counted.
     """
     copies, opened = entry["copies"], entry["opened"]
     pairs = []
     for x in range(len(opened)):
         for y in range(x + 1, len(opened)):
             a, b = opened[x], opened[y]
-            tc = _transcript_copies([copies[a]["path"], copies[b]["path"]])
-            pairs.append({"a": a, "b": b, "relation": tc["relation"],
-                          "reason": tc["reason"]})
+            pa, pb = copies[a]["path"], copies[b]["path"]
+            tc = _transcript_copies([pa, pb])
+            p = {"a": a, "b": b, "bytes_relation": tc["relation"],
+                 "relation": tc["relation"], "reason": tc["reason"],
+                 "ahead": None, "a_tail": None, "b_tail": None}
+            if tc["relation"] in ("strict_prefix", "diverged", "identical"):
+                try:
+                    rel, ahead, p["a_tail"], p["b_tail"] = _history_pair(
+                        pa, pb, copies[a]["bytes"], copies[b]["bytes"],
+                        tc["relation"])
+                    p["relation"] = rel
+                    p["ahead"] = {"a": a, "b": b}.get(ahead)
+                except OSError:
+                    p["relation"] = "inconclusive"
+                    p["reason"] = "a copy could not be read"
+            pairs.append(p)
     entry["pairs"] = pairs
     entry["live"] = None
     if not pairs:
         entry["relation"] = "unplaced"
     else:
         entry["relation"] = max((p["relation"] for p in pairs),
-                                key=lambda r: _SPLIT_RANK.get(r, 3))
-    active = [r for r in entry["rows"] if not r["archived"]]
-    counted = False
+                                key=lambda r: _SPLIT_RANK.get(r, 4))
+    for r in entry["rows"]:
+        r["behind"] = False
     if entry["relation"] == "strict_prefix":
-        entry["live"] = opened[0]          # copies are sorted longest first
-        top = copies[opened[0]]["bytes"]
-        counted = any(r["copy"] is not None and copies[r["copy"]]["bytes"] < top
-                      for r in active)
-    elif entry["relation"] == "diverged":
-        counted = bool(active)
-    entry["counted"] = counted
+        # The live copy: no opened copy is ahead of it. Pairs here are all
+        # strict_prefix, same_history or identical, which cannot cycle.
+        behind = {p["b"] if p["ahead"] == p["a"] else p["a"]
+                  for p in pairs if p["ahead"] is not None}
+        live = [i for i in opened if i not in behind]
+        if live:
+            entry["live"] = live[0]
+            ahead_of = {p["b"] if p["ahead"] == p["a"] else p["a"]
+                        for p in pairs if p["ahead"] == live[0]}
+            for r in entry["rows"]:
+                r["behind"] = r["copy"] in ahead_of
+        else:
+            entry["relation"] = "inconclusive"
+    active = [r for r in entry["rows"] if not r["archived"]]
+    if entry["relation"] == "strict_prefix":
+        entry["counted"] = any(r["behind"] for r in active)
+    else:
+        entry["counted"] = entry["relation"] == "diverged" and bool(active)
     return entry
 
 
@@ -3939,10 +4053,10 @@ def _short_ids(text):
 # belongs here; one that is missed degrades to the old corruption, never
 # to a leak.
 _ANON_STRUCTURAL_KEYS = frozenset((
-    "a", "a_in_b", "a_total", "a_unique", "account", "accounts",
-    "activity_unknown", "after", "age_days", "allow_orphan", "archived", "b",
-    "b_in_a", "b_total", "b_unique", "blank_rows", "by_account_count",
-    "bytes",
+    "a", "a_in_b", "a_tail", "a_total", "a_unique", "account", "accounts",
+    "activity_unknown", "after", "age_days", "ahead", "allow_orphan",
+    "archived", "b", "b_in_a", "b_tail", "b_total", "b_unique", "behind",
+    "blank_rows", "by_account_count", "bytes", "bytes_relation",
     "classification", "cli_session_id", "command_runnable", "complete",
     "config", "consistent", "conversations", "copies", "copy", "counted",
     "created", "current",
@@ -4840,6 +4954,7 @@ def _print_split_rows(env, splits, say, say_ids):
         kinds.append("{0} only in archived rows".format(n))
     for rel, words in (("inconclusive", "could not be compared"),
                        ("unplaced", "with one copy that rows open"),
+                       ("same_history", "differ only in bookkeeping records"),
                        ("identical", "are byte-identical for now")):
         n = sum(1 for s in splits if s["relation"] == rel)
         if n:
@@ -4872,7 +4987,6 @@ def _print_split_rows(env, splits, say, say_ids):
         if len(copies) > len(listed):
             say("[observed]     ... and {0} other copies no row opens"
                 .format(len(copies) - len(listed)))
-        top = copies[s["live"]]["bytes"] if s.get("live") is not None else None
         for r in s["rows"]:
             tail = " (archived)" if r["archived"] else ""
             if r["copy"] is None:
@@ -4888,19 +5002,31 @@ def _print_split_rows(env, splits, say, say_ids):
                        "in one of that folder's worktrees, the documented "
                        "placement")
             behind = ""
-            if top is not None and isinstance(copies[r["copy"]]["bytes"], int) \
-                    and copies[r["copy"]]["bytes"] < top:
+            if r.get("behind") and s.get("live") is not None:
                 behind = ", which is behind copy {0}".format(s["live"] + 1)
             say("[observed]     {0}{1} opens copy {2}{3}{4}".format(
                 r["label"], tail, r["copy"] + 1, behind, how))
         for p in s.get("pairs") or []:
             a, b = p["a"] + 1, p["b"] + 1
             if p["relation"] == "strict_prefix":
-                short, long_ = (b, a) if (copies[p["b"]]["bytes"] or 0) \
-                    < (copies[p["a"]]["bytes"] or 0) else (a, b)
-                say("[observed]     copy {0} is a strict byte-prefix of copy "
-                    "{1}: one history, and a row on copy {0} shows it as it "
-                    "was when that copy stopped growing".format(short, long_))
+                long_, short = (a, b) if p["ahead"] == p["a"] else (b, a)
+                if p.get("bytes_relation") == "strict_prefix":
+                    say("[observed]     copy {0} is a strict byte-prefix of copy "
+                        "{1}: one history, and a row on copy {0} shows it as it "
+                        "was when that copy stopped growing".format(short, long_))
+                else:
+                    say("[observed]     copy {0} stops where copy {1} goes on: "
+                        "past the bytes they share, copy {0} holds only "
+                        "bookkeeping records ({2}), which the app writes to a "
+                        "copy it opens and quits, while copy {1} holds more of "
+                        "the conversation".format(
+                            short, long_,
+                            ", ".join(sorted(BOOKKEEPING_RECORD_TYPES))))
+            elif p["relation"] == "same_history":
+                say("[observed]     copies {0} and {1} hold the same "
+                    "conversation: they differ only in bookkeeping records "
+                    "({2}) the app writes to a copy it opens and quits".format(
+                        a, b, ", ".join(sorted(BOOKKEEPING_RECORD_TYPES))))
             elif p["relation"] == "identical":
                 say("[observed]     copies {0} and {1} are byte-identical "
                     "now - the next turn taken from one account leaves the "
