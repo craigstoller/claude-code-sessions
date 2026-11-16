@@ -109,6 +109,21 @@ for key, val, word in (("stale_lock", True, "stale lock"),
     check("%s surfaces as NEEDS ATTENTION" % key, lines[0] == "NEEDS ATTENTION")
     check("  and names it", any(word in l for l in lines), word)
 
+# Split rows that make `ccs doctor` exit 1 (an account opens an older or a
+# diverged copy) must not sit under "Nothing is blocking"; the ones that do
+# not (identical copies, a row with no copy of its own) are inventory.
+split = [{"counted": True}, {"counted": False}, {"counted": False}]
+lines = gp.SyncApp.doctor_lines(dict(clean, split_rows=split))
+check("a counted split row surfaces as NEEDS ATTENTION",
+      lines[0] == "NEEDS ATTENTION", lines[0])
+check("  and names the count and doctor",
+      any("1 conversation(s)" in l and "ccs doctor" in l for l in lines))
+check("  and the inventory counts all three",
+      any("different transcript copies: 3" in l for l in lines))
+lines = gp.SyncApp.doctor_lines(dict(clean, split_rows=split[1:]))
+check("uncounted split rows are not blocking",
+      lines[0].startswith("Nothing is blocking"), lines[0])
+
 # GUI polish (Change 6): one spelling for the command - the copyable
 # RECOVER_COMMAND and the doctor lines agree.
 lines = gp.SyncApp.doctor_lines(dict(clean, stale_lock=True,
