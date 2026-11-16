@@ -174,8 +174,9 @@ claude-code-sessions list gate
 ```
 
 **`doctor`** - read-only health report (stale locks, unresolved operations, orphaned rows,
-encoding-scheme ambiguity, a synthesized row that has since vanished, and **conversations no
-account's sidebar points at**):
+encoding-scheme ambiguity, a synthesized row that has since vanished, **conversations no
+account's sidebar points at**, and **conversations whose accounts open different copies of one
+transcript**):
 
 ```
 claude-code-sessions doctor
@@ -188,6 +189,23 @@ only the top few are printed, with the total alongside (the full list is in `--j
 Resuming a session while signed into a different account repoints its row, which can leave the
 conversation you were in an hour ago reachable from no sidebar at all. That is what this
 ranking is for, and `repoint` is how you put it back.
+
+The copies check covers a case every other number misses. A conversation's transcript can end
+up in two project folders, usually after a session moves into a second worktree. Each account's
+row names a folder through its `cwd`, and the app opens the copy in that folder, even a stale
+one. So one sidebar can show a conversation as it was weeks ago while another shows it today,
+and `alignment` still counts it complete. `doctor` lists each such conversation, which
+copy each account's row opens, and how each pair of copies relates: one a strict byte-prefix of
+the other (one history, one copy stopped growing), byte-identical, or diverged (each holds
+turns the other lacks). It exits 1 when an unarchived row opens an older or a diverged copy.
+Identical copies are listed and do not change the exit code. Neither does a row whose folder
+holds no copy at all. A row whose `cwd` names a main repository while the transcript sits in
+one of its worktree folders is the app's normal placement, not a fault.
+
+Deleting the stale copy is a catch-up, not a fix. On one conversation, measured on Desktop
+5.11492.5, opening a row whose folder held no copy made the app copy the transcript back into
+that folder, so the split returns once the conversation is worked from one account and opened
+from another. No command yet changes which folder a row names.
 
 **`alignment`** - read-only scoreboard: how close your accounts are to holding one shared
 history. `doctor` answers "is anything broken"; this answers "how far apart are my sidebars,
@@ -207,8 +225,10 @@ Two of those actively trade against each other: making a conversation reachable 
 both halves of a disagreeing pair in every sidebar under one name, which is a direct hit to
 *distinguishable*. A single "aligned: yes/no" would hide exactly the decision you have to make.
 
-It reads row files and transcript **filenames** only - no transcript content - so it stays fast
-on a store with gigabytes behind it. **It always exits 0** when it could produce the report. It
+It reads row files and transcript **filenames and sizes** only - no transcript content - so it
+stays fast on a store with gigabytes behind it. That is why its line on conversations whose
+accounts open different copies only counts them, and how many differ in length; telling a stale
+copy from a diverged one means reading both, which `doctor` does. **It always exits 0** when it could produce the report. It
 is a scoreboard, not a check: these numbers stay non-zero for as long as the work takes, and a
 command that exits 1 for months trains you to stop reading it.
 

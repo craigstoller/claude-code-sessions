@@ -267,6 +267,43 @@ listing row and transcript entries, but the transcript file itself is written un
 folder for a session from `cwd` alone, without scanning all project folders, will wrongly
 report such a session as missing.
 
+## Split rows: one conversation, a different copy per account
+
+*(observed November 2026, Claude Desktop 5.11492.5 (Windows), one conversation; format may
+change)*
+
+A conversation's transcript can sit in two project folders: a session that enters a second
+worktree and is later resumed from its sidebar row leaves a copy in each (see the
+duplicated-transcript hold in the README's roadmap). Every account has its own listing row for
+the conversation, and each row names a folder through its `cwd`. What was measured:
+
+- **A row whose folder holds a copy opens that copy, even a stale one.** The row of one account
+  named a worktree folder whose copy was a strict byte-prefix of the copy in a nested worktree
+  folder that the other accounts' rows named. Opened from the first account, the conversation
+  showed its history as of the day that copy stopped growing.
+- **Opening it writes to that copy anyway.** When the app quit, a `cost-state` record was
+  appended to the stale copy, with no conversation content. The writer was most likely the CLI
+  process the app had started for the conversation; that part is inferred from timing.
+- **A row whose folder holds no copy gets one.** With the stale copy removed, opening the row
+  showed the full history, and the app (or the CLI it started) copied the transcript into the
+  folder the row names: the other copy byte for byte, plus one `tools-used` record. So the
+  conversation was in two folders again, with the longer copy now in the first account's.
+
+So removing a stale copy is a catch-up, not a fix: the split comes back once the conversation
+is worked from one account and opened from another. It lasts until every account's row names
+the same folder. Rows carry other path keys besides `cwd` (`originCwd`, `worktreePath`, a
+`folderPlace` object with `cwd` and `realPath`, `gitAnchorsFolderRealpath`); which of them the
+app reads to choose the folder is **untested**.
+
+`doctor` reports these as split rows (`_split_conversations`, `_classify_split`). It resolves the
+folder a row opens from `cwd` alone, in this order: the folder `cwd` encodes to under the
+current scheme, then the legacy one, if it holds a copy; otherwise the one copy under that
+folder's `--claude-worktrees-` folders (the worktree placement above); otherwise none. It then
+compares each pair of copies the rows open with the duplicated-transcript comparison
+(`_transcript_copies`), and exits 1 when an unarchived row opens an older or a diverged copy.
+Folder names compare without case on Windows. `alignment` counts the same conversations from
+names and sizes only.
+
 ## Retention
 
 *(observed July 2026, Claude Desktop (Windows); format may change)*
