@@ -350,7 +350,25 @@ copy that appears or changes between plan and apply holds the conversation. `rec
 (`_realign_forward_blockers`); `back` works per conversation, puts the transcript and the
 sidecar folder back each on its own, and keeps realign's placement for a conversation whose
 copy cannot go back. Every move back is checked at both ends (`_realign_paths_check`).
-`rotate_ops` keeps an operation while it holds a copy, and no command releases one yet.
+`rotate_ops` keeps an operation while it holds a copy.
+
+`realign --release` (`plan_release`, `run_release`; D10, ruled 2026-11-17) ends a held copy's
+stay: it releases one only when every row of the conversation now opens one copy
+(`_split_conversations` with `keep_all`), that copy holds the journaled copy's conversation by
+the same comparison realign plans with, and its sidecar holds every journaled sidecar file with
+the same hash. The copy goes to the Recycle Bin through the shell's own delete with undo allowed
+(`SHFileOperationW`, `FOF_ALLOWUNDO` and no UI), and release then looks for the bin's `$I` record
+naming the path. Before that it asks the volume's `BitBucket` registry key for `NukeOnDelete` and
+`MaxCapacity` and `SHQueryRecycleBinW` for what the bin holds, and refuses a copy the bin is off
+for or has no room for, or whose capacity is not recorded: what the shell does with an item
+larger than the bin's room is untested, and the documented risk is a permanent delete. Measured
+2026-11-17 on Windows 11 with scratch files: a file and a folder each left a version-2 `$I`
+record naming the original path, with the size recorded, and the registry key held both values.
+A copy is marked `releasing` before its move and `released` after, so an interrupted run is
+finished by the next one when the bin's record names the copy, and held when it does not.
+Release writes no store row, so the closed-app guard does not apply; it takes the journal lock
+and plans again under it. The bin sits behind `Env.recycle_bin`, which only `default_env` sets,
+so a test that forgets to provide one gets a refusal, not the real bin.
 
 `undo` is per conversation and key-scoped: a row's post-image is a function of the store, so
 bytes cannot prove ownership, and the app rewrites other keys on open. A conversation is put

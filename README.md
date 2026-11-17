@@ -626,10 +626,25 @@ another conversation, were written by a later operation, or when the conversatio
 turns since (bookkeeping records do not count). The other conversations go ahead, and a later
 `undo --apply` retries the refused ones.
 
-A copy realign sets aside stays in its journal until `undo` puts it back. Once a conversation
-has gained turns, undo refuses it for good, so its stale copy stays in the journal, and the
-journal keeps that operation for as long as it holds one; `doctor` lists every copy held. No
-command releases one yet.
+A copy realign sets aside stays in its journal until `undo` puts it back or `realign --release`
+sends it to the Recycle Bin; `doctor` lists every copy held. Once a conversation has gained
+turns, undo refuses it for good, which is what release is for:
+
+```
+claude-code-sessions realign --release
+claude-code-sessions realign --release --apply
+```
+
+A copy is released only when every row of its conversation now opens one copy, that copy holds
+the set-aside copy's whole conversation (bookkeeping records aside), and its sidecar folder holds
+every file the set-aside copy's does, with the same content: a copy that holds anything the live
+one lacks stays in the journal, with the reason printed. It goes to the Windows Recycle Bin, from
+which it can be restored by hand until the bin is emptied, and only when the bin for that drive
+is on and has room for it, since a bin that cannot take a file deletes it outright. After the
+move it checks that the bin's record names the file. Release writes no sidebar row, so it does
+not need the app closed. Once every copy of an operation is released, the journal ages the
+operation out like any other, and `undo` refuses a conversation whose copy was released.
+Windows only, like every other store mutation here.
 
 ## Safety design
 

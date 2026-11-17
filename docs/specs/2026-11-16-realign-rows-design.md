@@ -435,6 +435,11 @@ Every decision above, the maintainer's call, each as recommended:
   converge alone.
 - **D9**: `doctor` lists single-copy conversations with a row that reaches no copy, not counted,
   and realign plans them. Not taken: list them before the probe; leave them until they split.
+- **D10** (2026-11-17, after the code review): a release step for held copies - check the
+  rows still open the live copy and the journaled copy holds nothing the live copy lacks,
+  then move it to the Recycle Bin. Not taken: leave them for removal by hand. The same
+  ruling kept D6's narrow reading (only a copy a moved row opened is set aside). See the
+  implementation notes.
 
 ## Revisions
 
@@ -509,26 +514,50 @@ added while applying round 2 and have not been reviewed.
 
 ## Implementation notes (2026-11-17)
 
-Built test-first on the branch: `tests/test_realign.py` holds 83 tests. The first 38 were written
-before the code, and the 25 that answer the code review below were written before their fixes.
+Built test-first on the branch: `tests/test_realign.py` holds 102 tests. The first 38 were
+written before the code, the 25 that answer the code review below before their fixes, and the
+19 for D10's release step before it.
 Where the build departs from the text above, or settles what the text left open:
 
-- **D6 is read narrowly, pending the maintainer.** Only a copy a rewritten row used to open,
-  and no row opens afterwards, goes into the journal. A copy no row opened even before
-  realign (converge's duplicated-transcript case) stays on disk, behind or identical, and the
-  conversation keeps converge's hold for it. On the store this was built against, the wider
-  reading would have moved 13 more copies (about 509 MB) in 2 conversations, one of them a
-  conversation with a single row-opened copy and a row that opens none. Two reviewers noted
+- **D6 is read narrowly, ruled by the maintainer 2026-11-17.** Only a copy a rewritten row
+  used to open, and no row opens afterwards, goes into the journal. A copy no row opened even
+  before realign (converge's duplicated-transcript case) stays on disk, behind or identical,
+  and the conversation keeps converge's hold for it. On the store this was built against, the
+  wider reading would have moved 13 more copies (about 509 MB) in 2 conversations, one of them
+  a conversation with a single row-opened copy and a row that opens none. Two reviewers noted
   what the narrow reading leaves: once every row opens one copy, `doctor` no longer lists the
   conversation, while `converge`, `move` and `repoint` still refuse it for the second copy.
-  Whether realign should clear those copies, or `doctor` list them, is a question for the
-  maintainer; the build's default is the narrow one.
-- **No command releases a copy realign set aside.** `undo` puts a copy back with its rows
-  while its conversation has not moved on; once the conversation gains turns, undo refuses
-  that conversation for good (D5's history check), and the copy stays in the journal, which
-  `rotate_ops` keeps for as long as it holds one. Every reviewer raised this. A release path
-  (keep the rows, drop the copy, after checking it holds nothing the live copy lacks) is not
-  designed; it is a question for the maintainer, and `doctor` says no command releases one yet.
+  The maintainer kept the narrow reading, the wider one to be reconsidered now that a release
+  step exists. Not taken: the wider reading; the narrow one with `doctor` listing such
+  conversations.
+- **D10, a release step, ruled by the maintainer 2026-11-17** after every reviewer of the
+  build found that nothing removed a held copy once its conversation had gained turns. Ruled:
+  check that the conversation's rows still open the live copy and that the journaled copy holds
+  nothing the live copy lacks, then move it to the Recycle Bin. Not taken: leave held copies in
+  the journal for removal by hand. Built as `realign --release`:
+  - A held copy is released only when every row of its conversation now opens one copy, that
+    copy holds the journaled one's conversation (bookkeeping records aside, by the comparison
+    realign plans with), and its sidecar holds every journaled sidecar file with the same
+    hash. "Holds nothing the live copy lacks" is read to include the sidecar, since the two
+    moved together. The consequence on the store this was built against: each of the 3 copies
+    the default plan would set aside has sidecar files the live copy's lacks (5, 9 and 60), so
+    release would hold all three; of the 20 copies `--include-identical` would set aside, 16
+    have none. Whether to carry such files into the live copy's sidecar first, or to release
+    regardless (the Recycle Bin keeps them), is a question for the maintainer.
+  - The move is the shell's own delete with undo allowed (`SHFileOperationW` with
+    `FOF_ALLOWUNDO` and no UI), and release then checks that a `$I` record in the user's
+    `$Recycle.Bin` folder names the path. It first refuses a copy the bin is turned off for
+    (`NukeOnDelete`), has no recorded capacity for (`MaxCapacity`), or has no room for, by
+    `SHQueryRecycleBinW`: the shell's behaviour with an item larger than the bin's room is
+    untested, and the documented risk is a permanent delete. Measured 2026-11-17 on Windows 11
+    with scratch files only: a file and a folder each left a version-2 `$I` record naming the
+    original path and the size, the volume's `BitBucket` key held both values, and the
+    module's own bin class passed the same check end to end.
+  - It writes no store row, so the closed-app guard does not apply; it takes the journal lock
+    and plans again under it, marks a copy `releasing` before the move and `released` after,
+    and finishes an interrupted release when the bin's record names the copy. Undo refuses a
+    conversation whose copy was released. Windows only. Tests use a fake bin; the real one sits
+    behind `Env.recycle_bin`, which only `default_env` sets.
 - **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
   only when everything it would act on is as the journal expects
   (`_realign_forward_blockers`): each pending row still holds its journaled original, each
@@ -597,7 +626,7 @@ Rejected: that unopened copies enter the pair comparison and so mask the target 
 not choose among identical copies (D3 as ruled; it runs only under `--include-identical`, and
 the plan names the deciding row); that an identical split with a no-copy row should move every
 row without the flag (D3 as ruled: only the no-copy row moves, and the split stays listed);
-that rotation should pin every operation a realign's ownership check might read (above). Open
-for the maintainer: the release path and the D6 reading, both above.
+that rotation should pin every operation a realign's ownership check might read (above). The
+release path and the D6 reading it left open were ruled the same day (D10 and D6 above).
 
 End of the realign design.
