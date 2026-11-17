@@ -1354,6 +1354,7 @@ def test_an_interrupted_release_is_finished_when_the_bin_holds_the_copy(world):
     cp = op.manifest["copies"][0]
     cp["releasing"] = True
     cp["release_at"] = world.env.now()
+    cp["release_live"] = {"path": s.live_p, "basis": ct._file_basis(s.live_p)}
     ct.save_manifest(op)
     b.recycle(cp["aside"])                       # it reached the bin; the record did not
     m = ct.plan_release(world.env, release_flags())
@@ -1531,6 +1532,7 @@ def test_finishing_an_interrupted_release_checks_the_sidecar_still_in_the_journa
     cp = op.manifest["copies"][0]
     cp["releasing"] = True
     cp["release_at"] = world.env.now()
+    cp["release_live"] = {"path": s.live_p, "basis": ct._file_basis(s.live_p)}
     ct.save_manifest(op)
     b.recycle(cp["aside"])                          # the transcript went; the sidecar did not
     with_sidecar(s.live_p, {"subagents/a.jsonl": "changed"})   # live no longer holds it
@@ -1668,3 +1670,157 @@ def test_the_bin_record_parser_refuses_a_truncated_version_1_record():
     import struct
     v1 = struct.pack("<qqq", 1, 5, 0) + "C:\\x".encode("utf-16-le")
     assert ct._recycle_record_path(v1) is None
+
+
+# ------------------------------------------- the release step's review, round 2
+
+def test_finishing_a_release_rechecks_a_live_copy_that_changed(world):
+    """The stale transcript is already in the bin; the live copy was then
+    rewritten shorter. Finishing must hold it, not record it released."""
+    s, op = applied(world)
+    b = with_bin(world)
+    m = ct.plan_release(world.env, release_flags())
+    real = b.recycle
+
+    def recycle_then_stop(path):
+        out = real(path)
+        raise SimulatedCrash()
+    b.recycle = recycle_then_stop
+    with pytest.raises(SimulatedCrash):
+        ct.run_release(world.env, m)
+    ct.release_lock(world.env)
+    b.recycle = real
+    with open(s.live_p, "w", encoding="utf-8") as fh:      # the live copy, rewritten
+        fh.write(json.dumps(t_entries(cwd=s.live_cwd)[0]) + "\n")
+    m2 = ct.plan_release(world.env, release_flags())
+    assert m2["copies"] == [] and "live copy" in held_reasons(m2)[S1]
+
+
+def test_a_release_refused_before_anything_moved_leaves_undo_possible(world):
+    s, op = applied(world)
+    with_bin(world, recycle_ok=(False, "Windows refused"))   # the first move fails
+    m = ct.plan_release(world.env, release_flags())
+    with pytest.raises(ct.Refusal):
+        ct.run_release(world.env, m)
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    cp = o.manifest["copies"][0]
+    assert cp["moved"] and not cp.get("releasing") and os.path.isfile(cp["aside"])
+    assert ct.undo_realign(world.env, o) == "undone"
+    assert world.read(s.r2)["cwd"] == s.old_cwd
+
+
+def test_undo_proceeds_when_an_interrupted_release_moved_nothing(world):
+    s, op = applied(world)
+    cp = op.manifest["copies"][0]
+    cp["releasing"] = True
+    cp["release_at"] = world.env.now()
+    ct.save_manifest(op)                             # stopped before its first move
+    assert ct.undo_realign(world.env, op) == "undone"
+    assert world.read(s.r2)["cwd"] == s.old_cwd
+
+
+def interrupted_with_sidecar(world, sidecar_text="a"):
+    """A release stopped after the transcript went to the bin, its sidecar
+    still in the journal. Returns (s, op, bin, copy)."""
+    s = behind_store(world)
+    with_sidecar(s.live_p, {"subagents/a.jsonl": sidecar_text})
+    with_sidecar(s.old_p, {"subagents/a.jsonl": sidecar_text})
+    s, op = applied_with(world, s)
+    b = with_bin(world)
+    cp = op.manifest["copies"][0]
+    cp["releasing"] = True
+    cp["release_at"] = world.env.now()
+    cp["release_live"] = {"path": s.live_p, "basis": ct._file_basis(s.live_p)}
+    ct.save_manifest(op)
+    b.recycle(cp["aside"])
+    return s, op, b, cp
+
+
+def test_damaged_release_fields_are_a_damaged_record_not_a_crash(world):
+    s, op = applied(world)
+    with_bin(world)
+    cp = op.manifest["copies"][0]
+    cp["releasing"] = True
+    cp["release_at"] = "yesterday"
+    ct.save_manifest(op)
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "damaged" in held_reasons(m)[S1]
+
+
+def test_the_room_check_runs_for_a_part_of_no_bytes(world):
+    s, op, b, cp = interrupted_with_sidecar(world, sidecar_text="")
+    b._room = (False, "the Recycle Bin is turned off for that drive")
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "turned off" in held_reasons(m)[S1]
+
+
+def test_an_open_operation_on_the_conversation_holds_its_release(world):
+    s, op = applied(world)
+    with_bin(world)
+    ct.new_op(world.env, {"op_type": "retitle", "cli_session_id": S1, "new_title": "x",
+                          "rows": []})
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "unfinished operation" in held_reasons(m)[S1]
+
+
+def test_an_undo_stopped_part_way_holds_its_release(world):
+    s, op = applied(world)
+    with_bin(world)
+    op.manifest["undo_status"] = {S1: "undoing"}
+    ct.save_manifest(op)
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "undo" in held_reasons(m)[S1]
+
+
+def test_a_journaled_row_in_an_unreadable_store_holds_its_release(world):
+    s, op = applied(world)
+    with_bin(world)
+    r = op.manifest["rows"][0]
+    r["dest_path"] = str(world.tmp / "elsewhere" / "acct" / "org" / "local_1.json")
+    r["store_path"] = os.path.dirname(r["dest_path"])
+    ct.save_manifest(op)
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "store" in held_reasons(m)[S1]
+
+
+def test_a_move_whose_bin_record_does_not_match_stops_the_release(world):
+    s, op = applied(world)
+    b = with_bin(world)
+    real = b.recycle
+
+    def recycle_wrong_size(path):
+        out = real(path)
+        key = os.path.normcase(os.path.abspath(path))
+        t, n, dest = b.items[key][-1]
+        b.items[key][-1] = (t, n + 1, dest)
+        return out
+    b.recycle = recycle_wrong_size
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_release(world.env, ct.plan_release(world.env, release_flags()))
+    assert "record" in str(exc.value)
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    assert o.manifest["copies"][0]["releasing"] and not o.manifest["copies"][0].get("released")
+
+
+def test_a_release_all_in_the_bin_is_recorded_even_after_the_rows_changed(world):
+    s, op, b, cp = interrupted_with_sidecar(world)
+    b.recycle(cp["aside"][:-len(".jsonl")])          # the sidecar went too
+    world.row(A3, O3, "local_1", S1, s.old_cwd)      # and a row now opens no copy
+    m = ct.plan_release(world.env, release_flags())
+    (c,) = m["copies"]
+    assert c["finish"]
+    assert ct.run_release(world.env, m) == "completed"
+
+
+def test_an_empty_folder_too_long_for_the_bin_is_held(world):
+    s = behind_store(world)
+    with_sidecar(s.live_p, {"subagents/a.jsonl": "a"})
+    with_sidecar(s.old_p, {"subagents/a.jsonl": "a"})
+    s, op = applied_with(world, s)
+    b = with_bin(world)
+    side_aside = op.manifest["copies"][0]["aside"][:-len(".jsonl")]
+    deep = os.path.join(side_aside, "x" * 40)
+    os.makedirs(deep)
+    b.path_limit = len(os.path.abspath(deep)) - 1
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "too long" in held_reasons(m)[S1]
