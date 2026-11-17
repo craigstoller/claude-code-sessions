@@ -545,8 +545,9 @@ Where the build departs from the text above, or settles what the text left open:
     which carry no conversation. The consequence on the store this was built against: each of
     the 3 copies the default plan would set aside has sidecar files the live copy's lacks (5, 9
     and 60), so release would hold all three; of the 20 copies `--include-identical` would set
-    aside, 16 have none. Whether to carry such files into the live copy's sidecar first, or to
-    release regardless, is a question for the maintainer, and so is the bookkeeping reading.
+    aside, 16 have none. Ruled by the maintainer 2026-11-17 (D10b, D10c): the sidecar rule
+    stays strict, so such a copy stays in the journal, and the bookkeeping reading stands. Not
+    taken: carrying the missing files into the live copy's sidecar first; releasing regardless.
   - A permanent delete must not happen silently. The move is the shell's delete with undo
     allowed (`SHFileOperationW`, `FOF_ALLOWUNDO`, no UI) plus `FOF_WANTNUKEWARNING`, which
     Microsoft documents as warning before an item is destroyed rather than recycled. Before
@@ -590,7 +591,9 @@ Where the build departs from the text above, or settles what the text left open:
     released copy blocks undo of the operation's other conversations (undo's checks are per
     conversation); that the bin may record a folder's size as 0 (both measurements recorded the
     size of its contents); and that a release wholly in the bin should be recorded whatever the
-    live copy did (above). Not built, for the maintainer: a hard veto on a permanent delete.
+    live copy did (above). Not built, by the maintainer's ruling (D10a, 2026-11-17): a hard
+    veto on a permanent delete; the guard stays as built, and the warning flag is to be
+    measured on a drive whose Recycle Bin cannot take a file before the first real apply.
     Two reviewers proposed `IFileOperation` with `FOFX_RECYCLEONDELETE`, but Microsoft's text
     for that flag says only that it sends an item to the Recycle Bin rather than deleting it,
     not that the shell fails when it cannot, and no case the shell cannot recycle can be made
