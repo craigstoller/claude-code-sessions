@@ -512,6 +512,13 @@ added while applying round 2 and have not been reviewed.
 Built test-first on the branch (`tests/test_realign.py`, 56 tests, written before the code
 for the first 38). Where the build departs from the text above:
 
+- **D6 is read narrowly, pending the maintainer.** Only a copy a rewritten row used to open,
+  and no row opens afterwards, goes into the journal. A copy no row opened even before
+  realign (converge's duplicated-transcript case) stays on disk, behind or identical, and the
+  conversation keeps converge's hold for it. On the store this was built against, the wider
+  reading would have moved 13 more copies (about 509 MB) in 2 conversations, one of them a
+  conversation with a single row-opened copy and a row that opens none. Whether realign should
+  also clear those is a question for the maintainer; the build's default is the narrow one.
 - **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
   only when every pending row still holds its journaled pre-image and every pending copy is
   where the plan found it (or already in the journal); otherwise it offers `back` alone. The

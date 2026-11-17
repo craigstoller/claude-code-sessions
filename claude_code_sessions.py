@@ -12102,16 +12102,20 @@ def _realign_decide(env, e, include_identical, recs, nt):
             "is_update": True, "written": False})
     open_after = {target} | {r["copy"] for r in rows
                              if r not in change and r["copy"] is not None}
-    # D6: every copy no row opens once the rows are rewritten goes into the
-    # journal with its sidecar folder. It holds nothing the live copy lacks:
-    # the comparison above held the conversation otherwise. The sidecar is
+    # D6: a copy a row opened before, and no row opens once the rows are
+    # rewritten, goes into the journal with its sidecar folder. It holds
+    # nothing the live copy lacks: the comparison above held the
+    # conversation otherwise. A copy NO row opened even before is left where
+    # it is - that is converge's duplicated-transcript case, which realign
+    # did not make and the ruling did not give it (on the store this was
+    # built against, 13 such copies in 2 conversations). The sidecar is
     # inventoried the way `move` inventories one (refusing a symlink or
     # junction inside it), and the files only it holds are named.
     try:
         tinv = {x["rel"] for x in sidecar_inventory(sidecar_path(tp))}
         moves = []
         for i, c in enumerate(copies):
-            if i in open_after:
+            if i in open_after or i not in opened:
                 continue
             side = sidecar_path(c["path"])
             inv = sidecar_inventory(side)
@@ -12143,6 +12147,9 @@ def _realign_decide(env, e, include_identical, recs, nt):
             "folder": copies[target]["folder"], "cwd": value,
             "target_path": tp, "target_basis": target_basis,
             "path_from": source, "decided_by": decided_by,
+            # Every copy on disk, for the apply-time re-check: a copy that
+            # appears or changes size since the plan holds the conversation.
+            "copies_seen": sorted([c["folder"], c["bytes"]] for c in copies),
             "rows": len(out_rows), "copies_moved": len(moves)}
     return {"plan": (conv, out_rows, moves)}
 
@@ -12286,7 +12293,8 @@ def _realign_fingerprint(m, sid):
                   json.dumps(c["sidecar_inventory"], sort_keys=True))
                  for c in m["copies"] if c["session_id"] == sid)
     return (conv["folder"], conv["cwd"], conv["target_basis"]["sha256"],
-            conv["target_basis"]["bytes"], tuple(rows), tuple(cps))
+            conv["target_basis"]["bytes"], json.dumps(conv.get("copies_seen")),
+            tuple(rows), tuple(cps))
 
 
 def _realign_recheck(env, m):

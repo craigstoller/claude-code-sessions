@@ -733,6 +733,34 @@ def test_mixed_copies_end_with_every_row_on_the_live_copy(world):
     assert ct.gather_doctor(world.env)["split_rows"] == []
 
 
+def test_a_copy_no_row_ever_opened_stays_where_it_is(world):
+    """D6 sets aside the copy realign leaves unopened. A copy no row opened
+    even before - converge's duplicated-transcript case - is not realign's
+    to move, behind or not."""
+    s = behind_store(world)
+    far, far_f = world.place("Far")
+    far_p = world.copy(far, S1, t_entries(cwd=s.live_cwd))
+    m = plan(world)
+    assert [c["folder"] for c in m["copies"]] == [s.old_f]
+    ct.run_realign(world.env, m)
+    assert os.path.isfile(far_p) and not os.path.exists(s.old_p)
+    assert ct.gather_doctor(world.env)["split_rows"] == []
+
+
+def test_d9_leaves_an_unopened_second_copy_alone(world):
+    a, _ = world.place("Northwind")
+    b, _ = world.place("Northwind-wt")
+    none_cwd, _ = world.place("Elsewhere")
+    world.copy(a, S1, t_entries(cwd=a) + later_turns())
+    pb = world.copy(b, S1, t_entries(cwd=a))
+    world.row(A1, O1, "local_1", S1, a)
+    r2 = world.row(A2, O2, "local_1", S1, none_cwd)
+    m = plan(world)
+    assert [r["dest_path"] for r in m["rows"]] == [r2] and m["copies"] == []
+    ct.run_realign(world.env, m)
+    assert os.path.isfile(pb)
+
+
 def test_undo_refuses_when_the_old_folder_is_gone(world):
     s, op = applied(world)
     shutil.rmtree(s.old_cwd)

@@ -341,8 +341,11 @@ One run is one journaled operation (`op_type: realign`). Each row is journaled w
 pre-image and post-image and, for undo, `old` and `new`: the previous and written value of each
 key it changed, with whether the key was present. `execute_realign_op` writes the rows (each
 checked against its pre-image, verified after as the pre-image with exactly those keys changed),
-then moves every copy no row opens any more into `<op>/set-aside/<id>/<folder>.jsonl`, sidecar
-folder beside it, after checking its bytes against the plan. `rotate_ops` keeps an operation
+then moves every copy a rewritten row used to open, and no row opens now, into
+`<op>/set-aside/<id>/<folder>.jsonl`, sidecar folder beside it, after checking its bytes and
+its sidecar's inventory against the plan. A copy no row opened before is left in place. The
+plan records every copy on disk with its size, so a copy that appears or changes between plan
+and apply holds the conversation. `rotate_ops` keeps an operation
 while it holds a copy. `recover` finishes forward from the journal, without re-planning, or goes
 back by restoring the copies and every row that still holds its post-image.
 

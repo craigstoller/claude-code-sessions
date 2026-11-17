@@ -593,7 +593,9 @@ rewrites `cwd`, and `folderPlace.cwd` and `folderPlace.realPath` where the row h
 the title. The rewritten rows then open the live copy. No row opens the stale copy any more, so
 it moves into the operation's journal, with its sidecar folder, where `undo` can put it back
 and `doctor` lists it. Without that step, `move`, `repoint`, `new-row` and `converge` would
-keep refusing the conversation for its duplicated transcript.
+keep refusing the conversation for its duplicated transcript. A copy that no row opened even
+before `realign` stays where it is: that is the duplicated-transcript case, which `realign` did
+not cause.
 
 By default it plans conversations with a copy behind the live one, and rows whose folder holds
 no copy. Copies that hold the same conversation (byte-identical, or different only in
