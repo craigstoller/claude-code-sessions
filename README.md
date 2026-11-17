@@ -636,15 +636,26 @@ claude-code-sessions realign --release --apply
 ```
 
 A copy is released only when every row of its conversation now opens one copy, that copy holds
-the set-aside copy's whole conversation (bookkeeping records aside), and its sidecar folder holds
-every file the set-aside copy's does, with the same content: a copy that holds anything the live
-one lacks stays in the journal, with the reason printed. It goes to the Windows Recycle Bin, from
-which it can be restored by hand until the bin is emptied, and only when the bin for that drive
-is on and has room for it, since a bin that cannot take a file deletes it outright. After the
-move it checks that the bin's record names the file. Release writes no sidebar row, so it does
-not need the app closed. Once every copy of an operation is released, the journal ages the
-operation out like any other, and `undo` refuses a conversation whose copy was released.
-Windows only, like every other store mutation here.
+the set-aside copy's whole conversation (the bookkeeping records `tools-used` and `cost-state`
+aside, which carry no conversation), and its sidecar folder holds every file the set-aside
+copy's does, with the same content: a copy that holds anything else the live one lacks stays in
+the journal, with the reason printed. It goes to the Windows Recycle Bin, and the step is built
+so that a permanent delete cannot happen silently. A shell that cannot recycle a file destroys
+it instead. So release refuses a bin turned off (by you or by policy), one whose capacity the
+registry does not record, one without room for the whole run without pushing out your older
+deleted files (asked again just before each move), and a path too long for the shell, and it
+asks Windows to warn rather than delete in any case it cannot see. After each move it checks
+that a new bin record names the file, with its size and its contents present. It needs the
+desktop app closed, since its checks read the rows and transcripts the app rewrites. A copy
+whose release is interrupted is finished by the next run, and only after the same checks. Once
+every copy of an operation is released, the journal ages the operation out like any other;
+`undo` refuses a conversation whose copy was released or is part-way through release, and
+`--json` gives each copy's outcome, a failed run included.
+
+A released copy can be restored from the Recycle Bin by hand until the bin is emptied or
+Windows clears it to make room. It comes back to its journal folder, not to its project folder;
+the operation's record names where each part went. Windows only, like every other store mutation
+here.
 
 ## Safety design
 

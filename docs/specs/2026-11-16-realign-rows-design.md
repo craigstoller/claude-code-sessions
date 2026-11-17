@@ -514,9 +514,9 @@ added while applying round 2 and have not been reviewed.
 
 ## Implementation notes (2026-11-17)
 
-Built test-first on the branch: `tests/test_realign.py` holds 102 tests. The first 38 were
-written before the code, the 25 that answer the code review below before their fixes, and the
-19 for D10's release step before it.
+Built test-first on the branch: `tests/test_realign.py` holds 119 tests. The first 38 were
+written before the code, the 25 that answer the code review below before their fixes, the
+19 for D10's release step before it, and the 17 that answer its review before theirs.
 Where the build departs from the text above, or settles what the text left open:
 
 - **D6 is read narrowly, ruled by the maintainer 2026-11-17.** Only a copy a rewritten row
@@ -534,30 +534,44 @@ Where the build departs from the text above, or settles what the text left open:
   build found that nothing removed a held copy once its conversation had gained turns. Ruled:
   check that the conversation's rows still open the live copy and that the journaled copy holds
   nothing the live copy lacks, then move it to the Recycle Bin. Not taken: leave held copies in
-  the journal for removal by hand. Built as `realign --release`:
+  the journal for removal by hand. Built as `realign --release`, and reviewed by all four
+  engines the same evening; this is the reviewed form:
   - A held copy is released only when every row of its conversation now opens one copy, that
-    copy holds the journaled one's conversation (bookkeeping records aside, by the comparison
-    realign plans with), and its sidecar holds every journaled sidecar file with the same
-    hash. "Holds nothing the live copy lacks" is read to include the sidecar, since the two
-    moved together. The consequence on the store this was built against: each of the 3 copies
-    the default plan would set aside has sidecar files the live copy's lacks (5, 9 and 60), so
-    release would hold all three; of the 20 copies `--include-identical` would set aside, 16
-    have none. Whether to carry such files into the live copy's sidecar first, or to release
-    regardless (the Recycle Bin keeps them), is a question for the maintainer.
-  - The move is the shell's own delete with undo allowed (`SHFileOperationW` with
-    `FOF_ALLOWUNDO` and no UI), and release then checks that a `$I` record in the user's
-    `$Recycle.Bin` folder names the path. It first refuses a copy the bin is turned off for
-    (`NukeOnDelete`), has no recorded capacity for (`MaxCapacity`), or has no room for, by
-    `SHQueryRecycleBinW`: the shell's behaviour with an item larger than the bin's room is
-    untested, and the documented risk is a permanent delete. Measured 2026-11-17 on Windows 11
-    with scratch files only: a file and a folder each left a version-2 `$I` record naming the
-    original path and the size, the volume's `BitBucket` key held both values, and the
-    module's own bin class passed the same check end to end.
-  - It writes no store row, so the closed-app guard does not apply; it takes the journal lock
-    and plans again under it, marks a copy `releasing` before the move and `released` after,
-    and finishes an interrupted release when the bin's record names the copy. Undo refuses a
-    conversation whose copy was released. Windows only. Tests use a fake bin; the real one sits
-    behind `Env.recycle_bin`, which only `default_env` sets.
+    copy holds the journaled one's conversation (the bookkeeping records `tools-used` and
+    `cost-state` aside, by the comparison realign plans with), and its sidecar holds every
+    journaled sidecar file with the same hash. "Holds nothing the live copy lacks" is read to
+    include the sidecar, since the two moved together, and to exclude bookkeeping records,
+    which carry no conversation. The consequence on the store this was built against: each of
+    the 3 copies the default plan would set aside has sidecar files the live copy's lacks (5, 9
+    and 60), so release would hold all three; of the 20 copies `--include-identical` would set
+    aside, 16 have none. Whether to carry such files into the live copy's sidecar first, or to
+    release regardless, is a question for the maintainer, and so is the bookkeeping reading.
+  - A permanent delete must not happen silently. The move is the shell's delete with undo
+    allowed (`SHFileOperationW`, `FOF_ALLOWUNDO`, no UI) plus `FOF_WANTNUKEWARNING`, which
+    Microsoft documents as warning before an item is destroyed rather than recycled. Before
+    any move release refuses each case it can see in which the shell would destroy rather
+    than recycle: the bin turned off by policy (`NoRecycleFiles`) or by the volume's
+    `NukeOnDelete`, a `MaxCapacity` the registry does not record, too little room for the
+    whole run on that drive without evicting older items (asked again just before each move),
+    and a path over 259 characters. After each move it requires a new `$I` record naming the
+    path, with its `$R` payload present.
+  - The transcript and the sidecar folder are tracked apart. A copy is marked `releasing`, with
+    the time, before its first move; each part's bin location is recorded as it goes; and
+    `released` closes it. An interrupted release is finished only for parts still in the
+    journal (checked as on a first run) or in the bin under a record made since the release
+    began, of the planned size, with its payload; anything else holds the copy, and `doctor`
+    names it. A part that is in neither place has no exit in the tool, which is recorded.
+  - It needs the desktop app closed (three reviewers; the fourth argued it need not, since it
+    writes no store row, and the cautious side was taken), takes the journal lock, plans again
+    under it, and refuses `--live` and `--include-identical` rather than ignoring them. Every
+    copy ends with an `outcome`, printed with `--json` even when the run is refused part-way.
+    Undo refuses a conversation whose copy was released or is part-way through release.
+  - Measured 2026-11-17 on Windows 11 with scratch files: a file and a folder each left a
+    version-2 `$I` record naming the original path, with the size and a deletion time that
+    decodes to the moment of the move, beside its `$R` payload; the volume's `BitBucket` key
+    held both values; and the module's own bin class passed the round trip, matching a record
+    only with the right size and a time after the run began. Untested: what the shell does with
+    an item it cannot recycle, and how `FOF_WANTNUKEWARNING` combines with the silent flags.
 - **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
   only when everything it would act on is as the journal expects
   (`_realign_forward_blockers`): each pending row still holds its journaled original, each

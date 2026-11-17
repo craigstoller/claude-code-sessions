@@ -355,20 +355,30 @@ copy cannot go back. Every move back is checked at both ends (`_realign_paths_ch
 `realign --release` (`plan_release`, `run_release`; D10, ruled 2026-11-17) ends a held copy's
 stay: it releases one only when every row of the conversation now opens one copy
 (`_split_conversations` with `keep_all`), that copy holds the journaled copy's conversation by
-the same comparison realign plans with, and its sidecar holds every journaled sidecar file with
-the same hash. The copy goes to the Recycle Bin through the shell's own delete with undo allowed
-(`SHFileOperationW`, `FOF_ALLOWUNDO` and no UI), and release then looks for the bin's `$I` record
-naming the path. Before that it asks the volume's `BitBucket` registry key for `NukeOnDelete` and
-`MaxCapacity` and `SHQueryRecycleBinW` for what the bin holds, and refuses a copy the bin is off
-for or has no room for, or whose capacity is not recorded: what the shell does with an item
-larger than the bin's room is untested, and the documented risk is a permanent delete. Measured
-2026-11-17 on Windows 11 with scratch files: a file and a folder each left a version-2 `$I`
-record naming the original path, with the size recorded, and the registry key held both values.
-A copy is marked `releasing` before its move and `released` after, so an interrupted run is
-finished by the next one when the bin's record names the copy, and held when it does not.
-Release writes no store row, so the closed-app guard does not apply; it takes the journal lock
-and plans again under it. The bin sits behind `Env.recycle_bin`, which only `default_env` sets,
-so a test that forgets to provide one gets a refusal, not the real bin.
+the same comparison realign plans with (`tools-used` and `cost-state` records aside), and its
+sidecar holds every journaled sidecar file with the same hash (names compared without case on
+Windows). The copy goes to the Recycle Bin through the shell's own delete with undo allowed
+(`SHFileOperationW` with `FOF_ALLOWUNDO`, no UI, and `FOF_WANTNUKEWARNING`, which Microsoft
+documents as sending a warning when an item would be destroyed rather than recycled and as
+partly overriding `FOF_NOCONFIRMATION`). The shell destroys what it cannot recycle, so before
+any move release refuses every such case it can see: `NoRecycleFiles` set by policy (machine
+or user), the volume's `BitBucket` key saying `NukeOnDelete` or recording no `MaxCapacity`,
+too little room by `SHQueryRecycleBinW` for the whole run per drive without evicting older
+items (asked again just before each move), and a path over 259 characters (the shell takes no
+`\\?\` paths). After each move it requires a `$I` record that was not there before, naming the
+path, with its `$R` payload present. The transcript and the sidecar folder are tracked apart:
+a copy is marked `releasing`, with the time, before its first move, each part's bin location
+is recorded as it goes, and `released` closes it. A later run finishes an interrupted release
+only for parts that are either still in the journal (and then checked as on a first run) or in
+the bin under a record made since the release began, of the planned size, with its payload;
+anything else holds the copy. It needs the desktop app closed, since its decision reads the
+rows and the live transcript, and it takes the journal lock and plans again under it. The bin
+sits behind `Env.recycle_bin`, which only `default_env` sets, so a test that forgets to provide
+one gets a refusal, not the real bin. Measured 2026-11-17 on Windows 11 with scratch files: a
+file and a folder each left a version-2 `$I` record naming the original path, with the size and
+a deletion time that decodes to the moment of the move, beside its `$R` payload; the registry
+key held both values; and the module's bin class passed the round trip. What the shell does
+with an item it cannot recycle remains untested.
 
 `undo` is per conversation and key-scoped: a row's post-image is a function of the store, so
 bytes cannot prove ownership, and the app rewrites other keys on open. A conversation is put
