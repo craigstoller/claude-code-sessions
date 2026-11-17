@@ -42,6 +42,8 @@ The lasting state is every account's row opening the same copy, the live one.
 | `cwd` is the key the app reads to choose that folder | **measured on a plain-folder row** (probe phase 1, 2026-11-17, Desktop 5.11492.5): `cwd` alone on the other folder opened that folder's copy, every other path key there but `cwd` did not, and `originCwd`, `folderPlace.cwd`, `folderPlace.realPath` and `gitAnchorsFolderRealpath` each alone did not. **Untested on a worktree row** (phase 2) |
 | The app does not rewrite the folder keys back when it opens a row | **measured, plain row**: it never rewrote `cwd`, `originCwd` or `gitAnchorsFolderRealpath`; it rewrote `folderPlace` to `{cwd: <the row's cwd>, lost: true}` whenever `folderPlace.cwd` disagreed with `cwd`, and left it when they agreed |
 | Changing a row's folder keys changes where the conversation's next turns run | **measured, plain row**: a turn typed after `cwd` moved ran in, and was written to, the new folder, in the same transcript (no new conversation id) |
+| A row with a worktree link (`worktreePath`, `worktreeName`, `branch`) can have its folder keys rewritten | **measured false** (probe phase 2, one worktree session): moving `worktreePath` to another folder, even another live worktree of the same repository, made the app drop the row's worktree link (`worktreePath`, `worktreeName`, `sourceBranch` deleted) and say the old worktree was removed; moving `cwd` alone showed that folder's copy, but the session could not start (the app recorded a "worktree branch in use" failure). Git was not touched either time |
+| A session started in a worktree records the main repository as `cwd` (the July placement) | **not what the current app writes**: a worktree session started on 2026-11-17 recorded the worktree as `cwd` and `worktreePath`, kept its transcript in the worktree's own folder, and kept the main repository as `originCwd` and `folderPlace.origin` |
 | The live copy is the one holding every other copy's conversation | inference from append-only transcripts, with the two bookkeeping records set aside; `doctor` computes it among the copies rows open, and realign must compare it with every copy on disk |
 
 Nothing below is built until the probe has run.
@@ -133,6 +135,12 @@ opening the target, and `doctor` no longer lists it. `--include-identical` decid
 a conversation with no copy behind is planned at all. A row that already opens the target copy
 is left alone, whether it reaches it through its `cwd` or through the documented worktree
 placement (`cwd` names the main repository and the copy sits in one of its worktree folders).
+
+**A row with a worktree link is never rewritten.** A row carrying `worktreePath` or
+`worktreeName` holds its conversation, with the reason: the probe showed that rewriting such a
+row's folder keys either detaches it from its worktree or leaves a conversation that cannot
+start. On the store this was found on, no row realign would change carries a worktree link;
+the rows that do are live rows, which realign leaves alone.
 
 **Which copy a row opens is decided by one shared rule.** `doctor`'s `_split_conversations`
 resolves it from `cwd` today, which the probe has to confirm. If the probe shows another key
@@ -318,7 +326,11 @@ call it later.
 decides, alone; the app rewrites `folderPlace` to match `cwd` and flags it `lost` when they
 disagree, so writing `folderPlace.cwd` and `folderPlace.realPath` together with `cwd` keeps the
 row as the app would leave it; `originCwd` and `gitAnchorsFolderRealpath` do not choose the
-folder and can stay. Phase 2 (a worktree row) is still open.*
+folder and can stay. Phase 2 (a worktree row) is in too: a row with a worktree link cannot be
+moved by its path keys (it detaches, or will not start), so it is held. The recommendation is
+now concrete: on a row without a worktree link, write `cwd`, `folderPlace.cwd` and
+`folderPlace.realPath` (where `folderPlace` exists; never add it); leave every other key;
+hold a row with a worktree link.*
 (a) The keys the probe shows decide the folder, on a plain row and on a worktree row alike,
 plus any the app rewrites back on open; if that is not `cwd` alone, detection's placement rule
 changes to match before realign is built. (b) If the probe is inconclusive, or the two phases
