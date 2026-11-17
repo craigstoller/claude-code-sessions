@@ -1,7 +1,7 @@
 # realign - point every account's row at the folder holding the live copy (design)
 
-Status: **draft, not implemented.** Waiting on the maintainer's rulings below, and on the
-probe that says which row keys the app reads. Detection (`doctor`'s split rows, `alignment`'s
+Status: **ruled, not implemented.** The maintainer ruled every decision below on
+2026-11-16 and 2026-11-17, all as recommended, after the probe ran in both phases. Detection (`doctor`'s split rows, `alignment`'s
 line under `consistent`) is built on branch `claude/split-row-detection`; this design is the
 repair that would follow it. Two review rounds (four engines each) are applied; the Revisions
 section says what they changed.
@@ -408,6 +408,32 @@ the command writes keys outside its job and its undo grows.
 (a) A separate, later change: a row converge builds names the folder whose copy it read.
 Recommended after the probe, since it depends on D2's keys. (b) Fold it into this change. (c)
 Leave converge alone.
+
+## Decisions taken (maintainer, 2026-11-16 and 2026-11-17)
+
+Every decision above, the maintainer's call, each as recommended:
+
+- **D0** (2026-11-16): the detection defaults as built, all five.
+- **D1** (2026-11-17): a new `realign` command. Not taken: `repoint --folder`; a step inside
+  `converge`.
+- **D2**: on a row without a worktree link, write `cwd`, `folderPlace.cwd` and
+  `folderPlace.realPath` (where `folderPlace` exists; never add it) and leave every other key;
+  hold a row with a worktree link. Not taken: every path key naming the old folder; `cwd` alone;
+  rewriting a worktree row's identity keys.
+- **D3**: behind conversations and rows with no copy by default; identical and same-conversation
+  splits with `--include-identical`. Not taken: behind only; everything by default; `--only`
+  required.
+- **D4**: hold a conversation whose target directory is gone. Not taken: realign and warn;
+  recreate the directory.
+- **D5**: undo per conversation, the changed keys only, with the identity, ownership, folder and
+  history checks. Not taken: byte pre-images; no undo beyond recover's `back`.
+- **D6**: move the stale copy into the journal, with the transaction above. Not taken: leave it
+  (the fallback); remove it.
+- **D7**: leave row metadata. Not taken: refresh it from the live copy.
+- **D8**: `converge`'s folder choice is a separate, later change. Not taken: fold it in; leave
+  converge alone.
+- **D9**: `doctor` lists single-copy conversations with a row that reaches no copy, not counted,
+  and realign plans them. Not taken: list them before the probe; leave them until they split.
 
 ## Revisions
 
