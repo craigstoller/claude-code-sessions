@@ -763,7 +763,7 @@ def _copies_advice(env, tc):
 _WORKTREE_FOLDER_INFIX = "--claude-worktrees-"
 
 
-def _split_conversations(env, rows, transcripts):
+def _split_conversations(env, rows, transcripts, single=False):
     """Conversations whose rows open different copies of one transcript -
     'split rows'. Names and sizes only: no copy is opened here, so
     `alignment` can count these, and `doctor` compares the bytes after.
@@ -785,7 +785,9 @@ def _split_conversations(env, rows, transcripts):
                  measurement), which makes a split of its own.
 
     Only `cwd` is read. Rows also carry `originCwd`, `worktreePath` and
-    `folderPlace`, and which of them the app consults is untested.
+    `folderPlace`; the probe (2026-11-17, same app version) found `cwd`
+    alone chooses the copy on a row without a worktree link, and
+    docs/internals.md has the rest.
 
     Returns one entry per conversation with at least two copies on disk
     whose rows open two or more of them, or include a row that opens none.
@@ -793,6 +795,11 @@ def _split_conversations(env, rows, transcripts):
     other copies exist: that is converge's duplicated-transcript hold.
     Folder names compare without case on Windows, where NTFS resolves them
     that way.
+
+    SINGLE adds conversations with ONE copy on disk and a row that opens no
+    copy (D9, 2026-11-17): opening that row has the app copy the transcript
+    into its folder (measured twice), which starts a split. Each row carries
+    its file as `_path`, for realign; _public_split drops it.
     """
     def key(name):
         return name.lower() if env.is_windows else name
@@ -801,10 +808,11 @@ def _split_conversations(env, rows, transcripts):
     for folder, path in transcripts:
         sid = os.path.splitext(os.path.basename(path))[0]
         by_sid.setdefault(sid, []).append((folder, path))
+    least = 1 if single else 2
     rows_by_sid = {}
     for r in rows:
         sid = r.cli_session_id
-        if isinstance(sid, str) and len(by_sid.get(sid, ())) > 1:
+        if isinstance(sid, str) and len(by_sid.get(sid, ())) >= least:
             rows_by_sid.setdefault(sid, []).append(r)
     labels = {}
 
@@ -854,6 +862,7 @@ def _split_conversations(env, rows, transcripts):
                 "worktree_copies": len(under) if hit is None else 0,
                 "archived": data.get("isArchived") is True,
                 "_activity": r.last_activity, "_title": data.get("title"),
+                "_path": r.path,
             })
         opened = sorted({p["copy"] for p in placed if p["copy"] is not None})
         if len(opened) < 2 and all(p["copy"] is not None for p in placed):
@@ -1041,6 +1050,8 @@ def _public_split(entry):
     e.pop("opened", None)
     e["copies"] = [{"folder": c["folder"], "bytes": c["bytes"]}
                    for c in entry["copies"]]
+    e["rows"] = [{k: v for k, v in r.items() if not k.startswith("_")}
+                 for r in entry["rows"]]
     return e
 
 
@@ -1264,10 +1275,12 @@ def rotate_ops(env):
     # Retitle ops carry the same exposure since 0.11.0: their undo/back
     # ownership rule (_retitle_claimed_elsewhere) reads other ops' journals
     # for the same dest_path, so a terminal claimant is evidence there too.
+    # Realign's (_realign_claimed_later) reads them the same way.
+    claimants = ("sync", "retitle", "realign")
     live = set()
     for o in ops:
         om = o.manifest
-        if om.get("op_type") not in ("sync", "retitle") \
+        if om.get("op_type") not in claimants \
                 or om.get("status") not in NONTERMINAL:
             continue
         for r in om.get("rows") or []:
@@ -1283,7 +1296,14 @@ def rotate_ops(env):
         # vanished-row check reads only 'completed' ops, deliberately. Hold it.
         if om.get("rollback_residue"):
             return True
-        if not live or om.get("op_type") not in ("sync", "retitle"):
+        # A realign op holding a transcript copy it set aside (D6) IS where
+        # that copy lives now: pruning it would delete the copy. It goes when
+        # undo puts every copy back.
+        if om.get("op_type") == "realign" and any(
+                isinstance(c, dict) and c.get("moved")
+                for c in om.get("copies") or []):
+            return True
+        if not live or om.get("op_type") not in claimants:
             return False
         if om.get("status") in ("undone", "rolled_back"):
             return False          # claim withdrawn; nothing left to protect
@@ -2879,7 +2899,8 @@ def classify_op(env, op):
     if stray and kind not in ("move", "undo"):
         shape = {"new-row": _new_row_shape_error, "repoint": _repoint_shape_error,
                  "retitle": _retitle_shape_error,
-                 "converge": _converge_shape_error}.get(kind)
+                 "converge": _converge_shape_error,
+                 "realign": _realign_shape_error}.get(kind)
         if not (shape and shape(m)):
             return {"status": status, "source": m.get("store_label", "n/a"),
                     "dest": m.get("store_label", "n/a"), "resolutions": ["back"],
@@ -3015,6 +3036,8 @@ def classify_op(env, op):
         return classify_retitle_op(env, op)
     if m.get("op_type") == "converge":
         return classify_converge_op(env, op)
+    if m.get("op_type") == "realign":
+        return classify_realign_op(env, op)
 
     def _src_state():
         transcript_present = os.path.isfile(m["source_transcript"])
@@ -3227,7 +3250,7 @@ def recover_op(env, op, direction):
         # Refusal/LayoutError, so the user got a traceback from the one command
         # that exists to get them unstuck.
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row",
-                                              "retitle", "converge"):
+                                              "retitle", "converge", "realign"):
             _validate_manifest_paths(env, op.manifest, leave_unresolved=bool(stray))
         elif op.manifest.get("op_type") == "new-row":
             # The allowlist above skips the move-shaped validator, so this op
@@ -3248,6 +3271,8 @@ def recover_op(env, op, direction):
                           .format(direction, op.manifest["op_id"], c["note"],
                                   c["resolutions"] or "none - manual intervention"))
         m = op.manifest
+        if m.get("op_type") == "realign":
+            return _recover_realign(env, op, direction, stray)
         if m.get("op_type") == "new-row":
             if direction == "forward":
                 # The preflight moved out of execute_new_row_op, so this arm
@@ -4054,6 +4079,8 @@ def _short_ids(text):
 # to a leak.
 _ANON_STRUCTURAL_KEYS = frozenset((
     "a", "a_in_b", "a_tail", "a_total", "a_unique", "account", "accounts",
+    "copies_moved", "decided_by", "include_identical", "moved", "path_from",
+    "realign_held_copies", "sidecar_only", "waiting_rows",
     "activity_unknown", "after", "age_days", "ahead", "allow_orphan",
     "archived", "b", "b_in_a", "b_tail", "b_total", "b_unique", "behind",
     "blank_rows", "by_account_count", "bytes", "bytes_relation",
@@ -4632,11 +4659,43 @@ def gather_doctor(env):
     # The ones that count first: on the store this was found on, 21 of 30
     # were byte-identical, and an id order put them ahead of the six an
     # account was opening an old history of.
+    split = _split_conversations(env, rows, transcripts, single=True)
     split_rows = sorted(
-        (_public_split(_classify_split(e))
-         for e in _split_conversations(env, rows, transcripts)),
+        (_public_split(_classify_split(e)) for e in split if len(e["copies"]) > 1),
         key=lambda s: (not s["counted"], _SPLIT_ORDER.get(s["relation"], 2),
                        s["session_id"]))
+    # D9 (ruled 2026-11-17): one copy on disk, and a row whose folder holds
+    # none. Not a split yet - but opening that row has the app copy the
+    # transcript into its folder (measured twice), and from then on the two
+    # copies grow apart. Listed, not counted: nothing is wrong until it is
+    # opened, and on the store this was found on there were 64 of them.
+    waiting_rows = []
+    for e in split:
+        if len(e["copies"]) != 1:
+            continue
+        waiting_rows.append({
+            "session_id": e["session_id"], "title": e["title"],
+            "folder": e["copies"][0]["folder"],
+            "rows": [{"label": r["label"], "local_id": r["local_id"],
+                      "cwd": r["cwd"], "archived": r["archived"]}
+                     for r in e["rows"] if r["copy"] is None]})
+    # D6: transcript copies realign set aside in its journal. Each is a
+    # conversation's stale copy, kept so undo can put it back - and kept by
+    # rotate_ops for as long as it is there.
+    held_copies = []
+    for o in list_ops(env):
+        om = o.manifest
+        if om.get("op_type") != "realign":
+            continue
+        titles = {c.get("session_id"): c.get("title", "")
+                  for c in om.get("conversations") or [] if isinstance(c, dict)}
+        for c in om.get("copies") or []:
+            if isinstance(c, dict) and c.get("moved"):
+                held_copies.append({
+                    "op_id": om.get("op_id"), "session_id": c.get("session_id"),
+                    "title": titles.get(c.get("session_id"), ""),
+                    "folder": c.get("folder"),
+                    "bytes": (c.get("basis") or {}).get("bytes")})
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
@@ -4649,6 +4708,8 @@ def gather_doctor(env):
         "unknown_layout": unknown_layout,
         "duplicate_titles": duplicate_titles,
         "split_rows": split_rows,
+        "waiting_rows": waiting_rows,
+        "realign_held_copies": held_copies,
         "vanished_new_rows": vanished_new,
         "rollback_residue": rollback_residue,
         "unresolved_rows": unresolved_rows,
@@ -4927,6 +4988,46 @@ def cmd_alignment(env, ns):
 SPLIT_DETAIL_LIMIT = 5
 
 
+def _print_waiting_rows(waiting, say):
+    """Doctor's D9 block: single-copy conversations with a row whose folder
+    holds no copy. Listed, not counted."""
+    if not waiting:
+        return
+    n = sum(len(w["rows"]) for w in waiting)
+    say("[observed] {0} conversation(s) have one transcript copy and {1} row(s) "
+        "whose folder holds none; opening such a row copies the transcript "
+        "into its folder (measured twice), and the two copies then grow apart"
+        .format(len(waiting), n))
+    for w in waiting[:SPLIT_DETAIL_LIMIT]:
+        say("[observed]   {0!r}  {1}  copy in {2}".format(
+            w["title"] or "(untitled)", w["session_id"], w["folder"]))
+        for r in w["rows"]:
+            say("[observed]     {0}{1}: its cwd names {2}".format(
+                r["label"], " (archived)" if r["archived"] else "",
+                r["cwd"] or "no folder"))
+    if len(waiting) > SPLIT_DETAIL_LIMIT:
+        say("[observed]   ... and {0} more; --json lists them all".format(
+            len(waiting) - SPLIT_DETAIL_LIMIT))
+    say("[hypothesis]   'realign' points those rows at the copy before the app "
+        "makes a second one; listed, not counted in the exit code.")
+
+
+def _print_held_copies(held, say):
+    """Doctor's D6 block: the transcript copies realign holds in its
+    journal."""
+    if not held:
+        return
+    say("[observed] realign holds {0} stale transcript cop(ies) in its journal, "
+        "set aside when every row moved to the live copy:".format(len(held)))
+    for h in held:
+        say("[observed]   {0!r}  {1}  from {2} ({3}), op {4}".format(
+            h["title"] or "(untitled)", h["session_id"], h["folder"],
+            "{0:,} bytes".format(h["bytes"]) if isinstance(h["bytes"], int)
+            else "size ?", h["op_id"]))
+    say("[hypothesis]   'undo' puts them back with the rows; the journal keeps "
+        "each one until then.")
+
+
 def _print_split_rows(env, splits, say, say_ids):
     """Doctor's split-rows block: for each conversation, its copies longest
     first, which copy each account's row opens and why, and how each pair of
@@ -5043,14 +5144,15 @@ def _print_split_rows(env, splits, say, say_ids):
             len(splits) - len(shown)))
     if any(r["copy"] is None for s in splits for r in s["rows"]):
         say("[hypothesis]   a row that opens no copy of its own has been seen "
-            "to copy the transcript into its folder when opened (once, on "
-            "Desktop 5.11492.5); which copy it takes is untested")
+            "to copy the transcript into its folder when opened (twice, on "
+            "Desktop 5.11492.5); which copy it takes when there are several "
+            "is untested")
     say("[hypothesis]   removing a stale copy is a one-time catch-up, not a "
         "fix: opening a row whose folder then holds no copy copies the "
         "transcript back into it, so the split returns once the conversation "
         "is worked from one account and opened from another. It lasts until "
-        "every account's row names the same folder, and no command changes a "
-        "row's folder yet")
+        "every account's row names the same folder: 'realign' points the "
+        "rows that do not at the live copy and sets the stale copy aside")
 
 
 def cmd_doctor(env, ns):
@@ -5182,6 +5284,8 @@ def cmd_doctor(env, ns):
         say("[observed] journal: {0} operation(s) recorded before the data moved; "
             "their paths are read under the moved root".format(rep["rerooted_ops"]))
     _print_split_rows(env, rep.get("split_rows") or [], say, say_ids)
+    _print_waiting_rows(rep.get("waiting_rows") or [], say)
+    _print_held_copies(rep.get("realign_held_copies") or [], say)
     dupes = rep.get("duplicate_titles") or []
     # Split before printing. These are two different conditions that happen to
     # look alike, and reporting them together produced a cleanup list that told
@@ -5459,6 +5563,35 @@ def build_parser():
     cv.add_argument("--json", action="store_true", help="print the plan as JSON")
     common(cv)
 
+    ra = sub.add_parser(
+        "realign",
+        help="point every account's row of a split conversation at the folder "
+             "holding its live transcript copy",
+        description="Point every account's row of a split conversation at the "
+                    "folder holding its live transcript copy - the split rows "
+                    "'doctor' reports. Rewrites each such row's cwd (and its "
+                    "folderPlace, where it has one), moves the stale copy into "
+                    "the operation's journal, and holds anything it cannot "
+                    "decide safely, with the reason. Undoable per conversation.")
+    ra.add_argument("--only", default="", metavar="TITLE_OR_ID",
+                    help="narrow to one conversation: a title substring, or a "
+                         "cliSessionId prefix - must resolve to exactly one")
+    ra.add_argument("--include-identical", action="store_true",
+                    dest="include_identical",
+                    help="also realign conversations whose copies hold the same "
+                         "conversation (byte-identical, or differing only in "
+                         "bookkeeping), onto the copy the most recently active "
+                         "row opens")
+    ra.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into "
+                         "(RULING 5), when the identity files disagree")
+    ra.add_argument("--apply", action="store_true",
+                    help="actually rewrite the rows and set the stale copies "
+                         "aside. Needs the desktop app fully closed. Exits 3 when "
+                         "conversation(s) are held - each printed with its reason")
+    ra.add_argument("--json", action="store_true", help="print the plan as JSON")
+    common(ra)
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -5560,10 +5693,13 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is one of the six this command
+    # delta: only a completed op whose op_type is one of the seven this command
     # can actually reverse - "move", "sync", "repoint", "new-row", "retitle",
-    # "converge" (or missing, which in practice never happens - every manifest
-    # sets op_type) - is eligible as "the operation to undo". A completed *undo* op is itself
+    # "converge", "realign" (or missing, which in practice never happens -
+    # every manifest sets op_type) - is eligible as "the operation to undo".
+    # A realign undo can be partial (per conversation, D5): the op stays
+    # 'completed' and stays the candidate, so a re-run retries the rest.
+    # A completed *undo* op is itself
     # terminal from cmd_undo's point of view - plan_undo always refuses an
     # undo-of-undo ("to redo, run move again") - so selecting one here would
     # only ever produce that refusal instead of reaching an older, still-
@@ -5578,7 +5714,8 @@ def cmd_undo(env, ns):
                  and o.manifest.get("op_type", "move") in ("move", "sync",
                                                            "repoint", "new-row",
                                                            "retitle",
-                                                           "converge")]
+                                                           "converge",
+                                                           "realign")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -5642,6 +5779,19 @@ def cmd_undo(env, ns):
                     "created across {2} account(s), skipping any that is now "
                     "load-bearing); pass --apply to execute"
                     .format(pm["op_id"], len(created), n_acct))
+        elif prior.manifest.get("op_type") == "realign":
+            pm = prior.manifest
+            st = pm.get("undo_status") or {}
+            left = [c for c in pm.get("conversations", [])
+                    if st.get(c.get("session_id")) != "undone"]
+            n_rows = sum(1 for r in pm.get("rows", []) if r.get("written")
+                         and st.get(r.get("session_id")) != "undone")
+            n_copies = sum(1 for c in pm.get("copies", []) if c.get("moved"))
+            line = ("would undo {0} (realign: {1} conversation(s) - {2} row(s) "
+                    "go back to their previous folders and {3} cop(ies) come "
+                    "back out of the journal, each conversation only if it has "
+                    "not moved on since); pass --apply to execute".format(
+                        pm["op_id"], len(left), n_rows, n_copies))
         else:
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
@@ -5662,9 +5812,23 @@ def cmd_undo(env, ns):
         final = undo_retitle(env, prior)
     elif prior.manifest.get("op_type") == "converge":
         final = undo_converge(env, prior)
+    elif prior.manifest.get("op_type") == "realign":
+        final = undo_realign(env, prior)
     else:
         final = run_undo(env, prior)
     print("result: " + final)
+    if prior.manifest.get("op_type") == "realign":
+        titles = {c.get("session_id"): c.get("title", "")
+                  for c in prior.manifest.get("conversations", [])}
+        for sid, state in sorted((prior.manifest.get("undo_status") or {}).items()):
+            line = "   {0!r}  {1}: {2}".format(_pub_title(titles.get(sid, "")),
+                                              (sid or "")[:8], state)
+            print(line if ns.verbose else redact(env, line))
+        if final == "partial":
+            line = ("each refused conversation keeps realign's folder; re-run "
+                    "'undo --apply' once its reason clears, or leave it")
+            print(line if ns.verbose else redact(env, line))
+            return 1
     # Converge's undo is FORGIVING - it deletes what is still redundant and
     # skips what became load-bearing - so a bare "undone" would hide exactly
     # the rows it deliberately left. Print the tally the spec requires:
@@ -5819,6 +5983,7 @@ def main(argv=None):
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
                 "repoint": cmd_repoint, "new-row": cmd_new_row,
                 "retitle": cmd_retitle, "converge": cmd_converge,
+                "realign": cmd_realign,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -11585,6 +11750,1241 @@ def cmd_retitle(env, ns):
     # execute_retitle_op can only return "completed" or raise today; the
     # explicit non-zero exit is the trap-avoidance cmd_new_row documents.
     return 1
+
+
+# ====================================================================== realign
+# docs/specs/2026-11-16-realign-rows-design.md, as the maintainer ruled it
+# (D1-D9, 2026-11-17), on the probe's findings (Desktop 5.11492.5): `cwd`
+# alone chooses which copy of a transcript a row opens; the app rewrites
+# `folderPlace` to match `cwd` when they disagree and never writes `cwd` back;
+# a row whose folder holds no copy has one copied in when opened; and a row
+# with a worktree link cannot be moved by its path keys (it detaches from the
+# worktree, or will not start). So realign rewrites `cwd` and `folderPlace`
+# together, on rows without a worktree link, and parks the stale copy in its
+# own journal.
+import shutil as _shutil
+
+
+@dataclasses.dataclass
+class RealignFlags:
+    """Which split conversations to repair."""
+    only: str = ""                  # title substring, or a cliSessionId prefix
+    include_identical: bool = False  # also conversations with no copy behind
+    live: str = ""                  # RULING 5 assertion, converge's account scope
+
+
+REALIGN_GUARD_WHY = ("The app holds these rows in memory and rewrites them on "
+                     "focus, so a folder written underneath it is whatever the "
+                     "app decides later, not what you wrote")
+
+_REALIGN_SCAN_WHY = ("which folder it names, and so whether its conversation "
+                     "is split")
+
+# The row keys realign writes, in the order it writes them. `cwd` is the key
+# the probe found chooses the copy; the two folderPlace members are written
+# with it where the row has a folderPlace, because the app rewrites that
+# object to match `cwd` (flagging it `lost`) whenever the two disagree.
+_REALIGN_KEYS = ("cwd", "folderPlace.cwd", "folderPlace.realPath")
+
+
+def _file_basis(path):
+    """{bytes, sha256} of the file at PATH. OSError propagates."""
+    h = hashlib.sha256()
+    n = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(_COPIES_CHUNK), b""):
+            h.update(chunk)
+            n += len(chunk)
+    return {"bytes": n, "sha256": h.hexdigest()}
+
+
+def _anon_register_path(env, path):
+    """Teach --anonymize's substitution table one path a realign plan found
+    outside every row - a cwd read from a transcript whose conversation has
+    rows elsewhere, which _anon_pairs does not collect. Whole strings only,
+    as _anon_register_title."""
+    p = path.strip() if isinstance(path, str) else ""
+    pairs = _anon_pairs(env)
+    if len(p) >= _ANON_MIN and p not in {real for real, _l in pairs}:
+        pairs.append((p, _anon_label("project", p)))
+        pairs.sort(key=lambda kv: -len(kv[0]))
+
+
+def _realign_get(d, key):
+    """(present, value) of one of _REALIGN_KEYS in row dict D."""
+    if key.startswith("folderPlace."):
+        fp = d.get("folderPlace")
+        member = key.split(".", 1)[1]
+        if isinstance(fp, dict) and member in fp:
+            return True, fp[member]
+        return False, None
+    return (key in d), d.get(key)
+
+
+def _realign_set(d, key, present, value):
+    """Row dict D, copied, with KEY set to VALUE (or removed when not
+    PRESENT). A folderPlace member is only ever set inside an existing
+    folderPlace object: realign never adds one."""
+    out = dict(d)
+    if key.startswith("folderPlace."):
+        fp = out.get("folderPlace")
+        if not isinstance(fp, dict):
+            return out
+        fp = dict(fp)
+        member = key.split(".", 1)[1]
+        if present:
+            fp[member] = value
+        else:
+            fp.pop(member, None)
+        out["folderPlace"] = fp
+        return out
+    if present:
+        out[key] = value
+    else:
+        out.pop(key, None)
+    return out
+
+
+def _realign_apply_new(d, new):
+    for k in _REALIGN_KEYS:
+        if k in new:
+            d = _realign_set(d, k, True, new[k])
+    return d
+
+
+def _realign_apply_old(d, old):
+    for k in _REALIGN_KEYS:
+        if k in old:
+            d = _realign_set(d, k, bool(old[k].get("present")), old[k].get("value"))
+    return d
+
+
+def _path_key(env, p):
+    p = os.path.normpath(p)
+    return os.path.normcase(p) if env.is_windows else p
+
+
+def _grew_only_bookkeeping(path, basis):
+    """(ok, why) for a copy measured as BASIS ({bytes, sha256}): ok when it is
+    unchanged, or has only BOOKKEEPING_RECORD_TYPES records appended - the app
+    writes those to any copy it opens. Anything else - a rewrite, a shrink, a
+    new turn, a file gone - is not ok, and WHY names it."""
+    try:
+        size = os.path.getsize(path)
+    except FileNotFoundError:
+        return False, "is gone"
+    except OSError as exc:
+        return False, "could not be read ({0})".format(exc)
+    n = basis.get("bytes")
+    if not isinstance(n, int) or size < n:
+        return False, "was shortened or rewritten"
+    try:
+        h = hashlib.sha256()
+        left = n
+        with open(path, "rb") as fh:
+            while left:
+                chunk = fh.read(min(left, _COPIES_CHUNK))
+                if not chunk:
+                    return False, "was shortened or rewritten"
+                h.update(chunk)
+                left -= len(chunk)
+        if h.hexdigest() != basis.get("sha256"):
+            return False, "was rewritten"
+        if size == n:
+            return True, ""
+        if _tail_kind(path, n) == "history":
+            return False, "has gained turns"
+    except OSError as exc:
+        return False, "could not be read ({0})".format(exc)
+    return True, ""
+
+
+def _history_between(pa, pb):
+    """(relation, ahead) of two copies as conversation: relation is
+    identical / same_history / strict_prefix / diverged / inconclusive, and
+    ahead is "a" or "b" when one holds turns the other lacks."""
+    tc = _transcript_copies([pa, pb])
+    rel = tc["relation"]
+    if rel not in ("strict_prefix", "diverged", "identical"):
+        return "inconclusive", None
+    try:
+        rel, ahead, _ka, _kb = _history_pair(
+            pa, pb, os.path.getsize(pa), os.path.getsize(pb), rel)
+    except OSError:
+        return "inconclusive", None
+    return rel, ahead
+
+
+def _realign_open_op(nt, sid, paths):
+    """The op_id of an unfinished operation that names conversation SID or
+    one of the row PATHS, or None."""
+    keys = {os.path.normcase(os.path.abspath(p)) for p in paths}
+    for o in nt:
+        om = o.manifest
+        if sid in (om.get("session_id"), om.get("cli_session_id"),
+                   om.get("to_session"), om.get("from_session")):
+            return om.get("op_id")
+        for c in om.get("conversations") or []:
+            if isinstance(c, dict) and c.get("session_id") == sid:
+                return om.get("op_id")
+        for _r, p, _s in _journal_rows(om):
+            if isinstance(p, str) and os.path.normcase(os.path.abspath(p)) in keys:
+                return om.get("op_id")
+    return None
+
+
+def _realign_decide(env, e, include_identical, recs, nt):
+    """What realign does with one classified split entry E: {"hold": reason},
+    {"plan": (conversation, rows, copies)}, or None when there is nothing to
+    change. RECS maps a row file to its strict scan record; NT is the list of
+    unfinished operations."""
+    sid = e["session_id"]
+    copies = e["copies"]
+    rows = e["rows"]
+    rel = e["relation"]
+    opened = sorted({r["copy"] for r in rows if r["copy"] is not None})
+    no_copy = [r for r in rows if r["copy"] is None]
+
+    def hold(reason, paths=()):
+        # PATHS: the paths the reason quotes, for --anonymize to learn.
+        return {"hold": reason, "paths": [p for p in paths if isinstance(p, str)]}
+
+    if rel == "diverged":
+        return hold("its copies have diverged - each holds turns the other lacks "
+                    "- so which history to keep is yours to choose; 'doctor' "
+                    "names the copies")
+    if rel == "inconclusive":
+        reasons = sorted({p.get("reason") or "" for p in e.get("pairs") or []} - {""})
+        return hold("its copies could not be compared ({0})".format(
+            "; ".join(reasons) or "no reason given"))
+
+    # The copies that hold the whole conversation: no opened copy is ahead
+    # of them. One of them is the target.
+    behind = {p["b"] if p["ahead"] == p["a"] else p["a"]
+              for p in e.get("pairs") or [] if p.get("ahead") is not None}
+    full = [i for i in opened if i not in behind]
+    if not opened:
+        if len(copies) == 1:
+            full = [0]
+        else:
+            return hold("no row opens any of its {0} copies, so none of them is "
+                        "the one in use".format(len(copies)))
+    if rel in ("identical", "same_history") and not include_identical and not no_copy:
+        return hold("its copies hold the same conversation (byte-identical, or "
+                    "differing only in bookkeeping); pass --include-identical to "
+                    "point every row at one of them")
+    decided_by = None
+    if len(full) == 1:
+        target = full[0]
+    else:
+        # Several copies hold the whole conversation: the folder the most
+        # recently active unarchived row opens. Rows with no copy do not vote.
+        # A converge-built row carries the transcript's activity, which can
+        # run ahead of the app's own row, so the plan names the row that won.
+        voters = [r for r in rows if r["copy"] in full and not r["archived"]]
+        if not voters:
+            return hold("several copies hold the whole conversation and no "
+                        "unarchived row opens one, so none is the one in use")
+
+        def act(r):
+            a = _activity_of(recs[r["_path"]].data)
+            return a if a is not None else -1
+        top = max(act(r) for r in voters)
+        winners = {r["copy"] for r in voters if act(r) == top}
+        if len(winners) != 1:
+            return hold("several copies hold the whole conversation, and the "
+                        "rows that last opened them tie on recency between "
+                        "folders ({0})".format(", ".join(
+                            sorted(copies[i]["folder"] for i in winners))))
+        target = winners.pop()
+        won = next(r for r in voters if r["copy"] == target and act(r) == top)
+        decided_by = {"label": won["label"], "local_id": won["local_id"]}
+    tp = copies[target]["path"]
+
+    # The target against EVERY copy on disk, not only the opened ones: a copy
+    # no row opens that holds turns the target lacks would be orphaned.
+    for i, c in enumerate(copies):
+        if i == target:
+            continue
+        rel_c, ahead = _history_between(tp, c["path"])
+        if rel_c == "inconclusive":
+            return hold("its copy in {0} could not be compared with the live "
+                        "copy".format(c["folder"]))
+        if rel_c == "diverged":
+            return hold("its copy in {0} has diverged from the live copy"
+                        .format(c["folder"]))
+        if rel_c == "strict_prefix" and ahead == "b":
+            return hold("a copy {0} in {1} holds turns the live copy lacks"
+                        .format("no row opens" if i not in opened
+                                else "a row opens", c["folder"]))
+
+    if rel in ("identical", "same_history") and not include_identical:
+        change = list(no_copy)
+    else:
+        change = [r for r in rows if r["copy"] != target]
+    if not change:
+        return None
+
+    for r in change:
+        d = recs[r["_path"]].data
+        if d.get("worktreePath") or d.get("worktreeName"):
+            return hold("the row in {0} has a worktree link (worktreePath / "
+                        "worktreeName): rewriting such a row's folder detaches it "
+                        "from its worktree or leaves it unable to start"
+                        .format(r["label"]))
+    reach_cwd = [r for r in rows if r["copy"] == target and r["via"] == "cwd"]
+    reach_wt = [r for r in rows if r["copy"] == target and r["via"] == "worktree"]
+    if not reach_cwd and reach_wt:
+        return hold("the live copy is reached only through the worktree "
+                    "placement (a row's cwd names the main repository), and "
+                    "pointing other rows at it that way is untested")
+
+    def fkey(name):
+        return name.lower() if env.is_windows else name
+    # The path value: the cwd of the rows that already reach the live copy
+    # through their own cwd, as they spell it; else the cwd values the live
+    # copy's records carry. Only those that encode to its folder under the
+    # CURRENT scheme are candidates - a legacy-only match would send the app
+    # to another folder, where it would copy the transcript.
+    cands = [r["cwd"] for r in reach_cwd if r["cwd"]]
+    source = "row"
+    if not cands:
+        cands = _cwds_in(tp)
+        source = "transcript"
+    good = [c for c in cands if isinstance(c, str)
+            and fkey(encode(c, SCHEME_CURRENT)) == fkey(copies[target]["folder"])]
+    if not good:
+        if any(isinstance(c, str)
+               and fkey(encode(c, SCHEME_LEGACY)) == fkey(copies[target]["folder"])
+               for c in cands):
+            return hold("the live copy is in a legacy-encoded folder; how the "
+                        "app finds such a copy is unmeasured")
+        return hold("nothing on record names the live copy's folder as a path "
+                    "(no row reaches it through its cwd, and its transcript "
+                    "records no cwd that encodes to it)")
+    distinct = []
+    for c in good:
+        if _path_key(env, c) not in [_path_key(env, x) for x in distinct]:
+            distinct.append(c)
+    if len(distinct) > 1:
+        return hold("the paths that reach the live copy's folder disagree ({0}), "
+                    "so they may be different directories".format(
+                        ", ".join(distinct)), distinct)
+    value = distinct[0]
+    if not os.path.isdir(value):
+        return hold("the live copy's directory {0} no longer exists".format(value),
+                    [value])
+    op_id = _realign_open_op(nt, sid, [r["_path"] for r in rows])
+    if op_id:
+        return hold("an unfinished operation ({0}) involves this conversation; "
+                    "run 'recover' first".format(op_id))
+
+    out_rows = []
+    for r in change:
+        rec = recs[r["_path"]]
+        d = rec.data
+        new = {"cwd": value}
+        if isinstance(d.get("folderPlace"), dict):
+            new["folderPlace.cwd"] = value
+            new["folderPlace.realPath"] = value
+        old = {}
+        for k in new:
+            present, v = _realign_get(d, k)
+            old[k] = {"present": present, "value": v}
+        post = json.dumps(_realign_apply_new(d, new),
+                          separators=(",", ":")).encode("utf-8")
+        old_folder = copies[r["copy"]]["folder"] if r["copy"] is not None else ""
+        out_rows.append({
+            "session_id": sid, "name": rec.name, "dest_path": rec.path,
+            "store_path": rec.store, "label": rec.label, "account": rec.account,
+            "old": old, "new": new, "old_folder": old_folder,
+            "pre_b64": b64(rec.raw), "post_b64": b64(post),
+            "is_update": True, "written": False})
+    open_after = {target} | {r["copy"] for r in rows
+                             if r not in change and r["copy"] is not None}
+    # D6: every copy no row opens once the rows are rewritten goes into the
+    # journal with its sidecar folder. It holds nothing the live copy lacks:
+    # the comparison above held the conversation otherwise. The sidecar is
+    # inventoried the way `move` inventories one (refusing a symlink or
+    # junction inside it), and the files only it holds are named.
+    try:
+        tinv = {x["rel"] for x in sidecar_inventory(sidecar_path(tp))}
+        moves = []
+        for i, c in enumerate(copies):
+            if i in open_after:
+                continue
+            side = sidecar_path(c["path"])
+            inv = sidecar_inventory(side)
+            moves.append({"session_id": sid, "folder": c["folder"],
+                          "src": c["path"],
+                          "sidecar_src": side if os.path.isdir(side) else "",
+                          "basis": _file_basis(c["path"]),
+                          "sidecar_inventory": inv,
+                          "sidecar_only": sorted({x["rel"] for x in inv} - tinv),
+                          "aside": "", "moved": False})
+        for r in out_rows:
+            # A row whose old copy stays where it is (another row still
+            # opens it): that copy's state now, for undo's check that it
+            # gained no turns of its own. No plan leaves one today - either
+            # every row off the live copy moves, or only rows with no copy
+            # do - so this guards a narrower rule, should one come.
+            r["old_copy_basis"] = None
+            if r["old_folder"] and not any(m["folder"] == r["old_folder"]
+                                           for m in moves):
+                r["old_copy_basis"] = _file_basis(
+                    os.path.join(env.projects_root, r["old_folder"],
+                                 sid + ".jsonl"))
+        target_basis = _file_basis(tp)
+    except Refusal as exc:
+        return hold("a copy's sidecar folder cannot be inventoried: {0}".format(exc))
+    except OSError as exc:
+        return hold("a copy could not be read ({0})".format(exc))
+    conv = {"session_id": sid, "title": e["title"], "relation": rel,
+            "folder": copies[target]["folder"], "cwd": value,
+            "target_path": tp, "target_basis": target_basis,
+            "path_from": source, "decided_by": decided_by,
+            "rows": len(out_rows), "copies_moved": len(moves)}
+    return {"plan": (conv, out_rows, moves)}
+
+
+def plan_realign(env, flags):
+    """Build a realign manifest. Pure planning - writes nothing.
+
+    Every split conversation `doctor` reports (and every single-copy one
+    with a row that reaches no copy, D9) is planned or held, and the plan
+    says which and why. Every decision is re-made against the store as it is
+    at apply time (_realign_recheck)."""
+    if flags.live:
+        live = _resolve_live_assertion(env, flags.live, _account_dirs(env),
+                                       account_scope=True)
+    else:
+        live = live_account(env)
+    records = _retitle_scan(env, live=live, why=_REALIGN_SCAN_WHY)
+    recs = {rec.path: rec for rec in records}
+    rows = [Row(rec.path, rec.data) for rec in records]
+    transcripts = iter_transcripts(env.projects_root)
+    entries = [_classify_split(e)
+               for e in _split_conversations(env, rows, transcripts, single=True)]
+    if flags.only:
+        want = flags.only.lower()
+        hit = [e for e in entries
+               if want in (e["title"] or "").lower()
+               or e["session_id"].lower().startswith(want)]
+        if not hit:
+            raise Refusal(
+                "no split conversation matches --only {0!r} (a title substring, "
+                "or a cliSessionId prefix). 'doctor' lists the split ones."
+                .format(_only_display(flags.only)))
+        if len(hit) > 1:
+            raise Refusal(
+                "--only {0!r} matches {1} conversations. Re-run with the id of "
+                "the one you mean (a prefix is enough):\n{2}".format(
+                    _only_display(flags.only), len(hit),
+                    "\n".join("   {0}   {1}".format(
+                        e["session_id"][:8],
+                        _listing_title(env, e["title"])[:60]) for e in hit)))
+        entries = hit
+    nt = nonterminal_ops(env)
+    convs, out_rows, copies, held = [], [], [], []
+    for e in entries:
+        res = _realign_decide(env, e, flags.include_identical, recs, nt)
+        if res is None:
+            continue
+        if "hold" in res:
+            held.append({"session_id": e["session_id"], "title": e["title"],
+                         "reason": res["hold"], "paths": res["paths"]})
+            continue
+        conv, rws, mvs = res["plan"]
+        convs.append(conv)
+        out_rows += rws
+        copies += mvs
+    return {"op_type": "realign", "only": flags.only,
+            "include_identical": bool(flags.include_identical),
+            # A corroborated --live records no assertion, as converge's.
+            "live_asserted": (live.account_uuid
+                              if flags.live and live
+                              and live.resolved_from == "user" else ""),
+            "conversations": convs, "held": held, "rows": out_rows,
+            "copies": copies}
+
+
+def _realign_shape_error(m):
+    """A sentence naming what is wrong with this realign manifest, or None.
+    NEVER RAISES - classify_op calls it."""
+    try:
+        for k in ("conversations", "rows", "copies"):
+            if not isinstance(m.get(k), list):
+                return "its {0!r} is not a list".format(k)
+        if not m["conversations"]:
+            return "it names no conversation"
+        for i, c in enumerate(m["conversations"]):
+            if not isinstance(c, dict):
+                return "conversation {0} is not an object".format(i)
+            for k in ("session_id", "folder", "cwd", "target_path"):
+                if not isinstance(c.get(k), str) or not c[k]:
+                    return "conversation {0} has no usable {1!r}".format(i, k)
+            if not isinstance(c.get("target_basis"), dict):
+                return "conversation {0} has no usable 'target_basis'".format(i)
+        for i, r in enumerate(m["rows"]):
+            if not isinstance(r, dict):
+                return "row {0} is not an object".format(i)
+            for k in ("session_id", "name", "dest_path", "store_path",
+                      "pre_b64", "post_b64"):
+                if not isinstance(r.get(k), str) or not r[k]:
+                    return "row {0} has no usable {1!r}".format(i, k)
+            if not isinstance(r.get("old"), dict) or not isinstance(r.get("new"), dict):
+                return "row {0} has no usable 'old'/'new'".format(i)
+            if not r["new"] or not set(r["new"]) <= set(_REALIGN_KEYS) \
+                    or set(r["old"]) != set(r["new"]):
+                return "row {0} names keys realign does not write".format(i)
+            if not all(isinstance(v, dict) for v in r["old"].values()):
+                return "row {0} has no usable 'old'".format(i)
+        sids = {c["session_id"] for c in m["conversations"]}
+        for i, c in enumerate(m["copies"]):
+            if not isinstance(c, dict):
+                return "copy {0} is not an object".format(i)
+            for k in ("session_id", "folder", "src"):
+                if not isinstance(c.get(k), str) or not c[k]:
+                    return "copy {0} has no usable {1!r}".format(i, k)
+            if c["session_id"] not in sids:
+                return "copy {0} belongs to no conversation of this operation".format(i)
+            if any(s in c["folder"] for s in ("/", "\\", "..")) \
+                    or os.path.basename(c["src"]) != c["session_id"] + ".jsonl":
+                return "copy {0}'s folder or path is not a transcript's".format(i)
+            b = c.get("basis")
+            if not isinstance(b, dict) or not isinstance(b.get("bytes"), int) \
+                    or not isinstance(b.get("sha256"), str):
+                return "copy {0} has no usable 'basis'".format(i)
+            side = c.get("sidecar_src")
+            if not isinstance(side, str) or (side and side != sidecar_path(c["src"])):
+                return "copy {0} has no usable 'sidecar_src'".format(i)
+            inv = c.get("sidecar_inventory")
+            if not isinstance(inv, list):
+                return "copy {0} has no usable 'sidecar_inventory'".format(i)
+            for x in inv:
+                if not isinstance(x, dict) or not isinstance(x.get("rel"), str) \
+                        or not isinstance(x.get("sha256"), str):
+                    return "copy {0}'s sidecar inventory is damaged".format(i)
+                try:
+                    _validate_sidecar_rel(x["rel"])
+                except LayoutError:
+                    return "copy {0}'s sidecar inventory names an unsafe path " \
+                           "{1!r}".format(i, x["rel"])
+            if not isinstance(c.get("aside", ""), str):
+                return "copy {0} has no usable 'aside'".format(i)
+    except Exception as exc:                  # pragma: no cover - belt and braces
+        return "it could not be read ({0})".format(exc)
+    return None
+
+
+def _realign_fingerprint(m, sid):
+    """What a plan decided for conversation SID, to compare two plans."""
+    conv = next(c for c in m["conversations"] if c["session_id"] == sid)
+    rows = sorted((r["dest_path"], r["pre_b64"], r["post_b64"])
+                  for r in m["rows"] if r["session_id"] == sid)
+    cps = sorted((c["src"], c["basis"]["bytes"], c["basis"]["sha256"],
+                  json.dumps(c["sidecar_inventory"], sort_keys=True))
+                 for c in m["copies"] if c["session_id"] == sid)
+    return (conv["folder"], conv["cwd"], conv["target_basis"]["sha256"],
+            conv["target_basis"]["bytes"], tuple(rows), tuple(cps))
+
+
+def _realign_recheck(env, m):
+    """Under the lock, before journaling: the identity check, then a fresh
+    plan with the same scope. A conversation whose rows, copies, target or
+    path changed since the plan - or that is held now, or gone - moves to
+    `held` and nothing is written for it. Mutates M; raises Refusal for the
+    whole run."""
+    dis = _identity_disagreement(env)
+    if dis and (m.get("live_asserted") or "") not in dis:
+        raise Refusal(
+            "~/.claude.json ({0}) and config.json ({1}) disagree about the "
+            "signed-in account (RULING 5). The designed remedy is to assert "
+            "which account the desktop app is on and re-plan:\n"
+            "   claude-code-sessions realign --live <email, or acct/org as "
+            "reports print it> --apply\n"
+            "If it is the CLI's record that is stale, re-authenticating the CLI "
+            "as the desktop's account (run 'claude', then /login) also clears "
+            "this. Nothing was written.".format(dis[0][:8], dis[1][:8]))
+    try:
+        fresh = plan_realign(env, RealignFlags(
+            only=m.get("only") or "",
+            include_identical=bool(m.get("include_identical"))))
+    except Refusal:
+        fresh = {"conversations": [], "rows": [], "copies": [], "held": []}
+    keep = []
+    for c in m["conversations"]:
+        sid = c["session_id"]
+        try:
+            same = _realign_fingerprint(fresh, sid) == _realign_fingerprint(m, sid)
+        except StopIteration:
+            same = False
+        if same:
+            keep.append(c)
+            continue
+        now_held = [h["reason"] for h in fresh.get("held") or []
+                    if h.get("session_id") == sid]
+        m["held"].append({
+            "session_id": sid, "title": c.get("title", ""),
+            "reason": "its rows, copies or target changed since the plan{0}; "
+                      "nothing was written for it - re-run to replan".format(
+                          " (now: " + now_held[0] + ")" if now_held else "")})
+    gone = {c["session_id"] for c in m["conversations"]} - {c["session_id"] for c in keep}
+    m["conversations"] = keep
+    m["rows"] = [r for r in m["rows"] if r["session_id"] not in gone]
+    m["copies"] = [c for c in m["copies"] if c["session_id"] not in gone]
+
+
+def _realign_write_rows(op, m, roots):
+    """Per row: containment, byte-drift check, atomic write, verify. The
+    verify is value-identity: the row on disk must be the journaled original
+    with exactly realign's keys changed."""
+    for r in m["rows"]:
+        if r.get("written"):
+            continue
+        _retitle_contained(r, roots)
+        try:
+            pre = _sync_pre_image(r)
+            post = unb64(r["post_b64"])
+        except (KeyError, ValueError) as exc:
+            raise Refusal(
+                "row {0!r}: the journaled images cannot be read ({1}). The op is "
+                "left at 'writing' - 'recover --resolve {2} --back' reverses what "
+                "landed.".format(r.get("name"), exc, m.get("op_id", "")))
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                current = fh.read()
+        except OSError as exc:
+            raise Refusal(
+                "could not read row {0!r} ({1}): {2}. The op is left at "
+                "'writing' - 'recover --resolve {3} --back' reverses what "
+                "landed.".format(r["name"], r.get("label", ""), exc,
+                                 m.get("op_id", "")))
+        if current == post:
+            r["written"] = True
+            save_manifest(op)
+            continue
+        if current != pre:
+            raise Refusal(
+                "row {0!r} ({1}) changed since this realign was planned - "
+                "writing would discard whatever changed it, most likely the app. "
+                "The op is left at 'writing' - 'recover --resolve {2} --back' "
+                "restores what landed, then re-run to replan."
+                .format(r["name"], r.get("label", ""), m.get("op_id", "")))
+        try:
+            atomic_write(r["dest_path"], post)
+        except OSError as exc:
+            raise Refusal(
+                "could not write row {0!r}: {1}. The op is left at 'writing' - "
+                "'recover --resolve {2} --back' restores what landed."
+                .format(r["name"], exc, m.get("op_id", "")))
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                check = json.loads(fh.read().decode("utf-8"))
+            want = _realign_apply_new(json.loads(pre.decode("utf-8")), r["new"])
+        except (OSError, ValueError) as exc:
+            r["written"] = True
+            save_manifest(op)
+            raise LayoutError(
+                "verify failed on {0!r}: the row could not be re-read after "
+                "writing ({1}). 'recover --resolve {2} --back --apply' restores "
+                "it.".format(r["name"], exc, m.get("op_id", "")))
+        r["written"] = True
+        save_manifest(op)
+        if check != want:
+            raise LayoutError(
+                "verify failed on {0!r}: the row on disk is not the journaled "
+                "original with realign's keys changed. 'recover --resolve {1} "
+                "--back --apply' restores every row this operation wrote."
+                .format(r["name"], m.get("op_id", "")))
+
+
+def _realign_aside(op, c):
+    return os.path.join(op.op_dir, "set-aside", c["session_id"], c["folder"] + ".jsonl")
+
+
+def _realign_copy_contained(env, c):
+    """The copy's path, checked to be <projects root>/<its folder>/<id>.jsonl,
+    and its sidecar's to be that path without the extension."""
+    real = ensure_contained(c["src"], [env.projects_root])
+    want = os.path.join(os.path.realpath(env.projects_root), c["folder"],
+                        c["session_id"] + ".jsonl")
+    if os.path.normcase(real) != os.path.normcase(want):
+        raise LayoutError("copy {0!r} is not where its record says it is; "
+                          "refusing".format(c["src"]))
+    if c.get("sidecar_src"):
+        ensure_contained(c["sidecar_src"], [env.projects_root])
+    return real
+
+
+def _realign_sidecar_matches(folder, inventory):
+    """Whether FOLDER holds exactly INVENTORY (absent counts as empty)."""
+    try:
+        return sidecar_inventory(folder) == inventory
+    except (Refusal, OSError):
+        return False
+
+
+def _realign_move_copies(env, op, m):
+    """D6: each stale copy, and its sidecar folder, into this op's journal,
+    each checked against the plan before it moves and in the journal after.
+    The intent (`aside`) is journaled before the move, and a move that
+    already landed - the copy in the journal and none at its folder, from
+    an interrupted run - is finished and recorded rather than repeated."""
+    for c in m["copies"]:
+        if c.get("moved"):
+            continue
+        src = _realign_copy_contained(env, c)
+        aside = _realign_aside(op, c)
+        side_aside = aside[:-len(".jsonl")]
+        side = c.get("sidecar_src") or ""
+        if not os.path.exists(src) and os.path.isfile(aside):
+            if _file_basis(aside) != c["basis"]:
+                raise LayoutError("the copy from {0} in this op's journal is not "
+                                  "the one it planned to move".format(c["folder"]))
+            # Interrupted between the two moves: the transcript landed, its
+            # sidecar folder did not.
+            if side and os.path.isdir(side) and not os.path.exists(side_aside):
+                _shutil.move(side, side_aside)
+        else:
+            try:
+                now = _file_basis(src)
+            except OSError as exc:
+                raise Refusal(
+                    "the copy in {0} could not be read ({1}). The rows are "
+                    "written; the op is left at 'writing' - 'recover --resolve "
+                    "{2}' finishes or reverses it.".format(
+                        c["folder"], exc, m.get("op_id", "")))
+            if now != c["basis"] or (
+                    side and not _realign_sidecar_matches(side, c["sidecar_inventory"])):
+                raise Refusal(
+                    "the copy in {0}, or its sidecar folder, changed since this "
+                    "realign was planned, so it is not moved. The op is left at "
+                    "'writing' - 'recover --resolve {1} --back' reverses it."
+                    .format(c["folder"], m.get("op_id", "")))
+            os.makedirs(os.path.dirname(aside), exist_ok=True)
+            c["aside"] = aside
+            save_manifest(op)
+            _shutil.move(src, aside)
+            _maybe_crash("realign-mid-move")
+            if side and os.path.isdir(side):
+                _shutil.move(side, side_aside)
+        if _file_basis(aside) != c["basis"] or (
+                side and not _realign_sidecar_matches(side_aside,
+                                                      c["sidecar_inventory"])):
+            raise LayoutError("the copy from {0} did not arrive in the journal "
+                              "intact".format(c["folder"]))
+        c["aside"] = aside
+        c["moved"] = True
+        save_manifest(op)
+
+
+def _realign_restore_copy(c):
+    """Put a moved copy, and its sidecar, back where it was; verify both
+    against what the plan recorded."""
+    aside = c["aside"]
+    side_aside = aside[:-len(".jsonl")]
+    if os.path.isfile(aside):
+        _shutil.move(aside, c["src"])
+    if c.get("sidecar_src") and os.path.isdir(side_aside) \
+            and not os.path.exists(c["sidecar_src"]):
+        _shutil.move(side_aside, c["sidecar_src"])
+    if _file_basis(c["src"]) != c["basis"] or (
+            c.get("sidecar_src")
+            and not _realign_sidecar_matches(c["sidecar_src"],
+                                             c["sidecar_inventory"])):
+        raise LayoutError("the copy put back in {0}, or its sidecar folder, is "
+                          "not the one realign moved".format(c["folder"]))
+    c["moved"] = False
+    c["restored"] = True
+
+
+def execute_realign_op(env, op):
+    """journaled -> writing -> completed: every row, then every stale copy
+    into the journal. Callers own the guard and the recheck."""
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_realign_op runs ops from 'journaled'; use "
+                          "recover for interrupted ops")
+    roots = _retitle_roots(env)
+    set_status(op, "writing")
+    try:
+        _realign_write_rows(op, m, roots)
+        _maybe_crash("realign-after-rows")
+        _realign_move_copies(env, op, m)
+    except BaseException:
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_realign(env, manifest):
+    """Guard, lock, re-check, journal, execute, rotate. Returns the result,
+    or "nothing to write" when the re-check held every conversation."""
+    _guard_mutation(env, "realign rows in", NEW_ROW_STORE,
+                    because=REALIGN_GUARD_WHY)
+    acquire_lock(env, "realign")
+    try:
+        _realign_recheck(env, manifest)
+        if not manifest["conversations"]:
+            return "nothing to write"
+        try:
+            op = new_op(env, manifest)
+        except OSError as exc:
+            raise Refusal(
+                "could not write the operation record ({0}). The journal is "
+                "written before any row is touched, so nothing landed - fix the "
+                "space or permissions under {1} and re-run.".format(exc, env.ops_dir))
+        manifest["op_id"] = op.manifest["op_id"]
+        final = execute_realign_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def _realign_claimed_later(env, m, r):
+    """The op_id of another live operation that wrote row R and was not
+    started before this one, or None. Realign's post-image is a function of
+    the store, so bytes prove nothing: ownership goes by row path and journal
+    order, and an operation started in the same second counts, since the
+    order between them cannot be shown. Never raises."""
+    try:
+        mine = m.get("op_id") or ""
+        my_at = (m.get("history") or [{}])[0].get("at", 0)
+        dest = os.path.normcase(os.path.abspath(r["dest_path"]))
+        for o in list_ops(env):
+            om = o.manifest
+            oid = om.get("op_id") or ""
+            if oid == mine or om.get("status") in ("undone", "rolled_back"):
+                continue
+            at = (om.get("history") or [{}])[0].get("at", 0)
+            if at < my_at:
+                continue
+            # A move rewrites every row it journals and records no flag.
+            moveish = om.get("op_type", "move") in ("move", "undo")
+            for orow, p, _s in _journal_rows(om):
+                if not isinstance(p, str):
+                    continue
+                if os.path.normcase(os.path.abspath(p)) != dest:
+                    continue
+                if moveish or orow.get("written") \
+                        or om.get("status") in NONTERMINAL:
+                    return oid
+    except Exception:
+        return None
+    return None
+
+
+def _realign_undo_blocker(env, m, conv, roots, resuming=False):
+    """Why conversation CONV of realign op M cannot be undone now, or None.
+    RESUMING: an earlier undo of it was interrupted, so a row already
+    holding its old values, and a copy already put back, pass."""
+    sid = conv["session_id"]
+    rows = [r for r in m["rows"] if r["session_id"] == sid and r.get("written")]
+    copies = [c for c in m["copies"] if c["session_id"] == sid]
+    for r in rows:
+        _retitle_contained(r, roots)
+        try:
+            with open(r["dest_path"], "rb") as fh:
+                cur = _strict_row_dict(fh.read())
+        except FileNotFoundError:
+            return "row {0} in {1} is gone from that store".format(
+                r["name"], r.get("label", ""))
+        except (OSError, ValueError) as exc:
+            return "row {0} in {1} could not be read ({2})".format(
+                r["name"], r.get("label", ""), exc)
+        if not isinstance(cur, dict) or cur.get("cliSessionId") != sid:
+            return "row {0} in {1} now opens another conversation".format(
+                r["name"], r.get("label", ""))
+        if resuming and all(_realign_get(cur, k) == (bool(o.get("present")),
+                                                     o.get("value") if o.get("present")
+                                                     else None)
+                            for k, o in r["old"].items()):
+            continue
+        for k, v in r["new"].items():
+            present, now = _realign_get(cur, k)
+            if not present or now != v:
+                return "row {0} in {1} no longer holds what realign wrote ({2})" \
+                    .format(r["name"], r.get("label", ""), k)
+        claim = _realign_claimed_later(env, m, r)
+        if claim:
+            return "operation {0} wrote row {1} after this one - undo that " \
+                   "first".format(claim, r["name"])
+        old_cwd = (r["old"].get("cwd") or {}).get("value")
+        if isinstance(old_cwd, str) and old_cwd and not os.path.isdir(old_cwd):
+            return "the folder row {0} would go back to, {1}, no longer exists" \
+                .format(r["name"], old_cwd)
+        if not r.get("old_folder"):
+            if isinstance(old_cwd, str) and old_cwd:
+                for scheme in (SCHEME_CURRENT, SCHEME_LEGACY):
+                    p = os.path.join(env.projects_root, encode(old_cwd, scheme),
+                                     sid + ".jsonl")
+                    if os.path.exists(p):
+                        return "the folder row {0} would go back to now holds " \
+                               "a copy".format(r["name"])
+        elif r.get("old_copy_basis"):
+            p = os.path.join(env.projects_root, r["old_folder"], sid + ".jsonl")
+            ok, why = _grew_only_bookkeeping(p, r["old_copy_basis"])
+            if not ok:
+                return "the copy row {0} would go back to {1}".format(r["name"], why)
+    for c in copies:
+        if not c.get("moved"):
+            continue                 # never moved, or already put back
+        if resuming and not (c.get("aside") and os.path.isfile(c["aside"])) \
+                and os.path.isfile(c["src"]) and _file_basis(c["src"]) == c["basis"]:
+            continue                 # put back before the interruption
+        if not (c.get("aside") and os.path.isfile(c["aside"])):
+            return "its copy from {0} is no longer in the journal".format(c["folder"])
+        if _file_basis(c["aside"]) != c["basis"] or (
+                c.get("sidecar_src") and not _realign_sidecar_matches(
+                    c["aside"][:-len(".jsonl")], c["sidecar_inventory"])):
+            return "its copy from {0} changed in the journal".format(c["folder"])
+        if os.path.exists(c["src"]) or (c.get("sidecar_src")
+                                        and os.path.exists(c["sidecar_src"])):
+            return "a copy is back in {0} since realign moved one out".format(
+                c["folder"])
+    ok, why = _grew_only_bookkeeping(conv["target_path"], conv["target_basis"])
+    if not ok:
+        if why == "has gained turns":
+            return ("the conversation has gained turns since realign, which "
+                    "putting the rows back would hide")
+        return "the live copy {0}".format(why)
+    return None
+
+
+def _realign_undo_conversation(env, op, m, conv):
+    """Copies back first, then each row's keys: the old values of exactly
+    the keys realign changed, every other key as the app now has it."""
+    sid = conv["session_id"]
+    for c in m["copies"]:
+        if c["session_id"] == sid and c.get("moved"):
+            _realign_restore_copy(c)
+            save_manifest(op)
+    for r in m["rows"]:
+        if r["session_id"] != sid or not r.get("written"):
+            continue
+        with open(r["dest_path"], "rb") as fh:
+            cur = _strict_row_dict(fh.read())
+        restored = _realign_apply_old(cur, r["old"])
+        atomic_write(r["dest_path"],
+                     json.dumps(restored, separators=(",", ":")).encode("utf-8"))
+        with open(r["dest_path"], "rb") as fh:
+            if json.loads(fh.read().decode("utf-8")) != restored:
+                raise LayoutError("verify failed restoring row {0!r}".format(r["name"]))
+
+
+def undo_realign(env, op):
+    """Undo per conversation: each one is put back whole (its copies, then its
+    rows' keys) or refused with the reason, and the others go ahead. The op is
+    'undone' when every conversation is; until then a later undo retries the
+    rest. Returns "undone" or "partial"."""
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "realign":
+            raise Refusal("not a realign op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        bad = _realign_shape_error(m)
+        if bad:
+            raise Refusal("the record for {0} is damaged ({1}); refusing rather "
+                          "than guess. Nothing was changed.".format(m.get("op_id"), bad))
+        _guard_mutation(env, "restore realigned rows in", NEW_ROW_STORE,
+                        because=REALIGN_GUARD_WHY)
+        stray = _unresolved_rows(_journal_discovery(env, "undo"), m, written_only=True)
+        if stray:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(m["op_id"], _unresolved_clause(stray)))
+        roots = _retitle_roots(env)
+        status = m.setdefault("undo_status", {})
+        for conv in m["conversations"]:
+            sid = conv["session_id"]
+            if status.get(sid) == "undone":
+                continue
+            # "undoing": an earlier undo was interrupted inside this
+            # conversation, so rows and copies already put back are accepted.
+            resuming = str(status.get(sid, "")).startswith("undoing")
+            try:
+                why = _realign_undo_blocker(env, m, conv, roots, resuming)
+            except OSError as exc:
+                why = "a file could not be read ({0})".format(exc)
+            if why:
+                status[sid] = ("undoing; refused: " if resuming
+                               else "refused: ") + why
+                save_manifest(op)
+                continue
+            status[sid] = "undoing"
+            save_manifest(op)
+            _realign_undo_conversation(env, op, m, conv)
+            status[sid] = "undone"
+            save_manifest(op)
+        if all(status.get(c["session_id"]) == "undone" for c in m["conversations"]):
+            set_status(op, "undone")
+            rotate_ops(env)
+            return "undone"
+        return "partial"
+    finally:
+        release_lock(env)
+
+
+def classify_realign_op(env, op):
+    """Recovery shape for an interrupted realign. Forward finishes from the
+    journal - the pending rows still hold their journaled originals, and the
+    pending copies are where the plan found them - with no new plan; back
+    puts the copies and every written row back. Never raises."""
+    m = op.manifest
+    bad = _realign_shape_error(m)
+    if bad:
+        return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "realign: this operation's record is damaged ({0}), so "
+                        "neither direction can be run from it".format(bad)}
+    written = [r for r in m["rows"] if r.get("written")]
+    pending = [r for r in m["rows"] if not r.get("written")]
+    moved = [c for c in m["copies"] if c.get("moved")]
+    if m.get("status") not in NONTERMINAL:
+        return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "realign: {0} row(s) written, {1} cop(ies) in the "
+                        "journal (use undo to reverse a completed realign)"
+                        .format(len(written), len(moved))}
+    stuck = []
+    for r in pending:
+        state = _sync_row_drift(r)
+        if state not in ("pristine", "match"):
+            stuck.append(r.get("name") or "?")
+    for c in m["copies"]:
+        if c.get("moved"):
+            continue
+        aside = c.get("aside") or ""
+        if not os.path.isfile(c["src"]) and not (aside and os.path.isfile(aside)):
+            stuck.append("the copy in {0}".format(c["folder"]))
+    res = ["back"] if stuck else ["forward", "back"]
+    note = ("realign: {0} row(s) written, {1} pending, {2} cop(ies) moved into "
+            "the journal; forward finishes from the journal, back puts the "
+            "copies and the written rows back".format(
+                len(written), len(pending), len(moved)))
+    if stuck:
+        note += "; forward is not offered: {0} changed or went missing".format(
+            ", ".join(stuck))
+    return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+            "resolutions": res, "drifted_rows": stuck, "note": note}
+
+
+def _recover_realign(env, op, direction, stray):
+    """recover_op's realign arm."""
+    m = op.manifest
+    bad = _realign_shape_error(m)
+    if bad:
+        raise Refusal("the record for {0} is damaged ({1}), so neither direction "
+                      "can be run from it. Nothing was changed."
+                      .format(m.get("op_id"), bad))
+    if direction == "forward":
+        _guard_mutation(env, "realign rows in", NEW_ROW_STORE,
+                        because=REALIGN_GUARD_WHY)
+        set_status(op, "journaled")
+        final = execute_realign_op(env, op)
+        rotate_ops(env)
+        return final
+    roots = _retitle_roots(env)
+    stray_ids = {id(r) for r, _ in stray}
+    restorable, skipped, copies_back, copies_stuck = [], [], [], []
+    for c in m["copies"]:
+        aside = c.get("aside") or ""
+        if aside and os.path.isfile(aside):
+            if os.path.exists(c["src"]):
+                copies_stuck.append(c)
+            else:
+                copies_back.append(c)
+    for r in m["rows"]:
+        if id(r) in stray_ids:
+            continue
+        try:
+            _retitle_contained(r, roots)
+        except LayoutError:
+            if r.get("written"):
+                raise
+            continue
+        state = _sync_row_drift(r)
+        if state == "match":
+            claim = _realign_claimed_later(env, m, r)
+            if claim:
+                skipped.append("{0} (operation {1} wrote it since)".format(
+                    r.get("name"), claim))
+                continue
+            try:
+                restorable.append((r["dest_path"], _sync_pre_image(r)))
+            except (KeyError, ValueError):
+                skipped.append("{0} (its journaled pre-image cannot be read)"
+                               .format(r.get("name")))
+        elif state in ("pristine",):
+            continue
+        elif r.get("written"):
+            skipped.append("{0} ({1} since)".format(r.get("name"), state))
+    if restorable or copies_back:
+        _guard_mutation(env, "restore realigned rows in", NEW_ROW_STORE,
+                        because=REALIGN_GUARD_WHY)
+        for c in copies_back:
+            _realign_restore_copy(c)
+            save_manifest(op)
+        _sync_restore_all(restorable)
+    if skipped:
+        m["abort_reason"] = ("back restored {0} row(s) and {1} cop(ies); left "
+                             "{2} untouched: {3}".format(
+                                 len(restorable), len(copies_back), len(skipped),
+                                 ", ".join(skipped)))
+    # A copy in the journal whose place is taken again: left where it is,
+    # marked moved (rotate_ops keeps the op, doctor lists the copy) and
+    # recorded as residue. Not as a residue PATH: those name rows.
+    for c in copies_stuck:
+        c["moved"] = True
+        _add_residue(m, "left the copy from {0} in the journal at {1} - a copy "
+                        "is back in that folder".format(c["folder"], c["aside"]),
+                     [])
+    _add_residue(m, *_unresolved_residue(stray))
+    set_status(op, "rolled_back")
+    rotate_ops(env)
+    return "rolled_back"
+
+
+def _public_realign_manifest(env, m):
+    """The plan or op without row images, journal paths or file hashes, for
+    --json and the printed report; --anonymize honoured here."""
+    out = {"op_type": "realign", "only": m.get("only", ""),
+           "include_identical": bool(m.get("include_identical")),
+           "live_asserted": m.get("live_asserted", "")}
+    if m.get("op_id"):
+        out["op_id"] = m["op_id"]
+    out["conversations"] = [
+        {"session_id": c["session_id"], "title": c.get("title", ""),
+         "relation": c.get("relation", ""), "folder": c["folder"],
+         "cwd": c["cwd"], "path_from": c.get("path_from", ""),
+         "decided_by": c.get("decided_by"),
+         "rows": c.get("rows", 0), "copies_moved": c.get("copies_moved", 0)}
+        for c in m.get("conversations", [])]
+    out["rows"] = [
+        {"session_id": r["session_id"], "name": r["name"],
+         "label": r.get("label", ""), "account": r.get("account", ""),
+         "store_path": r.get("store_path", ""), "dest_path": r.get("dest_path", ""),
+         "folder": r.get("old_folder", ""),
+         "cwd": (r.get("old", {}).get("cwd") or {}).get("value") or "",
+         "written": bool(r.get("written"))}
+        for r in m.get("rows", [])]
+    out["copies"] = [
+        {"session_id": c["session_id"], "folder": c["folder"],
+         "bytes": (c.get("basis") or {}).get("bytes"),
+         "sidecar_only": list(c.get("sidecar_only") or []),
+         "moved": bool(c.get("moved"))}
+        for c in m.get("copies", [])]
+    out["held"] = [{"session_id": h["session_id"], "title": h.get("title", ""),
+                    "reason": h.get("reason", "")} for h in m.get("held", [])]
+    if _ANONYMIZE:
+        # Paths the plan read from transcripts, or quotes in a hold, that no
+        # row carries, so _anon_pairs never saw them.
+        for c in m.get("conversations", []):
+            _anon_register_path(env, c.get("cwd"))
+        for h in m.get("held", []):
+            for p in h.get("paths") or []:
+                _anon_register_path(env, p)
+        for h in out["held"]:
+            h["reason"] = anonymize(env, h["reason"])
+        out = anonymize_report(env, out)
+    return out
+
+
+def _print_realign_report(say, m):
+    """The plan: each conversation's target, each row's move, each copy that
+    goes into the journal, and each hold with its reason. M is the PUBLIC
+    manifest."""
+    convs, held = m.get("conversations", []), m.get("held", [])
+    if not convs and not held:
+        say("no split conversation to realign")
+        return
+    say("realign: {0} conversation(s) planned, {1} held".format(len(convs), len(held)))
+    for c in convs:
+        sid = c["session_id"]
+        say("")
+        say("{0!r}  {1}".format(c.get("title") or "(untitled)", sid[:8]))
+        say("   live copy : {0}  [{1}]".format(c["folder"], c.get("relation", "")))
+        say("   path      : {0}  (from {1})".format(
+            c["cwd"], "a row that opens it" if c.get("path_from") == "row"
+            else "the live copy's own records"))
+        d = c.get("decided_by")
+        if isinstance(d, dict):
+            say("   chosen as : the copy the most recently active row opens - "
+                "{0}'s {1}".format(d.get("label", ""), d.get("local_id", "")))
+        for r in m.get("rows", []):
+            if r["session_id"] != sid:
+                continue
+            say("   {0}  row {1}".format(r.get("label", ""), r.get("name", "")))
+            say("      opens  : {0} -> the live copy".format(
+                "the copy in " + r["folder"] if r.get("folder")
+                else "no copy (its folder holds none)"))
+            say("      cwd    : {0} -> {1}: its next turns run there, and the "
+                "sidebar groups it there".format(r.get("cwd") or "(none)", c["cwd"]))
+        for cp in m.get("copies", []):
+            if cp["session_id"] != sid:
+                continue
+            say("   moves into the journal: the copy in {0} ({1:,} bytes)".format(
+                cp["folder"], cp.get("bytes") or 0))
+            only = cp.get("sidecar_only") or []
+            if only:
+                say("      its sidecar folder moves with it, holding {0} file(s) "
+                    "the live copy's lacks: {1}{2}".format(
+                        len(only), ", ".join(only[:5]),
+                        ", ..." if len(only) > 5 else ""))
+    if held:
+        say("")
+        say("held:")
+        for h in held:
+            say("   {0!r}  {1}: {2}".format(h.get("title") or "(untitled)",
+                                           h["session_id"][:8], h["reason"]))
+
+
+def cmd_realign(env, ns):
+    flags = RealignFlags(only=ns.only, include_identical=ns.include_identical,
+                         live=ns.live)
+    m = plan_realign(env, flags)
+
+    def say(line):
+        text = line if ns.verbose else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
+    if not ns.json:
+        _print_realign_report(say, _public_realign_manifest(env, m))
+    final = None
+    if ns.apply and m["conversations"]:
+        final = run_realign(env, m)
+    code = 3 if (ns.apply and m["held"]) else 0
+    if ns.json:
+        pub = _public_realign_manifest(env, m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        return code
+    if not ns.apply:
+        say("\ndry run - pass --apply to realign")
+        return 0
+    if final is not None:
+        say("\nresult  : {0}".format(final))
+        if final == "completed":
+            say("Reopen the app: every realigned row opens the live copy. 'undo' "
+                "puts the rows and the moved copies back.")
+    if m["held"]:
+        say("{0} conversation(s) held; each is listed above with its reason"
+            .format(len(m["held"])))
+    return code
 
 
 def _public_manifest(env, m):

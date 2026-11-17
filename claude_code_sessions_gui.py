@@ -3649,6 +3649,8 @@ class SyncApp:
         new-row. "retitle" joined the tuple in 0.11.0 for the same reason,
         and "converge" in 0.12.0; both are now also types this window itself
         creates (the Level tab), so they are offered rather than parked.
+        "realign" joined with the command; it is CLI-only, so it is parked:
+        a completed realign on top means no undo is offered here.
 
         The descriptor carries what the confirmation needs: op_id, type, the
         written-row count, a button label naming what it reverses, and the
@@ -3663,7 +3665,8 @@ class SyncApp:
                    and o.manifest.get("op_type", "move") in ("move", "sync",
                                                              "repoint", "new-row",
                                                              "retitle",
-                                                             "converge")]
+                                                             "converge",
+                                                             "realign")]
         except Exception:
             return None
         if not ops:
