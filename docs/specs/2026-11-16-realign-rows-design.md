@@ -36,12 +36,12 @@ The lasting state is every account's row opening the same copy, the live one.
 
 | Claim | Basis |
 |---|---|
-| A row opens the copy in the folder its `cwd` encodes to, even a stale one | measured, one conversation, Desktop 5.11492.5 |
-| A row whose folder holds no copy gets one copied in when opened | measured, same conversation |
-| The app appends `tools-used` to a copy it opens and `cost-state` to one it quits on, the stale one included | measured, same conversation |
-| `cwd` is the key the app reads to choose that folder | **untested**: rows also carry `originCwd`, `worktreePath`, `folderPlace` (`cwd`, `realPath`) and `gitAnchorsFolderRealpath`; on every row checked, `worktreePath` and `folderPlace.cwd` equal `cwd` where present. The probe below |
-| The app does not rewrite the folder keys back when it opens a row | **untested**; the probe records which keys the app rewrites |
-| Changing a row's folder keys changes where the conversation's next turns run | **untested** (inference: the transcript records each turn's `cwd`); the probe's typed trial measures it |
+| A row opens the copy in the folder its `cwd` encodes to, even a stale one | measured, one conversation, Desktop 5.11492.5; and by the probe, phase 1 |
+| A row whose folder holds no copy gets one copied in when opened | measured twice: that conversation, and the probe's `empty-b` trial (the whole transcript, plus what the open appended) |
+| The app appends `tools-used` to a copy it opens and `cost-state` to one it quits on, the stale one included | measured, same conversation; the probe saw `bridge-session` and `mode` records too, written only when the app started the conversation's session |
+| `cwd` is the key the app reads to choose that folder | **measured on a plain-folder row** (probe phase 1, 2026-11-17, Desktop 5.11492.5): `cwd` alone on the other folder opened that folder's copy, every other path key there but `cwd` did not, and `originCwd`, `folderPlace.cwd`, `folderPlace.realPath` and `gitAnchorsFolderRealpath` each alone did not. **Untested on a worktree row** (phase 2) |
+| The app does not rewrite the folder keys back when it opens a row | **measured, plain row**: it never rewrote `cwd`, `originCwd` or `gitAnchorsFolderRealpath`; it rewrote `folderPlace` to `{cwd: <the row's cwd>, lost: true}` whenever `folderPlace.cwd` disagreed with `cwd`, and left it when they agreed |
+| Changing a row's folder keys changes where the conversation's next turns run | **measured, plain row**: a turn typed after `cwd` moved ran in, and was written to, the new folder, in the same transcript (no new conversation id) |
 | The live copy is the one holding every other copy's conversation | inference from append-only transcripts, with the two bookkeeping records set aside; `doctor` computes it among the copies rows open, and realign must compare it with every copy on disk |
 
 Nothing below is built until the probe has run.
@@ -314,7 +314,11 @@ toward exit 1.
 that already exist breaks converge's promise that it only adds rows. Recommended: (a); (c) can
 call it later.
 
-**D2. Which keys it rewrites.** Ruled after the probe.
+**D2. Which keys it rewrites.** Ruled after the probe. *Phase 1 (plain row) is in: `cwd`
+decides, alone; the app rewrites `folderPlace` to match `cwd` and flags it `lost` when they
+disagree, so writing `folderPlace.cwd` and `folderPlace.realPath` together with `cwd` keeps the
+row as the app would leave it; `originCwd` and `gitAnchorsFolderRealpath` do not choose the
+folder and can stay. Phase 2 (a worktree row) is still open.*
 (a) The keys the probe shows decide the folder, on a plain row and on a worktree row alike,
 plus any the app rewrites back on open; if that is not `cwd` alone, detection's placement rule
 changes to match before realign is built. (b) If the probe is inconclusive, or the two phases
@@ -338,7 +342,9 @@ session whose directory is gone is untested, and a broken row is worse than a st
 Realign anyway and warn. (c) Recreate the directory: a write outside the store, which no
 command here does.
 
-**D5. Undo.** Ruled after the probe.
+**D5. Undo.** Ruled after the probe. *Phase 1: the app did not write `cwd` back on any open,
+and rewrote `folderPlace` only when it disagreed with `cwd`, so a realign that writes the two
+together leaves nothing the app will change, and (a) is open to it on a plain row.*
 (a) Key-scoped and per conversation, with the identity, ownership, folder and history checks
 above. Recommended if the probe shows the app leaves the folder keys alone. (b) Byte
 pre-images, all-or-nothing, as `repoint` and `retitle`: exact, but refused as soon as the app
@@ -374,7 +380,8 @@ open one copy while another copy remains.
 conversations with two or more copies. On the measured store, 64 conversations with one copy
 (63 with an unarchived row among those rows) have a row whose folder holds no copy and which
 the worktree placement does not reach either: by the one measurement, each becomes a split the
-first time that row is opened. (a) After the probe's `empty-b` trial confirms the copy-in,
+first time that row is opened (the probe's `empty-b` trial measured the copy-in a second
+time, on 2026-11-17). (a) After the probe's `empty-b` trial confirms the copy-in,
 `doctor` lists them (not counted) and realign plans them like a row that opens no copy.
 Recommended: the realign half is cheap once the rest exists, and a listing that predicts a
 split should rest on more than one observation. (b) List them now, before the probe. (c) Leave
