@@ -502,6 +502,8 @@ def test_undo_is_per_conversation_and_retries_the_rest(world):
 
 def test_a_later_operation_on_the_row_blocks_undo(world):
     s, op = applied(world)
+    t0 = world.env.now()
+    world.env.now = lambda: t0 + 5
     later = ct.new_op(world.env, {"op_type": "retitle", "cli_session_id": S1,
                                   "new_title": "x",
                                   "rows": [{"name": "local_1.json", "dest_path": s.r2,
@@ -848,9 +850,10 @@ _OP_TYPE_BRANCHES = {
     "cmd_undo": "names it",
     "undo_realign": "names it",
     "_collides": "names it",
+    "plan_realign": "names it",
     "_journal_rows": "realign rows take the last branch, a per-row store_path",
     "_unresolved_rows": "tells moves apart; realign rows carry `written`",
-    "_realign_claimed_later": "realign's own; tells moves apart",
+    "_realign_claimed_later": "names it",
     "plan_undo": "undo of a move only",
     "undo_new_row": "its own type",
     "undo_sync": "its own type",
@@ -898,3 +901,285 @@ def test_every_op_type_branch_names_realign_or_says_why_not():
         assert names_it == (_OP_TYPE_BRANCHES[name] == "names it"), name
     gui = _op_type_branches(os.path.join(root, "claude_code_sessions_gui.py"))
     assert gui == {"_find_undoable_op": True}
+
+
+# ------------------------------------------- the code review's findings
+# Codex, DeepSeek and Kimi reviewed the diff 1541937..1acf6bd on 2026-11-17;
+# each test below is a finding verified against the code, failing first.
+
+def crashed_after_rows(world, s=None):
+    s = s or behind_store(world)
+    op = crash_at(world, "realign-after-rows", plan(world))
+    return s, op
+
+
+def test_forward_is_withheld_when_a_pending_copy_changed(world):
+    s, op = crashed_after_rows(world)
+    with open(s.old_p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"content": "x"}}) + "\n")
+    assert ct.classify_op(world.env, op)["resolutions"] == ["back"]
+
+
+def test_forward_is_withheld_when_a_pending_sidecar_changed(world):
+    s = behind_store(world)
+    with_sidecar(s.old_p, {"subagents/a.jsonl": "a"})
+    s, op = crashed_after_rows(world, s)
+    with_sidecar(s.old_p, {"subagents/b.jsonl": "b"})
+    assert ct.classify_op(world.env, op)["resolutions"] == ["back"]
+
+
+def test_forward_is_withheld_when_the_live_copy_is_gone(world):
+    s, op = crashed_after_rows(world)
+    os.remove(s.live_p)
+    assert ct.classify_op(world.env, op)["resolutions"] == ["back"]
+
+
+def test_forward_is_withheld_when_a_written_row_moved_on(world):
+    s, op = crashed_after_rows(world)
+    d = world.read(s.r2)
+    d["cwd"] = s.old_cwd
+    with open(s.r2, "w") as fh:
+        json.dump(d, fh)
+    assert ct.classify_op(world.env, op)["resolutions"] == ["back"]
+
+
+@pytest.mark.parametrize("direction", ["forward", "back"])
+def test_an_interruption_between_rows_recovers_both_ways(world, direction):
+    s = behind_store(world)
+    r3 = world.row(A3, O3, "local_1", S1, s.old_cwd, activity=4)
+    op = crash_at(world, "realign-mid-rows", plan(world))
+    written = [r for r in op.manifest["rows"] if r.get("written")]
+    assert len(written) == 1
+    final = ct.recover_op(world.env, op, direction)
+    if direction == "forward":
+        assert final == "completed"
+        assert world.read(s.r2)["cwd"] == s.live_cwd == world.read(r3)["cwd"]
+    else:
+        assert final == "rolled_back"
+        assert world.read(s.r2)["cwd"] == s.old_cwd == world.read(r3)["cwd"]
+        assert os.path.isfile(s.old_p)
+
+
+def applied_with(world, s):
+    ct.run_realign(world.env, plan(world))
+    (op,) = [o for o in ct.list_ops(world.env) if o.manifest["op_type"] == "realign"]
+    return s, op
+
+
+def test_back_brings_a_sidecar_back_after_a_crash_mid_restore(world):
+    s = behind_store(world)
+    side = with_sidecar(s.old_p, {"subagents/a.jsonl": "a"})
+    s, op = applied_with(world, s)
+    ct.set_status(op, "writing")
+    (cp,) = op.manifest["copies"]
+    shutil.move(cp["aside"], cp["src"])          # the transcript came back,
+    assert not os.path.exists(side)              # the sidecar did not
+    assert ct.recover_op(world.env, op, "back") == "rolled_back"
+    assert os.path.isfile(os.path.join(side, "subagents", "a.jsonl"))
+    assert world.read(s.r2)["cwd"] == s.old_cwd
+
+
+def test_back_keeps_a_conversation_whose_old_folder_is_taken_again(world):
+    """The copy's place holds another copy now: putting the rows back would
+    point them at a transcript nobody checked, so the conversation keeps
+    realign's placement and its copy stays in the journal, listed."""
+    s, op = applied(world)
+    ct.set_status(op, "writing")
+    world.copy(s.old_cwd, S1, t_entries(cwd=s.live_cwd) + diverging_turn())
+    assert ct.recover_op(world.env, op, "back") == "rolled_back"
+    assert world.read(s.r2)["cwd"] == s.live_cwd
+    (cp,) = op.manifest["copies"]
+    assert cp["moved"] and os.path.isfile(cp["aside"])
+    assert "taken" in op.manifest["abort_reason"]
+    rep = ct.gather_doctor(world.env)
+    assert rep["realign_held_copies"] and not rep["rollback_residue"]
+
+
+def test_a_restore_refuses_a_journal_path_outside_its_operation(world):
+    s, op = applied(world)
+    (cp,) = op.manifest["copies"]
+    outside = str(world.tmp / "elsewhere.jsonl")
+    shutil.copyfile(cp["aside"], outside)
+    cp["aside"] = outside
+    ct.save_manifest(op)
+    with pytest.raises((ct.Refusal, ct.LayoutError)):
+        ct.undo_realign(world.env, op)
+    assert not os.path.exists(s.old_p) and os.path.isfile(outside)
+
+
+def test_a_restore_refuses_a_source_outside_the_projects_root(world):
+    s, op = applied(world)
+    (cp,) = op.manifest["copies"]
+    cp["src"] = str(world.tmp / "outside" / (S1 + ".jsonl"))
+    os.makedirs(os.path.dirname(cp["src"]))
+    ct.save_manifest(op)
+    with pytest.raises((ct.Refusal, ct.LayoutError)):
+        ct.undo_realign(world.env, op)
+    assert not os.path.exists(cp["src"])
+
+
+def test_the_recheck_refuses_with_its_own_reason(world):
+    behind_store(world)
+    a, _ = world.place("Other")
+    b, _ = world.place("Other-wt")
+    world.copy(a, S2, t_entries(cwd=a) + later_turns())
+    world.copy(b, S2, t_entries(cwd=a))
+    world.row(A1, O1, "local_2", S2, a, title="Northwind intake")
+    world.row(A2, O2, "local_2", S2, b, title="Northwind intake")
+    m = plan(world, only="ACME")
+    world.row(A3, O3, "local_9", S2, b, title="ACME intake",   # now 2 match
+              activity=99)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_realign(world.env, m)
+    assert "2 conversations" in str(exc.value)
+
+
+def test_holds_found_under_the_lock_are_printed(world, capsys, monkeypatch):
+    s = behind_store(world)
+    real = ct._realign_recheck
+
+    def grow_then_recheck(env, m):
+        with open(s.live_p, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "user", "message": {"content": "n"}}) + "\n")
+        return real(env, m)
+    monkeypatch.setattr(ct, "_realign_recheck", grow_then_recheck)
+    assert ct.cmd_realign(world.env, ns(apply=True)) == 3
+    out = capsys.readouterr().out
+    assert "result" in out
+    assert "changed since" in out[out.index("result"):]
+
+
+def test_a_sidecar_file_that_differs_by_content_is_named(world):
+    s = behind_store(world)
+    with_sidecar(s.live_p, {"tool-results/t.txt": "new"})
+    with_sidecar(s.old_p, {"tool-results/t.txt": "old"})
+    (cp,) = plan(world)["copies"]
+    assert cp["sidecar_only"] == ["tool-results/t.txt"]
+
+
+def test_a_live_sidecar_change_since_the_plan_holds_the_conversation(world):
+    s = behind_store(world)
+    with_sidecar(s.live_p, {"subagents/a.jsonl": "a"})
+    m = plan(world)
+    with_sidecar(s.live_p, {"subagents/b.jsonl": "b"})
+    assert ct.run_realign(world.env, m) == "nothing to write"
+    assert "changed since" in held_reasons(m)[S1]
+
+
+def _boom(*a, **k):
+    raise PermissionError(13, "Access is denied")
+
+
+def test_an_os_error_moving_a_copy_is_a_refusal(world, monkeypatch):
+    s = behind_store(world)
+    m = plan(world)
+    monkeypatch.setattr(ct, "_shutil", types.SimpleNamespace(move=_boom))
+    with pytest.raises(ct.Refusal):
+        ct.run_realign(world.env, m)
+    monkeypatch.undo()
+    ct.release_lock(world.env)
+    (op,) = ct.nonterminal_ops(world.env)
+    assert ct.recover_op(world.env, op, "back") == "rolled_back"
+    assert world.read(s.r2)["cwd"] == s.old_cwd and os.path.isfile(s.old_p)
+
+
+def test_an_os_error_during_undo_is_a_refusal_and_resumes(world, monkeypatch):
+    s, op = applied(world)
+    monkeypatch.setattr(ct, "_shutil", types.SimpleNamespace(move=_boom))
+    with pytest.raises(ct.Refusal):
+        ct.undo_realign(world.env, op)
+    monkeypatch.undo()
+    assert op.manifest["undo_status"][S1] == "undoing"
+    assert ct.undo_realign(world.env, op) == "undone"
+    assert world.read(s.r2)["cwd"] == s.old_cwd
+
+
+def test_an_open_converge_op_for_the_conversation_holds_it(world):
+    s = behind_store(world)
+    store = os.path.dirname(s.r1)
+    ct.new_op(world.env, {"op_type": "converge", "only": "", "only_session": "",
+                          "rows": [{"name": "local_new.json", "session": S1,
+                                    "dest_path": os.path.join(store, "local_new.json"),
+                                    "store_path": store, "pre_b64": None,
+                                    "post_b64": "e30=", "written": False}]})
+    assert "unfinished operation" in held_reasons(plan(world))[S1]
+
+
+def test_an_open_sync_op_naming_the_conversation_in_its_images_holds_it(world):
+    s = behind_store(world)
+    store = os.path.dirname(s.r1)
+    post = ct.b64(json.dumps({"cliSessionId": S1}).encode("utf-8"))
+    ct.new_op(world.env, {"op_type": "sync", "dest_path": store,
+                          "rows": [{"name": "local_x.json",
+                                    "dest_path": os.path.join(store, "local_x.json"),
+                                    "pre_b64": None, "post_b64": post,
+                                    "written": False}]})
+    assert "unfinished operation" in held_reasons(plan(world))[S1]
+
+
+def test_folderplace_members_are_not_added(world):
+    s = behind_store(world)
+    world.row(A2, O2, "local_1", S1, s.old_cwd, activity=10,
+              folderPlace={"cwd": s.old_cwd, "lost": True})
+    (r,) = plan(world)["rows"]
+    post = json.loads(ct.unb64(r["post_b64"]).decode("utf-8"))
+    assert post["folderPlace"] == {"cwd": s.live_cwd, "lost": True}
+    assert set(r["new"]) == {"cwd", "folderPlace.cwd"}
+
+
+def test_a_damaged_undo_status_is_refused(world):
+    s, op = applied(world)
+    op.manifest["undo_status"] = ["not", "a", "dict"]
+    ct.save_manifest(op)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_realign(world.env, op)
+    assert "undo_status" in str(exc.value)
+
+
+def test_doctor_survives_a_damaged_held_copy_record(world):
+    s, op = applied(world)
+    op.manifest["copies"][0]["basis"] = 5
+    ct.save_manifest(op)
+    rep = ct.gather_doctor(world.env)
+    assert rep["realign_held_copies"][0]["bytes"] is None
+
+
+def test_anonymized_json_hides_the_only_filter(world, capsys):
+    behind_store(world)
+    ct._ANONYMIZE = True
+    ct.cmd_realign(world.env, ns(json=True, only="ACME"))
+    js = json.loads(capsys.readouterr().out)
+    assert js["only"] == "<only-filter>"
+
+
+def test_two_operations_started_together_do_not_lock_each_other_out(world):
+    """Ownership goes by the journal's total order (time, then op id), so of
+    two operations journaled in the same instant exactly one is later."""
+    s = behind_store(world)
+    rows = [{"name": "local_1.json", "dest_path": s.r2,
+             "store_path": os.path.dirname(s.r2), "written": True}]
+    for _ in range(2):
+        o = ct.new_op(world.env, {"op_type": "realign", "rows": rows})
+        ct.set_status(o, "completed")
+    ma, mb = [o.manifest for o in ct.list_ops(world.env)]
+    claims = [ct._realign_claimed_later(world.env, ma, ma["rows"][0]),
+              ct._realign_claimed_later(world.env, mb, mb["rows"][0])]
+    assert sum(1 for c in claims if c) == 1
+
+
+def test_the_plan_marks_an_archived_row(world, capsys):
+    s = behind_store(world)
+    world.row(A2, O2, "local_1", S1, s.old_cwd, activity=10, isArchived=True)
+    ct.cmd_realign(world.env, ns())
+    assert "(archived)" in capsys.readouterr().out
+
+
+def test_the_window_reports_held_copies_and_waiting_rows(world):
+    import claude_code_sessions_gui as gui
+    s, op = applied(world)
+    none_cwd, _ = world.place("Elsewhere")
+    lonely, _ = world.place("Lonely")
+    world.copy(lonely, S2, t_entries(cwd=lonely))
+    world.row(A1, O1, "local_2", S2, none_cwd, title="Northwind intake")
+    text = "\n".join(gui.SyncApp.doctor_lines(ct.gather_doctor(world.env)))
+    assert "journal" in text and "copies the transcript" in text
