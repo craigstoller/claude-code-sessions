@@ -344,16 +344,20 @@ checked against its pre-image, verified after as the pre-image with exactly thos
 then moves every copy a rewritten row used to open, and no row opens now, into
 `<op>/set-aside/<id>/<folder>.jsonl`, sidecar folder beside it, after checking its bytes and
 its sidecar's inventory against the plan. A copy no row opened before is left in place. The
-plan records every copy on disk with its size, so a copy that appears or changes between plan
-and apply holds the conversation. `rotate_ops` keeps an operation
-while it holds a copy. `recover` finishes forward from the journal, without re-planning, or goes
-back by restoring the copies and every row that still holds its post-image.
+plan records every copy on disk with its hash, and the live copy's sidecar inventory, so a
+copy that appears or changes between plan and apply holds the conversation. `recover` offers
+`forward` only when every row and copy it would act on is as the journal expects
+(`_realign_forward_blockers`); `back` works per conversation, puts the transcript and the
+sidecar folder back each on its own, and keeps realign's placement for a conversation whose
+copy cannot go back. Every move back is checked at both ends (`_realign_paths_check`).
+`rotate_ops` keeps an operation while it holds a copy, and no command releases one yet.
 
 `undo` is per conversation and key-scoped: a row's post-image is a function of the store, so
 bytes cannot prove ownership, and the app rewrites other keys on open. A conversation is put
 back (copies first, then the old value of each changed key, every other key as the app now has
 it) only if each row still holds what realign wrote and still opens that conversation, no
-operation started at or after this one wrote the row (`_realign_claimed_later`), each old
+operation after this one in the journal's order (`_op_sort_key`) wrote the row
+(`_realign_claimed_later`), each old
 folder still exists and the folder a no-copy row returns to still holds no copy, the moved
 copies are intact in the journal with nothing back at their place, and the live copy has
 gained nothing but bookkeeping records. The result is recorded per conversation in

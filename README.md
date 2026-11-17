@@ -614,14 +614,22 @@ recently active row opens. `--only` narrows to one conversation, resolved the wa
 - an unfinished operation involves it, or anything about it changed between plan and apply.
 
 `--apply` needs the desktop app fully closed, re-plans under its lock and writes only the
-conversations whose rows, copies and target are unchanged, and exits 3 when any conversation
-was held. An interrupted run recovers in both directions: `recover --forward` finishes from
-the journal, and `recover --back` puts the copies and the rows back. `undo` works per
-conversation. It puts back only the keys realign changed, keeps whatever the app wrote to
-other keys since, and refuses a conversation, naming the reason, when its rows no longer hold
-what realign wrote, now open another conversation, were written by a later operation, or when
-the conversation has gained turns since (bookkeeping records do not count). The other
-conversations go ahead, and a later `undo --apply` retries the refused ones.
+conversations whose rows, copies and target are unchanged, prints any it held at that point,
+and exits 3 when any conversation was held. An interrupted run recovers in both directions:
+`recover --forward` finishes from the journal, and is offered only when every row and copy it
+would touch is as the journal expects; `recover --back` puts each conversation's copies and
+rows back, and keeps realign's placement for a conversation whose copy cannot go back (its
+place is taken, for instance), saying why. `undo` works per conversation. It puts back only
+the keys realign changed, keeps whatever the app wrote to other keys since, and refuses a
+conversation, naming the reason, when its rows no longer hold what realign wrote, now open
+another conversation, were written by a later operation, or when the conversation has gained
+turns since (bookkeeping records do not count). The other conversations go ahead, and a later
+`undo --apply` retries the refused ones.
+
+A copy realign sets aside stays in its journal until `undo` puts it back. Once a conversation
+has gained turns, undo refuses it for good, so its stale copy stays in the journal, and the
+journal keeps that operation for as long as it holds one; `doctor` lists every copy held. No
+command releases one yet.
 
 ## Safety design
 

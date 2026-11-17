@@ -509,35 +509,95 @@ added while applying round 2 and have not been reviewed.
 
 ## Implementation notes (2026-11-17)
 
-Built test-first on the branch (`tests/test_realign.py`, 56 tests, written before the code
-for the first 38). Where the build departs from the text above:
+Built test-first on the branch: `tests/test_realign.py` holds 83 tests. The first 38 were written
+before the code, and the 25 that answer the code review below were written before their fixes.
+Where the build departs from the text above, or settles what the text left open:
 
 - **D6 is read narrowly, pending the maintainer.** Only a copy a rewritten row used to open,
   and no row opens afterwards, goes into the journal. A copy no row opened even before
   realign (converge's duplicated-transcript case) stays on disk, behind or identical, and the
   conversation keeps converge's hold for it. On the store this was built against, the wider
   reading would have moved 13 more copies (about 509 MB) in 2 conversations, one of them a
-  conversation with a single row-opened copy and a row that opens none. Whether realign should
-  also clear those is a question for the maintainer; the build's default is the narrow one.
+  conversation with a single row-opened copy and a row that opens none. Two reviewers noted
+  what the narrow reading leaves: once every row opens one copy, `doctor` no longer lists the
+  conversation, while `converge`, `move` and `repoint` still refuse it for the second copy.
+  Whether realign should clear those copies, or `doctor` list them, is a question for the
+  maintainer; the build's default is the narrow one.
+- **No command releases a copy realign set aside.** `undo` puts a copy back with its rows
+  while its conversation has not moved on; once the conversation gains turns, undo refuses
+  that conversation for good (D5's history check), and the copy stays in the journal, which
+  `rotate_ops` keeps for as long as it holds one. Every reviewer raised this. A release path
+  (keep the rows, drop the copy, after checking it holds nothing the live copy lacks) is not
+  designed; it is a question for the maintainer, and `doctor` says no command releases one yet.
 - **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
-  only when every pending row still holds its journaled pre-image and every pending copy is
-  where the plan found it (or already in the journal); otherwise it offers `back` alone. The
-  text says anything else "stops for that conversation". The build is the stricter of the two.
+  only when everything it would act on is as the journal expects
+  (`_realign_forward_blockers`): each pending row still holds its journaled original, each
+  written row still holds realign's values, each pending copy is the one planned (its hash
+  and its sidecar's inventory, and no sidecar folder appeared since the plan) or is intact in
+  the journal, and each live copy is still there and unshortened. Otherwise it offers `back`
+  alone. The text says anything else "stops for that conversation"; the build is the stricter
+  of the two.
+- **Back works per conversation and always terminates.** A conversation whose copy cannot go
+  back - its place is taken by another file, the journaled copy changed, or the copy is in
+  neither place - keeps realign's placement whole: its rows are not touched, its copy stays in
+  the journal and `doctor` lists it, and the reason is recorded in the operation. Every other
+  conversation gets its copies back (the transcript and the sidecar folder each on its own,
+  so a restore interrupted between them finishes on the next run), then its rows: the
+  journaled original where a row holds exactly what realign wrote, the old values of
+  realign's keys where the app has rewritten other keys since, and otherwise the row is left
+  and named. Both ends of every move back are checked: the transcript's place under the
+  projects root and its journal place inside this operation's folder.
+- **`folderPlace` members are written only where the row has them.** "A missing key is not
+  added" (Tests) is read to cover `folderPlace.cwd` and `folderPlace.realPath` too: the app's
+  own rewrite of a disagreeing `folderPlace` leaves `{cwd, lost}`, so realign does not add a
+  `realPath` to it.
+- **Ownership goes by the journal's total order.** `_realign_claimed_later` counts an
+  operation as later by `_op_sort_key` (creation time, then op id), so of two operations
+  journaled in the same instant exactly one is later. A realign undone for one conversation and
+  not another claims nothing for the conversation it put back. Evidence it reads is not pinned
+  against rotation beyond what `rotate_ops` already keeps; undo restores only realign's keys,
+  and only while they hold realign's values, so a later operation that changed them stops undo
+  whether or not its record is still there.
+- **The re-plan under the lock is the whole plan again,** with the same `--only`,
+  `--include-identical` and `--live`; a refusal of that plan refuses the run with its own
+  reason. Holds it adds are printed after the result. It compares every copy on disk by
+  hash, the live copy's sidecar inventory included.
 - **A row's old copy never stays behind today.** Under D3 and D6 either every row off the live
-  copy moves, so every other copy goes into the journal, or only rows with no copy move. Undo's
-  check that "the copy undo sends a row back to is unchanged or only gained bookkeeping"
-  therefore runs on the journaled copy (its size, hash and sidecar inventory). The check on an
-  old copy left in place is kept for a narrower rule later, and nothing reaches it now.
+  copy moves, so every copy a moved row opened goes into the journal, or only rows with no copy
+  move. Undo's check that "the copy undo sends a row back to is unchanged or only gained
+  bookkeeping" therefore runs on the journaled copy (its hash and sidecar inventory). The check
+  on an old copy left in place is kept for a narrower rule later, and nothing reaches it now.
 - **An interrupted undo resumes.** A conversation is marked `undoing` before its first write,
-  and a later undo accepts the rows and copies already put back. The text did not cover this.
+  and a later undo accepts the rows and copies already put back. A plan run meanwhile holds
+  that conversation as having an unfinished operation.
 - **The GUI mirror is `_find_undoable_op`** (the text says `_find_undoable_sync`, its old
   name). `realign` is parked there: the window does not run it, so a completed realign on top
-  means the window offers no undo, the way it treats a move.
+  means the window offers no undo, the way it treats a move. Its Health tab counts `doctor`'s
+  two new listings.
 - **The dispatch-point test** is `test_every_op_type_branch_names_realign_or_says_why_not`.
   It lists each function that compares an operation's type with a literal, and whether it
   names `realign` or why it need not.
 - **The sidecar inventory is `move`'s own** (`sidecar_inventory`), so a symlink or junction
   inside a stale copy's sidecar holds the conversation at plan time. The plan names the files
-  only the stale sidecar holds, the first five in text and all of them in `--json`.
+  the stale sidecar holds that the live copy's lacks, by name or by content, the first five in
+  text and all of them in `--json`.
+
+**Code review, 2026-11-17.** The diff `1541937..1acf6bd` was reviewed by Codex, Gemini via
+agy (on its one retry; the first run hit its 15-minute print timeout), and the repo-aware
+DeepSeek and Kimi on the Fireworks API; all four reported. Applied: forward recovery checked
+before it is offered; back per conversation and resumable per component; containment on every
+move back; `OSError` in moves and undo turned into refusals naming what to do; open
+operations found wherever an op type names its conversation, a converge row's `session` and a
+sync row's images included; an interrupted undo counted as open; the re-plan's scope and its
+refusals; apply-time holds printed; sidecars compared by content; `--only` hidden under
+`--anonymize`; doctor safe on a damaged record and its advice matched to each copy's
+operation; a crash point between rows; archived rows marked in the plan; the window's counts.
+Rejected: that unopened copies enter the pair comparison and so mask the target (they do not:
+`_classify_split` pairs only copies a row opens, and a test pins the hold); that recency should
+not choose among identical copies (D3 as ruled; it runs only under `--include-identical`, and
+the plan names the deciding row); that an identical split with a no-copy row should move every
+row without the flag (D3 as ruled: only the no-copy row moves, and the split stays listed);
+that rotation should pin every operation a realign's ownership check might read (above). Open
+for the maintainer: the release path and the D6 reading, both above.
 
 End of the realign design.
