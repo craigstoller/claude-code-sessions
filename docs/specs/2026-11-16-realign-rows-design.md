@@ -1,9 +1,10 @@
 # realign - point every account's row at the folder holding the live copy (design)
 
-Status: **ruled, not implemented.** The maintainer ruled every decision below on
+Status: **ruled and implemented, not released.** The maintainer ruled every decision below on
 2026-11-16 and 2026-11-17, all as recommended, after the probe ran in both phases. Detection (`doctor`'s split rows, `alignment`'s
-line under `consistent`) is built on branch `claude/split-row-detection`; this design is the
-repair that would follow it. Two review rounds (four engines each) are applied; the Revisions
+line under `consistent`) and `realign` itself, with D9's listing, are built on branch
+`claude/split-row-detection` (2026-11-17); "Implementation notes" at the end says where the
+build departs from this text. Two review rounds (four engines each) are applied; the Revisions
 section says what they changed.
 
 Fake cast only: Northwind, ACME-REVIEW, alice@ and bob@example.com, the `u` user path.
@@ -505,5 +506,31 @@ API (the last two reading the repository); all four engines reported in both rou
 finding was applied and none rejected, so the stopping rule (no unresolved blocker or major)
 was met after round 2 and a third round was not run. D9 and the probe's `empty-b` trial were
 added while applying round 2 and have not been reviewed.
+
+## Implementation notes (2026-11-17)
+
+Built test-first on the branch (`tests/test_realign.py`, 56 tests, written before the code
+for the first 38). Where the build departs from the text above:
+
+- **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
+  only when every pending row still holds its journaled pre-image and every pending copy is
+  where the plan found it (or already in the journal); otherwise it offers `back` alone. The
+  text says anything else "stops for that conversation". The build is the stricter of the two.
+- **A row's old copy never stays behind today.** Under D3 and D6 either every row off the live
+  copy moves, so every other copy goes into the journal, or only rows with no copy move. Undo's
+  check that "the copy undo sends a row back to is unchanged or only gained bookkeeping"
+  therefore runs on the journaled copy (its size, hash and sidecar inventory). The check on an
+  old copy left in place is kept for a narrower rule later, and nothing reaches it now.
+- **An interrupted undo resumes.** A conversation is marked `undoing` before its first write,
+  and a later undo accepts the rows and copies already put back. The text did not cover this.
+- **The GUI mirror is `_find_undoable_op`** (the text says `_find_undoable_sync`, its old
+  name). `realign` is parked there: the window does not run it, so a completed realign on top
+  means the window offers no undo, the way it treats a move.
+- **The dispatch-point test** is `test_every_op_type_branch_names_realign_or_says_why_not`.
+  It lists each function that compares an operation's type with a literal, and whether it
+  names `realign` or why it need not.
+- **The sidecar inventory is `move`'s own** (`sidecar_inventory`), so a symlink or junction
+  inside a stale copy's sidecar holds the conversation at plan time. The plan names the files
+  only the stale sidecar holds, the first five in text and all of them in `--json`.
 
 End of the realign design.

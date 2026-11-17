@@ -292,8 +292,20 @@ the conversation, and each row names a folder through its `cwd`. What was measur
 So removing a stale copy is a catch-up, not a fix: the split comes back once the conversation
 is worked from one account and opened from another. It lasts until every account's row names
 the same folder. Rows carry other path keys besides `cwd` (`originCwd`, `worktreePath`, a
-`folderPlace` object with `cwd` and `realPath`, `gitAnchorsFolderRealpath`); which of them the
-app reads to choose the folder is **untested**.
+`folderPlace` object with `cwd` and `realPath`, `gitAnchorsFolderRealpath`). A probe on the
+same app version (November 2026, one plain-folder and one worktree conversation, each key
+written alone and in combination, the app restarted between trials) found:
+
+- **`cwd` alone chooses the copy** on a row without a worktree link: moving it was enough,
+  and moving every other path key without it was not.
+- **The app keeps `folderPlace` in step with `cwd`**: when the two disagreed it rewrote
+  `folderPlace` to `{cwd: <the row's cwd>, lost: true}`. It never wrote `cwd` back, and never
+  rewrote `originCwd` or `gitAnchorsFolderRealpath`.
+- **A turn typed after `cwd` moved ran in the new folder**, appended to the same transcript.
+- **A row with a worktree link cannot be moved by its path keys.** Moving `worktreePath` made
+  the app drop the link (it deleted `worktreePath`, `worktreeName` and `sourceBranch`) and run
+  the conversation without a worktree; moving `cwd` alone showed the copy, but the session
+  would not start (`priorErrorMark` with category `worktree_branch_in_use`).
 
 `doctor` reports these as split rows (`_split_conversations`, `_classify_split`). It resolves the
 folder a row opens from `cwd` alone, in this order: the folder `cwd` encodes to under the
@@ -309,7 +321,40 @@ on quit is still behind the live one although the bytes have diverged. On the st
 found on, two of the six conversations the bytes called behind differed only in `cost-state`
 records. `doctor` exits 1 when an unarchived row opens an older or a diverged copy.
 Folder names compare without case on Windows. `alignment` counts the same conversations from
-names and sizes only.
+names and sizes only. `doctor` also lists (`waiting_rows`, not counted) conversations with one
+copy and a row whose folder holds none, since opening that row makes a second copy.
+
+### `realign`
+
+`realign` (`plan_realign`, `run_realign`, `undo_realign`) repairs a split by rewriting rows,
+never transcripts: on each row that does not open the live copy, `cwd` and, where the row has
+a `folderPlace` object, its `cwd` and `realPath` members (`_REALIGN_KEYS`). The value is the
+path that reaches the live copy's folder: the `cwd` of the rows that already open it, else a
+`cwd` recorded in the transcript that encodes to that folder. Rows with a worktree link are
+held, after the probe above. The live copy is the opened copy no other opened copy is ahead
+of; with several (identical or same-conversation copies, `--include-identical`), the one the
+most recently active unarchived row opens, and a tie between folders is held. The live copy is
+then compared with every copy on disk, opened or not, so a copy no row opens that holds more
+turns holds the conversation instead of being orphaned.
+
+One run is one journaled operation (`op_type: realign`). Each row is journaled with its whole
+pre-image and post-image and, for undo, `old` and `new`: the previous and written value of each
+key it changed, with whether the key was present. `execute_realign_op` writes the rows (each
+checked against its pre-image, verified after as the pre-image with exactly those keys changed),
+then moves every copy no row opens any more into `<op>/set-aside/<id>/<folder>.jsonl`, sidecar
+folder beside it, after checking its bytes against the plan. `rotate_ops` keeps an operation
+while it holds a copy. `recover` finishes forward from the journal, without re-planning, or goes
+back by restoring the copies and every row that still holds its post-image.
+
+`undo` is per conversation and key-scoped: a row's post-image is a function of the store, so
+bytes cannot prove ownership, and the app rewrites other keys on open. A conversation is put
+back (copies first, then the old value of each changed key, every other key as the app now has
+it) only if each row still holds what realign wrote and still opens that conversation, no
+operation started at or after this one wrote the row (`_realign_claimed_later`), each old
+folder still exists and the folder a no-copy row returns to still holds no copy, the moved
+copies are intact in the journal with nothing back at their place, and the live copy has
+gained nothing but bookkeeping records. The result is recorded per conversation in
+`undo_status`; the operation becomes `undone` when every conversation is.
 
 ## Retention
 

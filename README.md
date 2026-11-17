@@ -127,7 +127,7 @@ read. See `docs/internals.md`, RULING 7.
 
 ## Before any move: close the Claude app.
 
-`move`, `undo`, `recover`, `repoint --apply`, `new-row --apply`, and every mutating `sync`
+`move`, `undo`, `recover`, `repoint --apply`, `new-row --apply`, `realign --apply`, and every mutating `sync`
 route (`--apply`, `undo` of a completed sync, `recover --back` on a stuck one) all refuse
 while they can see the Claude desktop app running - whoever the identity files currently say
 is signed in. That includes `undo` of a completed `repoint` or `new-row`, and `recover` on an
@@ -153,7 +153,7 @@ itself, and the guard counts it - if a refusal names that process, fully exit th
 
 ## Usage
 
-Twelve commands. All mutating commands default to a dry run; add `--apply` to execute.
+Thirteen commands. All mutating commands default to a dry run; add `--apply` to execute.
 (`trust-signed-helper` is the opt-in described above; it changes a setting, not your
 sessions.)
 
@@ -210,7 +210,9 @@ one of its worktree folders is the app's normal placement, not a fault.
 Deleting the stale copy is a catch-up, not a fix. On one conversation, measured on Desktop
 5.11492.5, opening a row whose folder held no copy made the app copy the transcript back into
 that folder, so the split returns once the conversation is worked from one account and opened
-from another. No command yet changes which folder a row names.
+from another. For the same reason `doctor` also lists, without counting them, conversations with
+a single copy and a row whose folder holds none: opening that row starts a split. `realign`
+(below) is the repair for both.
 
 **`alignment`** - read-only scoreboard: how close your accounts are to holding one shared
 history. `doctor` answers "is anything broken"; this answers "how far apart are my sidebars,
@@ -573,6 +575,51 @@ a row someone has repointed, and a row someone has retitled since - presence it 
 stopped being redundant is presence it leaves alone. `doctor`'s vanished-row check watches
 converge-created rows the same way it watches `new-row`'s, with the same journal-retention
 window.
+
+**`realign`** - point every account's row of a split conversation at the folder holding its
+live transcript copy:
+
+```
+claude-code-sessions realign
+claude-code-sessions realign --apply
+```
+
+These are the split rows `doctor` reports. A probe on Desktop 5.11492.5, run on one plain and
+one worktree conversation, found that a row's `cwd` alone decides which copy it opens; that the
+app rewrites the row's `folderPlace` to match `cwd`, and never writes `cwd` back; and that a
+turn typed after `cwd` moved runs in the new folder, in the same transcript. So `realign`
+rewrites `cwd`, and `folderPlace.cwd` and `folderPlace.realPath` where the row has a
+`folderPlace` (it never adds one), and leaves every other key alone, including `originCwd` and
+the title. The rewritten rows then open the live copy. No row opens the stale copy any more, so
+it moves into the operation's journal, with its sidecar folder, where `undo` can put it back
+and `doctor` lists it. Without that step, `move`, `repoint`, `new-row` and `converge` would
+keep refusing the conversation for its duplicated transcript.
+
+By default it plans conversations with a copy behind the live one, and rows whose folder holds
+no copy. Copies that hold the same conversation (byte-identical, or different only in
+bookkeeping records) are realigned only with `--include-identical`, onto the copy the most
+recently active row opens. `--only` narrows to one conversation, resolved the way `converge
+--only` is. A conversation is **held**, with the reason printed, when:
+
+- its copies have diverged (each holds turns the other lacks), so which history to keep is
+  your decision;
+- a copy no row opens holds turns the live copy lacks;
+- a row to change has a worktree link (`worktreePath` or `worktreeName`). In the probe, moving
+  such a row's path keys either detached it from its worktree or left it unable to start;
+- the live copy is reached only through the worktree placement, sits in a legacy-encoded
+  folder, or has no path on record that encodes to its folder;
+- the paths that reach the live copy's folder disagree, or its directory no longer exists;
+- an unfinished operation involves it, or anything about it changed between plan and apply.
+
+`--apply` needs the desktop app fully closed, re-plans under its lock and writes only the
+conversations whose rows, copies and target are unchanged, and exits 3 when any conversation
+was held. An interrupted run recovers in both directions: `recover --forward` finishes from
+the journal, and `recover --back` puts the copies and the rows back. `undo` works per
+conversation. It puts back only the keys realign changed, keeps whatever the app wrote to
+other keys since, and refuses a conversation, naming the reason, when its rows no longer hold
+what realign wrote, now open another conversation, were written by a later operation, or when
+the conversation has gained turns since (bookkeeping records do not count). The other
+conversations go ahead, and a later `undo --apply` retries the refused ones.
 
 ## Safety design
 
