@@ -94,7 +94,7 @@ def plan(w, **kw):
 
 def ns(**kw):
     d = {"json": False, "verbose": False, "anonymize": False, "apply": False,
-         "only": "", "include_identical": False, "live": ""}
+         "only": "", "include_identical": False, "live": "", "release": False}
     d.update(kw)
     return types.SimpleNamespace(**d)
 
@@ -851,6 +851,7 @@ _OP_TYPE_BRANCHES = {
     "undo_realign": "names it",
     "_collides": "names it",
     "plan_realign": "names it",
+    "_release_candidates": "names it",
     "_journal_rows": "realign rows take the last branch, a per-row store_path",
     "_unresolved_rows": "tells moves apart; realign rows carry `written`",
     "_realign_claimed_later": "names it",
@@ -1183,3 +1184,245 @@ def test_the_window_reports_held_copies_and_waiting_rows(world):
     world.row(A1, O1, "local_2", S2, none_cwd, title="Northwind intake")
     text = "\n".join(gui.SyncApp.doctor_lines(ct.gather_doctor(world.env)))
     assert "journal" in text and "copies the transcript" in text
+
+
+# ------------------------------------------------ D10: releasing held copies
+# Ruled 2026-11-17 14:35 (Craig's call): check that the conversation's rows
+# still open the live copy and that the journaled copy holds nothing the live
+# copy lacks, then move it to the Recycle Bin. A fake bin stands in for
+# Windows' here; the real one is never touched by a test.
+
+class FakeBin:
+    def __init__(self, root, room=(True, ""), recycle_ok=(True, "")):
+        self.root, self._room, self._ok = root, room, recycle_ok
+        self.items = {}
+        os.makedirs(root, exist_ok=True)
+
+    def room(self, path, nbytes):
+        return self._room
+
+    def recycle(self, path):
+        if not self._ok[0]:
+            return self._ok
+        dest = os.path.join(self.root, "R%d" % len(self.items))
+        shutil.move(path, dest)
+        self.items[os.path.normcase(os.path.abspath(path))] = dest
+        return True, ""
+
+    def holds(self, path):
+        return os.path.normcase(os.path.abspath(path)) in self.items
+
+
+def release_flags(**kw):
+    return ct.ReleaseFlags(**kw)
+
+
+def with_bin(world, **kw):
+    b = FakeBin(str(world.tmp / "bin"), **kw)
+    world.env.recycle_bin = b
+    return b
+
+
+def test_release_needs_a_recycle_bin(world):
+    applied(world)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.plan_release(world.env, release_flags())
+    assert "Recycle Bin" in str(exc.value)
+
+
+def test_a_copy_whose_rows_all_open_the_live_copy_is_released(world):
+    s, op = applied(world)
+    b = with_bin(world)
+    m = ct.plan_release(world.env, release_flags())
+    (c,) = m["copies"]
+    assert c["session_id"] == S1 and m["held"] == []
+    aside = op.manifest["copies"][0]["aside"]
+    assert ct.run_release(world.env, m) == "completed"
+    assert not os.path.exists(aside) and b.holds(aside)
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    cp = o.manifest["copies"][0]
+    assert not cp["moved"] and cp["released"]["bytes"] == cp["basis"]["bytes"]
+    assert ct.gather_doctor(world.env)["realign_held_copies"] == []
+
+
+def test_a_released_copy_lets_rotation_prune_the_operation(world):
+    s, op = applied(world)
+    with_bin(world)
+    ct.run_release(world.env, ct.plan_release(world.env, release_flags()))
+    t0 = world.env.now()
+    for i in range(12):
+        world.env.now = (lambda k: (lambda: t0 + 10 + k))(i)
+        o = ct.new_op(world.env, {"op_type": "retitle", "cli_session_id": "x%d" % i,
+                                  "new_title": "t", "rows": []})
+        ct.set_status(o, "completed")
+    ct.rotate_ops(world.env)
+    assert not os.path.isdir(op.op_dir)
+
+
+def test_the_sidecar_goes_to_the_bin_too(world):
+    s = behind_store(world)
+    with_sidecar(s.live_p, {"subagents/a.jsonl": "a"})
+    with_sidecar(s.old_p, {"subagents/a.jsonl": "a"})
+    s, op = applied_with(world, s)
+    b = with_bin(world)
+    side_aside = op.manifest["copies"][0]["aside"][:-len(".jsonl")]
+    assert os.path.isdir(side_aside)
+    assert ct.run_release(world.env, ct.plan_release(world.env, release_flags())) == "completed"
+    assert not os.path.exists(side_aside) and b.holds(side_aside)
+
+
+def test_release_holds_a_copy_whose_sidecar_holds_files_the_live_lacks(world):
+    s = behind_store(world)
+    with_sidecar(s.old_p, {"tool-results/t.txt": "t"})
+    s, op = applied_with(world, s)
+    with_bin(world)
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "sidecar" in held_reasons(m)[S1]
+
+
+def test_release_holds_when_a_row_no_longer_opens_the_live_copy(world):
+    s, op = applied(world)
+    with_bin(world)
+    world.row(A3, O3, "local_1", S1, s.old_cwd)      # opens no copy
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "open" in held_reasons(m)[S1]
+
+
+def test_release_holds_when_the_journaled_copy_holds_turns_the_live_lacks(world):
+    s, op = applied(world)
+    with_bin(world)
+    with open(s.live_p, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(t_entries(cwd=s.live_cwd)[0]) + "\n")
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "lacks" in held_reasons(m)[S1]
+
+
+def test_release_holds_a_copy_changed_in_the_journal(world):
+    s, op = applied(world)
+    with_bin(world)
+    with open(op.manifest["copies"][0]["aside"], "a", encoding="utf-8") as fh:
+        fh.write("{}\n")
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "changed in the journal" in held_reasons(m)[S1]
+
+
+def test_release_holds_when_the_bin_has_no_room(world):
+    applied(world)
+    with_bin(world, room=(False, "the Recycle Bin for C: has no room for it"))
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "no room" in held_reasons(m)[S1]
+
+
+def test_a_failed_recycle_is_a_refusal_and_a_rerun_finishes(world):
+    s, op = applied(world)
+    with_bin(world, recycle_ok=(False, "Windows refused"))
+    m = ct.plan_release(world.env, release_flags())
+    with pytest.raises(ct.Refusal):
+        ct.run_release(world.env, m)
+    ct.release_lock(world.env)
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    assert o.manifest["copies"][0]["moved"]
+    with_bin(world)
+    assert ct.run_release(world.env, ct.plan_release(world.env, release_flags())) == "completed"
+
+
+def test_an_interrupted_release_is_finished_when_the_bin_holds_the_copy(world):
+    s, op = applied(world)
+    b = with_bin(world)
+    cp = op.manifest["copies"][0]
+    cp["releasing"] = True
+    ct.save_manifest(op)
+    b.recycle(cp["aside"])                       # it reached the bin; the record did not
+    m = ct.plan_release(world.env, release_flags())
+    (c,) = m["copies"]
+    assert c["finish"]
+    assert ct.run_release(world.env, m) == "completed"
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    assert not o.manifest["copies"][0]["moved"]
+
+
+def test_an_interrupted_release_the_bin_does_not_hold_is_held(world):
+    s, op = applied(world)
+    with_bin(world)
+    cp = op.manifest["copies"][0]
+    cp["releasing"] = True
+    ct.save_manifest(op)
+    os.remove(cp["aside"])
+    m = ct.plan_release(world.env, release_flags())
+    assert m["copies"] == [] and "Recycle Bin" in held_reasons(m)[S1]
+
+
+def test_undo_refuses_a_conversation_whose_copy_was_released(world):
+    s, op = applied(world)
+    with_bin(world)
+    ct.run_release(world.env, ct.plan_release(world.env, release_flags()))
+    (o,) = [x for x in ct.list_ops(world.env) if x.manifest["op_type"] == "realign"]
+    assert ct.undo_realign(world.env, o) == "partial"
+    assert "released" in o.manifest["undo_status"][S1]
+    assert world.read(s.r2)["cwd"] == s.live_cwd
+
+
+def test_release_only_narrows_to_one_conversation(world):
+    s = behind_store(world)
+    a, _ = world.place("Other")
+    b2, _ = world.place("Other-wt")
+    world.copy(a, S2, t_entries(cwd=a) + later_turns())
+    world.copy(b2, S2, t_entries(cwd=a))
+    world.row(A1, O1, "local_2", S2, a, title="Northwind intake")
+    world.row(A2, O2, "local_2", S2, b2, title="Northwind intake")
+    ct.run_realign(world.env, plan(world))
+    with_bin(world)
+    m = ct.plan_release(world.env, release_flags(only="intake"))
+    assert [c["session_id"] for c in m["copies"]] == [S2]
+
+
+def test_cmd_realign_release_dry_run_and_apply(world, capsys):
+    applied(world)
+    with_bin(world)
+    assert ct.cmd_realign(world.env, ns(release=True)) == 0
+    out = capsys.readouterr().out
+    assert "dry run" in out and "Recycle Bin" in out and TITLE in out
+    assert ct.cmd_realign(world.env, ns(release=True, apply=True)) == 0
+    assert ct.gather_doctor(world.env)["realign_held_copies"] == []
+
+
+def test_cmd_realign_release_exits_3_when_a_copy_is_held(world):
+    applied(world)
+    with_bin(world, room=(False, "no room"))
+    assert ct.cmd_realign(world.env, ns(release=True, apply=True)) == 3
+
+
+def test_release_report_keys_are_structural_and_anonymized(world, capsys):
+    from test_anonymize import walk_fixed_keys
+    applied(world)
+    with_bin(world)
+    m = ct.plan_release(world.env, release_flags())
+    assert walk_fixed_keys(ct._public_release_manifest(world.env, m)) == []
+    ct._ANONYMIZE = True
+    ct.cmd_realign(world.env, ns(release=True, json=True))
+    js = capsys.readouterr().out
+    ct.cmd_realign(world.env, ns(release=True))
+    out = capsys.readouterr().out
+    for text in (js, out):
+        assert TITLE not in text and "Northwind" not in text
+    json.loads(js)
+
+
+# The real bin's pure parts: the $I record parser and the room verdict.
+
+def test_the_recycle_record_parser_reads_both_versions():
+    import struct
+    path = "C:\\Users\\u\\x.jsonl"
+    v2 = struct.pack("<qqqi", 2, 17000, 0, len(path) + 1) + (path + "\0").encode("utf-16-le")
+    assert ct._recycle_record_path(v2) == (17000, path)
+    v1 = struct.pack("<qqq", 1, 5, 0) + (path + "\0").encode("utf-16-le").ljust(520, b"\0")
+    assert ct._recycle_record_path(v1) == (5, path)
+    assert ct._recycle_record_path(b"junk") is None
+
+
+def test_the_room_verdict():
+    mb = 1024 * 1024
+    assert ct._bin_room_verdict(nuke=0, max_mb=10, used=0, need=5 * mb)[0]
+    assert not ct._bin_room_verdict(nuke=1, max_mb=10, used=0, need=1)[0]
+    assert not ct._bin_room_verdict(nuke=0, max_mb=None, used=0, need=1)[0]
+    assert not ct._bin_room_verdict(nuke=0, max_mb=10, used=8 * mb, need=3 * mb)[0]
