@@ -371,14 +371,23 @@ a copy is marked `releasing`, with the time, before its first move, each part's 
 is recorded as it goes, and `released` closes it. A later run finishes an interrupted release
 only for parts that are either still in the journal (and then checked as on a first run) or in
 the bin under a record made since the release began, of the planned size, with its payload;
-anything else holds the copy. It needs the desktop app closed, since its decision reads the
+anything else holds the copy. Once the stale transcript is in the bin it cannot be compared
+again, so the live copy is recorded when the release begins (`release_live`) and must still
+start with every byte it had, with its sidecar intact, before the release is finished or
+recorded; when every part is in the bin the rows no longer matter, but that check does. Each
+move is proved the same way, by a record made since the release began, before it counts. A
+release refused before anything moved clears its mark, and undo refuses a copy only once part
+of it has left the journal. The plan also holds a conversation an unfinished operation, an
+interrupted undo or a row in an unreadable store involves, and `room()` also reads the older
+global `BitBucket` `NukeOnDelete`. It needs the desktop app closed, since its decision reads the
 rows and the live transcript, and it takes the journal lock and plans again under it. The bin
 sits behind `Env.recycle_bin`, which only `default_env` sets, so a test that forgets to provide
 one gets a refusal, not the real bin. Measured 2026-11-17 on Windows 11 with scratch files: a
 file and a folder each left a version-2 `$I` record naming the original path, with the size and
 a deletion time that decodes to the moment of the move, beside its `$R` payload; the registry
 key held both values; and the module's bin class passed the round trip. What the shell does
-with an item it cannot recycle remains untested.
+with an item it cannot recycle remains untested, and so does how `FOF_WANTNUKEWARNING`
+combines with `FOF_SILENT` and `FOF_NOERRORUI`: a case none of the checks sees rests on it.
 
 `undo` is per conversation and key-scoped: a row's post-image is a function of the store, so
 bytes cannot prove ownership, and the app rewrites other keys on open. A conversation is put

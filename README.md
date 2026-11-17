@@ -647,7 +647,10 @@ deleted files (asked again just before each move), and a path too long for the s
 asks Windows to warn rather than delete in any case it cannot see. After each move it checks
 that a new bin record names the file, with its size and its contents present. It needs the
 desktop app closed, since its checks read the rows and transcripts the app rewrites. A copy
-whose release is interrupted is finished by the next run, and only after the same checks. Once
+whose release is interrupted is finished by the next run, and only after the same checks; once
+its transcript is in the bin, only while the live copy still starts with everything it held
+when the release began. One gap is stated rather than closed: a case the checks cannot see
+rests on Windows' warning, whose behaviour beside the silent flags release uses is untested. Once
 every copy of an operation is released, the journal ages the operation out like any other;
 `undo` refuses a conversation whose copy was released or is part-way through release, and
 `--json` gives each copy's outcome, a failed run included.

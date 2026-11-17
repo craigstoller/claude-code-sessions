@@ -514,9 +514,10 @@ added while applying round 2 and have not been reviewed.
 
 ## Implementation notes (2026-11-17)
 
-Built test-first on the branch: `tests/test_realign.py` holds 119 tests. The first 38 were
+Built test-first on the branch: `tests/test_realign.py` holds 130 tests. The first 38 were
 written before the code, the 25 that answer the code review below before their fixes, the
-19 for D10's release step before it, and the 17 that answer its review before theirs.
+19 for D10's release step before it, and the 28 that answer its two review rounds
+before theirs.
 Where the build departs from the text above, or settles what the text left open:
 
 - **D6 is read narrowly, ruled by the maintainer 2026-11-17.** Only a copy a rewritten row
@@ -572,6 +573,32 @@ Where the build departs from the text above, or settles what the text left open:
     held both values; and the module's own bin class passed the round trip, matching a record
     only with the right size and a time after the run began. Untested: what the shell does with
     an item it cannot recycle, and how `FOF_WANTNUKEWARNING` combines with the silent flags.
+  - **Round 2 of its review** (same evening, all four engines reported) found that a few of
+    round 1's fixes were themselves short, and they are fixed. An interrupted release whose
+    stale transcript is already in the bin is finished only while the live copy recorded when
+    the release began still starts with every byte it had, and while its sidecar holds every
+    file; when every part is in the bin the rows no longer matter, but that check still does,
+    because recording the release lets rotation drop the only pointer to the copy. A release
+    refused before anything moved leaves the copy as it was, undo included, and undo refuses
+    a copy only once part of it has left the journal. Each move is proved by the same bin
+    record an interrupted run would ask for (made since the release began, of the planned
+    size, with its payload), or the release stays marked interrupted. Room is asked even for
+    a part of no bytes, per volume; the older global `BitBucket` `NukeOnDelete` refuses too;
+    a missing bin folder counts as an empty bin; the path check walks every folder; the new
+    journal fields are shape-checked; and the plan holds a conversation an unfinished
+    operation, an interrupted undo or a row in an unreadable store involves. Rejected: that one
+    released copy blocks undo of the operation's other conversations (undo's checks are per
+    conversation); that the bin may record a folder's size as 0 (both measurements recorded the
+    size of its contents); and that a release wholly in the bin should be recorded whatever the
+    live copy did (above). Not built, for the maintainer: a hard veto on a permanent delete.
+    Two reviewers proposed `IFileOperation` with `FOFX_RECYCLEONDELETE`, but Microsoft's text
+    for that flag says only that it sends an item to the Recycle Bin rather than deleting it,
+    not that the shell fails when it cannot, and no case the shell cannot recycle can be made
+    on this machine without changing a system setting. So a case none of the checks above
+    sees still rests on `FOF_WANTNUKEWARNING`, whose behaviour beside the silent flags is
+    untested. A part that has left the journal and is not in the bin has no exit in the
+    tool. A released copy's record, and a rolled-back operation's reason, last as long as the
+    journal keeps the operation; release prints where each part went.
 - **Recovery forward is all or nothing, not per conversation.** `classify_op` offers forward
   only when everything it would act on is as the journal expects
   (`_realign_forward_blockers`): each pending row still holds its journaled original, each
