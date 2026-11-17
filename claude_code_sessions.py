@@ -4089,7 +4089,7 @@ def _short_ids(text):
 _ANON_STRUCTURAL_KEYS = frozenset((
     "a", "a_in_b", "a_tail", "a_total", "a_unique", "account", "accounts",
     "copies_moved", "decided_by", "finish", "include_identical", "late", "moved",
-    "path_from", "sidecar_bytes",
+    "outcome", "path_from", "releasing", "sidecar_bytes",
     "realign_held_copies", "sidecar_only", "waiting_rows",
     "activity_unknown", "after", "age_days", "ahead", "allow_orphan",
     "archived", "b", "b_in_a", "b_tail", "b_total", "b_unique", "behind",
@@ -4712,7 +4712,8 @@ def gather_doctor(env):
                     "session_id": c.get("session_id"),
                     "title": titles.get(c.get("session_id"), ""),
                     "folder": c.get("folder"),
-                    "bytes": n if isinstance(n, int) else None})
+                    "bytes": n if isinstance(n, int) else None,
+                    "releasing": c.get("releasing") is True})
     report = {
         "stores": {"status": disc.status, "roots": disc.roots, "detail": disc.detail},
         "row_count": len(rows), "row_errors": row_errors, "blank_rows": sorted(blank),
@@ -5042,6 +5043,8 @@ def _print_held_copies(held, say):
             h["title"] or "(untitled)", h["session_id"], h["folder"],
             "{0:,} bytes".format(h["bytes"]) if isinstance(h["bytes"], int)
             else "size ?", h["op_id"],
+            " - its release was interrupted; 'realign --release --apply' finishes it"
+            if h.get("releasing") else
             "" if h.get("status") == "completed" else
             " - kept by 'recover --back', which could not put it back"))
     if any(h.get("status") == "completed" for h in held):
@@ -5053,7 +5056,8 @@ def _print_held_copies(held, say):
     if any(h.get("status") != "completed" for h in held):
         say("[hypothesis]   a copy 'recover --back' kept is listed in that "
             "operation's record with the reason; its conversation kept "
-            "realign's placement, and 'undo' does not apply to it.")
+            "realign's placement, 'undo' does not apply to it, and 'realign "
+            "--release' does, on the same conditions.")
 
 
 def _print_split_rows(env, splits, say, say_ids):
@@ -12195,7 +12199,9 @@ def _realign_decide(env, e, include_identical, recs, nt):
     # sidecar does not - absent there, or there with other bytes - are named.
     try:
         target_sidecar = sidecar_inventory(sidecar_path(tp))
-        tinv = {x["rel"]: x["sha256"] for x in target_sidecar}
+        def rkey(rel):              # NTFS names compare without case
+            return rel.lower() if env.is_windows else rel
+        tinv = {rkey(x["rel"]): x["sha256"] for x in target_sidecar}
         moves = []
         for i, c in enumerate(copies):
             if i in open_after or i not in opened:
@@ -12207,8 +12213,9 @@ def _realign_decide(env, e, include_identical, recs, nt):
                           "sidecar_src": side if os.path.isdir(side) else "",
                           "basis": _file_basis(c["path"]),
                           "sidecar_inventory": inv,
-                          "sidecar_only": sorted(x["rel"] for x in inv
-                                                 if tinv.get(x["rel"]) != x["sha256"]),
+                          "sidecar_only": sorted(
+                              x["rel"] for x in inv
+                              if tinv.get(rkey(x["rel"])) != x["sha256"]),
                           "aside": "", "moved": False})
         for r in out_rows:
             # A row whose old copy stays where it is (another row still
@@ -12379,7 +12386,9 @@ def _realign_shape_error(m):
                 return "copy {0} has no usable 'sidecar_inventory'".format(i)
             for x in inv:
                 if not isinstance(x, dict) or not isinstance(x.get("rel"), str) \
-                        or not isinstance(x.get("sha256"), str):
+                        or not isinstance(x.get("sha256"), str) \
+                        or isinstance(x.get("size"), bool) \
+                        or not isinstance(x.get("size"), int) or x["size"] < 0:
                     return "copy {0}'s sidecar inventory is damaged".format(i)
                 try:
                     _validate_sidecar_rel(x["rel"])
@@ -12872,6 +12881,10 @@ def _realign_undo_blocker(env, m, conv, roots, resuming=False):
         if c.get("released"):
             return ("its copy from {0} was released to the Recycle Bin, so its "
                     "rows cannot go back on it".format(c["folder"]))
+        if c.get("releasing"):
+            return ("a release of its copy from {0} was interrupted; finish it with "
+                    "'realign --release --apply' (undo cannot use a copy that may be "
+                    "part-way into the Recycle Bin)".format(c["folder"]))
         if not c.get("moved"):
             continue                 # never moved, or already put back
         place, taken = _realign_copy_place(c)
@@ -13361,11 +13374,19 @@ def cmd_realign(env, ns):
 # journal until undo puts it back, and once its conversation gains turns undo
 # refuses it for good. Release ends that: once every row of the conversation
 # opens one copy, and that copy holds everything the journaled one does - its
-# conversation (bookkeeping aside) and every file of its sidecar, byte for
-# byte - the journaled copy goes to the Recycle Bin, and the operation can age
-# out of the journal. Windows only, like every store mutation here, and only
-# into a Recycle Bin that is on and has room: a bin that cannot take a copy
-# would delete it outright, so release refuses rather than risk it.
+# conversation (the bookkeeping records `tools-used` and `cost-state` aside)
+# and every file of its sidecar, byte for byte - the journaled copy goes to
+# the Recycle Bin, and the operation can age out of the journal.
+#
+# Fail closed on the one irreversible thing here, a permanent delete. The
+# shell's delete with undo allowed sends an item to the bin when it can and
+# destroys it when it cannot; release asks for the shell's warning in that
+# case (FOF_WANTNUKEWARNING, which overrides the no-confirmation flag for
+# exactly it) and, before that, refuses every case it can see: the bin turned
+# off by the user or by policy, a capacity the registry does not record, too
+# little room for the whole run (counted per drive, and asked again just
+# before each move), and a path too long for the shell. Windows only, with the
+# desktop app closed, like every store mutation here.
 
 @dataclasses.dataclass
 class ReleaseFlags:
@@ -13373,140 +13394,237 @@ class ReleaseFlags:
     only: str = ""                  # title substring, or a cliSessionId prefix
 
 
+RELEASE_GUARD_WHY = ("release decides a copy is redundant from the rows and "
+                     "the live transcript, which the running app rewrites")
+
 FO_DELETE = 3
 FOF_SILENT = 0x0004
 FOF_NOCONFIRMATION = 0x0010
 FOF_ALLOWUNDO = 0x0040
 FOF_NOERRORUI = 0x0400
+FOF_WANTNUKEWARNING = 0x4000
+# MAX_PATH less its terminating NUL: SHFileOperationW takes no \\?\ paths, and
+# a path the shell cannot address is one it may not recycle.
+_RECYCLE_PATH_LIMIT = 259
 
 
-def _recycle_record_path(data):
-    """(size, original path) out of a Recycle Bin `$I` record's bytes, or
-    None. Version 2 (Windows 10 and later): an 8-byte version, the 8-byte
-    size, the 8-byte deletion time, a 4-byte character count, then the path
-    in UTF-16; version 1 has a fixed 520-byte path field in place of the
-    count. Measured 2026-11-17 on this tool's own probe (Windows 11). Never
-    raises."""
+def _recycle_record(data):
+    """(size, original path, deletion time as a Unix timestamp) out of a
+    Recycle Bin `$I` record's bytes, or None. Version 2 (Windows 10 and
+    later): an 8-byte version, the 8-byte size, an 8-byte FILETIME, a 4-byte
+    character count, then the path in UTF-16; version 1 has a fixed 520-byte
+    path field in place of the count. Measured 2026-11-17 on this tool's own
+    probe (Windows 11). Never raises."""
     import struct
     try:
-        ver, size = struct.unpack_from("<qq", data, 0)
+        ver, size, ft = struct.unpack_from("<qqq", data, 0)
         if ver == 2:
             n = struct.unpack_from("<i", data, 24)[0]
             if n <= 0 or len(data) < 28 + 2 * n:
                 return None
             path = data[28:28 + 2 * n].decode("utf-16-le").rstrip("\0")
         elif ver == 1:
+            if len(data) < 24 + 520:
+                return None
             path = data[24:24 + 520].decode("utf-16-le").split("\0")[0]
         else:
             return None
     except (struct.error, UnicodeDecodeError):
         return None
-    return (size, path) if path else None
+    if not path:
+        return None
+    return size, path, ft / 1e7 - 11644473600.0
+
+
+def _recycle_record_path(data):
+    """(size, original path) out of a `$I` record, or None."""
+    rec = _recycle_record(data)
+    return (rec[0], rec[1]) if rec else None
 
 
 def _bin_room_verdict(nuke, max_mb, used, need):
     """(ok, why) for putting NEED bytes in a Recycle Bin whose registry says
     NukeOnDelete=NUKE and MaxCapacity=MAX_MB megabytes, holding USED bytes. A
-    capacity the registry does not record is not guessed at."""
+    capacity the registry does not record is not guessed at. Deliberately
+    stricter than the bin: a full bin would evict its oldest items to take
+    the copy, which would destroy someone's older deletions."""
     if nuke:
         return False, "the Recycle Bin is turned off for that drive"
     if not isinstance(max_mb, int) or max_mb <= 0:
         return False, ("the Recycle Bin's size for that drive is not recorded, so "
                        "whether it can take the copy cannot be checked")
     if used + need > max_mb * 1024 * 1024:
-        return False, ("the Recycle Bin for that drive has no room for it "
-                       "({0:,} bytes, {1:,} of {2:,} in use)".format(
-                           need, used, max_mb * 1024 * 1024))
+        return False, ("the Recycle Bin for that drive has no room for it without "
+                       "pushing out older items ({0:,} bytes, {1:,} of {2:,} in "
+                       "use)".format(need, used, max_mb * 1024 * 1024))
     return True, ""
 
 
 class _WindowsRecycleBin:
     """The current user's Recycle Bin, through the shell's own delete with
     undo allowed. Probed 2026-11-17 (Windows 11): a file and a folder sent
-    this way left the shell's `$I` record naming each original path, and the
-    volume's BitBucket registry key held MaxCapacity and NukeOnDelete. What
-    the shell does with an item larger than the bin's room is untested, which
-    is why room() is asked first."""
+    this way each left a `$I` record naming the original path, with the size,
+    beside its `$R` payload, and the volume's BitBucket registry key held
+    MaxCapacity and NukeOnDelete. What the shell does with an item it cannot
+    recycle is untested; room() and the path limit refuse every such case
+    this code can see, and FOF_WANTNUKEWARNING asks for a warning in place of
+    a silent delete in any case it cannot."""
 
-    def _drive(self, path):
-        drive = os.path.splitdrive(os.path.realpath(path))[0]
-        return drive if len(drive) == 2 and drive[1] == ":" else ""
+    path_limit = _RECYCLE_PATH_LIMIT
 
-    def _bin_dir(self, drive):
+    def __init__(self):
+        self._sid = None
+
+    def _k32(self):
+        import ctypes
+        import ctypes.wintypes as wt
+        k = ctypes.windll.kernel32
+        for name in ("GetVolumePathNameW", "GetVolumeNameForVolumeMountPointW"):
+            f = getattr(k, name)
+            f.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
+            f.restype = wt.BOOL
+        return k
+
+    def _volume(self, path):
+        """The root of the volume PATH is on ("C:\\", or a mount folder)."""
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if not self._k32().GetVolumePathNameW(os.path.realpath(path), buf, 1024):
+            return ""
+        root = buf.value
+        return root if root.endswith("\\") else root + "\\"
+
+    def _sid_str(self):
         import subprocess
-        out = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
-                             capture_output=True, text=True, timeout=30).stdout
-        sid = out.strip().split(",")[-1].strip('"')
-        if not sid.startswith("S-1-"):
-            raise OSError("could not read the current user's SID")
-        return os.path.join(drive + "\\", "$Recycle.Bin", sid)
+        if self._sid is None:
+            try:
+                out = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
+                                     capture_output=True, text=True, timeout=30).stdout
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise OSError("could not read the current user's SID ({0})".format(exc))
+            sid = out.strip().split(",")[-1].strip('"')
+            if not sid.startswith("S-1-"):
+                raise OSError("could not read the current user's SID")
+            self._sid = sid
+        return self._sid
+
+    def _bin_dir(self, root):
+        return os.path.join(root, "$Recycle.Bin", self._sid_str())
+
+    def _policy_off(self):
+        import winreg
+        key = "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer"
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    if winreg.QueryValueEx(k, "NoRecycleFiles")[0] == 1:
+                        return True
+            except OSError:
+                continue
+        return False
 
     def room(self, path, nbytes):
         import ctypes
         import ctypes.wintypes as wt
         import winreg
-        drive = self._drive(path)
-        if not drive:
-            return False, "the copy is not on a local drive letter"
+        root = self._volume(path)
+        if not root:
+            return False, "the volume the copy is on could not be named"
+        if self._policy_off():
+            return False, "a Windows policy turns the Recycle Bin off (NoRecycleFiles)"
         vol = ctypes.create_unicode_buffer(64)
-        if not ctypes.windll.kernel32.GetVolumeNameForVolumeMountPointW(
-                drive + "\\", vol, 64) or "{" not in vol.value:
-            return False, "the volume of drive {0} could not be named".format(drive)
-        guid = vol.value[vol.value.index("{"):vol.value.index("}") + 1]
+        if not self._k32().GetVolumeNameForVolumeMountPointW(root, vol, 64):
+            return False, "the volume of {0} could not be named".format(root)
+        i, j = vol.value.find("{"), vol.value.find("}")
+        if i < 0 or j < i:
+            return False, "the volume of {0} has no GUID name".format(root)
         key = ("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket"
-               "\\Volume\\" + guid)
+               "\\Volume\\" + vol.value[i:j + 1])
         nuke, max_mb = 0, None
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
                 for name in ("NukeOnDelete", "MaxCapacity"):
                     try:
                         v = winreg.QueryValueEx(k, name)[0]
-                    except FileNotFoundError:
+                    except OSError:
                         continue
                     if name == "NukeOnDelete":
                         nuke = v
                     else:
                         max_mb = v
-        except FileNotFoundError:
+        except OSError:
             pass
 
         class _Info(ctypes.Structure):
+            if ctypes.sizeof(ctypes.c_void_p) == 4:
+                _pack_ = 1              # shellapi.h packs these on 32-bit Windows
             _fields_ = [("cbSize", wt.DWORD), ("i64Size", ctypes.c_longlong),
                         ("i64NumItems", ctypes.c_longlong)]
         info = _Info()
         info.cbSize = ctypes.sizeof(info)
-        if ctypes.windll.shell32.SHQueryRecycleBinW(drive + "\\", ctypes.byref(info)) != 0:
-            return False, "the Recycle Bin for drive {0} could not be read".format(drive)
+        q = ctypes.windll.shell32.SHQueryRecycleBinW
+        q.argtypes = [wt.LPCWSTR, ctypes.POINTER(_Info)]
+        q.restype = ctypes.c_long
+        if q(root, ctypes.byref(info)) != 0:
+            return False, "the Recycle Bin for {0} could not be read".format(root)
         ok, why = _bin_room_verdict(nuke, max_mb, info.i64Size, nbytes)
-        return ok, (why.replace("that drive", "drive " + drive) if why else "")
+        return ok, (why.replace("that drive", root) if why else "")
 
-    def holds(self, path):
-        drive = self._drive(path)
-        if not drive:
-            return False
-        want = os.path.normcase(os.path.abspath(path))
-        try:
-            bindir = self._bin_dir(drive)
-            names = os.listdir(bindir)
-        except OSError:
-            return False
-        for name in names:
+    def _records(self, root):
+        """{$I name: (size, original path, deleted at)} in this user's bin."""
+        bindir = self._bin_dir(root)
+        out = {}
+        for name in os.listdir(bindir):
             if not name.startswith("$I"):
                 continue
             try:
                 with open(os.path.join(bindir, name), "rb") as fh:
-                    rec = _recycle_record_path(fh.read())
+                    rec = _recycle_record(fh.read())
             except OSError:
                 continue
-            if rec and os.path.normcase(os.path.abspath(rec[1])) == want:
-                return True
-        return False
+            if rec:
+                out[name] = rec
+        return out
+
+    def _payload(self, root, iname):
+        r = os.path.join(self._bin_dir(root), "$R" + iname[2:])
+        return r if os.path.exists(r) else ""
+
+    def holds(self, path, since=None, size=None):
+        """The bin's payload for PATH, deleted no earlier than SINCE and of
+        SIZE bytes when given, or None. A record whose payload is gone does
+        not count. Never raises."""
+        try:
+            root = self._volume(path)
+            want = os.path.normcase(os.path.abspath(path))
+            for iname, (n, orig, when) in self._records(root).items():
+                if os.path.normcase(os.path.abspath(orig)) != want:
+                    continue
+                if since is not None and when < since - 5:
+                    continue
+                if size is not None and n != size:
+                    continue
+                r = self._payload(root, iname)
+                if r:
+                    return r
+        except OSError:
+            return None
+        return None
 
     def recycle(self, path):
+        """(ok, why, where): send PATH to the bin and find the NEW record
+        naming it, with its payload."""
         import ctypes
         import ctypes.wintypes as wt
+        try:
+            root = self._volume(path)
+            before = set(self._records(root))
+        except OSError as exc:
+            return False, "the Recycle Bin could not be read ({0})".format(exc), ""
 
         class _Op(ctypes.Structure):
+            if ctypes.sizeof(ctypes.c_void_p) == 4:
+                _pack_ = 1
             _fields_ = [("hwnd", wt.HWND), ("wFunc", wt.UINT), ("pFrom", wt.LPCWSTR),
                         ("pTo", wt.LPCWSTR), ("fFlags", ctypes.c_ushort),
                         ("fAnyOperationsAborted", wt.BOOL),
@@ -13515,16 +13633,30 @@ class _WindowsRecycleBin:
         op = _Op()
         op.wFunc = FO_DELETE
         op.pFrom = os.path.abspath(path) + "\0"       # ctypes adds the second NUL
-        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
-        rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+        op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+                     | FOF_WANTNUKEWARNING)
+        f = ctypes.windll.shell32.SHFileOperationW
+        f.argtypes = [ctypes.POINTER(_Op)]
+        f.restype = ctypes.c_int
+        rc = f(ctypes.byref(op))
         if rc != 0 or op.fAnyOperationsAborted:
-            return False, "Windows did not recycle it (code {0})".format(rc)
+            return False, "Windows did not recycle it (code {0})".format(rc), ""
         if os.path.exists(path):
-            return False, "Windows reported it recycled, but it is still there"
-        if not self.holds(path):
-            return False, ("Windows reported it recycled, but no Recycle Bin record "
-                           "names it, so it may be gone for good")
-        return True, ""
+            return False, "Windows reported it recycled, but it is still there", ""
+        try:
+            for iname, (n, orig, when) in self._records(root).items():
+                if iname in before:
+                    continue
+                if os.path.normcase(os.path.abspath(orig)) == \
+                        os.path.normcase(os.path.abspath(path)):
+                    r = self._payload(root, iname)
+                    if r:
+                        return True, "", r
+        except OSError as exc:
+            return False, ("Windows reported it recycled, but the Recycle Bin could "
+                           "not be read to confirm it ({0})".format(exc)), ""
+        return False, ("Windows reported it recycled, but no new Recycle Bin record "
+                       "names it, so it may be gone for good"), ""
 
 
 _RELEASE_SCAN_WHY = ("whether every row of a conversation now opens the copy "
@@ -13545,10 +13677,20 @@ def _release_candidates(env):
     return out
 
 
+def _too_long(paths, limit):
+    if not limit:
+        return []
+    return [p for p in paths if len(os.path.abspath(p)) > limit]
+
+
 def _release_decide(env, op, c, entry):
     """(reason to hold, or None) and the release item for copy C of OP.
-    ENTRY is the conversation's placement now, from _split_conversations
-    with keep_all, or None when no row names it."""
+    ENTRY is the conversation's placement now (_split_conversations with
+    keep_all), or None. The transcript and its sidecar folder are each
+    either still in the journal - and then checked against the plan and
+    against the live copy - or, after an interrupted release, in the bin
+    under a record made since that release began, with its payload and the
+    planned size. Anything else holds the copy."""
     m = op.manifest
     bad = _realign_shape_error(m)
     if bad:
@@ -13560,23 +13702,33 @@ def _release_decide(env, op, c, entry):
         return str(exc), None
     side_aside = aside[:-len(".jsonl")]
     side = c.get("sidecar_src") or ""
-    item = {"op_id": m.get("op_id"), "session_id": c["session_id"],
-            "folder": c["folder"], "aside": aside, "finish": False,
-            "bytes": c["basis"]["bytes"],
-            "sidecar_bytes": sum(x.get("size") or 0 for x in c["sidecar_inventory"])}
-    if c.get("releasing") and not os.path.isfile(aside):
-        if env.recycle_bin.holds(aside):
-            item["finish"] = True
-            item["live_folder"] = ""
-            return None, item
-        return ("a release of its copy from {0} was interrupted, and the copy is "
-                "neither in the journal nor named in the Recycle Bin".format(
-                    c["folder"])), None
+    if not side and os.path.exists(side_aside):
+        return ("an unexpected folder sits beside its copy from {0} in the journal; "
+                "release moves only what realign recorded".format(c["folder"])), None
+    inv = c["sidecar_inventory"]
+    side_bytes = sum(x["size"] for x in inv)
+    bin_ = env.recycle_bin
+    started = c.get("release_at") if c.get("releasing") else None
+    t_here = os.path.isfile(aside)
+    s_here = bool(side) and os.path.isdir(side_aside)
+    t_bin = (not t_here and started is not None
+             and bin_.holds(aside, since=started, size=c["basis"]["bytes"]))
+    s_bin = (bool(side) and not s_here and started is not None
+             and bin_.holds(side_aside, since=started, size=side_bytes))
+    if not t_here and not t_bin:
+        return (("a release of its copy from {0} was interrupted, and the copy is "
+                 "neither in the journal nor in the Recycle Bin under a record made "
+                 "since" if started else
+                 "its copy from {0} is gone from the journal").format(c["folder"])), None
+    if side and not s_here and not s_bin:
+        return (("its sidecar folder from {0} is neither in the journal nor in the "
+                 "Recycle Bin under a record made since the release began" if started
+                 else "its sidecar folder from {0} is gone from the journal")
+                .format(c["folder"])), None
     try:
-        if not os.path.isfile(aside) or _file_basis(aside) != c["basis"]:
-            return "its copy from {0} changed in the journal, or is gone from " \
-                   "it".format(c["folder"]), None
-        if side and not _realign_sidecar_matches(side_aside, c["sidecar_inventory"]):
+        if t_here and _file_basis(aside) != c["basis"]:
+            return "its copy from {0} changed in the journal".format(c["folder"]), None
+        if s_here and not _realign_sidecar_matches(side_aside, inv):
             return "its copy's sidecar folder from {0} changed in the journal" \
                 .format(c["folder"]), None
     except (OSError, Refusal) as exc:
@@ -13590,55 +13742,72 @@ def _release_decide(env, op, c, entry):
         return ("its rows do not all open one copy now - realign it first, "
                 "then release"), None
     live = entry["copies"][opened.pop()]
-    rel, ahead = _history_between(live["path"], aside)
-    if rel == "strict_prefix" and ahead == "b":
-        return "the set-aside copy holds turns the live copy lacks", None
-    if rel == "diverged":
-        return "the set-aside copy has diverged from the live copy", None
-    if rel not in ("identical", "same_history", "strict_prefix"):
-        return "the set-aside copy could not be compared with the live copy", None
-    try:
-        live_inv = {x["rel"]: x["sha256"]
-                    for x in sidecar_inventory(sidecar_path(live["path"]))}
-    except (OSError, Refusal) as exc:
-        return "the live copy's sidecar folder could not be read ({0})".format(exc), None
-    missing = sorted(x["rel"] for x in c["sidecar_inventory"]
-                     if live_inv.get(x["rel"]) != x["sha256"])
-    if missing:
-        return ("its sidecar folder holds {0} file(s) the live copy's lacks ({1}{2}), "
-                "which releasing it would lose".format(
-                    len(missing), ", ".join(missing[:3]),
-                    ", ..." if len(missing) > 3 else "")), None
-    try:
-        ok, why = env.recycle_bin.room(aside, item["bytes"] + item["sidecar_bytes"])
-    except OSError as exc:
-        ok, why = False, "the Recycle Bin could not be checked ({0})".format(exc)
-    if not ok:
-        return why, None
-    item["live_folder"] = live["folder"]
+    if t_here:
+        rel, ahead = _history_between(live["path"], aside)
+        if rel == "strict_prefix" and ahead == "b":
+            return "the set-aside copy holds turns the live copy lacks", None
+        if rel == "diverged":
+            return "the set-aside copy has diverged from the live copy", None
+        if rel not in ("identical", "same_history", "strict_prefix"):
+            return "the set-aside copy could not be compared with the live copy", None
+    if s_here:
+        def k(rel):
+            return rel.lower() if env.is_windows else rel
+        try:
+            live_inv = {k(x["rel"]): x["sha256"]
+                        for x in sidecar_inventory(sidecar_path(live["path"]))}
+        except (OSError, Refusal) as exc:
+            return "the live copy's sidecar folder could not be read ({0})".format(
+                exc), None
+        missing = sorted(x["rel"] for x in inv if live_inv.get(k(x["rel"])) != x["sha256"])
+        if missing:
+            return ("its sidecar folder holds {0} file(s) the live copy's lacks "
+                    "({1}{2}), which releasing it would lose".format(
+                        len(missing), ", ".join(missing[:3]),
+                        ", ..." if len(missing) > 3 else "")), None
+    pending = []
+    if t_here:
+        pending.append(("transcript", aside, c["basis"]["bytes"]))
+    if s_here:
+        pending.append(("sidecar", side_aside, side_bytes))
+    limit = getattr(bin_, "path_limit", None)
+    long_ = _too_long([aside] * t_here + [os.path.join(side_aside, *x["rel"].split("/"))
+                                          for x in inv] * s_here, limit)
+    if long_:
+        return ("{0} path(s) of its copy are too long for the Recycle Bin (over {1} "
+                "characters)".format(len(long_), limit)), None
+    item = {"op_id": m.get("op_id"), "session_id": c["session_id"],
+            "folder": c["folder"], "bytes": c["basis"]["bytes"],
+            "sidecar_bytes": side_bytes, "live_folder": live["folder"],
+            "pending": pending, "finish": not pending,
+            "need": sum(n for _w, _p, n in pending), "where": aside}
     return None, item
 
 
 def plan_release(env, flags):
     """Which held copies can go to the Recycle Bin now, and why the rest
-    cannot. Pure planning - writes nothing."""
+    cannot. Pure planning - writes nothing. Room is counted for the whole run,
+    per drive: a copy that fits alone but not after the ones before it is
+    held."""
     if not env.is_windows:
         raise Refusal("releasing a set-aside copy uses the Windows Recycle Bin, "
                       "and is Windows-only, like every store mutation here")
     if env.recycle_bin is None:
         raise Refusal("no Recycle Bin is available to this run, so nothing can be "
                       "released. Nothing was changed.")
+    _journal_discovery(env, "release a set-aside copy")
     cands = _release_candidates(env)
     titles = {}
     for o, c in cands:
         for cv in o.manifest.get("conversations") or []:
-            if isinstance(cv, dict):
-                titles.setdefault(cv.get("session_id"), cv.get("title", ""))
+            if isinstance(cv, dict) and isinstance(cv.get("session_id"), str):
+                titles.setdefault(cv["session_id"], cv.get("title", "") or "")
     if flags.only:
         want = flags.only.lower()
         sids = sorted({c.get("session_id") for _o, c in cands
-                       if want in (titles.get(c.get("session_id")) or "").lower()
-                       or str(c.get("session_id") or "").lower().startswith(want)})
+                       if isinstance(c.get("session_id"), str)
+                       and (want in (titles.get(c["session_id"]) or "").lower()
+                            or c["session_id"].lower().startswith(want))})
         if not sids:
             raise Refusal("no held copy's conversation matches --only {0!r} (a title "
                           "substring, or a cliSessionId prefix). 'doctor' lists the "
@@ -13658,12 +13827,24 @@ def plan_release(env, flags):
         entries = {e["session_id"]: e for e in _split_conversations(
             env, rows, iter_transcripts(env.projects_root), single=True,
             keep_all=True)}
+        reserved = {}
         for o, c in cands:
-            sid = c.get("session_id")
+            sid = c.get("session_id") if isinstance(c.get("session_id"), str) else "?"
             why, item = _release_decide(env, o, c, entries.get(sid))
+            if not why and item["need"]:
+                drive = os.path.splitdrive(os.path.abspath(item["where"]))[0].lower()
+                total = reserved.get(drive, 0) + item["need"]
+                try:
+                    ok, why = env.recycle_bin.room(item["where"], total)
+                except OSError as exc:
+                    ok, why = False, "the Recycle Bin could not be checked ({0})".format(exc)
+                if ok:
+                    reserved[drive] = total
+                elif reserved.get(drive):
+                    why += " - with the copies before it in this run"
             if why:
                 held.append({"op_id": o.manifest.get("op_id"), "session_id": sid,
-                             "title": titles.get(sid, ""), "folder": c.get("folder"),
+                             "title": titles.get(sid, ""), "folder": c.get("folder") or "",
                              "reason": why})
             else:
                 item["title"] = titles.get(sid, "")
@@ -13673,14 +13854,16 @@ def plan_release(env, flags):
 
 
 def run_release(env, m):
-    """Under the lock: plan again, and release only what both plans release.
-    Each copy is marked `releasing` before its move and `released` after, so
-    an interrupted run is finished by the next. Returns "completed", or
-    "nothing to release" when the re-plan held everything. Writes no store
-    row: the app reads none of this, so no closed-app guard."""
+    """Closed app, journal lock, plan again, then release only what both plans
+    release. A copy is marked `releasing`, with the time, before its first
+    move, and `released` - with where each part went - after; room is asked
+    again just before each move. Every item ends with an `outcome`. Returns
+    "completed", or "nothing to release" when the re-plan held everything."""
     if env.recycle_bin is None:
         raise Refusal("no Recycle Bin is available to this run, so nothing can be "
                       "released. Nothing was changed.")
+    _guard_mutation(env, "release a set-aside copy while", NEW_ROW_STORE,
+                    because=RELEASE_GUARD_WHY)
     acquire_lock(env, "release")
     try:
         fresh = plan_release(env, ReleaseFlags(only=m.get("only") or ""))
@@ -13700,61 +13883,96 @@ def run_release(env, m):
                               "it".format(" (now: " + now_held[k] + ")"
                                           if k in now_held else "")})
         m["copies"] = keep
+        for item in keep:
+            item["outcome"] = "not reached"
         if not keep:
             return "nothing to release"
-        then = ("Copies listed before it are released; re-run 'realign --release "
-                "--apply' to try the rest again.")
+        then = ("Copies marked released are; re-run 'realign --release --apply' to "
+                "finish the rest.")
         for item in keep:
-            op = next((o for o in list_ops(env)
-                       if o.manifest.get("op_id") == item["op_id"]), None)
-            c = next((x for x in (op.manifest.get("copies") or []) if op
-                      and isinstance(x, dict)
-                      and x.get("session_id") == item["session_id"]
-                      and x.get("folder") == item["folder"]), None) if op else None
-            if c is None:
-                raise Refusal("the record for {0} changed during the release. {1}"
-                              .format(item["op_id"], then))
-            aside = _realign_aside_checked(op, c)
-            if not item["finish"]:
-                c["releasing"] = True
-                save_manifest(op)
-                done, why = env.recycle_bin.recycle(aside)
-                if not done:
-                    raise Refusal("could not move the copy from {0} to the Recycle "
-                                  "Bin: {1}. {2}".format(c["folder"], why, then))
-            side_aside = aside[:-len(".jsonl")]
-            if os.path.isdir(side_aside):
-                done, why = env.recycle_bin.recycle(side_aside)
-                if not done:
-                    raise Refusal("could not move the sidecar folder from {0} to the "
-                                  "Recycle Bin: {1}. {2}".format(c["folder"], why, then))
-            c["moved"] = False
-            c["releasing"] = False
-            c["released"] = {"at": env.now(), "bytes": c["basis"]["bytes"]}
-            save_manifest(op)
+            item["outcome"] = "failed"
+            try:
+                _release_one(env, item, then)
+            except OSError as exc:
+                raise Refusal("the journal could not be written while releasing the "
+                              "copy from {0} ({1}). {2}".format(item["folder"], exc, then))
+            item["outcome"] = "released"
         rotate_ops(env)
         return "completed"
     finally:
         release_lock(env)
 
 
+def _release_one(env, item, then):
+    op = next((o for o in list_ops(env)
+               if o.manifest.get("op_id") == item["op_id"]), None)
+    c = next((x for x in (op.manifest.get("copies") or [])
+              if isinstance(x, dict) and x.get("session_id") == item["session_id"]
+              and x.get("folder") == item["folder"]), None) if op else None
+    if c is None:
+        raise Refusal("the record for {0} changed during the release. {1}"
+                      .format(item["op_id"], then))
+    aside = _realign_aside_checked(op, c)
+    side_aside = aside[:-len(".jsonl")]
+    bin_ = env.recycle_bin
+    if not c.get("releasing"):
+        c["releasing"] = True
+        c["release_at"] = env.now()
+        save_manifest(op)
+    where = dict(c.get("release_bin") or {})
+    for what, path, nbytes in item["pending"]:
+        okr, why = bin_.room(path, nbytes)
+        if not okr:
+            raise Refusal("the {0} of the copy from {1} was not moved: {2}. {3}"
+                          .format(what, item["folder"], why, then))
+        done, why, at = bin_.recycle(path)
+        if not done:
+            raise Refusal("could not move the {0} of the copy from {1} to the "
+                          "Recycle Bin: {2}. {3}".format(what, item["folder"], why, then))
+        where[what] = at
+        c["release_bin"] = where
+        save_manifest(op)
+    since = c.get("release_at")
+    if "transcript" not in where:
+        where["transcript"] = bin_.holds(aside, since=since, size=c["basis"]["bytes"]) or ""
+    if c.get("sidecar_src") and "sidecar" not in where:
+        where["sidecar"] = bin_.holds(side_aside, since=since, size=sum(
+            x["size"] for x in c["sidecar_inventory"])) or ""
+    c["moved"] = False
+    c["releasing"] = False
+    c["released"] = {"at": env.now(), "bytes": c["basis"]["bytes"],
+                     "sidecar_bytes": sum(x["size"] for x in c["sidecar_inventory"]),
+                     "bin": where}
+    save_manifest(op)
+
+
 def _public_release_manifest(env, m):
-    """The release plan for --json and the report; --anonymize honoured."""
+    """The release plan, or its result, for --json and the report;
+    --anonymize honoured, the journaled titles included - they may be ones no
+    row carries any more."""
     out = {"op_type": "realign-release", "only": _only_display(m.get("only", "")),
            "copies": [{"op_id": c["op_id"], "session_id": c["session_id"],
                        "title": c.get("title", ""), "folder": c["folder"],
                        "bytes": c.get("bytes"), "sidecar_bytes": c.get("sidecar_bytes"),
                        "live": {"folder": c.get("live_folder") or ""},
-                       "finish": bool(c.get("finish"))}
+                       "finish": bool(c.get("finish")),
+                       **({"outcome": c["outcome"]} if "outcome" in c else {})}
                       for c in m.get("copies", [])],
-           "held": [{"op_id": h.get("op_id"), "session_id": h["session_id"],
+           "held": [{"op_id": h.get("op_id"), "session_id": str(h.get("session_id")),
                      "title": h.get("title", ""), "folder": h.get("folder") or "",
                      "reason": h.get("reason", ""), "late": bool(h.get("late"))}
                     for h in m.get("held", [])]}
     if _ANONYMIZE:
+        for x in out["copies"] + out["held"]:
+            _anon_register_title(env, x.get("title"))
         for h in out["held"]:
             h["reason"] = anonymize(env, h["reason"])
         out = anonymize_report(env, out)
+        for pub, src in zip(out["copies"] + out["held"],
+                            m.get("copies", []) + m.get("held", [])):
+            t = src.get("title")
+            if isinstance(t, str) and t.strip():
+                pub["title"] = _anon_label("session", t)
     return out
 
 
@@ -13767,8 +13985,9 @@ def _print_release_report(say, pub):
         len(copies), len(held)))
     for c in copies:
         say("")
-        say("{0!r}  {1}  op {2}".format(c.get("title") or "(untitled)",
-                                       c["session_id"][:8], c["op_id"]))
+        say("{0!r}  {1}  op {2}{3}".format(
+            c.get("title") or "(untitled)", c["session_id"][:8], c["op_id"],
+            "  [{0}]".format(c["outcome"]) if c.get("outcome") else ""))
         if c.get("finish"):
             say("   the copy from {0} is already in the Recycle Bin from an "
                 "interrupted release; this records it".format(c["folder"]))
@@ -13782,16 +14001,35 @@ def _print_release_report(say, pub):
         say("held:")
         for h in held:
             say("   {0!r}  {1}: {2}".format(h.get("title") or "(untitled)",
-                                           h["session_id"][:8], h["reason"]))
+                                           str(h["session_id"])[:8], h["reason"]))
 
 
 def _cmd_release(env, ns, say):
+    if ns.include_identical or ns.live:
+        raise Refusal("--release takes --only, --apply and --json; it does not use "
+                      "{0}, so it refuses it rather than ignore it".format(
+                          "--include-identical" if ns.include_identical else "--live"))
     m = plan_release(env, ReleaseFlags(only=ns.only))
     if not ns.json:
         _print_release_report(say, _public_release_manifest(env, m))
     final = None
     if ns.apply and m["copies"]:
-        final = run_release(env, m)
+        try:
+            final = run_release(env, m)
+        except Refusal:
+            # What happened to each copy, before the refusal itself.
+            pub = _public_release_manifest(env, m)
+            pub["result"] = "refused"
+            if ns.json:
+                print(json.dumps(pub, indent=1))
+            else:
+                say("\noutcome:")
+                for c in pub["copies"]:
+                    say("   {0}  {1}: {2}".format(c["session_id"][:8], c["folder"],
+                                                 c.get("outcome", "not reached")))
+            raise
+    elif ns.apply:
+        final = "nothing to release"
     code = 3 if (ns.apply and m["held"]) else 0
     pub = _public_release_manifest(env, m)
     if ns.json:
@@ -13802,14 +14040,13 @@ def _cmd_release(env, ns, say):
     if not ns.apply:
         say("\ndry run - pass --apply to move these copies to the Recycle Bin")
         return 0
-    if final is not None:
-        say("\nresult  : {0}".format(final))
+    say("\nresult  : {0}".format(final))
     late = [h for h in pub["held"] if h.get("late")]
     if late:
         say("held at apply time, nothing released for them:")
         for h in late:
             say("   {0!r}  {1}: {2}".format(h.get("title") or "(untitled)",
-                                           h["session_id"][:8], h["reason"]))
+                                           str(h["session_id"])[:8], h["reason"]))
     return code
 
 
