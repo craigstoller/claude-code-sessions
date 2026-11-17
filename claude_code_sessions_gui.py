@@ -3557,6 +3557,17 @@ class SyncApp:
         if splits:
             notes.append("conversations whose accounts open different transcript "
                          "copies: {0}".format(len(splits)))
+        # The two realign listings `ccs doctor` prints, as counts: neither is
+        # counted in its exit code, and neither blocks a mutation.
+        waiting = rep.get("waiting_rows") or []
+        if waiting:
+            notes.append("conversations with one transcript copy and a row whose "
+                         "folder holds none - opening that row copies the "
+                         "transcript into its folder: {0}".format(len(waiting)))
+        held = rep.get("realign_held_copies") or []
+        if held:
+            notes.append("stale transcript copies realign holds in its journal: "
+                         "{0}".format(len(held)))
 
         out = []
         if blocking:
