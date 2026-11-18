@@ -594,6 +594,10 @@ Where the build departs from the text above, or settles what the text left open:
     live copy did (above). Not built, by the maintainer's ruling (D10a, 2026-11-17): a hard
     veto on a permanent delete; the guard stays as built, and the warning flag is to be
     measured on a drive whose Recycle Bin cannot take a file before the first real apply.
+    *(2026-11-17, before the first public release with the step, the maintainer's call
+    against the recommendation: release ships as built, before that measurement, with the
+    README naming the untested case. Not taken: shipping with `--release --apply` switched
+    off until the measurement; holding the release until it.)*
     Two reviewers proposed `IFileOperation` with `FOFX_RECYCLEONDELETE`, but Microsoft's text
     for that flag says only that it sends an item to the Recycle Bin rather than deleting it,
     not that the shell fails when it cannot, and no case the shell cannot recycle can be made

@@ -705,13 +705,14 @@ here.
 | Windows 11 + Claude Desktop 3.6556.2 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: read-only paths and `converge --apply` verified 2026-10-23, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 4.4212.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor`, `alignment` and `converge --apply` verified 2026-11-01, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 5.1231.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor` and `alignment` verified read-only 2026-11-10. Needs 0.16.3 or later to find the store | read-only + mutations, `--apply` not yet run on this build |
+| Windows 11 + Claude Desktop 6.6395.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | from 0.17.0: `doctor` and `realign --apply` verified 2026-11-17, the apply with the app closed; after the app reopened, `doctor` and a fresh `realign` plan found every rewritten row opening the live copy and no set-aside copy back in its old folder. Needs 0.16.3 or later to find the store | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds of the MSIX that Anthropic signs and
-distributes itself from claude.ai - most recently Claude Desktop 5.1231.0.0 with Claude Code
-CLI 2.1.321 for `doctor` and `alignment`, and 4.4212.0.0 with CLI 2.1.309 for the last
-`--apply` run. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
+distributes itself from claude.ai - most recently Claude Desktop 6.6395.0.0 with Claude Code
+CLI 2.1.326 for `doctor` and the last `--apply` run, a `realign`; `converge --apply` last ran
+on 4.4212.0.0 with CLI 2.1.309. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
 This tool does not look in that package's folder and has never been run against it.
 On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
@@ -1171,6 +1172,35 @@ window into `journaled`/`completed`/`rolled_back`.
   left every route refusing until a restart, or, when the app copied its data instead of moving
   it, left the window writing into the old copy. A press whose store layout changed since its
   plan now stops and replans before its next write.
+- **0.17.0 shows which copy of a transcript each account's row opens, and repairs it.** A
+  conversation's transcript can end up in two project folders, and each account's row opens
+  the copy in the folder its `cwd` names, so one sidebar can show a conversation as it was
+  weeks ago while another shows it today. `doctor` now lists each such conversation, which copy
+  each row opens, and how the copies relate, reading past the bookkeeping records the app
+  writes to whichever copy it has open; it exits 1 when an unarchived row opens an older or a
+  diverged copy. It also lists, without counting them, conversations with one copy and a row
+  whose folder holds none, because opening such a row made the app copy the transcript into
+  that folder (measured on Desktop 5.11492.5). The new `realign` command points those rows at
+  the folder holding the live copy, by rewriting `cwd` and the `folderPlace` keys the app keeps
+  in step with it, and moves the stale copy into its journal, where `undo` can put it back. It
+  holds anything it cannot decide safely, with the reason: diverged copies, a row with a
+  worktree link, a live copy whose folder is gone, and identical copies unless
+  `--include-identical` is given. On the machine it was built on, the first apply realigned 43
+  conversations (84 rows) and held 52; `doctor` then listed 26 split conversations where it
+  had listed 30, and 26 waiting ones where it had listed 65. `realign --release` sends a
+  set-aside copy to the Recycle Bin once every row of its conversation opens one copy and that
+  copy holds everything the set-aside one did, sidecar files included. It refuses each case it
+  can see in which Windows would delete the copy outright, and asks Windows to warn in any
+  other; how that warning behaves beside the silent flags release passes is untested, and no
+  `--release --apply` had run when this shipped. The window's health report counts the split
+  conversations, the waiting ones and the copies realign holds. `realign` itself is CLI-only,
+  and while one is the latest operation the window offers no undo.
+  The window also declares system DPI awareness before it opens, on Windows with Tk 9.0, so
+  at 250 % it draws its text and widgets at the display's resolution and at the size it had
+  before, where it used to be a stretched bitmap. Every pixel constant goes through one factor,
+  the process's DPI over 96. Verified at 250 % and in a faithful 100 % run, and every other
+  GUI harness passes in an aware process. 150 %, a common laptop setting, is untested; Tk 8.6
+  is unchanged.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 

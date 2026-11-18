@@ -3,7 +3,8 @@
 **Status: draft, 2026-11-02. A three-round panel review has been applied; see "Review" near
 the end. Decisions D1-D6 were ruled by the maintainer on 2026-11-02, each as recommended.
 Implemented 2026-11-02 on the maintainer's go-ahead. The release (0.16.6) waits on A5, the
-maintainer's real 150 % session.**
+maintainer's real 150 % session.** *(2026-11-17: A5 waived by the maintainer, D4 below; the
+work ships in the next release beside `realign`, with 150 % recorded as untested in its note.)*
 This is finding F8 of the 2026-09-01 UX/UI audit of the "Claude sessions" window
 (`ccs-gui`), the one item the GUI polish release (0.16.0) deliberately left for its own
 spec. Every other audit finding shipped in 0.16.0.
@@ -806,6 +807,10 @@ install, on 3.14, gets the change.
 **Ruling: Option A, run the real 150 % session once before release (the maintainer's
 call). Not taken: B, waiving it; C, deferring it. A5 is therefore a release gate: the
 maintainer runs the four steps below, since they change a display setting and sign out.**
+*(Superseded 2026-11-17, the maintainer's call against the recommendation: Option B, A5
+waived, so the work ships beside `realign` without the 150 % session and the release note
+records 150 % as untested. Not taken: A, the session first; holding this work out of that
+release by reverting its awareness declaration.)*
 This machine cannot simulate 150 % faithfully (measured, above). A real check is:
 
 1. Set the primary display to 150 %.
