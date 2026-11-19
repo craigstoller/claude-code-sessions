@@ -3733,15 +3733,17 @@ def recover_op(env, op, direction):
                 # blocking pending row is still never considered, because
                 # its state is drifted/deleted/unreadable rather than the
                 # "match" that would prove this op wrote it.
-                left_alone = []
+                left_alone, already = [], []
                 (drifted, unreadable, removable,
-                 restorable, claimed) = _sync_delete_targets(env, m,
-                                                             unresolved=left_alone)
+                 restorable, claimed) = _sync_delete_targets(
+                     env, m, unresolved=left_alone, pristine=already)
                 # Children before parents, adds and refreshes in one
                 # sequence (spec, "undo"), so an interrupted reversal never
-                # leaves a child naming a row already removed.
+                # leaves a child naming a row already removed. A row an
+                # earlier back, cut short, already put back counts as
+                # restored here too.
                 steps, removed, restored = _sync_reversal(m, removable,
-                                                          restorable)
+                                                          restorable, already)
                 _sync_reverse_all(steps)
                 # Rows in a store this version does not read were never read;
                 # recorded where doctor looks, so this close is not silent.
@@ -10737,7 +10739,7 @@ def _sync_paths_claimed_elsewhere(env, m):
     return out
 
 
-def _sync_delete_targets(env, m, unresolved=None, tally=None):
+def _sync_delete_targets(env, m, unresolved=None, tally=None, pristine=None):
     """Rows THIS sync op actually wrote, classified for safe deletion.
 
     The resolution gate comes first, per row: a written row in a store this
@@ -10745,7 +10747,10 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
     them in; undo passes none, and refuses - before anything is changed - if
     there are any. TALLY, when given, counts the written rows found absent:
     `already_gone` for an added row, `not_restored` for a refreshed one whose
-    pre-image is deliberately not put back.
+    pre-image is deliberately not put back. PRISTINE, when given, collects
+    the written refresh rows found already back at their pre-image - put
+    back by an earlier reversal that was cut short - so the link report
+    counts them as restored, as the run that restored them would have.
     Shared by undo_sync and recover_op's 'back' path, which react
     differently to a non-empty drifted/unreadable result: undo_sync refuses
     the whole operation (a surprise during a user-initiated reversal of a
@@ -10881,7 +10886,12 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
             claimed.append(_sync_row_title(r))
             continue
         if state == "pristine":
-            continue                       # untouched refresh - already original
+            # Already original: untouched, or put back by an earlier reversal
+            # cut short. Only a written row takes part in the link report,
+            # so only a written one is collected.
+            if pristine is not None and written:
+                pristine.append(r)
+            continue
         if state == "absent":
             # Nothing to undo. For a REFRESH this also means the destination
             # deleted the session after we rewrote it - putting the old bytes
@@ -10954,10 +10964,15 @@ def _sync_unlink_all(paths):
             ", ".join("{0} ({1})".format(p, exc) for p, exc in failures)))
 
 
-def _sync_reversal(m, removable, restorable):
+def _sync_reversal(m, removable, restorable, already=()):
     """(steps, removed, restored) for one reversal of sync op M: the list
     _sync_reverse_all takes, and the (store path, row id) pairs it removes
-    and restores, for the link report.
+    and restores, for the link report. ALREADY is the rows
+    _sync_delete_targets found already back at their pre-image (its
+    PRISTINE list): an earlier run of this reversal, cut short, restored
+    them, so their pairs join RESTORED with no step - otherwise a resumed
+    reversal would report as redirected a restored child whose pre-image
+    names the row id the op journaled.
 
     REMOVABLE paths and RESTORABLE (path, pre-image) pairs are
     _sync_delete_targets' results, which take each path from its row. Each
@@ -10980,10 +10995,15 @@ def _sync_reversal(m, removable, restorable):
             i = where.get(item[0], -1)
             steps.append((i, (kind,) + tuple(item)))
             if i >= 0:
-                pairs.add((os.path.dirname(rows[i]["dest_path"]),
-                           _lineage_stem(rows[i]["name"])))
+                pairs.add(_sync_row_pair(rows[i]))
+    restored.update(_sync_row_pair(r) for r in already)
     steps.sort(key=lambda s: s[0], reverse=True)
     return [s for _, s in steps], removed, restored
+
+
+def _sync_row_pair(r):
+    """A sync row's (store path, row id), as the link report takes it."""
+    return os.path.dirname(r["dest_path"]), _lineage_stem(r["name"])
 
 
 def _sync_reverse_all(ops):
@@ -11056,8 +11076,10 @@ def undo_sync(env, op):
                 "from it. Nothing was changed.".format(m.get("op_id"), bad))
         disc = _journal_discovery(env, "undo")
         tally = {"already_gone": 0, "not_restored": 0}
+        already = []
         (drifted, unreadable, removable,
-         restorable, claimed) = _sync_delete_targets(env, m, tally=tally)
+         restorable, claimed) = _sync_delete_targets(env, m, tally=tally,
+                                                     pristine=already)
         if drifted or unreadable:
             raise Refusal("these synced rows {0}; the other account may have opened "
                           "them. Refusing to change any of them."
@@ -11077,8 +11099,11 @@ def undo_sync(env, op):
                 .format(", ".join(claimed)))
         # One pass, every step always attempted - a locked added row must not
         # leave every refreshed row stranded in its overwritten state - in
-        # reverse write order, children before parents (spec, "undo").
-        steps, removed, restored = _sync_reversal(m, removable, restorable)
+        # reverse write order, children before parents (spec, "undo"). A
+        # row an earlier undo, cut short, already put back counts as
+        # restored here too.
+        steps, removed, restored = _sync_reversal(m, removable, restorable,
+                                                  already)
         _sync_reverse_all(steps)
         # What happened, not just that it ended: a bare "undone" read the
         # same whether every row was reversed or none was (decision 7 of the

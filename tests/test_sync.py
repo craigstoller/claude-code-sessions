@@ -5255,3 +5255,62 @@ def test_sync_undo_reports_dangling_links_to_removed_rows(
         assert out.index("removed 1 row(s), restored 0; 0 already gone; 0 "
                          "refreshed row(s) not restored - that account "
                          "deleted them since") < out.index(line)
+
+
+@pytest.mark.parametrize("leg", ["undo", "back"])
+def test_sync_resumed_reversal_after_the_childs_restore_reports_no_redirection(
+        two_account_env, tmp_path, monkeypatch, leg):
+    """The scenario above, with the first reversal cut short where the
+    children-first order puts the break: the child's row is back at its
+    pre-image, the parent's is not yet. The resumed reversal finds the
+    child already restored and restores the parent. That earlier run's
+    restore counts as this reversal's, so the child, whose pre-image names
+    the same row id the op journaled, is not reported as redirected. A third
+    row, added after the child, lets back find the child recorded as
+    written."""
+    env, src, dst = two_account_env(tmp_path)
+    _swapped_parent(env, src, dst, child_title="ACME-REVIEW side task v2",
+                    child_in_dst=True)
+    _lrow(src, "local_n.json", LR, "ACME-REVIEW notes", lastActivityAt=1)
+    pre = {n: _bytes(os.path.join(dst, n))
+           for n in ("local_p.json", "local_c.json")}
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, only="ACME"))
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json",
+                                              "local_n.json"]
+    if leg == "undo":
+        assert ct.run_sync(env, m) == "completed"
+        op = ct.list_ops(env)[-1]
+    else:
+        op = _sync_crash(env, m, nth=2)
+        assert [r["written"] for r in op.manifest["rows"]] == [True, True,
+                                                               False]
+    steps = []
+    real_write = ct.atomic_write
+
+    def write(path, data):
+        name = os.path.basename(path)
+        if name.startswith("local_"):
+            steps.append(name)
+            if name == "local_p.json":
+                raise SimulatedCrash()      # cut short after the child
+        return real_write(path, data)
+    monkeypatch.setattr(ct, "atomic_write", write)
+    with pytest.raises(SimulatedCrash):
+        if leg == "undo":
+            ct.undo_sync(env, op)
+        else:
+            ct.recover_op(env, op, "back")
+    monkeypatch.undo()
+    assert steps == ["local_c.json", "local_p.json"]
+    assert _bytes(os.path.join(dst, "local_c.json")) == pre["local_c.json"]
+    assert _bytes(os.path.join(dst, "local_p.json")) != pre["local_p.json"]
+    if leg == "undo":
+        assert ct.undo_sync(env, op) == "undone"
+    else:
+        assert ct.recover_op(env, op, "back") == "rolled_back"
+    for n, b in pre.items():
+        assert _bytes(os.path.join(dst, n)) == b
+    assert not os.path.exists(os.path.join(dst, "local_n.json"))
+    saved = _journal_of(env, op)
+    assert saved["link_report"]["redirected"] == []
+    assert saved["link_report"] == EMPTY_LINKS
