@@ -9308,6 +9308,176 @@ def _sync_refresh_loss(r):
                                          ("firstSessionId", "depth"))
 
 
+def _sync_row_now(m, r):
+    """The destination's row for sync row R as it is now, for the apply-time
+    pass: ("present", bytes), ("absent", None) or ("unreadable", None). R's
+    dest_path must resolve, through ensure_contained, to a direct child of
+    the plan's destination store M["dest_path"]; one that does not is
+    "unreadable". NEVER RAISES."""
+    try:
+        store = m["dest_path"]
+        real = ensure_contained(r["dest_path"], [store])
+        if os.path.normcase(os.path.dirname(real)) != \
+                os.path.normcase(os.path.realpath(store)):
+            return "unreadable", None
+        with open(real, "rb") as fh:
+            return "present", fh.read()
+    except FileNotFoundError:
+        return "absent", None
+    except Exception:
+        return "unreadable", None
+
+
+def _sync_source_changed(r, planned, src):
+    """Note on row R, whose source row no longer opens R's conversation,
+    what that cost: lineage_source_changed when the plan's record PLANNED
+    named a parent or a root, and lineage_chain_dropped too when it named a
+    root. SRC is the source row as read now, None when it is gone or could
+    not be read. A row whose plan named neither gets no note. Never
+    raises."""
+    lin = r.get("lineage")
+    p = planned if isinstance(planned, dict) else {}
+    parent, root = [isinstance(p.get(k), str) and p[k] != ""
+                    for k in ("parent_row", "root_row")]
+    if not isinstance(lin, dict) or not (parent or root):
+        return
+    if not isinstance(lin.get("notes"), list):
+        lin["notes"] = []
+    sid = r.get("session_id")
+    conv = _lineage_short(sid) if isinstance(sid, str) and sid else "?"
+    how = ("is gone or could not be read" if src is None
+           else "now opens another conversation")
+    notes = [("lineage_source_changed",
+              "the source row of {0} {1}".format(conv, how))]
+    if root:
+        notes.append(("lineage_chain_dropped",
+                      "the source row changed since the plan"))
+    for code, detail in notes:
+        if all(not isinstance(n, dict) or n.get("code") != code
+               for n in lin["notes"]):
+            lin["notes"].append({"code": code, "detail": detail})
+
+
+def _sync_tally_unchanged(tally, r):
+    """Count refresh R, dropped at apply time as unchanged, as plan_sync's
+    step 6 counts one: its title joins tally["unchanged"] and leaves the
+    activity_unknown and regressing lists, since a row that writes nothing
+    moves nothing. Never raises."""
+    try:
+        title = r.get("title")
+        if isinstance(tally.get("unchanged"), list):
+            tally["unchanged"].append(title)
+        for key, flag in (("activity_unknown", "activity_unknown"),
+                          ("regressing", "regresses")):
+            titles = tally.get(key)
+            if r.get(flag) is True and isinstance(titles, list) \
+                    and title in titles:
+                titles.remove(title)
+    except Exception:
+        pass
+
+
+def _sync_relink(env, m):
+    """Sync's lineage pass again, once, under the lock and before new_op
+    (spec, "sync", "Applying, once"), so the journal records the final
+    links, bytes and order. run_sync calls it for every op but a --verbatim
+    one, which copies links as they are.
+
+    1. The source and destination stores are read again.
+    2. Step 5 of plan_sync runs again. Each row's source row is read again
+       by name from the source store (the plan's Departure 2: no source
+       link is kept in the plan), and must still open the row's
+       conversation. One that does not - gone, unreadable, or opening
+       another conversation - is no holder: the row carries neither link
+       nor chain, and says lineage_source_changed when the plan's record
+       named a parent or a root (_sync_source_changed). Only the link and
+       the chain follow the stores now; every other byte is the plan's
+       snapshot, as in converge.
+    3. post_b64 and `lineage` are rewritten together. A change since the
+       plan is noted as converge notes it (_lineage_record_change), the
+       plan's record kept as `lineage_planned`; the existing-cycle count is
+       taken again.
+    4. Each refresh's field loss, link_change and chain_change are measured
+       again on its final bytes (_sync_refresh_loss).
+    5. A refresh whose final post_b64 equals its pre_b64 would change
+       nothing. It is dropped as unchanged only when the destination's row,
+       read now under the lock, holds exactly those bytes, and any row that
+       named it as planned then names it as existing (_sync_mark_existing).
+       A row that is gone, unreadable or different refuses, before anything
+       is journaled (the plan's Departure 7): equality with the plan's
+       pre-image says nothing about the store now, and treating that row as
+       existing could leave a child linking to a row that is gone.
+    6. The rows are re-sorted into write order.
+
+    Swap and voucher decisions read cliSessionId, which the link does not
+    change, so they stand. The work is done on copies of the rows and put
+    back only when nothing refused, so a refusal leaves the plan as it was;
+    the rows list and its row dicts stay the caller's own objects."""
+    rows = m["rows"]
+    work = [dict(r) for r in rows]
+    tally = m.get("tally") if isinstance(m.get("tally"), dict) else {}
+    held = tally.get("held_sessions")
+    held = held if isinstance(held, dict) else {}
+    source_store, _unread = _lineage_store_rows(m.get("source_path"))
+    dest_store, _unread = _lineage_store_rows(m.get("dest_path"))
+    now = {rid + ".json": d for rid, d in source_store}
+    sources, changed = {}, {}
+    for w in work:
+        src = now.get(w.get("name"))
+        if _lineage_cli(src) is not None \
+                and _lineage_cli(src) == w.get("session_id"):
+            sources[w["name"]] = src
+        else:
+            changed[id(w)] = src
+    # The plan's link and chain, decoded before the pass rewrites the bytes:
+    # `lineage` holds neither taskId nor depth, so the change test reads
+    # these, not the record.
+    before = [(w, _lineage_pair(w.get("post_b64")), w.get("lineage"))
+              for w in work]
+    found = {}
+
+    def exists(sid):
+        # The same test planning makes of a row's own transcript.
+        if sid not in found:
+            found[sid] = bool(find_transcripts(env.projects_root, sid))
+        return found[sid]
+    cycles = _sync_lineage(work, sources, source_store, dest_store, held,
+                           exists,
+                           source_account=m.get("source_account") or "",
+                           dest_account=m.get("dest_account") or "")
+    for w, pair, planned in before:
+        if id(w) in changed:
+            _sync_source_changed(w, planned, changed[id(w)])
+        _lineage_record_change(w, pair, planned)
+        _sync_refresh_loss(w)
+    gone = set()
+    for w in work:
+        if not _row_is_refresh(w):
+            continue
+        try:
+            post = unb64(w["post_b64"])
+            same = post == _sync_pre_image(w)
+        except Exception:
+            continue                # the write loop refuses such a row itself
+        if not same:
+            continue
+        state, cur = _sync_row_now(m, w)
+        if state != "present" or cur != post:
+            raise Refusal("the destination's row {0} changed since the plan; "
+                          "plan again".format(
+                              _lineage_short(_lineage_stem(w.get("name")))))
+        gone.add(w["name"])
+    for r, w in zip(rows, work):
+        r.update(w)
+    kept = [r for r in rows if r.get("name") not in gone]
+    _sync_mark_existing(kept, gone)
+    for r in rows:
+        if r.get("name") in gone:
+            _sync_tally_unchanged(tally, r)
+    m["lineage_cycles"] = cycles
+    rows[:] = _lineage_write_order(kept, _sync_row_key)
+
+
 def plan_sync(env, flags):
     """Build the sync manifest. Pure planning - writes nothing.
 
@@ -10065,6 +10235,13 @@ def run_sync(env, manifest):
     stays, unchanged: it is the ONLY guard recover --forward gets, since
     resuming a crash-interrupted op re-enters execute_sync_op directly and
     never calls back through here.
+
+    Under the lock and before new_op, the lineage pass runs again, once
+    (_sync_relink; not for a --verbatim op), so the journal holds the final
+    links, bytes and order. A run it leaves with no row to write returns
+    "unchanged" WITHOUT creating an op, as run_converge's does: nothing
+    durable happened and there is nothing to undo. Recovery re-enters
+    execute_sync_op and never resolves again.
     """
     _guard_mutation(env, "write to")
     # Learn the live account's email HERE, not while planning. plan_sync
@@ -10076,6 +10253,13 @@ def run_sync(env, manifest):
                            manifest.get("source_email"))
     acquire_lock(env, "pending")
     try:
+        if not manifest.get("verbatim"):
+            # Here and not while planning: the tally that holds the held
+            # rows' conversations is not journaled, and the stores may have
+            # changed since the plan was shown.
+            _sync_relink(env, manifest)
+            if not manifest["rows"]:
+                return "unchanged"
         # "tally" is the report's data, not the operation's: it names every
         # session the run skipped - including the ones the destination account
         # deliberately DELETED - and nothing in execute/undo/recover reads it.
@@ -14751,8 +14935,14 @@ def cmd_sync(env, ns):
         if final is not None:
             manifest["result"] = final
         print(json.dumps(_public_manifest(env, manifest), indent=1))
-        return 0 if final in (None, "completed") else 1
+        return 0 if final in (None, "completed", "unchanged") else 1
 
+    if final == "unchanged":
+        # run_sync's apply-time pass left no row to write (a refresh whose
+        # only change was a link the source has since lost), so no op was
+        # journaled. Success, as converge's "unchanged" is.
+        say("\nnothing to write: the destination already holds these rows")
+        return 0
     if not manifest["rows"]:
         say("\nnothing to copy")
         return 0
@@ -14773,6 +14963,10 @@ def cmd_sync(env, ns):
     say("\ncopied     : {0}".format(len(done) - n_upd))
     if n_upd:
         say("refreshed  : {0}".format(n_upd))
+    # What the written rows carry, as the apply-time pass left them, and
+    # what changed since the dry run printed above.
+    for line in _lineage_apply_lines(done):
+        say(line)
     say("result     : {0}".format(final))
     d = _live_override_derived(manifest)
     if d is not None:

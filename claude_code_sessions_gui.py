@@ -4689,6 +4689,23 @@ class SyncApp:
             # is fixable in seconds - so leave Apply reachable after a Refresh.
             self.apply_btn.configure(state="disabled")
             return
+        if result == "unchanged":
+            # run_sync's apply-time pass, under the lock, left no row to
+            # write - a refresh whose only change was a link the source has
+            # since lost - so nothing was written and no operation was
+            # journaled. No mutation ran: the identity answer is not spent,
+            # and Undo is left as it was. Recomputing it here could only
+            # find an older op, and Undo must never look like it reverses
+            # this press.
+            self._clear_plan()
+            self._show_sync_warning("")
+            self.show([])
+            self.status.set("Nothing to copy: the destination already holds "
+                            "these rows")
+            self.detail.set("Nothing was written, so there is nothing to undo. "
+                            "Refresh plans again against the destination as it "
+                            "is now.")
+            return
         done = [r for r in (manifest.get("rows") or []) if r.get("written")]
         written = len(done)
         n_upd = sum(1 for r in done if r.get("is_update"))
