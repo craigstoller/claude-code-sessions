@@ -364,7 +364,7 @@ def test_lineage_record_has_every_field_with_its_type_and_no_repeated_code():
                 row("acct_b", "local_rb", "cli_ra"))),
     ]
     for res in cases:
-        assert set(res) == {"link", "chain", "lineage", "edges"}
+        assert set(res) == {"child", "link", "chain", "lineage", "edges"}
         assert set(res["edges"]) == {"parent", "root"}
         rec = res["lineage"]
         assert set(rec) == set(shape)
@@ -628,7 +628,7 @@ def test_write_order_parents_and_roots_first_stable_ties():
     rows = [wrow("a", parent="b"), wrow("b", parent="c", root="d"),
             wrow("c"), wrow("e"), wrow("d")]
     out = ct._lineage_write_order(rows, WKEY)
-    assert names(out) == ["c", "d", "b", "a", "e"]
+    assert names(out) == ["c", "e", "d", "b", "a"]
     assert ct._lineage_write_order([wrow("x"), wrow("y")], WKEY) == \
         [wrow("x"), wrow("y")]
 

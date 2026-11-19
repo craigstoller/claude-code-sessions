@@ -14817,8 +14817,8 @@ def _lineage_resolve(child_sid, child_name, holders, holder_index, dest, *,
                      held, transcript_exists, prefer_parent_name="",
                      prefer_root_name=""):
     """Resolve the link and chain one row of conversation `child_sid` should
-    carry into the destination described by `dest`. Returns {"link", "chain",
-    "lineage", "edges"}; `link` and `chain` are dicts or None, `edges` names
+    carry into the destination described by `dest`. Returns {"child", "link",
+    "chain", "lineage", "edges"}; `link` and `chain` are dicts or None, `edges` names
     the parent and root conversations actually carried. Never raises."""
     notes = []
 
@@ -14992,8 +14992,265 @@ def _lineage_resolve(child_sid, child_name, holders, holder_index, dest, *,
         "dropped_keys": dropped_keys,
         "notes": notes,
     }
-    return {"link": link, "chain": chain, "lineage": lineage,
-            "edges": edges}
+    return {"child": child_sid, "link": link, "chain": chain,
+            "lineage": lineage, "edges": edges}
+
+
+
+# Step 7: no cycles, over both kinds of edge, and the order rows are written.
+
+def _lineage_edge_add(graph, src, dst):
+    graph.setdefault(src, set()).add(dst)
+
+
+def _lineage_existing_edges(dest):
+    """B's current conversation graph from its existing rows only:
+    {conversation: {target conversations}}. A planned row gives its identity
+    alone; its links are never read (a sync row's links are the source's, and
+    a refreshed row's old links are being replaced). Each existing row adds an
+    edge for its link and one for its chain when the target row is in
+    `dest.by_id`; a conversation with several rows gets the union. Never
+    raises."""
+    graph = {}
+    try:
+        by_id = dest.by_id
+        for r in list(by_id.values()):
+            if r.planned:
+                continue
+            src = _lineage_cli(r.data)
+            if src is None:
+                continue
+            for key, field in (("spawnedFrom", "sessionId"),
+                               ("startChain", "firstSessionId")):
+                ref = r.data.get(key)
+                if not isinstance(ref, dict):
+                    continue
+                sid = ref.get(field)
+                if not isinstance(sid, str):
+                    continue
+                trow = by_id.get(sid)
+                dst = _lineage_cli(trow.data) if trow is not None else None
+                if dst is not None:
+                    _lineage_edge_add(graph, src, dst)
+    except Exception:
+        pass
+    return graph
+
+
+def _lineage_reaches(graph, start, goal):
+    """True when `goal` is reachable from `start` (a node reaches itself).
+    Iterative."""
+    if start == goal:
+        return True
+    seen = {start}
+    stack = [start]
+    while stack:
+        n = stack.pop()
+        for m in graph.get(n, ()):
+            if m == goal:
+                return True
+            if m not in seen:
+                seen.add(m)
+                stack.append(m)
+    return False
+
+
+def _lineage_count_cycles(graph):
+    """Strongly connected components of two or more nodes, plus nodes linking
+    to themselves, each counted once. Iterative Tarjan."""
+    nodes = set(graph)
+    for ts in graph.values():
+        nodes.update(ts)
+    index = {}
+    low = {}
+    on_stack = set()
+    stack = []
+    counter = 0
+    cycles = 0
+    for root in sorted(nodes, key=str):
+        if root in index:
+            continue
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(sorted(graph.get(root, ()), key=str)))]
+        while work:
+            node, it = work[-1]
+            advanced = False
+            for m in it:
+                if m not in index:
+                    index[m] = low[m] = counter
+                    counter += 1
+                    stack.append(m)
+                    on_stack.add(m)
+                    work.append((m, iter(sorted(graph.get(m, ()), key=str))))
+                    advanced = True
+                    break
+                if m in on_stack:
+                    low[node] = min(low[node], index[m])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                low[parent] = min(low[parent], low[node])
+            if low[node] == index[node]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == node:
+                        break
+                if len(comp) > 1 or node in graph.get(node, ()):
+                    cycles += 1
+    return cycles
+
+
+def _lineage_note_into(res, code, detail):
+    notes = res["lineage"]["notes"]
+    if all(n["code"] != code for n in notes):
+        notes.append({"code": code, "detail": detail})
+
+
+def _lineage_clear_chain(res):
+    lin = res["lineage"]
+    res["chain"] = None
+    res["edges"]["root"] = None
+    lin["root_session"] = ""
+    lin["root_row"] = ""
+    lin["root_planned"] = False
+    lin["dropped_keys"] = [k for k in lin["dropped_keys"]
+                           if not str(k).startswith("startChain.")]
+
+
+def _lineage_drop_cycles(results, existing):
+    """Drop every proposed edge that would close a cycle, so the bytes and
+    the record agree. `results` maps (account, name) to a _lineage_resolve
+    result, for one destination account; `existing` is its
+    _lineage_existing_edges graph (not modified). Parent edges go in first,
+    then root edges, each in order of the child's conversation id, then the
+    row name. Returns the number of cycles among the existing edges alone.
+    Never raises."""
+    graph = {k: set(v) for k, v in (existing or {}).items()}
+    count = _lineage_count_cycles(graph)
+    try:
+        def order(item):
+            (acct, name), res = item
+            return (str(res.get("child") or ""), str(name), str(acct))
+
+        items = sorted(results.items(), key=order)
+        for (_acct, _name), res in items:
+            parent = res["edges"]["parent"]
+            if res["link"] is None or parent is None:
+                continue
+            child = res.get("child")
+            if child is None or _lineage_reaches(graph, parent, child):
+                lin = res["lineage"]
+                had_chain = res["chain"] is not None
+                res["link"] = None
+                res["edges"]["parent"] = None
+                lin["parent_session"] = ""
+                lin["parent_row"] = ""
+                lin["parent_planned"] = False
+                lin["carried_keys"] = []
+                lin["dropped_keys"] = []
+                _lineage_note_into(
+                    res, "lineage_cycle",
+                    "the link of {0} to {1} would close a cycle".format(
+                        _lineage_short(child), _lineage_short(parent)))
+                if had_chain:
+                    _lineage_clear_chain(res)
+                    _lineage_note_into(
+                        res, "lineage_chain_dropped",
+                        "the parent link was left out")
+            else:
+                _lineage_edge_add(graph, child, parent)
+        for (_acct, _name), res in items:
+            root = res["edges"]["root"]
+            if res["chain"] is None or root is None:
+                continue
+            child = res.get("child")
+            if child is None or _lineage_reaches(graph, root, child):
+                _lineage_clear_chain(res)
+                _lineage_note_into(
+                    res, "lineage_chain_dropped",
+                    "the chain root {0} would close a cycle".format(
+                        _lineage_short(root)))
+            else:
+                _lineage_edge_add(graph, child, root)
+    except Exception:
+        pass
+    return count
+
+
+def _lineage_write_order(rows, key):
+    """A stable topological order of one op's rows over planned targets: a row
+    whose `lineage` names a planned parent or root row in the same store comes
+    after it. `key(row)` gives (store_dir, filename). Ties keep input order,
+    rows without lineage keep their place, and rows left in a cycle are
+    appended in input order. Never raises."""
+    rows = list(rows)
+    n = len(rows)
+    try:
+        where = {}
+        for i, r in enumerate(rows):
+            try:
+                where.setdefault(tuple(key(r)), i)
+            except Exception:
+                pass
+        deps = [set() for _ in range(n)]
+        for i, r in enumerate(rows):
+            lin = r.get("lineage") if isinstance(r, dict) else None
+            if not isinstance(lin, dict):
+                continue
+            try:
+                store = key(r)[0]
+            except Exception:
+                continue
+            for rk, pk in (("parent_row", "parent_planned"),
+                           ("root_row", "root_planned")):
+                ref = lin.get(rk)
+                if lin.get(pk) is True and isinstance(ref, str) and ref:
+                    j = where.get((store, ref + ".json"))
+                    if j is not None and j != i:
+                        deps[i].add(j)
+        waiting = [len(d) for d in deps]
+        users = [[] for _ in range(n)]
+        for i, d in enumerate(deps):
+            for j in d:
+                users[j].append(i)
+        import heapq
+        ready = [i for i in range(n) if waiting[i] == 0]
+        heapq.heapify(ready)
+        out = []
+        done = set()
+        while ready:
+            i = heapq.heappop(ready)
+            out.append(i)
+            done.add(i)
+            for u in users[i]:
+                waiting[u] -= 1
+                if waiting[u] == 0:
+                    heapq.heappush(ready, u)
+        out.extend(i for i in range(n) if i not in done)
+        return [rows[i] for i in out]
+    except Exception:
+        return rows
+
+
+def _lineage_rewrite_post(post_b64, link, chain):
+    """Rewrite `spawnedFrom` and `startChain` in a row's bytes: a present key
+    keeps its position, an absent one is appended, a removed one (None) is
+    popped. Nothing else changes. Takes and returns base64."""
+    data = json.loads(unb64(post_b64))
+    for k, v in (("spawnedFrom", link), ("startChain", chain)):
+        if v is None:
+            data.pop(k, None)
+        else:
+            data[k] = v
+    return b64(json.dumps(data, separators=(",", ":")).encode())
 
 
 # ------------------------------------------------------------- 9. converge
