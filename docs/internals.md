@@ -1157,7 +1157,9 @@ the link report are how such a change is caught.
    renders no per-row notes of any kind. Its sync pane shows the same `link :` and `chain :`
    change lines as the CLI.
 5. `sync` keeps today's identity test ahead of the age holds, for a row whose source carries
-   neither `spawnedFrom` nor `startChain`. Taken literally, the spec's order would report such a
+   neither a `spawnedFrom` nor a `startChain` object. A key that is not an object, a null say,
+   names no row, to this test as to the resolver, the writer, the refresh's change lines and the
+   shape checks (R28). Taken literally, the spec's order would report such a
    byte-identical row under `--newer-only` as held, not unchanged. It writes nothing either way.
    A row whose source carries either takes the spec's path (narrowed in the final review, R21):
    identical bytes that carry the source account's link may name a row the destination lacks,

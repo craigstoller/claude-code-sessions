@@ -1124,3 +1124,9 @@ acceptance check runs on the maintainer's machine, with the app closed:
   - A shortened row id keeps its `local_` prefix and the first 8 characters after it (R18), so
     the Global Constraints' "first 8 characters" now holds for conversation ids and other values,
     and a row id no longer prints as the prefix and 2 characters.
+  - After the landing, R28 with m26 and m36: a `spawnedFrom` or `startChain` that is not an
+    object, a null say, names no row in three more places, as it already did to the resolver
+    and the writer. Those places are Departure 6's identity test, the refresh's `link :` and
+    `chain :` change lines, and the shape check's "agree with the bytes". So a byte-identical
+    row with null link keys is unchanged, and removing one reports no loss. An object without its
+    row id is still a link the lineage cannot read.

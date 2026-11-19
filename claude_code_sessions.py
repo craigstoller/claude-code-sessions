@@ -9187,11 +9187,14 @@ def _sync_same_apart_from_lineage(pre, post):
 
 
 def _sync_source_linked(data):
-    """True when a source row carries spawnedFrom or startChain, whatever
-    their values: plan_sync's step 1 leaves such a row to the lineage pass,
-    even when its bytes already equal the destination's. Never raises."""
-    return isinstance(data, dict) and ("spawnedFrom" in data
-                                       or "startChain" in data)
+    """True when a source row carries a spawnedFrom or startChain object:
+    plan_sync's step 1 leaves such a row to the lineage pass, even when its
+    bytes already equal the destination's. A key that is not an object (a
+    null, say) names no row, to the resolver and the writer alike, so it does
+    not count. Never raises."""
+    return isinstance(data, dict) and (
+        isinstance(data.get("spawnedFrom"), dict)
+        or isinstance(data.get("startChain"), dict))
 
 
 def _sync_link_name(data, key, inner):
@@ -9317,15 +9320,14 @@ def _sync_ref_change(pre, post, key, fields):
     the decoded rows PRE and POST. "dropped" when POST lacks it,
     "retargeted" when it names another row (FIELDS, compared in value and
     type alike, so a depth of True is not 1), else None. A destination value
-    that names no row (not a dict) can only be dropped. Never raises."""
-    if not isinstance(pre, dict) or key not in pre or not isinstance(post,
-                                                                    dict):
+    that is not an object (a null, say) names no row, so removing it changes
+    no link and is None. Never raises."""
+    if not isinstance(pre, dict) or not isinstance(pre.get(key), dict) \
+            or not isinstance(post, dict):
         return None
     if key not in post:
         return "dropped"
     old, new = pre[key], post[key]
-    if not isinstance(old, dict):
-        return None
 
     def names(v):
         return [(type(v.get(f)), v.get(f)) for f in fields] \
@@ -17436,9 +17438,11 @@ def _lineage_agreement_error(m, i, r, lin, names):
             ("spawnedFrom", "parent_row", "sessionId", "parent_planned"),
             ("startChain", "root_row", "firstSessionId", "root_planned")):
         want = lin[field]
-        if key in data:
-            v = data[key]
-            sid = v.get(inner) if isinstance(v, dict) else None
+        # A key that is not an object names no row, as it does to the
+        # resolver and the writer: such bytes carry no link (or chain).
+        v = data.get(key)
+        if isinstance(v, dict):
+            sid = v.get(inner)
             if not isinstance(sid, str) or not sid:
                 return "row {0} carries a {1} its lineage cannot read".format(
                     i, key)
@@ -17506,7 +17510,8 @@ def _lineage_shape_error(m):
                 except Exception:
                     data = None          # left to the readers, as above
                 if isinstance(data, dict) and (
-                        "spawnedFrom" in data or "startChain" in data):
+                        isinstance(data.get("spawnedFrom"), dict)
+                        or isinstance(data.get("startChain"), dict)):
                     return "row {0} carries a link and has no lineage" \
                         .format(i)
         return None

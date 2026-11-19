@@ -4392,8 +4392,7 @@ def test_sync_refresh_over_link_keys_that_name_no_row_reports_no_loss(
         assert r["link_change"] is None and r["chain_change"] is None
         post = _post(r)
         assert "spawnedFrom" not in post and "startChain" not in post
-        assert r["lineage"]["parent_row"] is None
-        assert r["lineage"]["root_row"] is None
+        assert r["lineage"]["parent_row"] == "" and r["lineage"]["root_row"] == ""
     assert ct._lineage_shape_error(m) is None
     rc, lines = _sync_main(env, monkeypatch, capsys, "--update")
     assert rc == 0
