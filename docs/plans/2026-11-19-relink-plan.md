@@ -27,18 +27,23 @@ disagreement is a defect to report, except the departures listed in "Departures 
 at the end.
 
 **Status:** reviewed in three rounds (Codex, agy, and the repo-aware DeepSeek and Kimi; see
-Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop's cap. Not built.
+Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop's cap. Amended
+once more for the pre-flight conflict scan (Revisions), also not re-reviewed. Not built.
 
 ## Global Constraints
 
 - **One module.** Production code goes in `claude_code_sessions.py`, in a new section
   `# ====== relink` placed after `cmd_converge` and before `if __name__ == "__main__":` (about line
-  18936), apart from the two lineage tables (Task 1), the parser and `main`'s handler (Task 6),
-  the ownership checks (Task 7), the undo and recovery dispatch (Tasks 8, 9) and one GUI line
-  (Task 8). Do not split either module.
+  18936), apart from the two lineage tables (Task 1); `_ANON_FIELDS`, `_ANON_STRUCTURAL_KEYS` and
+  `_identity_warning_lines` (Task 4); the parser, `main`'s handler, the shared RULING 5 helper
+  `_ruling5_recheck` and its two existing callers, `_realign_recheck` and `_converge_recheck`
+  (Task 6); `rotate_ops` and the three ownership checks (Task 7); the undo and recovery dispatch
+  (Tasks 8, 9); and one GUI line (Task 8). Do not split either module.
 - **Anchors.** Line numbers ("about line N") were taken before the transcript index reached
-  `main`, which added about 170 lines to the module, and they drift further as tasks land. Each
-  anchor also names its symbol, and the symbol wins.
+  `main`, which added about 170 lines to the module, and they drift further as tasks land. The
+  anchors the pre-flight scan added or re-checked (Task 1's second lineage pin, Task 4's console
+  fallback, Task 6's RULING 5 blocks and refusal tests, Task 7's Files and branch places) are at
+  `7c3f84b`. Each anchor also names its symbol, and the symbol wins.
 - **Line endings.** Tracked files are LF in git and CRLF in this working copy
   (`core.autocrlf=true`; `git ls-files --eol` shows `i/lf w/crlf` for the modules, README, internals
   and tests; the spec file is `w/lf`). Keep each file's working-copy endings and compare files by
@@ -94,13 +99,18 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
     `restored` (bool `True`), which means **no relink-written key remains at `new` on the row**.
     Undo and `back` set it only then (every key put back, already back at `old`, changed by the
     app, or the row gone). A row with a key still at `new` (a claimed key, a repointed row under
-    D19, an unreadable written row) stays unmarked, so its claim stands in `_relink_claims` and
-    the other ownership checks, whatever the op's status;
+    D19, an unreadable written row) stays unmarked. `restored` decides what `back` and undo
+    report, and which rows a live relink claims: a restored row never claims. Liveness is spec
+    D13's, `realign`'s test: an `undone` or `rolled_back` relink claims nothing, whatever its rows'
+    `restored`; a `completed` one claims its written rows not restored; a non-terminal one claims
+    every row it names that is not restored, written or not (Task 7);
   - per left-out row: `account`, `label`, `name`, `session_id`, `title`, `notes`
-    (`[{"code": str, "detail": str}]`, link code first, never empty);
+    (`[{"code": str, "detail": str}]`, link code first, never empty; Task 2, step 5);
   - `undo_left` and `back_left` entries: `{"name", "label", "what", "why"}`, `what` a key name or
-    `"the row"`. A row's entries are appended, and saved, before its `restored` mark is set or the
-    pass moves on, and an entry already present is not appended again (Tasks 8, 9).
+    `"the row"`. A row's entries are appended before its `restored` mark is set, and reach the disk
+    no later than that mark: `back` saves them before the mark (Task 9, step 4); undo saves them
+    with it, at the budget saver's tick or on the way out of any exception (Task 8, step 6). An
+    entry already present is not appended again (Tasks 8, 9).
 - **The `lineage` record** of a row to write. `*_planned` are always `False`.
   - `parent_row` is never empty: the `sessionId` of `spawnedFrom` in `new`, else in `kept`.
     `parent_session` is non-empty exactly when `parent_row` is, and `root_session` exactly when
@@ -169,8 +179,9 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
   refuses on its own, whether or not an operation is also open, with its own line, never an op
   id; every unreadable record is named: `<what> waits: the record(s) in <folders, sorted,
   comma-separated> could not be read, so whether they are unfinished cannot be told. Nothing was
-  changed.`, and for a journal folder that cannot be listed, `<what> waits: the journal folder
-  could not be listed (<error>). Nothing was changed.` When both apply, the refusal carries both
+  changed.`, and for a journal folder that exists and cannot be listed, `<what> waits: the journal
+  folder could not be listed (<error>). Nothing was changed.` A journal folder that does not exist
+  is no operations, as `list_ops` reads it (Task 3). When both apply, the refusal carries both
   lines, the open operations' first. Undo and recovery pass their own op id as `mine`, so a
   relink never waits on itself; the plan and the apply have no op yet and pass none.
 - **Containment roots come from discovery, at every mutation route.** The apply
@@ -196,7 +207,7 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
   fail=0; for t in tools/check_*.py tools/native-host-measurement/check_watch_ceremony.py; do python "$t" >/dev/null 2>&1 || { echo "FAIL $t"; fail=1; }; done; [ "$fail" = 0 ] && echo "checks: all passed"
   ```
 
-  The base is 1275 passed, measured at `eb7748a` on 2026-11-19 (the design commit adds no test).
+  The baseline is 1460 passed and 18 of 18 check scripts, at `7c3f84b`, 2026-11-19 14:42.
   Never pipe a suite through `tail` in a chain that hides its exit code.
 - **A name already taken.** 0.18.0's apply-time lineage pass is also called "relink":
   `_converge_recheck(..., relink=False)`, `_converge_relink` and `_sync_relink`. They are unrelated
@@ -249,7 +260,8 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
 - Modify: `claude_code_sessions.py` - `LINEAGE_PHRASES` and `LINEAGE_LEFT_OUT` (about 15557 and
   15582); the new relink section (constants and helpers below).
 - Modify: `tests/test_lineage.py` - `test_note_codes_phrases_and_left_out_set_match_the_table_exactly`
-  (about 716).
+  (about 716), and `test_lineage_record_has_every_field_with_its_type_and_no_repeated_code`
+  (about 353), whose `len(ct.LINEAGE_LEFT_OUT) == 11` (about 382) becomes `13`.
 - Modify: `tests/test_realign.py` - `_OP_TYPE_BRANCHES`, `_op_type_branches`, and its test (about
   845 to 908).
 - Create: `tests/test_relink.py`.
@@ -277,7 +289,8 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
   `("lineage_no_app_link", "no app-written link backs it")` right after the
   `lineage_source_changed` pair, and `("own_chain_differs", "the row's own chain disagrees with its
   holders'")` right after `lineage_chain_dropped`; the expected `LINEAGE_LEFT_OUT` gains
-  `"own_link_differs"` and `"lineage_no_app_link"`. Create `tests/test_relink.py` with the module
+  `"own_link_differs"` and `"lineage_no_app_link"`, and the second pin's count of the left-out set
+  goes from 11 to 13. Create `tests/test_relink.py` with the module
   docstring (the spec path, fake cast only), the autouse `_reset` fixture `test_realign.py` uses,
   and:
 
@@ -357,8 +370,9 @@ def test_row_bytes_are_compact_json():
   claims it, as any terminal op does`, `names it`); Task 8 `undo_relink` (`its own type`, `names
   it`) and flips the GUI pair to `(True, True)`.
 - [ ] **Step 2:** Run `python -m pytest -q -p no:cacheprovider tests/test_relink.py
-  tests/test_lineage.py tests/test_realign.py`. Expected: the new relink tests and the phrase pin
-  fail (names not defined, table mismatch); the inventory test passes in its new shape.
+  tests/test_lineage.py tests/test_realign.py`. Expected: the new relink tests and both lineage
+  pins fail (names not defined, table mismatch, count 11); the inventory test passes in its new
+  shape.
 - [ ] **Step 3: Implement** the three table entries and the Produces list.
 - [ ] **Step 4:** Run the three files, then both full suites. Expected: all pass.
 - [ ] **Step 5: Commit** the tests first, then the code.
@@ -373,7 +387,7 @@ def test_row_bytes_are_compact_json():
 - Consumes: Task 1; `LineageRow`, `_lineage_index`, `_lineage_named_conversation`,
   `_lineage_resolve`, `_lineage_existing_edges`, `_lineage_drop_cycles`, `_lineage_clear_chain`,
   `_lineage_note_into`, `_lineage_variant_ok`, `_lineage_task_ok`, `_lineage_stem`,
-  `_lineage_short`, `_RetitleRow`.
+  `_lineage_short`, `_RetitleRow`, `iter_transcripts` (for `_relink_tids`).
 - Produces:
   - `_relink_tids(env) -> set` - the transcript stems under `env.projects_root`, once.
   - `_relink_judge(lrows: list, index: dict) -> tuple` - D12 over every row of one conversation,
@@ -479,7 +493,11 @@ def test_row_bytes_are_compact_json():
    _lineage_drop_cycles(results_B, _lineage_existing_edges(index[B]))`. A link proposal whose link
    it dropped is left out (`lineage_cycle`, with `lineage_chain_dropped` when it carried a chain); a
    chain-only proposal whose chain it dropped is left out; a link kept with its chain dropped is
-   written with the chain code in its notes.
+   written with the chain code in its notes. Every left-out entry's notes are then put link code
+   first: a stable sort that moves `lineage_chain_dropped` and `own_chain_differs` behind every
+   other code, the order otherwise kept. The resolver can append `lineage_chain_dropped` before
+   `_lineage_drop_cycles` appends `lineage_cycle`, and the counting and the report read the first
+   note's code.
 6. Each surviving proposal becomes a row (Global Constraints, journal fields): `new` holds the
    written keys; `old[k] = {"present": k in data, "value": data.get(k)}`; `kept` the row's object
    keys; `post = _relink_apply_new(data, new)`; `pre_sha256 = _relink_sha(rec.raw)`,
@@ -496,6 +514,9 @@ def test_row_bytes_are_compact_json():
 LQ = "0abc0000-7777-4000-8000-000000000011"   # another parent; never a real id
 LR = "0bbb0000-6666-4000-8000-00000000000b"   # a chain root
 CHAIN = {"firstSessionId": "local_r1", "depth": 2}
+APP_KEYS = {"cwd": "C:/work/northwind", "model": "model-x", "permissionMode": "default",
+            "lastFocusedAt": 1700000000000, "folderPlace": None, "isArchived": False}
+            # the app's other row keys, fake values; Tasks 2 and 6 pass them as per-row keys
 
 def tool_link(row_id): return {"sessionId": row_id, "taskId": TASK}
 
@@ -543,7 +564,7 @@ def test_a_kept_link_record_names_the_kept_target_not_the_pick(...):
     # "local_p3" (never "local_p3b"), parent_session == LP, carried_keys == ["sessionId",
     # "taskId", "title", "sideSession"], dropped_keys == []; parent_title is local_p3's title
 def test_a_chain_only_repair_counts_the_rows_own_app_written_link(...):
-    # link=tool_link("local_p1"), chain=CHAIN, local_c3 keeps side_link("local_p3"):
+    # link=tool_link("local_p1"), chain=CHAIN, roots=True, local_c3 keeps side_link("local_p3"):
     # local_c3 gains the chain; local_c2 gains its link (local_c3 backs it) and its chain
 def test_a_kept_link_with_another_parent_is_the_conversations_disagreement(...):
     # LQ rows local_q1..3; local_c3 keeps side_link("local_q3") -> rows == [];
@@ -605,6 +626,10 @@ def test_every_reachable_0_18_reason_reaches_the_plan(code, row, setup, ...):
     # parent_pair_held and lineage_source_changed cannot arise (relink holds nothing; it is sync's)
 def test_cycles_are_dropped_against_existing_edges_a_kept_link_counting(...):
     # local_p2 keeps side_link("local_c2") -> local_c2 ["lineage_cycle"]; local_c3 planned
+def test_a_left_out_entrys_link_code_comes_first(...):                  # step 5's reorder
+    # chain=CHAIN, roots=True; local_r2 removed, so the resolver drops local_c2's chain first;
+    # local_p2 keeps side_link("local_c2"), so the cycle pass then drops its link -> local_c2's
+    # codes == ["lineage_cycle", "lineage_chain_dropped"], in that order
 def test_a_left_out_rows_link_still_counts_in_the_cycle_graph(...):
     # A3: local_p3 -> local_q3, local_q3 -> local_c3; local_q1 -> local_p1 so LQ's links disagree
     # and every LQ row is left out; local_c3 is still left out ["lineage_cycle"]
@@ -628,7 +653,7 @@ def test_a_titled_link_with_an_empty_title_is_not_app_written(cleared_in, code, 
     #     holder yielding the parent is the empty-title link, the resolver produces no link
     #     -> local_c2 left out ["lineage_variant"] (the resolver's own note stands)
 def test_the_new_value_is_the_old_with_only_the_written_keys_set(...):
-    # local_c2 with APP_KEYS (cwd, model, permissionMode, lastFocusedAt, folderPlace, isArchived):
+    # local_c2=APP_KEYS (cwd, model, permissionMode, lastFocusedAt, folderPlace, isArchived):
     # post = ct._relink_apply_new(data, new); {k: post[k] for k in data} == data;
     # list(post) == list(data) + ["spawnedFrom"]
 def test_a_key_not_written_keeps_its_null(...):
@@ -664,11 +689,14 @@ def test_a_stem_mismatched_row_is_repaired_and_never_a_target(...):     # Review
     `env.ops_dir` that is a directory holding `manifest.json`, each read on its own (`None` when it
     cannot be read, is not an object, or has no string `op_id`), rerooted as `list_ops` reroots.
     Files (the `lock` among them) and folders without `manifest.json` are not operations. A journal
-    folder that cannot be listed raises `OSError` to its callers, which word it. Used here for D18
-    and in Task 7 for claims.
+    folder that does not exist is no operations (`[]`), as `list_ops` reads it: only
+    `acquire_lock` creates it, so a machine where no mutating command has run has none. A journal
+    folder that exists and cannot be listed raises `OSError` to its callers, which word it. Used
+    here for D18 and in Task 7 for claims.
   - `_relink_open_others(env, mine="") -> tuple` - `(op ids, unreadable)`: the op ids of
     non-terminal operations other than `mine`, and the folder names of every record that could not
-    be read (or the listing error, for a journal folder that could not be listed). Never raises.
+    be read (or the listing error, for a journal folder that exists and could not be listed; a
+    missing one gives `([], [])`). Never raises.
   - `_relink_refuse_open(env, what, mine="") -> None` - the D18 refusal (Global Constraints),
     raised when any other op is open or any record (or the journal folder) could not be read, each
     condition on its own: the op-id sentence for open ops, and one line naming every unreadable
@@ -753,6 +781,11 @@ def test_an_unreadable_candidate_holder_target_or_kept_target_refuses(bad, ...):
     # Refusal "could not be read" naming bad + ".json"
 def test_an_account_in_two_org_folders_refuses(...):         # a row for A2 under O4 too ->
                                                              # "more than one org directory"
+def test_a_missing_journal_folder_means_no_operations(...):
+    # shutil.rmtree(env.ops_dir) (mkenv always creates it) -> plan_relink plans local_c2 and
+    # local_c3 as usual, no Refusal; ct._relink_open_others(env) == ([], []) and
+    # ct._relink_load_ops(env) == []. A journal path that exists but is a file -> Refusal
+    # "the journal folder could not be listed"
 def test_an_unfinished_operation_refuses_the_plan(...):
     # a hand-made manifest {"op_id": "20990101T000000Z-aaaaaa", "status": "writing", ...} ->
     # Refusal "relink waits while another operation is unfinished (20990101T000000Z-aaaaaa)"
@@ -861,8 +894,11 @@ def test_the_anonymized_projection_hides_titles_paths_and_both_filters(...):
     # ["parent_title"] start "<session-", no "store_path"/"dest_path", rows[0]["account"] == A2[:8]
     # + "…", "Northwind" and "ACME" absent from json.dumps(out)
 def test_odd_titles_survive_the_report_and_the_anonymized_json(...):    # Review Focus
-    # titles "Café ☕ Northwind" and "left_out": the report printed through a cp1252 say() with
-    # cmd_relink's replace fallback raises nothing; under --anonymize out["left_out"] is a list
+    # titles "Café ☕ Northwind" and "left_out": the report printed through the test's own say(),
+    # built on cmd_realign's fallback (about 14360 to 14366) over a strict cp1252
+    # io.TextIOWrapper(io.BytesIO()) monkeypatched in as sys.stdout, raises nothing (cmd_relink is
+    # Task 6's, which adds the end-to-end console check); under --anonymize out["left_out"] is a
+    # list
 def test_a_title_equal_to_a_schema_value_corrupts_neither_report(...):
     # the child titled "spawnedFrom", the parent "parent_not_in_account", local_p3 removed;
     # ct._ANONYMIZE = True: pub rows' "adds" == ["spawnedFrom"], left_out notes' codes ==
@@ -922,6 +958,11 @@ def test_a_title_equal_to_a_schema_value_corrupts_neither_report(...):
     step, the same text it gives `_relink_put`), `tick(self) -> None` (saves while the budget
     lasts; an `OSError` from the save is `Refusal("could not save the operation record in <op_dir>
     (<error>). " + then)`, never a traceback) and attributes `per_save`, `left`.
+- **The `op_type` inventory.** `tests/test_realign.py::_op_type_branches` lists every function that
+  holds `.get("op_type")` or `["op_type"]` in a comparison, or a name bound from either, and the
+  inventory test fails on any function without a row. Neither `_relink_shape_error` nor
+  `_RelinkSaver` compares `op_type`: the shape check reads the fields above, never `op_type`, since
+  the dispatch that reached it has already chosen relink. Neither opens a row (Task 6's rule).
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -984,17 +1025,34 @@ def test_the_saver_saves_per_row_while_the_budget_lasts(monkeypatch, ...):
 
 **Files:**
 - Modify: `claude_code_sessions.py` - the relink section; `build_parser` (a `relink` parser right
-  after `realign`'s, about 5730); `main`'s handlers (about 6149).
+  after `realign`'s, about 5730); `main`'s handlers (about 6149); a new `_ruling5_recheck` beside
+  `_identity_disagreement`, and its two existing callers, `_realign_recheck` (its RULING 5 block,
+  about 13458 to 13468) and `_converge_recheck` (about 18122 to 18136), whose blocks it replaces.
 - Modify: `tests/test_journal_reroot.py` - `_ROW_READERS` (about 899).
 - Test: `tests/test_relink.py`.
 
 **Interfaces:**
 - Consumes: Tasks 1 to 5; `_guard_mutation`, `NEW_ROW_STORE`, `acquire_lock`, `release_lock`,
   `new_op`, `set_status`, `rotate_ops`, `_retitle_roots`, `_retitle_contained`,
-  `_strict_row_dict`, `atomic_write`, `_maybe_crash`, `redact`, and `_realign_recheck`, whose
-  RULING 5 refusal `_relink_recheck` words the same way (with `relink --live`), so the two
-  commands do not drift.
+  `_strict_row_dict`, `atomic_write`, `_maybe_crash`, `redact`, `_identity_disagreement`.
 - Produces:
+  - `_ruling5_recheck(env, m, command: str, tail: str = "") -> None` - the one RULING 5 check of
+    the apply-time rechecks: `dis = _identity_disagreement(env)`; when `dis` and
+    `(m.get("live_asserted") or "") not in dis`, `Refusal("~/.claude.json ({0}) and config.json
+    ({1}) disagree about the signed-in account (RULING 5). The designed remedy is to assert which
+    account the desktop app is on and re-plan:\n   claude-code-sessions <command> --live <email,
+    or acct/org as reports print it> --apply\nIf it is the CLI's record that is stale,
+    re-authenticating the CLI as the desktop's account (run 'claude', then /login) also clears
+    this." + (" " + tail if tail else "") + " Nothing was written.")`, ids by 8 characters.
+    `_realign_recheck` calls it with `"realign"` and `_converge_recheck` with `"converge"` and its
+    tail (`Switching the desktop app may not - config.json has been measured both tracking a
+    switch (2026-08-02) and keeping the previous account across one (2026-08-29) - and
+    re-authenticating never writes it. --live exists for exactly that case.`), each message
+    byte-identical to today's; converge's comment on why the remedies are ordered moves with its
+    tail. The existing tests of both refusals (`tests/test_realign.py` about 363,
+    `tests/test_converge.py` about 1306) stay unchanged; they match substrings, so Step 1 also adds
+    a test pinning both full messages, which passes before the helper exists and must pass after
+    it. Relink is the third caller, so the three commands cannot drift apart.
   - `RELINK_GUARD_WHY = ("The app holds these rows in memory and rewrites them on focus, so a key
     written underneath it is whatever the app decides later, not what you wrote")`.
   - `_relink_read(r, roots) -> tuple` - `_retitle_contained(r, roots)` first (its `LayoutError`
@@ -1008,17 +1066,21 @@ def test_the_saver_saves_per_row_while_the_budget_lasts(monkeypatch, ...):
     returning `True` when it is `"present"` with a value equal to `value`, else `False`. What a
     `False` does is the caller's, each route stating its own (the apply and forward mark and
     raise; undo and `back` leave the row unmarked and raise). `then` is the caller's own next step,
-    every one runnable: the apply's and forward's `The op is left at 'writing' - 'recover --resolve
-    <op_id> --back --apply' takes out what landed.`, undo's `The relink stays 'completed'; run
-    'undo --apply' again to finish it.`, back's `The op is left at '<status>' - run 'recover
-    --resolve <op_id> --back --apply' again; it picks up where this stopped.`
+    every one runnable: the apply's and forward's `The op is left at '<status>' - 'recover
+    --resolve <op_id> --back --apply' takes out what landed.`, undo's `The relink stays
+    'completed'; run 'undo --apply' again to finish it.`, back's `The op is left at '<status>' -
+    run 'recover --resolve <op_id> --back --apply' again; it picks up where this stopped.`
+    `<status>` is the op's status when the text is built, never a fixed word: the apply's is
+    `writing`, but forward can run on an op that Task 6's status-save refusal left at
+    `journaled`.
   - `_relink_row_agrees(r, data: dict) -> bool` - the journal agrees with the row it names
     (D15 leaves no image to fall back on): for each key of `r["new"]`, `old[key]["present"]` is
     `key in data`, and when present `data[key]` is not an object and `_relink_same(data[key],
     old[key]["value"])`; and `_relink_sha(_relink_row_bytes(_relink_apply_new(data,
     r["new"]))) == r["post_sha256"]`. Never raises (`False`).
-  - `_relink_recheck(env, m) -> None` - under the lock, before `new_op`: RULING 5 as
-    `_realign_recheck` words it with `relink --live`; then `fresh = plan_relink(env,
+  - `_relink_recheck(env, m) -> None` - under the lock, before `new_op`:
+    `_ruling5_recheck(env, m, "relink")`, realign's wording with `relink --live`; then `fresh =
+    plan_relink(env,
     RelinkFlags(only=m["only"], account=m["account_filter"], live=m["live_asserted"]))` (its
     refusals refuse the run, nothing journaled); then `m["since_plan"]` by `(account, name)`:
     `changed` rows in both whose `new` differs (`_relink_same`), `dropped` in the plan only,
@@ -1101,6 +1163,17 @@ common(rl)
   - `_ROW_READERS` gains `"_relink_read": "checks the row with _retitle_contained first; the apply
     reads only rows its own locked plan scanned, undo_relink refuses unresolved rows first, and
     recover_op passes them in to be skipped"`.
+  - **The row-reader inventory.**
+    `tests/test_journal_reroot.py::test_every_row_reader_goes_through_the_gate` (about 945 to 968)
+    counts a function as a row reader when it calls `_sync_row_drift`,
+    `_row_state` or `ensure_contained` by name, or calls `open` with a first argument subscripted
+    by the constant `"path"` or `"dest_path"`, and fails unless the readers are exactly
+    `_ROW_READERS`. So `_relink_read` opens the row as `open(r["dest_path"], "rb")`, that subscript
+    literally: opening the path `_retitle_contained` returns would not be seen, and the listed
+    entry would then fail the test. No other function of this task opens a row or calls those
+    three: `_relink_put` writes through `atomic_write` and reads back through `_relink_read`. No
+    function of this task compares `op_type` (Task 5's rule); `cmd_relink` and `run_relink` have
+    no need to.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -1112,7 +1185,7 @@ def test_apply_writes_each_row_and_journals_it(...):
     # every row written is True (a bool) and has no "restored"; post_sha256 ==
     # sha256(open(dest_path, "rb").read()); no row key ends with "_b64"
 def test_a_row_with_many_app_keys_keeps_all_of_them_in_order(...):
-    # APP_KEYS row: list(after) == list(before) + ["spawnedFrom"], every other value equal
+    # local_c2=APP_KEYS: list(after) == list(before) + ["spawnedFrom"], every other value equal
 def test_an_unfinished_operation_refuses_the_apply_and_journals_nothing(...)
 def test_a_row_changed_after_the_locked_plan_refuses_and_leaves_writing(...):
     # crash hook at "relink-mid-rows" rewrites local_c3 (lastFocusedAt) and returns; run_relink
@@ -1123,9 +1196,10 @@ def test_a_store_path_that_is_not_the_rows_folder_is_unsafe(...):
 def test_a_row_repointed_mid_run_refuses(...):            # hook repoints local_c3 -> "now opens
                                                           # another conversation"
 def test_the_verify_is_by_value(monkeypatch, ...):
-    # atomic_write patched to write {"cliSessionId": LC} -> LayoutError "verify failed";
-    # rows[0]["written"] is True in the manifest on disk (marked and saved before the raise);
-    # the op is at "writing"
+    # atomic_write wrapped so that for local_c2's path only it writes {"cliSessionId": LC};
+    # every other path, the manifest's among them (new_op and save_manifest write through it),
+    # goes to the real one -> LayoutError "verify failed"; rows[0]["written"] is True in the
+    # manifest on disk (marked and saved before the raise); the op is at "writing"
 def test_a_record_that_does_not_match_its_row_is_not_written_from(...):
     # crash hook at "relink-mid-rows" edits op rows[1]["old"]["spawnedFrom"] to {"present": True,
     # "value": "x"} -> LayoutError "does not match row local_c3.json"; local_c3 unchanged
@@ -1142,7 +1216,10 @@ def test_a_journal_that_cannot_be_written_refuses_before_any_row(monkeypatch, ..
     # operation record", the op left at "journaled". Either way local_c2 and local_c3 are
     # byte-identical to before, and cmd_relink(apply) returns 1 through main without a traceback
 def test_the_apply_replans_under_the_lock_and_says_what_changed(capsys, ...):
-    # plan; then local_p3 removed and a second child LD (rows in A1 linked, A2 unlinked) added;
+    # cmd_relink plans and applies in one call, so the store changes between the two through a
+    # monkeypatched acquire_lock, as in
+    # test_a_locked_replan_that_leaves_nothing_says_so_after_the_result: it removes local_p3 and
+    # adds a second child LD (rows in A1 linked, A2 unlinked), then takes the real lock;
     # cmd_relink(apply) -> m["since_plan"] == {"changed": 0, "dropped": 1, "gained": 1};
     # out contains "links   : 2 added, 1 left out (no row for the parent in that account 1);
     # since the plan: 1 dropped, 1 gained"
@@ -1161,6 +1238,19 @@ def test_rows_left_out_still_exit_0_and_json_carries_the_result(capsys, ...):
     # local_p3 removed; --apply --json -> 0, json "result" == "completed", left_out non-empty
 def test_the_help_texts(...):
     # build_parser()'s relink subparser: the five options' help strings as in the plan
+def test_odd_titles_print_through_cmd_relink_on_a_cp1252_console(monkeypatch, ...):
+    # Task 4's titles ("Café ☕ Northwind", "left_out"); sys.stdout monkeypatched to a strict
+    # cp1252 io.TextIOWrapper(io.BytesIO()); cmd_relink dry run returns 0, no traceback; the
+    # bytes decode as cp1252 and hold "Caf" with the emoji replaced (cmd_relink's own fallback)
+@pytest.mark.parametrize("command", ["realign", "converge", "relink"])
+def test_the_ruling5_refusal_is_one_text_per_command(command, ...):
+    # identity_files(env, A1, A2); m = {"live_asserted": ""}; the command's recheck
+    # (_realign_recheck, _converge_recheck, _relink_recheck) raises Refusal whose str() equals,
+    # byte for byte, the literal message: for realign and relink, realign's as at 7c3f84b (about
+    # 13461 to 13468) naming that command; for converge, converge's as at 7c3f84b (about 18125
+    # to 18136). The realign and
+    # converge cases pass before _ruling5_recheck exists and must pass after it; relink's fails
+    # until Task 6
 def test_a_rerun_adds_only_what_the_first_run_made_resolvable(capsys, ...):   # Review Focus
     # (a) the base store: apply, then a second cmd_relink --apply prints "nothing to add", and the
     # journal holds one op. (b) Codex's two-account store: P, C and LR rows in A1 and A2;
@@ -1172,14 +1262,17 @@ def test_a_rerun_adds_only_what_the_first_run_made_resolvable(capsys, ...):   # 
 ```
 
   Also run `tests/test_journal_reroot.py::test_every_row_reader_goes_through_the_gate`.
-- [ ] **Steps 2 to 5** as in Task 2.
+- [ ] **Steps 2 to 5** as in Task 2, except that at Step 2 the realign and converge cases of
+  `test_the_ruling5_refusal_is_one_text_per_command` already pass: they guard the move of both
+  blocks into `_ruling5_recheck`, and Step 4 runs them again with `tests/test_realign.py` and
+  `tests/test_converge.py`.
 
 ### Task 7: Claims, and the other operations' ownership checks
 
 **Files:**
-- Modify: `claude_code_sessions.py` - the relink section; `rotate_ops` (about 1299);
-  `_repoint_claimed_later` (about 10437); `_retitle_claimed_elsewhere` (about 12310);
-  `_realign_claimed_later` (about 13666).
+- Modify: `claude_code_sessions.py` - the relink section; `rotate_ops` (about 1397);
+  `_repoint_claimed_later` (about 10576); `_retitle_claimed_elsewhere` (about 12449);
+  `_realign_claimed_later` (about 13805). Line numbers at `7c3f84b`.
 - Modify: `tests/test_realign.py` - `_OP_TYPE_BRANCHES` rows and flips (Task 1's table).
 - Test: `tests/test_relink.py`.
 
@@ -1189,34 +1282,49 @@ def test_a_rerun_adds_only_what_the_first_run_made_resolvable(capsys, ...):   # 
 - Produces:
   - `_relink_claims(env, m, rows) -> list` - D13, `[{"row": r, "op_id": str, "keys": set,
     "why": str}]`, one entry per claimed row and claimant; `keys` the claimed subset of `r["new"]`.
-    NEVER RAISES. A journal folder that cannot be listed claims every row asked about. For every
-    loaded operation other than `m`'s own:
+    NEVER RAISES. A journal folder that does not exist claims nothing (Task 3); one that exists
+    and cannot be listed claims every row asked about. For every loaded operation other than
+    `m`'s own:
     - `None` (unreadable), or rows that are not a list of objects with string paths: claims every
       row asked about, all keys, `why` `its record cannot be read`;
     - a sort key that cannot be computed counts as later; an earlier operation: nothing;
-    - any type but `relink` whose status is `undone` or `rolled_back`: nothing;
+    - any type whose status is `undone` or `rolled_back`: nothing, a relink included, whatever
+      its rows' `restored` (spec D13, `realign`'s liveness test: an undone or rolled-back op has
+      withdrawn its claim);
     - `realign`: nothing (it writes other keys);
-    - `relink`, whatever its status (`restored` alone says a row was put back; a row with a key
-      still at `new` stays unmarked after undo or back, and its claim stands): per row with the
-      same normalised `dest_path`, not `restored`, and `written` or the op non-terminal: the keys
-      of `r["new"]` it wrote or kept (`set(orow["new"]) | set(orow["kept"])`), when any;
+    - `relink`, `completed` or non-terminal: per row with the same normalised `dest_path`, not
+      `restored`, and `written` or the op non-terminal: the keys of `r["new"]` it wrote or kept
+      (`set(orow["new"]) | set(orow["kept"])`), when any. `restored` matters only here, inside a
+      relink that is still live;
     - `move` and `undo` (`_realign_claimed_later`'s "moveish" rule): every row they name, by its
       `path`, flag or not, all keys. Their rows carry `path`, `pre_b64`, `post_b64` and
       `rewritten`, never `written` (`plan_move`, `plan_undo`), so a flag test would miss them;
     - any other type: per row with the same path (`_journal_rows`), when the row is `written` or
       the op is non-terminal: all keys.
   - `rotate_ops`: `claimants = ("sync", "retitle", "realign", "relink")`.
-  - `_retitle_claimed_elsewhere`: a new `relink` branch, taken on `op_type` before the generic
-    loop, in a `try` of its own whose failure is a claim (returns the relink's op id), never the
-    function's broad `except` that returns `None`. In it: a sort key that cannot be computed, rows
-    that are not a list of objects, or a row whose `dest_path` is not a string claims; the relink
-    is passed over when `_op_sort_key(om) < _op_sort_key(m)`; a row marked `restored` is passed
-    over, whatever the relink's status (its undo or back leaves a row unmarked exactly when a key
-    stays at `new`); otherwise a `written` row with the same path claims when its `post_sha256` is
-    not a string or equals `hashlib.sha256(post).hexdigest()`.
+  - **Where the two relink branches sit.** In both functions the branch is the first thing in the
+    `for o in list_ops(env)` loop after the `oid == mine` test, ahead of every status filter and of
+    the generic row loop: in `_repoint_claimed_later` the `oid == mine` test and the `status not
+    in TERMINAL` filter share one `if` (about 10613), which is split into `if oid == mine:
+    continue`, then the relink branch, then `if om.get("status") not in TERMINAL: continue`; in
+    `_retitle_claimed_elsewhere` the branch goes between `if oid == mine: continue` (about 12478)
+    and the `undone`/`rolled_back` filter (about 12480). Each branch ends in `continue`, so a relink
+    never reaches the generic loop, and applies its own status rule. Placed after a status filter,
+    a malformed relink would reach the generic loop and its broad `except`, which returns `None`.
+  - `_retitle_claimed_elsewhere`: a new `relink` branch, taken on `op_type`, in a `try` of its own
+    whose failure is a claim (returns the relink's op id), never the function's broad `except`
+    that returns `None`. In it: a sort key that cannot be computed, rows that are not a list of
+    objects, or a row whose `dest_path` is not a string claims; the relink is passed over when
+    `_op_sort_key(om) < _op_sort_key(m)`, or when its status is `undone` or `rolled_back` (spec
+    D13; as the generic loop passes any withdrawn op over); a row marked `restored` is passed over;
+    otherwise a `written` row with the same path claims when its `post_sha256` is not a string or
+    equals `hashlib.sha256(post).hexdigest()`.
   - `_repoint_claimed_later`: the same shape of branch (its own `try`, malformed is a claim); a
-    `relink` op counts only when `_op_sort_key(om) > _op_sort_key(m)` and the row is `written` and
-    not `restored`, whatever the relink's status.
+    `relink` op counts only when `_op_sort_key(om) > _op_sort_key(m)`, its status is not `undone`
+    or `rolled_back` (spec D13 and the spec's Integration section: "not undone"), and the row is
+    not `restored` and is `written` or the relink is non-terminal (`_relink_claims`' rule; under
+    D18 a later relink cannot be open beside a non-terminal repoint, so in practice the row is
+    `written`).
   - `_realign_claimed_later`: `continue` past a `relink` op on `op_type`, before any of its rows is
     read (D13's per-key exception: a relink never writes realign's keys). So a malformed relink
     manifest claims nothing here and cannot reach the broad `except` either; the test pins that it
@@ -1245,23 +1353,26 @@ def test_a_later_relink_claims_only_the_keys_it_wrote_or_kept(...):
 def test_a_later_realign_claims_nothing(...)
 def test_a_non_terminal_later_op_naming_the_row_claims_it_written_or_not(...)
 def test_an_earlier_or_withdrawn_op_and_a_restored_row_claim_nothing(...):
-    # an earlier sync; a later sync "undone"; a later relink "rolled_back" whose rows are all
-    # restored; a later completed relink whose row is restored -> []
-def test_a_later_relink_row_left_unrestored_claims_whatever_its_status(...):
+    # an earlier sync; a later sync "undone"; a later relink "rolled_back"; a later completed
+    # relink whose row is restored -> []
+def test_an_undone_or_rolled_back_relink_claims_nothing_whatever_its_rows(...):     # spec D13
     # a later relink "undone" (and, separately, "rolled_back") whose local_c2 row is written and
-    # not restored, its spawnedFrom left at new -> one entry naming it, keys {"spawnedFrom"}
+    # not restored, its spawnedFrom left at new -> []; the same manifest "completed" -> one entry
+    # naming it, keys {"spawnedFrom"}
 @pytest.mark.parametrize("bad", ["{not json", '{"op_id": "x", "rows": "nope"}',
                                  '{"op_id": "x", "status": "completed", "rows": [5]}'])
 def test_an_unreadable_or_damaged_manifest_claims_every_row_without_crashing(bad, ...)
 def test_the_lock_file_and_stray_entries_are_not_operations(...):      # Review Focus
-    # ops_dir holds "lock", an empty folder and "notes.txt" -> _relink_claims == []
+    # ops_dir holds "lock", an empty folder and "notes.txt"; _relink_claims(env, m, [local_c2's
+    # row]) == [] (at least one row asked about, so an empty answer is not vacuous)
 def test_retitle_claim_passes_an_earlier_relink_and_a_restored_row(...):
     # _retitle_claimed_elsewhere(env, retitle_m, r) is None for an earlier relink with the same
-    # post_sha256; a later relink with the same post_sha256 claims; restored passes
-def test_repoint_claim_counts_only_a_later_unrestored_relink(...):
+    # post_sha256; a later relink with the same post_sha256 claims; restored passes; a later
+    # "undone" or "rolled_back" relink with the same post_sha256 and the row unrestored -> None
+def test_repoint_claim_counts_only_a_later_unrestored_relink_not_undone(...):
     # earlier relink -> None; later completed written -> its op_id; later with the row restored
-    # -> None; later "undone" with the row restored -> None, with the row left unrestored -> its
-    # op_id
+    # -> None; later "undone" (and "rolled_back") -> None, with the row restored and with it left
+    # unrestored alike (spec D13)
 def test_realign_claim_passes_a_later_relink(...)
 @pytest.mark.parametrize("damage", ['"rows": "nope"', '"rows": [5]',
                                     'a row whose dest_path is 7'])
@@ -1330,7 +1441,8 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(...):
        `_maybe_crash("relink-undo-before-mark")`; then `restored = True` only when no
        relink-written key remains at `new` on the row (every key put back, already at `"old"`, or
        changed by the app, or the row gone). A repointed row whose key is still at `new` keeps its
-       entry and stays unmarked, so its claim stands after the undo (Global Constraints). Then
+       entry and stays unmarked, so the record says the key was not taken out; once the op is
+       `undone` it claims nothing (spec D13, Global Constraints). Then
        `saver.tick()`. A write `OSError` refuses with undo's `then`; the rows already done keep
        their entries and marks on disk, and `undo --apply` again resumes.
     7. `set_status(op, "undone")`; `rotate_ops`. No link report (spec, `undo` step 4).
@@ -1357,9 +1469,17 @@ def test_undo_leaves_and_names_a_key_the_app_changed(capsys, ...):
 @pytest.mark.parametrize("change", ["gone", "repointed"])
 def test_undo_skips_and_names_a_missing_or_repointed_row(change, ...):
     # undo_left [{"what": "the row", "why": "gone from the store" / "now opens another
-    # conversation"}]; the gone row is restored True; the repointed row keeps its link, is NOT
-    # marked restored, and its claim stands: _relink_claims for a hand-made earlier relink naming
-    # local_c2 with new {"spawnedFrom": ...} returns this (now "undone") op, keys {"spawnedFrom"}
+    # conversation"}]; the gone row is restored True; the repointed row keeps its link and is NOT
+    # marked restored; the op is "undone", so it claims nothing (spec D13): _relink_claims for a
+    # hand-made earlier relink naming local_c2 with new {"spawnedFrom": ...} returns []
+def test_an_undone_relink_with_a_key_left_at_new_does_not_block_an_earlier_undo(...):  # D13
+    # R1 = applied(...) links local_c2 and local_c3. Then local_c1 gains CHAIN and LR rows
+    # local_r1..3 appear (roots), and R2 = run_relink adds startChain to both, keeping R1's links.
+    # local_c2 is repointed (cliSessionId LQ); undo_relink(R2) -> "undone", local_c2 named "now
+    # opens another conversation", its startChain left at new, not restored. undo_relink(R1)
+    # -> "undone", no Refusal naming R2: it names local_c2 the same way and takes local_c3's
+    # link out. Under a rule that let an undone relink's unrestored row claim, R1's undo would
+    # refuse "undo those first" naming R2, which no command can undo again
 def test_undo_restores_a_non_object_exactly(...):              # spawnedFrom False before ->
                                                                # False after, same position
 def test_a_resumed_undo_after_a_crash_before_the_mark_names_nothing_false(...):
@@ -1397,7 +1517,8 @@ def test_a_realign_undo_after_a_relink_of_the_same_row_succeeds(...):
     # test_realign's World layout plus links; realign, relink; undo_realign -> "undone",
     # the link kept
 def test_a_converge_undo_deletes_a_relinked_row_and_relink_undo_names_it_gone(...):
-    # a converge-created row relinked; undo --op-id <converge> deletes it; undo_relink ->
+    # a converge-created row relinked; undo --id <converge> (the parser's flag, dest op_id)
+    # deletes it; undo_relink ->
     # undo_left [{"what": "the row", "why": "gone from the store"}]
 def test_undoing_a_converge_whose_created_parent_a_relink_linked_to_reports_it_dangling(...):
     # A3 lacks P: converge creates P's row there (local_<uuid>); relink then links local_c3 to it;
@@ -1510,7 +1631,8 @@ def test_undoing_a_converge_whose_created_parent_a_relink_linked_to_reports_it_d
          saved (the budget saver's `tick`), all before the row's mark;
       5. `restored = True` only when no relink-written key remains at `"new"` on the row (Global
          Constraints): a claimed key, a repointed row's key or an unreadable written row keeps the
-         row unmarked, and its claim stands.
+         row unmarked. While `back` is under way the op is non-terminal and the unmarked row
+         claims; once it is `rolled_back` it claims nothing (spec D13).
       A resumed `back` passes over rows already `restored`. At the end `abort_reason` is built
       from the manifest's fields, so it covers earlier passes too: `back restored
       <back_restored> row(s); left <k>: <row> <what> (<why>), ...` when `back_left` is not empty,
@@ -1558,6 +1680,16 @@ def test_undoing_a_converge_whose_created_parent_a_relink_linked_to_reports_it_d
     m.get("op_type") == "relink": return _recover_relink(env, op, direction, stray)`.
   - `cmd_recover`: after a forward recovery of a relink, one `_relink_skip_line` per skipped row,
     through `redact` unless `--verbose`. `abort_reason` and the link report print as today.
+  - **The two AST inventories** (Task 5's `op_type` rule, Task 6's row-reader rule). The
+    `op_type` comparisons this task adds sit in `classify_op`, `recover_op` and `cmd_recover`,
+    which are listed and flip to `names it`. `_relink_d18_note`,
+    `classify_relink_op`, `_recover_relink`, `_relink_row_states`, `_relink_landed`,
+    `_relink_dependency_skip` and `_relink_skip_line` compare no `op_type`: the dispatch that
+    reached them has chosen relink, and a defensive check there would add a function the
+    inventory does not list. They read rows only through `_relink_read` (and the light store
+    read `_lineage_store_rows`, already listed), and call none of `_sync_row_drift`, `_row_state`
+    and `ensure_contained`, so `_ROW_READERS` gains nothing here. A function that does need one
+    of these gains its row in the same commit, with its reason.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -1627,7 +1759,8 @@ def test_back_names_a_landed_unmarked_row_repointed_since(...):
     # crash at "relink-before-mark" (local_c2 landed, unmarked); local_c2 then repointed to LQ
     # with its link kept -> back "rolled_back"; local_c2 untouched (its link still there);
     # abort_reason contains "local_c2 the row (now opens another conversation; its link was
-    # left)"; on disk local_c2's journal row is written True and not restored, so its claim stands
+    # left)"; on disk local_c2's journal row is written True and not restored; the op is
+    # "rolled_back", so it claims nothing (spec D13)
 def test_a_failed_verify_in_back_leaves_the_row_for_a_second_back(monkeypatch, ...):
     # crash at "relink-after-rows"; atomic_write patched so local_c3's restore writes other bytes
     # -> back raises LayoutError "verify failed restoring row local_c3.json" with "--back
@@ -1654,8 +1787,8 @@ def test_back_never_reports_an_untouched_pending_row(change, ...):
 def test_back_leaves_a_claimed_key_and_names_it_in_abort_reason(...):
     # crash at "relink-after-rows"; a later completed sync manifest wrote local_c2 -> back leaves
     # its key; abort_reason contains "local_c2 spawnedFrom (operation <sync id> wrote it
-    # since)"; local_c2 is not marked restored, so the now rolled-back relink still claims it
-    # (_relink_claims for a hand-made earlier relink naming local_c2 returns this op);
+    # since)"; local_c2 is not marked restored, and the now rolled-back relink claims nothing
+    # (spec D13: _relink_claims for a hand-made earlier relink naming local_c2 returns []);
     # local_c3's link is taken out and local_c3 restored
 def test_back_leaves_no_rollback_residue_for_an_existing_row(...)
 @pytest.mark.parametrize("direction, line", [...])   # one entry per matrix line and direction
@@ -1734,7 +1867,8 @@ def test_an_unfinished_relink_recovers_in_the_moved_store(direction, ...):
   - the journal: no images, the hashes, the agreement check that stands in for images, the byte
     budget, the status fields;
   - D13's claims and the per-key exceptions, the moveish rule, the three ownership checks
-    changed, and what `restored` means (no relink-written key left at `new`);
+    changed, and what `restored` means (no relink-written key left at `new`), which decides a
+    claim only within a live relink: an undone or rolled-back one claims nothing;
   - recovery by key: the recovery matrix, back's landed test, its durable intent
     (`rolling_back`) and report (`back_left`, `back_keys`, `back_restored`), and why not
     `rollback_residue`;
@@ -1751,6 +1885,9 @@ def test_an_unfinished_relink_recovers_in_the_moved_store(direction, ...):
 
 Recorded so the spec's authority can be checked against them. Departures 1, 2, 3, 5, 6, 7 and 8
 are the seven "Corrections from the build plan's read of the code" the spec's Revisions record.
+Departures 4, 9, 10 and 11, and two of the choices below (a conversation `--only` counting only
+rows that would be written, and forward recovery re-checking a kept parent link), change design
+calls; the maintainer approved all six on 2026-11-19, and the spec's Revisions record it.
 1. **The listing's first column is the row id** (`local_` and 8 characters, `_lineage_short`), not
    the sample's bare 8-character id. It pastes straight into `--only`, and it tells apart two rows
    of one conversation in one account, which the spec says are each repaired.
@@ -1771,7 +1908,8 @@ are the seven "Corrections from the build plan's read of the code" the spec's Re
 7. **RULING 5 is checked in `_relink_recheck`, not by the guard.** The spec's "Applying" says
    `_guard_mutation` settles "the app fully closed and the account identity", but it checks only
    the platform and the running app; the identity check sits in the apply-time recheck, as in
-   `_realign_recheck` and `_converge_recheck`.
+   `_realign_recheck` and `_converge_recheck`, through the `_ruling5_recheck` the three now share
+   (Task 6).
 8. **The status fields follow their siblings, not realign's rows alone.** `realign`'s rows carry
    only `written`; `restored` follows realign's copies, and `skipped` with `skip_detail` follows
    `converge`'s rows. The generic readers key on `written`, so the names work.
@@ -1819,9 +1957,6 @@ Residuals, recorded rather than changed:
   app has since changed is in neither undo's list (not `written`) nor `back`'s report (no key at
   `new`, so not provably landed); forward skips it as `changed_since_plan`, which names it once.
   Nothing is destroyed: the app's values stand, and relink has nothing of its own left on the row.
-- Rotation (`_collides`) still treats an undone or rolled-back relink as having withdrawn its
-  claim, so the claim of a row it left unrestored lasts while the journal keeps the operation,
-  the retention bound every operation's undo already has.
 
 Choices the spec leaves to the builder, made here:
 - The function names, the three phrases and their table positions, and the `--json` names
@@ -1986,7 +2121,8 @@ Choices the spec leaves to the builder, made here:
     key left at `new` (claimed, repointed under D19, unreadable) stays unmarked in `back` and in
     undo, and its claim stands: `_relink_claims`, `_retitle_claimed_elsewhere` and
     `_repoint_claimed_later` now judge a relink by its rows' `restored`, whatever its status.
-    Tests for both.
+    Tests for both. (Superseded by the pre-flight scan, item 1: an undone or rolled-back relink
+    claims nothing, as spec D13 says; `restored` keeps this meaning within a live relink.)
   - `classify_relink_op`'s `rolling_back` note and forward's refusal share the wording the test
     asserts, "began and stopped part-way", since `recover_op` refuses from the note before it
     dispatches (agy).
@@ -2002,7 +2138,8 @@ Choices the spec leaves to the builder, made here:
     (Kimi).
   - An unreadable manifest, or a journal folder that cannot be listed, refuses `plan_relink` and
     every relink route on its own, with its own line, whether or not another operation is open
-    (Kimi).
+    (Kimi). (Narrowed by the pre-flight scan, item 4: a journal folder that does not exist is no
+    operations; only one that exists and cannot be listed refuses.)
   - The recovery matrix in Task 9, with a parametrized test over its lines, for forward and back
     (Kimi).
   - Every printed recover hint carries `--apply`, and the tests assert it (DeepSeek).
@@ -2014,7 +2151,8 @@ Choices the spec leaves to the builder, made here:
     stand (DeepSeek).
   - `_realign_recheck` is named where `_relink_recheck` reuses its RULING 5 wording: in Task 6's
     Consumes, where `_relink_recheck` is defined, rather than Task 3's, which the disposition named
-    (DeepSeek).
+    (DeepSeek). (Superseded by the pre-flight scan, item 12: the three rechecks share
+    `_ruling5_recheck`.)
   - `--account`'s no-match refusal lists each account directory with its email where known
     (DeepSeek).
   - Found in the consistency pass after applying: `_relink_put`'s description said the caller
@@ -2028,6 +2166,56 @@ Choices the spec leaves to the builder, made here:
     crashes at `relink-back-before-mark`. Two Task 7 tests that asserted the old claim rule are
     updated, and one new test covers the new rule.
   No rejections this round.
+- **Pre-flight scan (2026-11-19), before the build.** A conflict scan of every task against the
+  others, the Global Constraints, the spec and the code at `7c3f84b`
+  (`.superpowers/sdd/2026-11-19-relink-plan/preflight.md`), with the maintainer's rulings.
+  Applied, by the scan's item numbers:
+  - Item 1: **Claims follow spec D13 again.** An `undone` or `rolled_back` relink claims nothing,
+    whatever its rows' `restored`; a `completed` one claims its written rows not restored; a
+    non-terminal one every row it names not restored. This returns the plan to spec D13 and
+    withdraws round 3's "whatever its status" from the Global Constraints, `_relink_claims`, the
+    `_retitle_claimed_elsewhere` and `_repoint_claimed_later` branches, undo's step 6 and back's
+    step 5; `restored` keeps its round-3 meaning within a live relink. The three tests that
+    encoded the old rule are restored to the spec's
+    (`test_an_undone_or_rolled_back_relink_claims_nothing_whatever_its_rows` in place of the
+    "claims whatever its status" test,
+    `test_repoint_claim_counts_only_a_later_unrestored_relink_not_undone`, and Task 8's
+    repointed-row case), Task 9's two `back` tests no longer assert a rolled-back claim, and a
+    new Task 8 test shows an undone relink with a key left at `new` no longer blocks an earlier
+    relink's undo, the deadlock the old rule made. The `_collides` residual goes with it.
+  - Item 2: Task 1 updates the second `LINEAGE_LEFT_OUT` pin
+    (`test_lineage_record_has_every_field_with_its_type_and_no_repeated_code`, 11 to 13).
+  - Item 3: `test_a_chain_only_repair_counts_the_rows_own_app_written_link` gains `roots=True`,
+    without which the resolver drops every chain.
+  - Item 4: a journal folder that does not exist is no operations, as `list_ops` reads it; only
+    one that exists and cannot be listed refuses. Task 3 tests both.
+  - Item 7: the baseline is 1460 passed and 18 of 18 check scripts at `7c3f84b`, 2026-11-19
+    14:42.
+  - Item 8: Task 4's odd-titles test builds its own cp1252 `say` on `cmd_realign`'s fallback;
+    Task 6 adds the end-to-end console check through `cmd_relink`.
+  - Item 9: `test_the_verify_is_by_value` patches `atomic_write` for the row's path only, so the
+    manifest still saves; `test_the_apply_replans_under_the_lock_and_says_what_changed` changes
+    the store from a monkeypatched `acquire_lock`.
+  - Item 10: Task 7 states where the two relink branches sit: first in the loop after the
+    `oid == mine` test, ahead of the status filters (about 10613 and 12480 at `7c3f84b`), each
+    with its own status rule; Task 7's Files anchors are re-read at `7c3f84b`.
+  - Item 11: Task 2, step 5 puts each left-out entry's link code first, and a test pins the
+    order.
+  - Item 12: one RULING 5 helper, `_ruling5_recheck(env, m, command, tail="")`, replaces the
+    blocks in `_realign_recheck` and `_converge_recheck` and serves `_relink_recheck`; each
+    message stays byte-identical, the existing tests are unchanged, and a new parametrized test
+    pins the full texts (its realign and converge cases pass before the helper exists).
+  - Item 13: Tasks 5, 6 and 9 state the two AST inventories' rules (`op_type` comparisons;
+    `_ROW_READERS`), and `_relink_read` opens the row as `open(r["dest_path"], "rb")`.
+  - Item 14: Task 8's converge test uses `undo --id`, the parser's flag.
+  Notes applied in passing: `APP_KEYS` is defined in Task 2's helpers; "One module" names every
+  edit outside the relink section; the apply's and forward's `then` names the op's status when
+  built, so an op left at `journaled` is described rightly; Task 2 consumes `iter_transcripts`;
+  the lock-file test asks about `local_c2`'s row; the undo-entries wording says when they reach
+  the disk. The plan's status line and the Anchors constraint say so.
+  Not changed here, as ruled: Departures 4, 9, 10 and 11, the Choices item on a conversation
+  `--only` counting rows that would be written, and forward recovery's re-validation of a kept
+  parent link (the scan's items 5 and 6).
 
 ## Release
 

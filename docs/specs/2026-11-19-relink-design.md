@@ -617,6 +617,24 @@ ordinary ones: `undo --apply` takes the step out, and the design comes back for 
     than D16's candidate, holder or target.
   - The dry run prints `local_` row ids, which `--only` accepts, not the sample's bare prefix.
 
+- **The build plan's departures, approved by the maintainer (2026-11-19).** The plan
+  (`docs/plans/2026-11-19-relink-plan.md`, "Departures") changes six of this design's calls, each
+  for a reason the plan gives. A pre-flight scan before the build found that they had not been
+  put to the maintainer, who then kept all six:
+  - D7 and step 4: a link that only tools wrote has its own code, `lineage_no_app_link`, "no
+    app-written link backs it", in place of `lineage_variant` (Departure 11).
+  - A chain-only D11 failure keeps `lineage_chain_dropped`, with that reason as its detail
+    (Departure 4).
+  - D12: a kept link without a usable `taskId` equal to the agreed one is `own_link_differs`
+    (Departure 10).
+  - Recovery, forward rule 4: recovery goes by key; a row with any written key at `new` has
+    landed (Departure 9).
+  - Options: a conversation `--only` counts only rows that would be written.
+  - Recovery: forward recovery of a chain-only row also re-checks the kept parent link the chain
+    relies on.
+
+  The same scan found that the plan's round-3 claim rule contradicted D13; the plan follows D13.
+
 ## Left to the builder
 
 - Function names, the exact wording of the two new phrases and their positions in
