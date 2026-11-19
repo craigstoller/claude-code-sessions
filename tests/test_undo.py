@@ -310,3 +310,58 @@ def test_undo_target_cwd_is_original_source_not_move_target(moved):
     undo_manifest = ct.plan_undo(env, prior)
     assert undo_manifest["target_cwd"] == "C:\\proj\\src"
     assert undo_manifest["target_cwd"] != m["target_cwd"]
+
+
+# ------------------------------------------- new-row's undo and the link report
+# docs/specs/2026-11-17-carry-lineage-design.md, "undo": new-row itself is
+# unchanged and writes no link, but a later op, or the app, may link a row to
+# the one it created. Its undo reports a surviving link to the row it removed.
+
+def test_new_row_undo_reports_a_surviving_link_to_its_row(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    from test_converge import (A1, O1, A2, O2, S3, _monotonic_now, t_entries,
+                               undo_ns)
+    env = _monotonic_now(mkenv(tmp_path))
+    write_transcript(env, "C--p", S3, t_entries(cwd="C:\\p"))
+    write_row(env, 0, A1, O1, "local_pad",
+              {"sessionId": "local_pad", "cliSessionId": "other-conversation",
+               "title": "Padding", "lastActivityAt": 9})
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": A1, "organizationUuid": O1,
+                                    "emailAddress": "alice@example.com"}}, fh)
+    m = ct.plan_new_row(env, ct.NewRowFlags(to_session=S3))
+    assert ct.run_new_row(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    row = op.manifest["rows"][0]
+    target = row["name"][:-len(".json")]
+    # new-row itself still writes no link.
+    with open(row["dest_path"], encoding="utf-8") as fh:
+        assert "spawnedFrom" not in json.load(fh)
+    # A side session linked to the new row since, in the same store, by its
+    # parent link and its chain root; and one in another account, under the
+    # same filename (sync keeps filenames), which this undo leaves alone.
+    linked = {"sessionId": "local_kid", "cliSessionId": "kid-conversation",
+              "title": "ACME-REVIEW side task",
+              "spawnedFrom": {"sessionId": target, "taskId": "task_7f"},
+              "startChain": {"firstSessionId": target, "depth": 1}}
+    write_row(env, 0, A1, O1, "local_kid", linked)
+    write_row(env, 0, A2, O2, target,
+              {"sessionId": target, "cliSessionId": S3, "title": "Northwind"})
+    write_row(env, 0, A2, O2, "local_kid", linked)
+    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert not os.path.exists(row["dest_path"])
+    want = {"dangling": [
+        {"row": "local_kid", "target": target, "kind": "parent"},
+        {"row": "local_kid", "target": target, "kind": "root"}],
+        "redirected": [], "unchecked": 0}
+    # cmd_undo loads its own copy of the op, so read the journal from disk.
+    with open(ct.manifest_path(op), encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert saved["status"] == "undone"
+    assert saved["link_report"] == want
+    assert out[0] == "result: undone"
+    assert out[1:] == [
+        "link left dangling: local_kid (its parent's row was removed)",
+        "link left dangling: local_kid (its chain root's row was removed)"]

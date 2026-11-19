@@ -927,6 +927,12 @@ _ROW_READERS = {
                              "_retitle_contained per row",
     "_realign_undo_conversation": "reached only after _realign_undo_blocker passed",
     "execute_op": "runs _validate_manifest_paths before touching a row",
+    "_lineage_target": "its callers pass only the store of a row the op's gate "
+                       "resolved (_unresolved_rows); it reads one direct child "
+                       "of that store, by an id that cannot leave it",
+    "_lineage_store_rows": "its callers pass only stores of rows the op's gate "
+                           "resolved (_unresolved_rows); it reads direct "
+                           "children of that store only",
     "_row_state": "the classifier itself; every caller above is gated or listed",
     "_sync_row_drift": "the classifier itself; every caller above is gated or listed",
 }

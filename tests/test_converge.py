@@ -3879,3 +3879,640 @@ def test_a_pending_converge_with_lineage_and_a_corrupt_post_image_still_goes_bot
     assert ct._converge_shape_error(op.manifest) is None
     c = ct.classify_op(env, op)
     assert sorted(c["resolutions"]) == ["back", "forward"]
+
+
+# ------------------------- carry the link (recovery, undo and the link report)
+# docs/specs/2026-11-17-carry-lineage-design.md, "converge" ("Recovery") and
+# "undo". Recovery never re-resolves: a pending row whose journaled link or
+# chain names a planned row that recovery does not write is skipped as
+# parent_not_written, and one whose written or existing target is gone or
+# opens another conversation as parent_changed. Reversals run children before
+# parents. Recovery, undo and recover --back end with the link report, read
+# from the stores after the command's writes.
+
+def stem(r):
+    return r["name"][:-len(".json")]
+
+
+def crash_on(env, m, nth=1, point="converge-mid-write"):
+    """Apply M and crash the NTH time POINT fires. Returns the stuck op."""
+    seen = {"n": 0}
+
+    def hook(p):
+        if p == point:
+            seen["n"] += 1
+            if seen["n"] == nth:
+                raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_converge(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    return op
+
+
+def crash_before_any_row(env, m, monkeypatch):
+    """Apply M and crash at its first row write, before anything lands."""
+    real = ct.atomic_write
+
+    def boom(path, data):
+        if os.path.basename(path).startswith("local_"):
+            raise SimulatedCrash()
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", boom)
+    with pytest.raises(SimulatedCrash):
+        ct.run_converge(env, m)
+    monkeypatch.setattr(ct, "atomic_write", real)
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    assert not any(r.get("written") for r in op.manifest["rows"])
+    return op
+
+
+def journal_of(env, op_id):
+    """The op's manifest as it is on disk."""
+    with open(os.path.join(env.ops_dir, op_id, "manifest.json"),
+              encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def recover_ns(op_id, direction):
+    return types.SimpleNamespace(op_id=op_id, forward=direction == "forward",
+                                 back=direction == "back", apply=True,
+                                 verbose=True)
+
+
+EMPTY_REPORT = {"dangling": [], "redirected": [], "unchecked": 0}
+
+
+def test_crash_before_the_parent_landed_forward_writes_parent_then_child(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Nothing landed before the crash. The child's planned parent is still
+    pending, so it is not checked: forward writes the parent, then the child
+    with its journaled link, and skips nothing."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_before_any_row(env, m, monkeypatch)
+    written = []
+    real = ct.atomic_write
+
+    def spy(path, data):
+        if os.path.basename(path).startswith("local_"):
+            written.append(os.path.basename(path))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", spy)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    rows = op.manifest["rows"]
+    assert not any(r.get("skipped") for r in rows)
+    assert written == [r["name"] for r in rows]
+    parent, child = rows_by(op.manifest, LP)[A3], rows_by(op.manifest, LC)[A3]
+    assert written.index(parent["name"]) < written.index(child["name"])
+    assert on_disk(child)["spawnedFrom"] == {"sessionId": stem(parent),
+                                             "taskId": TASK}
+    assert op.manifest["link_report"] == EMPTY_REPORT
+
+
+def test_crash_then_another_parent_row_appears_child_skipped_parent_not_written(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The first row landed; P's planned A3 row and C's A3 row, which links to
+    it, did not. A row for P appears in A3 in the window: P's planned row is
+    skipped as already_present, so C's A3 row is skipped as
+    parent_not_written - never written naming a row that does not exist,
+    and never re-resolved. The next converge plans it afresh."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_on(env, m)
+    parent, child = rows_by(op.manifest, LP)[A3], rows_by(op.manifest, LC)[A3]
+    assert not parent["written"] and not child["written"]
+    write_row(env, 0, A3, O3, "local_q3",
+              lrow(LP, "local_q3", "Northwind kickoff"))
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert parent["skipped"] == "already_present"
+    assert child["skipped"] == "parent_not_written"
+    assert LP[:8] in child["skip_detail"]
+    assert "already_present" in child["skip_detail"]
+    assert "Northwind" not in child["skip_detail"]
+    assert not child.get("written")
+    assert not os.path.exists(child["dest_path"])
+    # The post-image was never re-resolved.
+    assert post_of(child)["spawnedFrom"]["sessionId"] == stem(parent)
+    assert journal_of(env, op.manifest["op_id"])["rows"][2]["skipped"] == \
+        "parent_not_written"
+    # Short for the next converge, which links it to the row that exists.
+    again = ct.plan_converge(env, ct.ConvergeFlags())
+    assert post_of(rows_by(again, LC)[A3])["spawnedFrom"]["sessionId"] == \
+        "local_q3"
+
+
+def chain_of_three(env, write_transcript, write_row):
+    """R (LR), P (LP) and C (LC), each held by A1 and A2, where P is a side
+    session of R and C one of P. A3 holds none of them (a padding row keeps
+    it a destination), so the plan writes R, P and C into A3, in that order,
+    P linking to R's planned row and C to P's."""
+    for sid in (LR, LP, LC):
+        write_transcript(env, "C--p", sid, t_entries())
+    for acct in (A1, A2):
+        n = NUM[acct]
+        write_row(env, 0, acct, ORG[acct], "local_r" + n,
+                  lrow(LR, "local_r" + n, "Northwind root"))
+        write_row(env, 0, acct, ORG[acct], "local_p" + n,
+                  lrow(LP, "local_p" + n, "Northwind kickoff",
+                       spawnedFrom=side_link("local_r" + n)))
+        write_row(env, 0, acct, ORG[acct], "local_c" + n,
+                  lrow(LC, "local_c" + n, "ACME-REVIEW side task",
+                       spawnedFrom=side_link("local_p" + n)))
+    write_row(env, 0, A3, O3, "local_pad", lrow(PAD, "local_pad", "Padding"))
+
+
+def test_planned_chain_skip_carries_down_r_p_c(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    env = _monotonic_now(mkenv(tmp_path))
+    chain_of_three(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert [r["session"] for r in m["rows"]] == [LR, LP, LC]
+    op = crash_before_any_row(env, m, monkeypatch)
+    write_row(env, 0, A3, O3, "local_q3",
+              lrow(LR, "local_q3", "Northwind root"))
+    assert ct.recover_op(env, op, "forward") == "completed"
+    skips = [(r["session"], r.get("skipped")) for r in op.manifest["rows"]]
+    assert skips == [(LR, "already_present"), (LP, "parent_not_written"),
+                     (LC, "parent_not_written")]
+    p, c = rows_by(op.manifest, LP)[A3], rows_by(op.manifest, LC)[A3]
+    assert LR[:8] in p["skip_detail"]
+    assert LP[:8] in c["skip_detail"] and "parent_not_written" in \
+        c["skip_detail"]
+    assert not os.path.exists(p["dest_path"])
+    assert not os.path.exists(c["dest_path"])
+
+
+@pytest.mark.parametrize("target", ["parent", "root"])
+def test_parent_written_then_repointed_child_skipped_parent_changed(
+        mkenv, tmp_path, write_transcript, write_row, target):
+    """The parent's (or the chain root's) planned row was written before the
+    crash and repointed at another conversation since. The pending child
+    that names it is skipped as parent_changed - never written with the
+    stale link - and nothing is resolved again."""
+    env = _monotonic_now(mkenv(tmp_path))
+    if target == "parent":
+        linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+        m = ct.plan_converge(env, ct.ConvergeFlags())
+        assert [(r["session"], r["account"]) for r in m["rows"]] == \
+            [(LC, A2), (LP, A3), (LC, A3)]
+        op = crash_on(env, m, nth=2)
+        named, sid = rows_by(op.manifest, LP)[A3], LP
+    else:
+        chained_holdings(env, write_transcript, write_row, root_in=(A2,))
+        m = ct.plan_converge(env, ct.ConvergeFlags())
+        assert [(r["session"], r["account"]) for r in m["rows"]] == \
+            [(LR, A3), (LC, A2), (LC, A3)]
+        op = crash_on(env, m, nth=1)
+        named, sid = rows_by(op.manifest, LR)[A3], LR
+    child = rows_by(op.manifest, LC)[A3]
+    assert named["written"] and not child["written"]
+    _app_touches(named["dest_path"], cliSessionId=S3)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert child["skipped"] == "parent_changed"
+    assert sid[:8] in child["skip_detail"] and S3[:8] in child["skip_detail"]
+    assert not os.path.exists(child["dest_path"])
+    assert "lineage_planned" not in child
+    if target == "root":
+        assert rows_by(op.manifest, LC)[A2]["written"] is True
+
+
+def test_existing_parent_deleted_in_the_window_child_skipped(
+        mkenv, tmp_path, write_transcript, write_row):
+    """C's A3 row links to the parent row A3 already had. That row is
+    deleted in the crash window: C's A3 row is skipped as parent_changed.
+    (A padding row keeps A3 a populated destination once its row for P
+    goes.)"""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row)
+    write_row(env, 0, A3, O3, "local_pad", lrow(PAD, "local_pad", "Padding"))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_on(env, m)
+    first, child = op.manifest["rows"]
+    assert first["written"] and first["account"] == A2
+    os.unlink(os.path.join(env.store_candidates[0], A3, O3, "local_p3.json"))
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert child["skipped"] == "parent_changed"
+    assert LP[:8] in child["skip_detail"]
+    assert not os.path.exists(child["dest_path"])
+    assert op.manifest["link_report"] == EMPTY_REPORT
+
+
+def test_child_landed_then_parent_deleted_forward_reports_dangling(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """C's A2 row landed before the crash; its parent's row is then deleted.
+    Forward finishes C's A3 row and its link report names the landed row
+    whose link now dangles - the crash-window deletion."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_on(env, m)
+    landed = op.manifest["rows"][0]
+    assert landed["written"] and landed["account"] == A2
+    os.unlink(os.path.join(env.store_candidates[0], A2, O2, "local_p2.json"))
+    op_id = op.manifest["op_id"]
+    assert ct.cmd_recover(env, recover_ns(op_id, "forward")) == 0
+    out = capsys.readouterr().out
+    assert "result: completed" in out
+    rep = journal_of(env, op_id)["link_report"]
+    assert rep == {"dangling": [{"row": stem(landed), "target": "local_p2",
+                                 "kind": "parent"}],
+                   "redirected": [], "unchecked": 0}
+    lines = out.splitlines()
+    line = "link left dangling: {0} (its parent's row was removed)".format(
+        stem(landed))
+    assert line in lines
+    assert lines.index("result: completed") < lines.index(line)
+    assert rows_by(journal_of(env, op_id), LC)[A3]["written"] is True
+
+
+def test_all_landed_forward_still_reports_links(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Every row landed and only the completion marker is missing, so
+    forward is journal-only - no guard, no recheck - and it still ends with
+    the link report: one landed row's parent row deleted (dangling), the
+    other's repointed (redirected)."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_on(env, m, point="converge-before-complete")
+    a2, a3 = rows_by(op.manifest, LC)[A2], rows_by(op.manifest, LC)[A3]
+    assert a2["written"] and a3["written"]
+    os.unlink(os.path.join(env.store_candidates[0], A3, O3, "local_p3.json"))
+    _app_touches(os.path.join(env.store_candidates[0], A2, O2,
+                              "local_p2.json"), cliSessionId=S3)
+    env.process_lister = lambda: [(99999, "claude.exe")]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    want = {"dangling": [{"row": stem(a3), "target": "local_p3",
+                          "kind": "parent"}],
+            "redirected": [{"row": stem(a2), "target": "local_p2",
+                            "kind": "parent"}],
+            "unchecked": 0}
+    assert op.manifest["link_report"] == want
+    assert journal_of(env, op.manifest["op_id"])["link_report"] == want
+
+
+def test_undo_removes_children_before_parents(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """undo, and recover --back, remove the rows in reverse write order: the
+    child before the parent it links to, so an interrupted reversal never
+    leaves a child naming a row already removed."""
+    removed = []
+    real = ct.os.unlink
+
+    def spy(path, *a, **k):
+        if os.path.basename(str(path)).startswith("local_"):
+            removed.append(os.path.basename(str(path)))
+        return real(path, *a, **k)
+    monkeypatch.setattr(ct.os, "unlink", spy)
+    for leg in ("undo", "back"):
+        removed.clear()
+        env = _monotonic_now(mkenv(tmp_path / leg))
+        linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+        m = ct.plan_converge(env, ct.ConvergeFlags())
+        if leg == "undo":
+            assert ct.run_converge(env, m) == "completed"
+            op = ct.list_ops(env)[-1]
+            assert ct.undo_converge(env, op) == "undone"
+        else:
+            op = crash_on(env, m, point="converge-before-complete")
+            assert ct.recover_op(env, op, "back") == "rolled_back"
+        rows = op.manifest["rows"]
+        assert removed == [r["name"] for r in reversed(rows)], leg
+        parent, child = rows_by(op.manifest, LP)[A3], \
+            rows_by(op.manifest, LC)[A3]
+        assert removed.index(child["name"]) < removed.index(parent["name"])
+        assert op.manifest["link_report"] == EMPTY_REPORT, leg
+
+
+def test_undo_last_pointer_survivor_follows_reverse_write_order(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Both of S1's created rows would go once its holder is removed, and the
+    last-pointer rule keeps the one met last. Undo now meets rows in reverse
+    write order, so the survivor is S1's row that was written first."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = converged(env, write_transcript, write_row)
+    os.unlink(os.path.join(env.store_candidates[0], A1, O1, "local_s1.json"))
+    first, second = [r for r in op.manifest["rows"] if r["session"] == S1]
+    assert ct.undo_converge(env, op) == "undone"
+    kept = [s for s in op.manifest["undo_report"]["skipped"]
+            if s["reason"] == "last_pointer"]
+    assert [s["name"] for s in kept] == [first["name"]]
+    assert os.path.exists(first["dest_path"])
+    assert not os.path.exists(second["dest_path"])
+
+
+def test_undo_reports_a_surviving_link_to_a_removed_row_from_an_earlier_op(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """An earlier converge created P's row in A3; a later one linked C's new
+    A3 row to it. Undoing the earlier op removes P's row, and its link
+    report names C's surviving row, whichever op created it."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m1 = ct.plan_converge(env, ct.ConvergeFlags(only=LP[:8]))
+    assert [(r["session"], r["account"]) for r in m1["rows"]] == [(LP, A3)]
+    assert ct.run_converge(env, m1) == "completed"
+    op1 = ct.list_ops(env)[-1]
+    parent = op1.manifest["rows"][0]
+    m2 = ct.plan_converge(env, ct.ConvergeFlags())
+    assert ct.run_converge(env, m2) == "completed"
+    child = rows_by(m2, LC)[A3]
+    assert on_disk(child)["spawnedFrom"]["sessionId"] == stem(parent)
+    op1_id = op1.manifest["op_id"]
+    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True,
+                                    op_id=op1_id)) == 0
+    out = capsys.readouterr().out
+    assert not os.path.exists(parent["dest_path"])
+    assert os.path.exists(child["dest_path"])
+    rep = journal_of(env, op1_id)["link_report"]
+    assert rep == {"dangling": [{"row": stem(child), "target": stem(parent),
+                                 "kind": "parent"}],
+                   "redirected": [], "unchecked": 0}
+    lines = out.splitlines()
+    line = "link left dangling: {0} (its parent's row was removed)".format(
+        stem(child))
+    assert line in lines
+    assert lines.index("removed 1 row(s); 0 already gone") < lines.index(line)
+
+
+def test_undo_does_not_report_unrelated_pre_existing_broken_links(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The report names links to rows THIS undo removed. A row outside the
+    op whose links named a missing row before the undo, and a kept row of
+    the op whose parent someone else deleted before it, are not this undo's
+    doing and are not reported."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert ct.run_converge(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    write_row(env, 0, A3, O3, "local_k3", lrow(
+        LX, "local_k3", "Northwind loose end",
+        spawnedFrom={"sessionId": "local_never", "taskId": TASK},
+        startChain={"firstSessionId": "local_never", "depth": 1}))
+    kept = rows_by(op.manifest, LC)[A2]
+    _app_touches(kept["dest_path"], title="Northwind renamed")
+    os.unlink(os.path.join(env.store_candidates[0], A2, O2, "local_p2.json"))
+    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True)) == 0
+    out = capsys.readouterr().out
+    saved = journal_of(env, op.manifest["op_id"])
+    assert [s["name"] for s in saved["undo_report"]["skipped"]] == \
+        [kept["name"]]
+    assert saved["undo_report"]["deleted"] == 2
+    assert saved["link_report"] == EMPTY_REPORT
+    assert os.path.exists(kept["dest_path"])
+    assert not any(line.startswith(("link left", "link redirected",
+                                    "links not checked"))
+                   for line in out.splitlines())
+
+
+def test_back_after_a_skipped_drifted_child_reports_dangling(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """Every row landed; the app then rewrote C's A3 row. recover --back
+    leaves that drifted row in place, as residue, and removes P's A3 row
+    beneath it: the report names the surviving child's dangling link."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    op = crash_on(env, m, point="converge-before-complete")
+    parent, child = rows_by(op.manifest, LP)[A3], rows_by(op.manifest, LC)[A3]
+    _app_touches(child["dest_path"], lastFocusedAt=1_900_000_000_000)
+    op_id = op.manifest["op_id"]
+    assert ct.cmd_recover(env, recover_ns(op_id, "back")) == 0
+    out = capsys.readouterr().out
+    assert os.path.exists(child["dest_path"])
+    assert not os.path.exists(parent["dest_path"])
+    saved = journal_of(env, op_id)
+    assert child["name"] in saved["rollback_residue"]
+    assert saved["link_report"] == {
+        "dangling": [{"row": stem(child), "target": stem(parent),
+                      "kind": "parent"}],
+        "redirected": [], "unchecked": 0}
+    lines = out.splitlines()
+    line = "link left dangling: {0} (its parent's row was removed)".format(
+        stem(child))
+    assert line in lines
+    assert lines.index(line) > [i for i, x in enumerate(lines)
+                                if "left something behind" in x][0]
+
+
+def test_link_report_counts_unreadable_targets_and_never_raises(
+        tmp_path, monkeypatch):
+    store = tmp_path / "acct" / "org"
+    store.mkdir(parents=True)
+    s = str(store)
+
+    def put(name, text):
+        with open(os.path.join(s, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+    put("local_c.json", json.dumps({
+        "sessionId": "local_c", "cliSessionId": LC,
+        "spawnedFrom": {"sessionId": "local_p", "taskId": TASK},
+        "startChain": {"firstSessionId": "local_r", "depth": 1}}))
+    put("local_p.json", "{not json")
+    put("local_r.json", json.dumps({"sessionId": "local_r",
+                                    "cliSessionId": LR}))
+    put("local_junk.json", "[1, 2")
+    lin = dict(ct._lineage_empty(), parent_session=LP, parent_row="local_p",
+               root_session=LR, root_row="local_r")
+    op_row = {"name": "local_c.json", "store_path": s, "written": True,
+              "dest_path": os.path.join(s, "local_c.json"), "lineage": lin}
+    # Forward: the parent's row cannot be read; the root is fine. Rows the
+    # report never needed are not counted.
+    rep = ct._link_report([op_row], [s], forward=True)
+    assert rep == {"dangling": [], "redirected": [], "unchecked": 1}
+    # A reversal that removed a row from this store reads every row in it,
+    # and counts the two it could not read.
+    rep = ct._link_report([], [s], removed={(s, "local_gone")})
+    assert rep == {"dangling": [], "redirected": [], "unchecked": 2}
+    # Nothing it is handed makes it raise.
+    for args, kw in (
+            ((None, None), {}),
+            (([1, "x", {"lineage": "junk"}, {"name": 5, "lineage": {}}],
+              [None, 5, os.path.join(s, "missing")]),
+             {"removed": {("a",), None}, "restored": 5}),
+            (([op_row], [s]), {"removed": "nonsense", "forward": True})):
+        rep = ct._link_report(*args, **kw)
+        assert isinstance(rep, dict)
+        assert "error" in rep or set(rep) == {"dangling", "redirected",
+                                             "unchecked"}
+
+    def broken(*_a, **_k):
+        raise RuntimeError("a reader broke")
+    monkeypatch.setattr(ct, "_lineage_target", broken)
+    rep = ct._link_report([op_row], [s], forward=True)
+    assert set(rep) == {"error"} and isinstance(rep["error"], str)
+    assert rep["error"] and "\n" not in rep["error"]
+    # The two readers never raise either.
+    monkeypatch.undo()
+    assert ct._lineage_store_rows(None) == ([], 0)
+    assert ct._lineage_store_rows(os.path.join(s, "missing")) == ([], 0)
+    assert ct._lineage_target(None, None) == ("unreadable", None)
+    assert ct._lineage_target(s, "local_p") == ("unreadable", None)
+    assert ct._lineage_target(s, "local_none") == ("absent", None)
+    state, data = ct._lineage_target(s, "local_r")
+    assert state == "present" and data["cliSessionId"] == LR
+    rows, bad = ct._lineage_store_rows(s)
+    assert sorted(i for i, _ in rows) == ["local_c", "local_r"] and bad == 2
+
+
+def test_link_report_scans_only_the_ops_stores_after_the_writes(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Undo removes every row it created, child and parent alike. The report
+    reads each of the op's stores once, after the removals, so the removed
+    child is never read as a survivor. A2 holds a row under the removed
+    parent's filename (sync keeps filenames across accounts) and a row
+    linking to it: that pair was not removed, so it is not dangling. A4 is
+    not one of the op's stores and is never read."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert ct.run_converge(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    parent = rows_by(op.manifest, LP)[A3]
+    write_row(env, 0, A2, O2, stem(parent),
+              lrow(LP, stem(parent), "Northwind kickoff"))
+    write_row(env, 0, A2, O2, "local_k2", lrow(
+        LX, "local_k2", "Northwind loose end",
+        spawnedFrom={"sessionId": stem(parent), "taskId": TASK}))
+    write_row(env, 0, A4, O4, "local_k4", lrow(
+        LX, "local_k4", "Northwind loose end",
+        spawnedFrom={"sessionId": stem(parent), "taskId": TASK}))
+    scans = []
+    real = ct._lineage_store_rows
+
+    def spy(store_path):
+        rows, bad = real(store_path)
+        scans.append((os.path.normcase(os.path.realpath(store_path)),
+                      sorted(i for i, _ in rows)))
+        return rows, bad
+    monkeypatch.setattr(ct, "_lineage_store_rows", spy)
+    assert ct.undo_converge(env, op) == "undone"
+    assert op.manifest["undo_report"]["deleted"] == 3
+    root = env.store_candidates[0]
+
+    def norm(acct, org):
+        return os.path.normcase(os.path.realpath(os.path.join(root, acct,
+                                                              org)))
+    a2, a3 = norm(A2, O2), norm(A3, O3)
+    assert sorted(p for p, _ in scans) == sorted([a2, a3])
+    ids = dict(scans)
+    assert ids[a2] == sorted(["local_p2", stem(parent), "local_k2"])
+    assert ids[a3] == ["local_pad"]
+    assert op.manifest["link_report"] == EMPTY_REPORT
+
+
+@pytest.mark.parametrize("path", ["pending", "all landed"])
+def test_link_report_is_saved_to_the_journal_on_forward_recovery(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, path):
+    """execute_converge_op has already saved the completed op when the report
+    is made, so forward recovery saves it again - before rotate_ops, on both
+    paths."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    if path == "pending":
+        op = crash_on(env, m)
+    else:
+        op = crash_on(env, m, point="converge-before-complete")
+    op_id = op.manifest["op_id"]
+    at_rotate = {}
+    real = ct.rotate_ops
+
+    def spy(env_):
+        at_rotate.update(journal_of(env, op_id))
+        return real(env_)
+    monkeypatch.setattr(ct, "rotate_ops", spy)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert at_rotate["status"] == "completed"
+    assert at_rotate["link_report"] == EMPTY_REPORT
+
+
+def test_link_report_failure_prints_its_line(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, capsys):
+    """A report that fails never fails the command it reports for: undo and
+    recover still finish, exit 0, and print the report's own line."""
+    def broken(*_a, **_k):
+        raise RuntimeError("a reader broke")
+    env = _monotonic_now(mkenv(tmp_path / "undo"))
+    m, op = converged(env, write_transcript, write_row)
+    monkeypatch.setattr(ct, "_lineage_store_rows", broken)
+    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "result: undone" in out
+    failed = [x for x in out
+              if x.startswith("links not checked: the link report failed (")]
+    assert len(failed) == 1 and failed[0].endswith(")")
+    assert out.index(failed[0]) > out.index("result: undone")
+    assert "error" in journal_of(env, op.manifest["op_id"])["link_report"]
+
+    env = _monotonic_now(mkenv(tmp_path / "recover"))
+    linked_holdings(env, write_transcript, write_row)
+    op = crash_on(env, ct.plan_converge(env, ct.ConvergeFlags()))
+    monkeypatch.setattr(ct, "_lineage_target", broken)
+    assert ct.cmd_recover(env, recover_ns(op.manifest["op_id"],
+                                          "forward")) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "result: completed" in out
+    assert any(x.startswith("links not checked: the link report failed (")
+               for x in out)
+
+
+def test_lineage_target_refuses_a_traversal_id_and_never_reads_an_unresolved_store(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    env = _monotonic_now(mkenv(tmp_path))
+    store = os.path.join(env.store_candidates[0], A2, O2)
+    os.makedirs(store)
+    good = json.dumps({"sessionId": "local_x", "cliSessionId": LP})
+    # A readable row one level up, and one beside the store: a traversal id
+    # must never reach either.
+    for where in (os.path.dirname(store), os.path.join(store, "sub")):
+        os.makedirs(where, exist_ok=True)
+        with open(os.path.join(where, "local_x.json"), "w",
+                  encoding="utf-8") as fh:
+            fh.write(good)
+    for bad in ("../local_x", "..\\local_x", "local_x/../../local_x",
+                "sub/local_x", "sub\\local_x", "local_x\n", "local_x.json",
+                "local_", "LOCAL_x", "x", "", None, 5, ["local_x"]):
+        assert ct._lineage_target(store, bad) == ("unreadable", None), bad
+    # A store this version does not read is never handed to either reader:
+    # a pending row of a stuck op is moved, in its journal, outside every
+    # discovered root. Only back is offered, and its report scans only the
+    # stores the resolution gate resolved.
+    env2 = _monotonic_now(mkenv(tmp_path / "stray"))
+    m, op = _crash_after_first_row(env2, write_transcript, write_row)
+    outside = str(tmp_path / "elsewhere" / A3 / O3)
+    os.makedirs(outside)
+    stray = [r for r in op.manifest["rows"] if not r["written"]][-1]
+    stray["store_path"] = outside
+    stray["dest_path"] = os.path.join(outside, stray["name"])
+    with open(stray["dest_path"], "w", encoding="utf-8") as fh:
+        fh.write(good)
+    ct.save_manifest(op)
+    assert ct.classify_op(env2, op)["resolutions"] == ["back"]
+    seen = []
+    real_rows, real_target = ct._lineage_store_rows, ct._lineage_target
+
+    def rows_spy(store_path):
+        seen.append(store_path)
+        return real_rows(store_path)
+
+    def target_spy(store_path, row_id):
+        seen.append(store_path)
+        return real_target(store_path, row_id)
+    monkeypatch.setattr(ct, "_lineage_store_rows", rows_spy)
+    monkeypatch.setattr(ct, "_lineage_target", target_spy)
+    assert ct.recover_op(env2, op, "back") == "rolled_back"
+    assert seen
+    norm = os.path.normcase(os.path.realpath(outside))
+    assert not any(os.path.normcase(os.path.realpath(p)) == norm
+                   for p in seen)
+    assert os.path.exists(stray["dest_path"])
+    assert "link_report" in op.manifest
