@@ -934,6 +934,44 @@ def test_a_planned_target_not_in_the_op_is_a_shape_error():
     assert ct._lineage_shape_error(jman([other, root_row(), c]))  # other store
 
 
+NOT_AN_OBJECT = {
+    "a null link and chain": dict(spawnedFrom=None, startChain=None),
+    "a null link": dict(spawnedFrom=None),
+    "a link that is a string": dict(spawnedFrom="local_p"),
+    "a chain that is a list": dict(startChain=[1]),
+}
+
+
+@pytest.mark.parametrize("why", sorted(NOT_AN_OBJECT))
+def test_a_link_key_that_is_not_an_object_names_no_row_to_the_shape_check(why):
+    """R28 with m26: a spawnedFrom or startChain that is not an object names
+    no row, to the shape check as to the resolver and the writer. A row
+    whose bytes hold one passes with no lineage, and with a lineage that
+    names no row; a lineage that names a row those bytes do not carry is
+    still a shape error."""
+    post = b64post(**NOT_AN_OBJECT[why])
+    assert ct._lineage_shape_error(jman([jrow("local_c.json", post)])) is None
+    assert ct._lineage_shape_error(
+        jman([jrow("local_c.json", post, lin())])) is None
+    c = good_child()
+    c["post_b64"] = post
+    err = ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
+    assert isinstance(err, str) and "its bytes do not carry" in err
+
+
+def test_a_link_object_without_its_row_id_is_still_a_shape_error():
+    """The R28 change leaves an object that lacks its row id a link the
+    lineage cannot read."""
+    c = good_child()
+    c["post_b64"] = b64post(spawnedFrom={"taskId": "task_7f"},
+                            startChain=CHAIN)
+    err = ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
+    assert err == "row 2 carries a spawnedFrom its lineage cannot read"
+    plain = jrow("local_c.json", b64post(spawnedFrom={"taskId": "task_7f"}))
+    assert ct._lineage_shape_error(jman([plain])) \
+        == "row 0 carries a link and has no lineage"
+
+
 def test_planned_false_is_not_held_to_the_rows():
     c = good_child()
     c["lineage"]["parent_planned"] = False

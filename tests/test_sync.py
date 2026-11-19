@@ -4343,6 +4343,63 @@ def test_sync_byte_identical_linked_child_is_translated_not_unchanged(
                                                "ACME-REVIEW side task"]
 
 
+def test_sync_byte_identical_row_with_null_link_keys_is_unchanged(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """R28: a spawnedFrom or startChain of null names no row, so a row whose
+    bytes already match, and whose source holds only null link keys, takes
+    the exact-identity exit ahead of the age holds (Departure 6, narrowed):
+    it is unchanged, never planned or held, and no line says it loses its
+    link."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LC, "sid-u")
+    for store in (src, dst):
+        _lrow(store, "local_c.json", LC, "ACME-REVIEW side task",
+              lastActivityAt=5, spawnedFrom=None, startChain=None)
+        _lrow(store, "local_u.json", "sid-u", "ACME-REVIEW notes",
+              lastActivityAt=4, startChain=None)
+    both = ["ACME-REVIEW notes", "ACME-REVIEW side task"]
+    for flags in (ct.SyncFlags(update=True, only="ACME"),
+                  ct.SyncFlags(update=True, newer_only=True, only="ACME")):
+        m = ct.plan_sync(env, flags)
+        assert m["rows"] == []
+        assert sorted(m["tally"]["unchanged"]) == both
+        assert m["tally"]["held_same"] == []
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update")
+    assert rc == 0
+    assert not any("loses its" in ln for ln in lines)
+
+
+def test_sync_refresh_over_link_keys_that_name_no_row_reports_no_loss(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """m36: a destination spawnedFrom or startChain that is not an object
+    names no row, so a refresh that removes it reports no link or chain
+    change. A null link key in the source is popped, never written, and the
+    plan's lineage agrees with its bytes."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LC, LR)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=2,
+          spawnedFrom=None)
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=None, startChain=None)
+    _lrow(src, "local_d.json", LR, "ACME-REVIEW second task",
+          lastActivityAt=2)
+    _lrow(dst, "local_d.json", LR, "ACME-REVIEW second task",
+          spawnedFrom="local_p", startChain=[1])
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    by = _by_name(m)
+    assert sorted(by) == ["local_c.json", "local_d.json"]
+    for r in by.values():
+        assert r["link_change"] is None and r["chain_change"] is None
+        post = _post(r)
+        assert "spawnedFrom" not in post and "startChain" not in post
+        assert r["lineage"]["parent_row"] is None
+        assert r["lineage"]["root_row"] is None
+    assert ct._lineage_shape_error(m) is None
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update")
+    assert rc == 0
+    assert not any("loses its" in ln or "another row" in ln for ln in lines)
+
+
 def test_sync_row_dropped_as_unchanged_is_not_counted_as_activity_unknown(
         two_account_env, tmp_path):
     """Neither side of the parent's refresh has a readable lastActivityAt.
