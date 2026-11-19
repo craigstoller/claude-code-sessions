@@ -36,8 +36,9 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
   18936), apart from the two lineage tables (Task 1), the parser and `main`'s handler (Task 6),
   the ownership checks (Task 7), the undo and recovery dispatch (Tasks 8, 9) and one GUI line
   (Task 8). Do not split either module.
-- **Anchors.** Line numbers ("about line N") were taken at `eb7748a` (child `main` cf93614 plus the
-  design commit) and drift as tasks land. Each anchor also names its symbol, and the symbol wins.
+- **Anchors.** Line numbers ("about line N") were taken before the transcript index reached
+  `main`, which added about 170 lines to the module, and they drift further as tasks land. Each
+  anchor also names its symbol, and the symbol wins.
 - **Line endings.** Tracked files are LF in git and CRLF in this working copy
   (`core.autocrlf=true`; `git ls-files --eol` shows `i/lf w/crlf` for the modules, README, internals
   and tests; the spec file is `w/lf`). Keep each file's working-copy endings and compare files by
@@ -200,14 +201,15 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
 - **A name already taken.** 0.18.0's apply-time lineage pass is also called "relink":
   `_converge_recheck(..., relink=False)`, `_converge_relink` and `_sync_relink`. They are unrelated
   to this command; leave them as they are, and prefix every new name `relink`/`_relink_`.
-- **Bring `main` in first.** The per-plan transcript index for `sync` planning
-  (`_TranscriptIndex`, `_transcript_finder`) landed on `main` at 00cfc0f on 2026-11-19, after
-  this branch left cf93614. It changed `load_rows`, `select_sync_rows`, `_row_is_refresh`,
-  `_displaced_overlap`, `_displaced_sizes`, `_sync_relink` and `cmd_new_row`, and this plan
-  consumes none of them. Before Task 1, merge `main` into `claude/relink` and run the suite and
-  the check scripts on the result. `relink` builds its transcript set once per plan through
-  `_relink_tids(env)` (`iter_transcripts`, as `plan_converge` does); switching it to the new
-  index is not part of this plan.
+- **The base.** This branch sits on `main` at dc08ad5, which holds the per-plan transcript index
+  for `sync` planning (`_TranscriptIndex`, `_transcript_finder`) and an identifiers scrub of
+  example output and one test fixture. The index changed `load_rows`, `select_sync_rows`,
+  `_row_is_refresh`, `_displaced_overlap`, `_displaced_sizes`, `_sync_relink` and
+  `cmd_new_row`, and this plan consumes none of them. `relink` builds its transcript set once
+  per plan through `_relink_tids(env)` (`iter_transcripts`, as `plan_converge` does);
+  switching it to the new index is not part of this plan. Every id in a test or a doc comes
+  from the fake cast (above), short 8-hex prefixes included: a real session, row or
+  conversation id prefix in a test or a doc breaks the repo's boundary rule.
 - **Commits:** the tests first, `test(relink): N tests, failing until ...`, then
   `feat(relink): ...` or `fix(<scope>): ...`, then `docs: ...`. No attribution trailers. No push.
   The version bump and the run sheet belong to the release (the maintainer's call).
