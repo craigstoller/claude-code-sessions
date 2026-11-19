@@ -933,8 +933,8 @@ address with a stable opaque label:
 ```
 claude-code-sessions list --anonymize
 
-f41ea19e…  <session-69f9>       <project-0c8f>
-e82cfaac…  <session-9c06>       <project-1a20>
+c0ffee06…  <session-69f9>       <project-0c8f>
+c0ffee07…  <session-9c06>       <project-1a20>
 ```
 
 The labels are deliberately unreadable rather than plausible fake titles - a convincing fake read

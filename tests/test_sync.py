@@ -235,27 +235,27 @@ def test_skips_sessions_the_destination_deleted(two_account_env, tmp_path):
 def test_skips_a_tombstone_filed_under_the_rows_local_id(two_account_env, tmp_path):
     """The spec said tombstones are named `deleted_<cliSessionId>`, and E4
     measured one. That is not the whole truth: on the author's own live store
-    the session 'E4 tombstone test' carries TWO tombstones - one for its
-    cliSessionId (bc7333f9...) and one for its filename stem, i.e. its local
-    id (747a0b6e...). A skip that only checks the session id therefore misses
+    one session carries TWO tombstones - one for its cliSessionId and one
+    for its filename stem, i.e. its local id. A skip that only checks the
+    session id therefore misses
     a real deletion and resurrects the session."""
     env, src, dst = two_account_env(tmp_path)
-    _row(src, "local_747a0b6e.json", "bc7333f9", "E4 tombstone test")
-    _transcript(env, "bc7333f9")
+    _row(src, "local_c0ffee02.json", "c0ffee01", "ACME tombstone test")
+    _transcript(env, "c0ffee01")
     # ONLY the local-id tombstone - the session-id one is absent, which is
     # the case the old `sid in tombs` test could not see.
-    with open(os.path.join(dst, "deleted_747a0b6e"), "w") as fh:
+    with open(os.path.join(dst, "deleted_c0ffee02"), "w") as fh:
         fh.write("1785541024931")
     source, dest = ct.resolve_sync_endpoints(env)
     picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags())
     assert picked == []
-    assert tally["deleted"] == ["E4 tombstone test"]
+    assert tally["deleted"] == ["ACME tombstone test"]
 
     # ...and --include-deleted can still name it, by either id.
     picked, tally = ct.select_sync_rows(
-        env, source, dest, ct.SyncFlags(include_deleted=("747a0b6e",)))
-    assert [r["title"] for r in picked] == ["E4 tombstone test"]
-    assert tally["resurrected"] == ["E4 tombstone test"]
+        env, source, dest, ct.SyncFlags(include_deleted=("c0ffee02",)))
+    assert [r["title"] for r in picked] == ["ACME tombstone test"]
+    assert tally["resurrected"] == ["ACME tombstone test"]
     assert picked[0]["overrode_tombstone"] is True
 
 

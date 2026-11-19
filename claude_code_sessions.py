@@ -7341,10 +7341,10 @@ def _tombstone_ids(e):
     """Both ids a tombstone for this row could be filed under.
 
     The spec said `deleted_<cliSessionId>`, and that was what E4 measured. It
-    is not the whole truth. On this machine's own live store the session titled
-    'E4 tombstone test' carries TWO tombstones: one named for its cliSessionId
-    (bc7333f9...) and one named for its filename stem, i.e. its local id
-    (747a0b6e...). So the app files deletions in both id spaces, and a skip
+    is not the whole truth. On this machine's own live store one session
+    carries TWO tombstones: one named for its cliSessionId and one named
+    for its filename stem, i.e. its local id. So the app files deletions
+    in both id spaces, and a skip
     that checks only the session id can miss a real deletion and resurrect a
     session the account's user deliberately removed - the first row of this
     design's own risk table.

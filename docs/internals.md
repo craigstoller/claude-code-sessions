@@ -118,8 +118,8 @@ whichever one that account last saw**. Two accounts can hold the same filename p
 entirely different conversations:
 
 ```
-local_a00afbc1-….json   in alice@example.com -> 0678aca4  17.9 MB, 1386 msgs, last used 19 Aug
-local_a00afbc1-….json   in bob@example.com   -> c92ae7b1  13.0 MB,  738 msgs, last used 14 Aug
+local_c0ffee03-….json   in alice@example.com -> c0ffee04  17.9 MB, 1386 msgs, last used 19 Aug
+local_c0ffee03-….json   in bob@example.com   -> c0ffee05  13.0 MB,  738 msgs, last used 14 Aug
 ```
 
 Both are titled "ACME-REVIEW session Northwind". Opening it under the second account does
@@ -421,8 +421,8 @@ is left on disk**.
 **`<id>` is not always the `cliSessionId`, which is the trap.** The obvious reading — and what
 the first measurement here recorded — is `deleted_<cliSessionId>`. That is incomplete. A
 session on the author's own store carries *two* tombstones: one named for its `cliSessionId`
-(`bc7333f9…`) and one named for its **local id**, the `local_<id>.json` filename stem
-(`747a0b6e…`). So deletions are filed in **both id spaces**, and anything that honours
+and one named for its **local id**, the `local_<id>.json` filename stem. So deletions are
+filed in **both id spaces**, and anything that honours
 tombstones has to test both. Checking only the session id misses a real deletion silently;
 `sync` checks both, and errs toward declining to copy, because a false positive is one named
 row you can override and a false negative resurrects something someone deliberately deleted.
