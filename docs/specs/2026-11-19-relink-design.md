@@ -599,6 +599,24 @@ ordinary ones: `undo --apply` takes the step out, and the design comes back for 
   - The dry run discloses an identity disagreement, as `converge` has since 0.13.0 (DeepSeek).
   - The 42 stated as an upper bound (DeepSeek).
 
+- **Corrections from the build plan's read of the code (2026-11-19).** These correct facts
+  and change no decision; the plan (`docs/plans/2026-11-19-relink-plan.md`, "Departures")
+  carries each:
+  - `_guard_mutation` checks only the platform and the running app. The RULING 5 identity
+    check sits in the apply-time recheck, as in `_realign_recheck` and `_converge_recheck`, so
+    `relink`'s goes there too.
+  - A `LayoutError`, such as a failed verify, exits 2, not 1, as for every command (D9).
+  - `realign`'s rows carry only `written`; `restored` follows its copies, and `skipped` follows
+    `converge`'s rows. The generic readers key on `written`, so the names work.
+  - `undo_repoint` refuses on byte drift and never calls `_repoint_claimed_later`; that check
+    matters at a repoint's `recover --back`, where an earlier relink must not block it. The
+    interop test is split that way.
+  - Under D18, D13's "non-terminal and naming the row" claim cannot arise from `undo` or `back`.
+    It is tested on the claim check directly.
+  - The scan refuses on an unreadable row anywhere, as `_retitle_scan` does, which is stricter
+    than D16's candidate, holder or target.
+  - The dry run prints `local_` row ids, which `--only` accepts, not the sample's bare prefix.
+
 ## Left to the builder
 
 - Function names, the exact wording of the two new phrases and their positions in
