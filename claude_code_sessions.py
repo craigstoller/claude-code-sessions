@@ -3493,7 +3493,6 @@ def recover_op(env, op, direction):
                     # completion marker is missing. Journal-only, so no
                     # mutation guard and no recheck - the same asymmetry the
                     # repoint and retitle arms document.
-                    save_manifest(op)
                     set_status(op, "completed")
                     rotate_ops(env)
                     return "completed"
@@ -3506,7 +3505,7 @@ def recover_op(env, op, direction):
                 # becomes an already_present skip; a pair that held at plan
                 # time is not in `rows` and stays unwritten even if its
                 # collision has since cleared.
-                _converge_recheck(env, m)
+                _converge_recheck(env, m, ignore_own_paths=True)
                 save_manifest(op)         # the skips just decided are durable
                 set_status(op, "journaled")
                 final = execute_converge_op(env, op)
@@ -15495,7 +15494,7 @@ def _converge_shape_error(m):
     return None
 
 
-def _converge_recheck(env, m):
+def _converge_recheck(env, m, ignore_own_paths=False):
     """Every apply-time guard and per-pair revalidation, under the operation
     lock, BEFORE the op record exists. Raises Refusal; MARKS apply-time skips
     on the manifest's rows (`skipped` + `skip_detail`) rather than returning
@@ -15561,8 +15560,21 @@ def _converge_recheck(env, m):
                 "Nothing was written; re-run to replan.".format(
                     r.get("label") or (r.get("account") or "?")[:8],
                     r.get("store_path")))
+    # IGNORE_OWN_PATHS is recovery's (recover_op's forward arm). There a
+    # pending row's own minted path is never evidence about that pair or any
+    # other: a file there is this op's own write whose flag was lost
+    # (_converge_mark_landed records those first, but one it could not read in
+    # that pass must not be judged `already_present` against itself), or
+    # something the write loop refuses as "a different row already exists".
+    # A first apply passes False: before new_op nothing of this op can be on
+    # disk, so it keeps the plain rule.
+    own = ({os.path.normcase(os.path.realpath(r["dest_path"]))
+            for r in m["rows"] if not r.get("written") and not r.get("skipped")}
+           if ignore_own_paths else set())
     acct_sids, acct_titles = {}, {}
     for rec in records:
+        if os.path.normcase(os.path.realpath(rec.path)) in own:
+            continue
         sid = rec.data.get("cliSessionId") or ""
         if sid:
             acct_sids.setdefault(rec.account, set()).add(sid)

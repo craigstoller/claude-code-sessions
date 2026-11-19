@@ -933,11 +933,17 @@ Each of these was a real defect. They are stated as rules because each one gener
   row that landed in the window above was judged against its own file. It became an
   `already_present` skip with `written: false`, and `undo`, which removes only written rows, never
   reached it. `_converge_mark_landed` now runs first in both directions of `recover`. It records
-  as written every pending row whose file holds its post-image, or holds the minted filename stem
-  as `sessionId` (`_row_is_ours`), since the app may rewrite a landed row before recovery and no
-  other writer mints that uuid4. Forward then finishes journal-only when nothing is left to write.
-  Back removes the row, or records it as residue if the app rewrote it. A file at the minted path
-  without that stem is never marked.
+  as written every pending row whose file holds its post-image, or has been rewritten (drifted)
+  but still carries the minted filename stem as `sessionId` (`_row_is_ours`), since the app may
+  rewrite a landed row before recovery and no other writer mints that uuid4. Forward then finishes
+  journal-only when nothing is left to write. Back removes the row, or records it as residue if
+  the app rewrote it. A file at the minted path without that stem is never marked.
+  - In recovery, `_converge_recheck` also ignores every pending row's own minted path when it
+    looks for rows that appeared (`ignore_own_paths`, passed by `recover_op`'s forward arm only).
+    So a landed row the marking pass could not read is still not judged against itself, and the
+    write loop records it. A foreign file at a minted path reaches the write loop's "a different
+    row already exists" refusal. A first apply keeps the plain rule, since nothing of the op can
+    be on disk before `new_op`.
   - An op journaled by an earlier version that already recorded such a row as `already_present`
     is not repaired: the skip is kept as recorded.
 - **Matching bytes are not proof of authorship.** `transform_row` is deterministic, so a later
