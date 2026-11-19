@@ -3866,3 +3866,16 @@ def test_a_retargeted_gained_or_dropped_row_passes_classify_recover_and_undo(
     assert sorted(c["resolutions"]) == ["back", "forward"]
     assert ct.recover_op(env, op, "forward") == "completed"
     assert ct.undo_converge(env, op) == "undone"
+
+
+def test_a_pending_converge_with_lineage_and_a_corrupt_post_image_still_goes_both_ways(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row)
+    assert op.manifest["lineage_format"] == 1
+    pending = [r for r in op.manifest["rows"] if not r.get("written")]
+    pending[0]["post_b64"] = "!!!not base64!!!"
+    ct.save_manifest(op)
+    assert ct._converge_shape_error(op.manifest) is None
+    c = ct.classify_op(env, op)
+    assert sorted(c["resolutions"]) == ["back", "forward"]

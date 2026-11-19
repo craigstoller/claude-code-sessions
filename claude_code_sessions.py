@@ -9229,7 +9229,7 @@ def plan_sync(env, flags):
             else:
                 r["displaced_orphan"] = True
             if r["displaced_orphan"] and not flags.allow_orphan:
-                tally["held_orphan"].append(r["title"])
+                tally["held_orphan"].append(_sync_row_title(r))
                 # Carried alongside rather than inside the title list, which
                 # other readers treat as plain titles. No row bytes here - only
                 # what a user needs to judge the hold.
@@ -9272,9 +9272,9 @@ def plan_sync(env, flags):
             r["dup_conversation"] = bool(sid) and sid in dest_sids
             r["dup_title"] = bool(k) and k in dest_keys
             if r["dup_conversation"]:
-                tally["dup_conversation"].append(r["title"])
+                tally["dup_conversation"].append(_sync_row_title(r))
             if r["dup_title"]:
-                tally["dup_title"].append(r["title"])
+                tally["dup_title"].append(_sync_row_title(r))
     out = {"op_type": "sync",
            "source_account": source.account_uuid, "source_org": source.org_uuid,
            "source_email": source.email, "source_path": source.path,
@@ -9882,6 +9882,14 @@ def _sync_row_drift(r):
     return "drifted"
 
 
+def _sync_row_title(r):
+    """A sync row's title as a string, "" when it has none. A journal row a
+    user edited may lack one or hold a non-string; the classify, undo and
+    recover readers join these into a sentence. Never raises."""
+    t = r.get("title") if isinstance(r, dict) else None
+    return t if isinstance(t, str) else ("" if t is None else str(t))
+
+
 def _sync_drift_titles(rows):
     """(changed, unreadable, deleted) titles for ROWS, via _sync_row_drift.
     Read-only and exception-safe.
@@ -9905,11 +9913,11 @@ def _sync_drift_titles(rows):
     for r in rows:
         state = _sync_row_drift(r)
         if state == "drifted":
-            changed.append(r["title"])
+            changed.append(_sync_row_title(r))
         elif state == "unreadable":
-            unreadable.append(r["title"])
+            unreadable.append(_sync_row_title(r))
         elif state == "absent" and _row_is_refresh(r):
-            deleted.append(r["title"])
+            deleted.append(_sync_row_title(r))
     return changed, unreadable, deleted
 
 
@@ -10240,7 +10248,7 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
         # dead end the previous two rounds closed. Ordering settles ownership
         # without reopening it.
         if state == "match" and os.path.normcase(os.path.abspath(r["dest_path"])) in elsewhere:
-            claimed.append(r["title"])
+            claimed.append(_sync_row_title(r))
             continue
         if state == "pristine":
             continue                       # untouched refresh - already original
@@ -10260,13 +10268,13 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None):
                 try:
                     restorable.append((r["dest_path"], _sync_pre_image(r)))
                 except (KeyError, ValueError):
-                    unreadable.append(r["title"])   # cannot rebuild the original
+                    unreadable.append(_sync_row_title(r))   # cannot rebuild the original
             else:
                 removable.append(r["dest_path"])
         elif state == "drifted":
-            drifted.append(r["title"])
+            drifted.append(_sync_row_title(r))
         else:                              # "unreadable"
-            unreadable.append(r["title"])
+            unreadable.append(_sync_row_title(r))
     if unresolved is None:
         refuse = [(r, p) for r, p, w in stray if w]
         if refuse:
@@ -16530,12 +16538,15 @@ def _lineage_row_store(m, r):
 def _lineage_agreement_error(m, i, r, lin, names):
     """A sentence when a row's `lineage` disagrees with its bytes ("Lineage
     must agree with the bytes"), or None. Never raises."""
+    # Bytes that cannot be read to a JSON object are not a shape error: the
+    # readers that own the row fail it closed as unreadable, and 'back' stays
+    # on offer. Agreement is checked only against bytes that can be read.
     try:
         data = json.loads(unb64(r["post_b64"]))
     except Exception:
-        return "row {0} has a post_b64 that cannot be read".format(i)
+        return None
     if not isinstance(data, dict):
-        return "row {0} has a post_b64 that cannot be read".format(i)
+        return None
     store = _lineage_row_store(m, r)
     for key, field, inner, planned in (
             ("spawnedFrom", "parent_row", "sessionId", "parent_planned"),
@@ -16609,8 +16620,7 @@ def _lineage_shape_error(m):
                 try:
                     data = json.loads(unb64(r["post_b64"]))
                 except Exception:
-                    return "row {0} has a post_b64 that cannot be read" \
-                        .format(i)
+                    data = None          # left to the readers, as above
                 if isinstance(data, dict) and (
                         "spawnedFrom" in data or "startChain" in data):
                     return "row {0} carries a link and has no lineage" \
@@ -16632,14 +16642,11 @@ def _sync_shape_error(m):
         for i, r in enumerate(rows):
             if not isinstance(r, dict):
                 return "row {0} is not an object".format(i)
-            # post_b64 is held to a string only for a journal that carries
-            # lineage: an older journal runs as it always did, and a row
-            # whose post-image is missing or corrupt still offers 'back'
-            # (_sync_row_drift reads it as unreadable), the one exit a stuck
-            # op must keep.
-            keys = ("name", "dest_path") + (
-                ("post_b64",) if "lineage_format" in m else ())
-            for k in keys:
+            # post_b64 is never required here, on an old journal or a new one:
+            # a row whose post-image is missing, not a string or undecodable
+            # is failed closed as unreadable by the readers (never written
+            # forward, never deleted), so 'back' stays on offer.
+            for k in ("name", "dest_path"):
                 if not isinstance(r.get(k), str):
                     return "row {0} has no usable {1!r}".format(i, k)
         return _lineage_shape_error(m)

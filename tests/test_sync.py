@@ -3543,8 +3543,6 @@ def test_a_0_17_sync_journal_with_a_verbatim_link_recovers_and_undoes(
 @pytest.mark.parametrize("damage", [
     lambda m: m.__setitem__("rows", 5),
     lambda m: m.__setitem__("rows", [5, None]),
-    lambda m: (m.__setitem__("lineage_format", 1),
-               m["rows"][0].__setitem__("post_b64", 7)),
     lambda m: m["rows"][0].__setitem__("dest_path", None),
     lambda m: m["rows"][0].__setitem__("name", ["x"]),
     lambda m: (m.__setitem__("lineage_format", 1),
@@ -3612,3 +3610,31 @@ def test_a_damaged_pending_op_does_not_crash_a_later_commands_rotation(
     assert os.path.isdir(oldest.op_dir)
     m = {"op_id": "zzz", "op_type": "sync", "rows": []}
     assert isinstance(ct._sync_paths_claimed_elsewhere(env, m), set)
+
+
+@pytest.mark.parametrize("title", ["missing", None, 5])
+@pytest.mark.parametrize("fmt", [False, True])
+def test_a_row_without_a_usable_title_and_bad_bytes_still_offers_back(
+        two_account_env, tmp_path, title, fmt):
+    import types
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    if fmt:
+        m["lineage_format"] = 1
+    r = m["rows"][0]
+    for bad in ("corrupt", "missing"):
+        if title == "missing":
+            r.pop("title", None)
+        else:
+            r["title"] = title
+        if bad == "corrupt":
+            r["post_b64"] = "!!!not base64!!!"
+        else:
+            r.pop("post_b64", None)
+        op = ct.new_op(env, m)
+        assert ct.classify_op(env, op)["resolutions"] == ["back"]
+        assert ct.classify_sync_op(env, op)["resolutions"] == ["back"]
+        assert ct.cmd_recover(env, types.SimpleNamespace(
+            op_id=None, verbose=True)) == 1
+        ct.set_status(op, "rolled_back")

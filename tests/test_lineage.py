@@ -898,8 +898,6 @@ DISAGREE = {
     "a chain the lineage cannot read":
         lambda c: c.__setitem__("post_b64", b64post(
             spawnedFrom=LINK, startChain={"depth": 1})),
-    "post_b64 that is not base64 json":
-        lambda c: c.__setitem__("post_b64", "!!!"),
 }
 
 
@@ -999,11 +997,30 @@ def test_sync_shape_error_checks_rows_and_their_strings():
     assert ct._sync_shape_error({"rows": []}) is None
     for bad in ({"rows": 3}, {}, {"rows": [4]}, {"rows": [srow(name=1)]},
                 {"rows": [srow(dest_path=None)]},
-                {"rows": [srow(post_b64=7)], "lineage_format": 1},
-                {"rows": [{"name": "a", "dest_path": "b"}],
-                 "lineage_format": 1}):
+                ):
         assert isinstance(ct._sync_shape_error(bad), str), bad
-    # An older journal is not held to a post_b64: a stuck op keeps its 'back'.
-    assert ct._sync_shape_error({"rows": [srow(post_b64=7)]}) is None
+    # post_b64 is never required, on an old journal or a new one: a stuck op
+    # keeps its 'back'.
+    for fmt in ({}, {"lineage_format": 1}):
+        for pb in (7, None, "!!!"):
+            m = dict(fmt, rows=[srow(post_b64=pb)])
+            assert ct._sync_shape_error(m) is None, (fmt, pb)
+        r = srow()
+        del r["post_b64"]
+        assert ct._sync_shape_error(dict(fmt, rows=[r])) is None
     m = {"rows": [srow(lineage="junk")], "lineage_format": 1}
     assert "lineage" in ct._sync_shape_error(m)
+
+
+def test_unreadable_bytes_are_not_a_shape_error_but_a_readable_disagreement_is():
+    for pb in ("!!!", 7, None):
+        c = good_child()
+        c["post_b64"] = pb
+        assert ct._lineage_shape_error(jman([parent_row(), root_row(), c]))             is None
+    bare = jrow("local_c.json", "!!!")
+    assert ct._lineage_shape_error(jman([bare])) is None
+    # the lineage record's own shape is still checked on such a row
+    c = good_child()
+    c["post_b64"] = "!!!"
+    c["lineage"]["notes"] = "n"
+    assert ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
