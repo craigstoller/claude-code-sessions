@@ -1269,6 +1269,17 @@ def nonterminal_ops(env):
     return [o for o in list_ops(env) if o.manifest.get("status") in NONTERMINAL]
 
 
+def _journal_dict_rows(m):
+    """The rows of manifest M that are objects, whatever else its 'rows'
+    holds. A damaged journal is a file a user can edit, and the readers that
+    run at the end of every mutation (rotate_ops, the sync claim scan) must
+    step over it. Never raises."""
+    rows = m.get("rows") if isinstance(m, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
 def rotate_ops(env):
     import shutil
     ops = list_ops(env)
@@ -1292,7 +1303,7 @@ def rotate_ops(env):
         if om.get("op_type") not in claimants \
                 or om.get("status") not in NONTERMINAL:
             continue
-        for r in om.get("rows") or []:
+        for r in _journal_dict_rows(om):
             p = r.get("dest_path")
             if isinstance(p, str):
                 live.add(os.path.normcase(os.path.abspath(p)))
@@ -1316,7 +1327,7 @@ def rotate_ops(env):
             return False
         if om.get("status") in ("undone", "rolled_back"):
             return False          # claim withdrawn; nothing left to protect
-        for r in om.get("rows") or []:
+        for r in _journal_dict_rows(om):
             p = r.get("dest_path")
             if r.get("written") and isinstance(p, str) \
                     and os.path.normcase(os.path.abspath(p)) in live:
@@ -2909,6 +2920,7 @@ def classify_op(env, op):
         shape = {"new-row": _new_row_shape_error, "repoint": _repoint_shape_error,
                  "retitle": _retitle_shape_error,
                  "converge": _converge_shape_error,
+                 "sync": _sync_shape_error,
                  "realign": _realign_shape_error}.get(kind)
         if not (shape and shape(m)):
             return {"status": status, "source": m.get("store_label", "n/a"),
@@ -3664,6 +3676,12 @@ def recover_op(env, op, direction):
             rotate_ops(env)
             return "rolled_back"
         if m.get("op_type") == "sync":
+            bad = _sync_shape_error(m)
+            if bad:
+                raise Refusal(
+                    "the record for {0} is damaged ({1}), so neither direction "
+                    "can be run from it. Nothing was changed.".format(
+                        m.get("op_id"), bad))
             # direction is already guaranteed to be a member of c["resolutions"]
             # by the check above, and classify_sync_op only ever offers
             # "back", "forward" or both (never anything else) for a
@@ -5803,7 +5821,8 @@ def cmd_undo(env, ns):
             # A sync manifest has no session_id - the move-shaped preview
             # below would print "session None". Name what undo would
             # actually remove instead: how many rows landed, and where.
-            n_written = sum(1 for r in prior.manifest.get("rows", []) if r.get("written"))
+            n_written = sum(1 for r in _journal_dict_rows(prior.manifest)
+                            if r.get("written"))
             dest = prior.manifest.get("dest_email") or prior.manifest.get("dest_account", "")
             if _ANONYMIZE and "@" in dest:
                 # An address names a person - the sync-manifest rule.
@@ -9951,6 +9970,15 @@ def classify_sync_op(env, op):
     for a refresh and still perfectly resumable for an add.
     """
     m = op.manifest
+    # Before anything reads `rows`: a damaged record offers nothing, as a
+    # damaged repoint does (classify_op's shape table only sees ops whose rows
+    # sit in a store this version does not resolve).
+    bad = _sync_shape_error(m)
+    if bad:
+        return {"status": m.get("status"), "source": "n/a", "dest": "n/a",
+                "resolutions": [], "drifted_rows": [],
+                "note": "sync: this operation's record is damaged ({0}), "
+                        "so neither direction can be run from it".format(bad)}
     written = [r for r in m["rows"] if r.get("written")]
     pending = [r for r in m["rows"] if not r.get("written")]
     if m["status"] not in NONTERMINAL:
@@ -10064,7 +10092,7 @@ def _sync_paths_claimed_elsewhere(env, m):
         # that cannot be cleared is as bad as no claim at all.
         if om.get("status") in ("undone", "rolled_back"):
             continue
-        for r in om.get("rows") or []:
+        for r in _journal_dict_rows(om):
             p = r.get("dest_path")
             if r.get("written") and isinstance(p, str):
                 out.add(os.path.normcase(os.path.abspath(p)))
@@ -10342,6 +10370,11 @@ def undo_sync(env, op):
         if m.get("status") != "completed":
             raise Refusal("op {0} is '{1}', not 'completed'".format(
                 m.get("op_id"), m.get("status")))
+        bad = _sync_shape_error(m)
+        if bad:
+            raise Refusal(
+                "the record for {0} is damaged ({1}), so it cannot be undone "
+                "from it. Nothing was changed.".format(m.get("op_id"), bad))
         _journal_discovery(env, "undo")
         tally = {"already_gone": 0, "not_restored": 0}
         (drifted, unreadable, removable,
@@ -16450,6 +16483,170 @@ def plan_converge(env, flags):
     return m
 
 
+def _lineage_record_error(lin, where):
+    """A sentence naming what is wrong with one `lineage` or `lineage_planned`
+    record's shape, or None. Never raises."""
+    if not isinstance(lin, dict):
+        return "{0} is not an object".format(where)
+    for k in ("parent_session", "parent_row", "root_session", "root_row"):
+        if not isinstance(lin.get(k), str):
+            return "{0} has no usable {1!r}".format(where, k)
+    for k in ("parent_planned", "root_planned"):
+        if not isinstance(lin.get(k), bool):
+            return "{0} has no usable {1!r}".format(where, k)
+    for k in ("carried_keys", "dropped_keys"):
+        v = lin.get(k)
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            return "{0} has no usable {1!r}".format(where, k)
+    notes = lin.get("notes")
+    if not isinstance(notes, list):
+        return "{0} has no usable 'notes'".format(where)
+    seen = set()
+    for n in notes:
+        if not isinstance(n, dict) or not isinstance(n.get("code"), str) \
+                or not isinstance(n.get("detail"), str):
+            return "{0} has a note that is not a code and a detail".format(
+                where)
+        if n["code"] in seen:
+            return "{0} repeats the note {1!r}".format(where, n["code"])
+        seen.add(n["code"])
+    return None
+
+
+def _lineage_row_store(m, r):
+    """The store a journal row sits in, normalised, or None: a sync row's
+    directory, a converge row's store_path. Never raises."""
+    try:
+        p = r.get("dest_path") if m.get("op_type") == "sync" \
+            else r.get("store_path")
+        if m.get("op_type") == "sync" and isinstance(p, str):
+            p = os.path.dirname(p)
+        return os.path.normcase(os.path.normpath(p)) \
+            if isinstance(p, str) and p else None
+    except Exception:
+        return None
+
+
+def _lineage_agreement_error(m, i, r, lin, names):
+    """A sentence when a row's `lineage` disagrees with its bytes ("Lineage
+    must agree with the bytes"), or None. Never raises."""
+    try:
+        data = json.loads(unb64(r["post_b64"]))
+    except Exception:
+        return "row {0} has a post_b64 that cannot be read".format(i)
+    if not isinstance(data, dict):
+        return "row {0} has a post_b64 that cannot be read".format(i)
+    store = _lineage_row_store(m, r)
+    for key, field, inner, planned in (
+            ("spawnedFrom", "parent_row", "sessionId", "parent_planned"),
+            ("startChain", "root_row", "firstSessionId", "root_planned")):
+        want = lin[field]
+        if key in data:
+            v = data[key]
+            sid = v.get(inner) if isinstance(v, dict) else None
+            if not isinstance(sid, str) or not sid:
+                return "row {0} carries a {1} its lineage cannot read".format(
+                    i, key)
+            if want != sid:
+                return "row {0}'s lineage {1} is not the {2} in its " \
+                    "bytes".format(i, field, key)
+        elif want:
+            return "row {0}'s lineage names a {1} its bytes do not " \
+                "carry".format(i, field)
+        if lin[planned]:
+            if not want or (store, want + ".json") not in names \
+                    or want + ".json" == r.get("name"):
+                return "row {0}'s lineage says its {1} is in this operation, " \
+                    "and no other row is".format(i, field)
+    return None
+
+
+def _lineage_shape_error(m):
+    """A sentence naming what is wrong with a manifest's lineage fields, or
+    None. NEVER RAISES.
+
+    No `lineage_format` means a journal from before lineage, and nothing is
+    checked: it runs as it always did. Any value but 1 is a format this
+    version cannot read. `lineage` must have the journal shape and agree with
+    the row's bytes; `lineage_planned` is the plan's record, kept as history
+    and checked for shape alone, since after a retarget, gain or drop it
+    disagrees with the final bytes by design."""
+    try:
+        if not isinstance(m, dict) or "lineage_format" not in m:
+            return None
+        fmt = m["lineage_format"]
+        if type(fmt) is not int or fmt != 1:
+            return "its 'lineage_format' is not one this version reads"
+        cycles = m.get("lineage_cycles")
+        if "lineage_cycles" in m and (type(cycles) is not int or cycles < 0):
+            return "its 'lineage_cycles' is not a count"
+        rows = m.get("rows")
+        if not isinstance(rows, list):
+            return "its 'rows' is not a list"
+        names = set()
+        for r in rows:
+            if isinstance(r, dict) and isinstance(r.get("name"), str):
+                names.add((_lineage_row_store(m, r), r["name"]))
+        verbatim = m.get("verbatim") is True
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                return "row {0} is not an object".format(i)
+            if "lineage_planned" in r:
+                bad = _lineage_record_error(
+                    r["lineage_planned"],
+                    "row {0}'s lineage_planned".format(i))
+                if bad:
+                    return bad
+            if "lineage" in r:
+                bad = _lineage_record_error(
+                    r["lineage"], "row {0}'s lineage".format(i))
+                if bad:
+                    return bad
+                bad = _lineage_agreement_error(m, i, r, r["lineage"], names)
+                if bad:
+                    return bad
+            elif not verbatim:
+                try:
+                    data = json.loads(unb64(r["post_b64"]))
+                except Exception:
+                    return "row {0} has a post_b64 that cannot be read" \
+                        .format(i)
+                if isinstance(data, dict) and (
+                        "spawnedFrom" in data or "startChain" in data):
+                    return "row {0} carries a link and has no lineage" \
+                        .format(i)
+        return None
+    except Exception:
+        return "its lineage could not be read"
+
+
+def _sync_shape_error(m):
+    """A sentence naming what is wrong with this sync manifest, or None.
+
+    The sync counterpart of _converge_shape_error: classify, undo and recover
+    read rows straight out of a journal file a user can edit. NEVER RAISES."""
+    try:
+        rows = m.get("rows")
+        if not isinstance(rows, list):
+            return "its 'rows' is not a list"
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                return "row {0} is not an object".format(i)
+            # post_b64 is held to a string only for a journal that carries
+            # lineage: an older journal runs as it always did, and a row
+            # whose post-image is missing or corrupt still offers 'back'
+            # (_sync_row_drift reads it as unreadable), the one exit a stuck
+            # op must keep.
+            keys = ("name", "dest_path") + (
+                ("post_b64",) if "lineage_format" in m else ())
+            for k in keys:
+                if not isinstance(r.get(k), str):
+                    return "row {0} has no usable {1!r}".format(i, k)
+        return _lineage_shape_error(m)
+    except Exception:
+        return "its record could not be read"
+
+
 def _converge_shape_error(m):
     """A sentence naming what is wrong with this converge manifest, or None.
 
@@ -16469,7 +16666,7 @@ def _converge_shape_error(m):
                   "session", "title"):
             if not isinstance(r.get(k), str) or not r[k]:
                 return "row {0} has no usable {1!r}".format(i, k)
-    return None
+    return _lineage_shape_error(m)
 
 
 def _converge_recheck(env, m, ignore_own_paths=False, relink=False):
