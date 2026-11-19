@@ -3648,6 +3648,79 @@ def test_after_apply_trailer_prints_the_links_lines(
     assert ct._lineage_apply_lines([row("")]) == []
 
 
+def test_verbose_apply_lists_each_rows_link_reasons_with_its_account(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, capsys):
+    """--verbose lists them (spec, "converge", "Reporting"): under the
+    after-apply links lines, one line per written row whose link or chain
+    was left out or changed since the plan, naming the row, its account and
+    each reason's phrase. A row that carried its link is not listed, and
+    without --verbose nothing is. Under --anonymize the account label is
+    scrubbed as the rest of converge's output scrubs it (main refuses
+    --anonymize beside --verbose or --apply; the list holds to it anyway)."""
+    real = ct.run_converge
+    outputs = {}
+    for leg in ("plain", "verbose", "anonymized"):
+        env = _monotonic_now(mkenv(tmp_path / leg))
+        linked_holdings(env, write_transcript, write_row, parent_in=(A2,),
+                        chain={"firstSessionId": "local_p1", "depth": 1})
+        agent_mode_email(env, A3, "bob@example.com")
+
+        def late(env_, m_, env=env):
+            # A collision for P's chosen title in A3, after the dry run.
+            write_row(env, 0, A3, O3, "local_x3",
+                      lrow(LX, "local_x3", "Northwind kickoff"))
+            return real(env_, m_)
+        monkeypatch.setattr(ct, "run_converge", late)
+        ct._ANONYMIZE = leg == "anonymized"
+        ct._ANON_CACHE.clear()
+        try:
+            rc = ct.cmd_converge(env, cv_ns(
+                apply=True, verbose=leg != "plain",
+                anonymize=leg == "anonymized"))
+        finally:
+            ct._ANONYMIZE = False
+            ct._ANON_CACHE.clear()
+        assert rc == 3, leg
+        op = ct.list_ops(env)[-1]
+        child = rows_by(op.manifest, LC)[A3]
+        assert codes(child["lineage"]) == [
+            "parent_pair_held", "lineage_chain_dropped", "lineage_dropped"]
+        # converge's own label for the account: its address, then its ids.
+        assert child["label"].startswith("bob@example.com")
+        outputs[leg] = (capsys.readouterr().out.splitlines(), stem(child),
+                        child["label"])
+    phrases = ("[link: the parent's own row is held in this plan; the chain "
+               "was left out; dropped since the plan]")
+    lines, child, label = outputs["verbose"]
+    at = lines.index("chains  : 1 carried, 1 left out")
+    assert lines[at - 1].startswith("links   : 1 carried, 1 left out")
+    assert lines[at + 1] == "   {0} -> {1}   {2}".format(child, label,
+                                                       phrases)
+    assert lines[at + 2].startswith("skipped : " + LP[:8])
+    assert sum(1 for x in lines if x.startswith("   local_")
+               and "[link:" in x) == 1
+    lines, child, _label = outputs["plain"]
+    at = lines.index("chains  : 1 carried, 1 left out")
+    assert lines[at + 1].startswith("skipped : ")
+    assert not any(x.startswith("   local_") and "[link:" in x
+                   for x in lines)
+    lines, child, label = outputs["anonymized"]
+    listed = [x for x in lines if x.startswith("   " + child)]
+    assert listed == ["   {0} -> {1}   {2}".format(
+        child, ct._anon_label("account", label), phrases)]
+    assert "@" not in listed[0]
+    # The helper itself: rows with nothing to list, and junk, give nothing.
+    assert ct._lineage_row_lines([
+        {"name": "local_a.json", "label": "x", "lineage": ct._lineage_empty()},
+        {"name": "local_b.json", "lineage": "junk"}, 5, None]) == []
+    assert ct._lineage_row_lines(None) == []
+    assert ct._lineage_row_lines([{
+        "name": "local_g.json", "account": A2, "lineage": dict(
+            ct._lineage_empty(), parent_row="local_p",
+            notes=[{"code": "lineage_gained", "detail": ""}])}]) == [
+        "   local_g -> {0}   [link: gained since the plan]".format(A2[:8])]
+
+
 def test_a_row_is_never_skipped_over_its_link(
         mkenv, tmp_path, write_transcript, write_row):
     """The plan creates P's row in A3 and links C's A3 row to it; P's
@@ -4103,6 +4176,38 @@ def test_existing_parent_deleted_in_the_window_child_skipped(
     assert LP[:8] in child["skip_detail"]
     assert not os.path.exists(child["dest_path"])
     assert op.manifest["link_report"] == EMPTY_REPORT
+
+
+@pytest.mark.parametrize("reason", ["parent_not_written", "parent_changed"])
+def test_recover_forward_prints_each_row_it_skipped_over_its_link(
+        mkenv, tmp_path, write_transcript, write_row, capsys, reason):
+    """recover --forward names each row it skipped as parent_not_written or
+    parent_changed, with its reason, in the shape converge prints its
+    skipped rows, after the result line. A row it wrote is not named, and
+    neither is a skip of another kind (P's already_present)."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    if reason == "parent_not_written":
+        op = crash_on(env, m)
+        write_row(env, 0, A3, O3, "local_q3",
+                  lrow(LP, "local_q3", "Northwind kickoff"))
+    else:
+        op = crash_on(env, m, nth=2)
+        _app_touches(rows_by(op.manifest, LP)[A3]["dest_path"],
+                     cliSessionId=S3)
+    op_id = op.manifest["op_id"]
+    assert ct.cmd_recover(env, recover_ns(op_id, "forward")) == 0
+    out = capsys.readouterr().out.splitlines()
+    child = rows_by(journal_of(env, op_id), LC)[A3]
+    assert child["skipped"] == reason
+    line = "skipped : {0} -> {1}: {2} - {3}".format(
+        LC[:8], child["label"], reason, child["skip_detail"])
+    assert ct._converge_skip_line(child) == line
+    skips = [x for x in out if x.startswith("skipped : ")]
+    assert skips == [line]
+    assert out.index("result: completed") < out.index(line)
+    assert "Northwind" not in line and "ACME" not in line
 
 
 def test_child_landed_then_parent_deleted_forward_reports_dangling(

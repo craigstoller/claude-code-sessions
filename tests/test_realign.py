@@ -866,6 +866,8 @@ _OP_TYPE_BRANCHES = {
     "_live_override_note": "only sync records a live override note",
     "_lineage_row_store": "reads a converge or sync row's store, for the "
                           "lineage check; a realign op carries no lineage",
+    "cmd_recover": "prints the rows converge's forward recovery skipped "
+                   "over their link; a realign op has no such skip",
 }
 
 

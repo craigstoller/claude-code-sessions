@@ -6082,6 +6082,16 @@ def cmd_recover(env, ns):
         return 0
     final = recover_op(env, matches[0], direction)
     print("result: " + final)
+    if direction == "forward" \
+            and matches[0].manifest.get("op_type") == "converge":
+        # Each row forward recovery skipped over its journaled link or chain
+        # (parent_not_written, parent_changed), with its reason, in the
+        # shape converge prints its skipped rows: it stays short for the
+        # next converge, which plans it afresh.
+        for r in _journal_dict_rows(matches[0].manifest):
+            if r.get("skipped") in LINEAGE_SKIP_REASONS:
+                line = _converge_skip_line(r)
+                print(line if ns.verbose else redact(env, line))
     if final != "completed":
         _print_abort_reason(env, ns, matches[0])
     if matches[0].manifest.get("rollback_residue"):
@@ -15464,6 +15474,10 @@ LINEAGE_PHRASES = {
     "lineage_gained": "gained since the plan",
 }
 
+# Recovery's skip reasons: a pending row not written forward because of the
+# row its journaled link or chain names.
+LINEAGE_SKIP_REASONS = ("parent_not_written", "parent_changed")
+
 # The codes that count as "link left out".
 LINEAGE_LEFT_OUT = frozenset((
     "lineage_parent_disagree", "lineage_self", "lineage_parent_dead",
@@ -16354,6 +16368,43 @@ def _lineage_apply_lines(rows):
         links = links + "; " + since if links else "links   : " + since
     return [ln for ln in (links, _lineage_chains_line(s, carried="carried"))
             if ln]
+
+
+# The codes a --verbose apply lists a row for: its link left out, its chain
+# left out, or a change since the plan.
+_LINEAGE_LISTED = LINEAGE_LEFT_OUT | {"lineage_chain_dropped",
+                                      "lineage_retargeted", "lineage_dropped",
+                                      "lineage_gained"}
+
+
+def _lineage_row_lines(rows):
+    """converge --verbose's list under the after-apply links lines (spec,
+    "converge", "Reporting": "`--verbose` lists them"): one line per row in
+    ROWS whose `lineage` carries a left-out reason (link or chain) or an
+    apply-time change code, `   <row id> -> <account label>   [link:
+    <phrase>; <phrase>]`, the phrases LINEAGE_PHRASES gives, in the notes'
+    order. The caller picks the rows (the written ones, from the public
+    manifest, so --anonymize has already scrubbed each label). Never
+    raises."""
+    out = []
+    try:
+        for r in rows or ():
+            if not isinstance(r, dict):
+                continue
+            phrases = [LINEAGE_PHRASES[c] for c in _lineage_codes(
+                r.get("lineage")) if c in _LINEAGE_LISTED]
+            if not phrases:
+                continue
+            label = r.get("label")
+            if not isinstance(label, str) or not label:
+                acct = r.get("account")
+                label = acct[:8] if isinstance(acct, str) and acct else "?"
+            out.append("   {0} -> {1}   [link: {2}]".format(
+                _lineage_stem(r.get("name")) or "?", label,
+                "; ".join(phrases)))
+    except Exception:
+        pass
+    return out
 
 
 # ------------------------------------------------------------- 9. converge
@@ -18619,6 +18670,16 @@ def _identity_warning_lines(env, m):
     ]
 
 
+def _converge_skip_line(r):
+    """`skipped : <conversation> -> <account label>: <reason> - <detail>`,
+    for a converge row that was not written: cmd_converge prints one per
+    skipped row after an apply, and cmd_recover one per row forward
+    recovery skipped over its journaled link or chain."""
+    return "skipped : {0} -> {1}: {2} - {3}".format(
+        (r.get("session") or "")[:8], r.get("label", ""),
+        r.get("skipped"), r.get("skip_detail", ""))
+
+
 def cmd_converge(env, ns):
     flags = ConvergeFlags(only=ns.only, live=ns.live)
     m = plan_converge(env, flags)
@@ -18682,11 +18743,18 @@ def cmd_converge(env, ns):
     for line in _lineage_apply_lines([r for r in m["rows"]
                                       if r.get("written")]):
         say(line)
+    if ns.verbose:
+        # --verbose lists them: each written row whose link or chain was
+        # left out, or changed since the plan, with its account. Read from
+        # the public manifest, so a label is scrubbed wherever converge's
+        # other output scrubs it.
+        for line in _lineage_row_lines(
+                [r for r in _public_converge_manifest(env, m).get("rows", [])
+                 if r.get("written")]):
+            say(line)
     for r in m["rows"]:
         if r.get("skipped"):
-            say("skipped : {0} -> {1}: {2} - {3}".format(
-                (r.get("session") or "")[:8], r.get("label", ""),
-                r["skipped"], r.get("skip_detail", "")))
+            say(_converge_skip_line(r))
     if final == "unchanged":
         say("nothing was written, so no operation was journalled and there "
             "is nothing to undo.")
