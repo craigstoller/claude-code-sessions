@@ -5792,24 +5792,149 @@ def test_sync_light_rows_plan_exactly_what_whole_rows_plan(
 
 def test_sync_planning_looks_up_each_transcript_once(two_account_env,
                                                      tmp_path, monkeypatch):
-    """A conversation's transcript is looked up once while planning: the
-    pass reuses selection's answer for a parent or root that is itself a
-    candidate. Under the lock the pass looks again, afresh."""
+    """A conversation's transcript is looked up once while planning, in the
+    plan's one index of the projects folder: the pass reuses selection's
+    answer for a parent or root that is itself a candidate, and nothing
+    scans the folder per conversation. Under the lock the pass looks again,
+    afresh, with find_transcripts."""
     env, src, dst = two_account_env(tmp_path)
     _decode_once_stores(env, src, dst)
-    looked = []
-    real = ct.find_transcripts
+    asked, scanned = [], []
+    real_find, real_scan = ct._TranscriptIndex.find, ct.find_transcripts
 
-    def spy(root, sid):
-        looked.append(sid)
-        return real(root, sid)
-    monkeypatch.setattr(ct, "find_transcripts", spy)
+    def spy_find(self, sid):
+        asked.append(sid)
+        return real_find(self, sid)
+
+    def spy_scan(root, sid):
+        scanned.append(sid)
+        return real_scan(root, sid)
+    monkeypatch.setattr(ct._TranscriptIndex, "find", spy_find)
+    monkeypatch.setattr(ct, "find_transcripts", spy_scan)
     m = ct.plan_sync(env, ct.SyncFlags())
-    assert LP in looked and LR in looked
-    assert sorted(looked) == sorted(set(looked))
-    del looked[:]
+    assert LP in asked and LR in asked
+    assert sorted(asked) == sorted(set(asked))
+    assert scanned == []
+    del asked[:]
     assert ct.run_sync(env, m) == "completed"
-    assert LP in looked and LR in looked
+    assert asked == []
+    assert LP in scanned and LR in scanned
+
+
+def _prose_transcript(env, folder, sid, bodies):
+    path = os.path.join(env.projects_root, folder, sid + ".jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for i, b in enumerate(bodies):
+            fh.write(json.dumps({"type": "user" if i % 2 == 0 else "assistant",
+                                 "message": {"content": b}}) + "\n")
+    return path
+
+
+def _index_stores(env, src, dst):
+    """Rows that reach every lookup planning makes - candidates, a parent
+    and a root for the lineage pass, and two swaps whose overlap and sizes
+    are measured - over transcripts in every shape the plan's index has to
+    answer as find_transcripts does: an id in two folders, a filename in
+    another case, a .jsonl that is a directory, a non-ASCII filename, and
+    an id with no transcript."""
+    _swapped_parent(env, src, dst)
+    turns = ["Northwind turn %d with enough words to be a real message" % i
+             for i in range(12)]
+    _prose_transcript(env, "C--p", LQ, turns[:10])
+    _prose_transcript(env, "C--p", LP, turns)
+    _lrow(src, "local_r.json", LR, "ACME-REVIEW root")
+    _transcript(env, "sid-dup")
+    _prose_transcript(env, "C--q", "sid-dup", turns[:9])
+    _transcript(env, "sid-s")
+    _lrow(dst, "local_s.json", "sid-dup", "ACME swap", lastActivityAt=1)
+    _lrow(src, "local_s.json", "sid-s", "ACME swap", lastActivityAt=4)
+    _lrow(src, "local_d.json", "sid-dup", "Northwind duplicate")
+    _prose_transcript(env, "C--q", "SID-CASE", turns[:2])
+    _lrow(src, "local_k.json", "sid-case", "ACME case")
+    os.makedirs(os.path.join(env.projects_root, "C--q", "sid-dir.jsonl"))
+    _lrow(src, "local_j.json", "sid-dir", "ACME directory")
+    _prose_transcript(env, "C--q", "n\u0131-x", turns[:2])
+    _lrow(src, "local_m.json", "sid-none", "Northwind no transcript")
+
+
+def _scan_per_lookup(self, sid):
+    """The index answering as 0.18.0's planning did: a fresh
+    find_transcripts for every lookup."""
+    return ct.find_transcripts(self.root, sid)
+
+
+@pytest.mark.parametrize("flags", [
+    ct.SyncFlags(), ct.SyncFlags(update=True),
+    ct.SyncFlags(update=True, allow_orphan=True), ct.SyncFlags(verbatim=True),
+    ct.SyncFlags(update=True, verbatim=True)],
+    ids=["add", "update", "update-allow-orphan", "verbatim", "update-verbatim"])
+def test_sync_plan_from_the_index_is_the_plan_from_scanning(
+        two_account_env, tmp_path, monkeypatch, flags):
+    """Planning from one index of the projects folder plans exactly what a
+    fresh scan per lookup plans, byte for byte."""
+    env, src, dst = two_account_env(tmp_path)
+    _index_stores(env, src, dst)
+    indexed = ct.plan_sync(env, flags)
+    with monkeypatch.context() as mp:
+        mp.setattr(ct._TranscriptIndex, "find", _scan_per_lookup)
+        scanned = ct.plan_sync(env, flags)
+    assert json.dumps(indexed) == json.dumps(scanned)   # key order included
+    if flags.update and flags.allow_orphan:
+        by = _by_name(indexed)
+        assert by["local_p.json"]["displaced_overlap"] == 1.0
+        assert (by["local_p.json"]["displaced_turns"],
+                by["local_p.json"]["incoming_turns"]) == (10, 12)
+        assert by["local_s.json"]["swaps_conversation"] is True
+        assert by["local_s.json"]["displaced_overlap"] is None   # two copies
+    names = {r["name"] for r in indexed["rows"]}
+    assert "local_d.json" in names and "local_j.json" not in names
+    assert "local_m.json" not in names
+    folds_case = os.path.isfile(os.path.join(env.projects_root, "C--q",
+                                             "sid-case.jsonl"))
+    assert ("local_k.json" in names) == folds_case
+
+
+@pytest.mark.parametrize("update", [False, True], ids=["add", "update"])
+def test_sync_planning_lists_the_projects_folder_once(
+        two_account_env, tmp_path, monkeypatch, update):
+    env, src, dst = two_account_env(tmp_path)
+    _index_stores(env, src, dst)
+    flags = ct.SyncFlags(update=update, allow_orphan=True)
+    listed = []
+    real = os.listdir
+
+    def spy(path="."):
+        listed.append(os.path.normcase(str(path)))
+        return real(path)
+    monkeypatch.setattr(os, "listdir", spy)
+    ct.plan_sync(env, flags)
+    assert listed.count(os.path.normcase(env.projects_root)) == 1
+    # And the scan it replaces listed it once per lookup.
+    del listed[:]
+    monkeypatch.setattr(ct._TranscriptIndex, "find", _scan_per_lookup)
+    ct.plan_sync(env, flags)
+    assert listed.count(os.path.normcase(env.projects_root)) > 5
+
+
+def test_sync_plan_fails_a_non_string_session_id_as_before(
+        two_account_env, tmp_path, monkeypatch):
+    """A row whose cliSessionId is not a string fails in find_transcripts,
+    as it always has, index or no index."""
+    env, src, dst = two_account_env(tmp_path)
+    _index_stores(env, src, dst)
+    _lrow(src, "local_z.json", 5, "ACME five")
+
+    def outcome():
+        try:
+            ct.plan_sync(env, ct.SyncFlags())
+        except Exception as e:
+            return type(e), str(e)
+        return None
+    indexed = outcome()
+    monkeypatch.setattr(ct._TranscriptIndex, "find", _scan_per_lookup)
+    assert indexed == outcome()
+    assert indexed is not None and indexed[0] is TypeError
 
 
 def test_sync_refresh_loss_decodes_each_image_once(monkeypatch):
