@@ -933,6 +933,10 @@ _ROW_READERS = {
     "_lineage_store_rows": "its callers pass only stores of rows the op's gate "
                            "resolved (_unresolved_rows); it reads direct "
                            "children of that store only",
+    "_sync_row_now": "run_sync's apply-time pass, under the lock and before "
+                     "new_op, over a plan's own rows; it reads one direct "
+                     "child of the plan's destination store, through "
+                     "ensure_contained",
     "_row_state": "the classifier itself; every caller above is gated or listed",
     "_sync_row_drift": "the classifier itself; every caller above is gated or listed",
 }

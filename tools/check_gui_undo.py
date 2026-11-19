@@ -257,6 +257,60 @@ check("Undo is offered at the LEFT of the bar, before the checkbox",
       and bar.pack_slaves().index(app.undo_btn)
       < bar.pack_slaves().index(app.trust_chk),
       str([str(w).split(".")[-1] for w in bar.pack_slaves()]))
+
+# ------------- carry-lineage, Task 8: an apply that leaves nothing to write
+# run_sync runs the lineage pass again under the lock. Here a refresh was
+# planned only to add the source row's link, and the source loses that link
+# before the apply, so the refresh would write the bytes the destination
+# already holds: run_sync returns "unchanged" and journals no op. The window
+# says so, spends no identity answer (no mutation ran), and leaves Undo as it
+# was - recomputing it could only find an older op, and Undo must never look
+# like it reverses this press.
+
+
+def put(folder, name, data):
+    with open(os.path.join(folder, name), "w") as fh:
+        fh.write(_json.dumps(data, separators=(",", ":")))
+
+
+for i in (7, 8):
+    with open(os.path.join(projects, ("%032d" % i) + ".jsonl"), "w") as fh:
+        fh.write('{"type":"user"}\n')
+parent = {"sessionId": "local_p8", "cliSessionId": "%032d" % 8,
+          "cwd": projects, "title": "Northwind kickoff", "lastActivityAt": 1}
+child = {"sessionId": "local_c7", "cliSessionId": "%032d" % 7,
+         "cwd": projects, "title": "ACME-REVIEW side task", "lastActivityAt": 1}
+for folder in (live_dir, dorm_dir):
+    put(folder, "local_p8.json", parent)
+put(live_dir, "local_c7.json", dict(child, spawnedFrom={
+    "sessionId": "local_p8", "taskId": "task_7f", "title": "Northwind kickoff",
+    "sideSession": True}))
+put(dorm_dir, "local_c7.json", child)
+um = ccs.plan_sync(env, ccs.SyncFlags(update=True, only="ACME-REVIEW"))
+check("a refresh that only adds the link is planned",
+      [r["name"] for r in um["rows"]] == ["local_c7.json"],
+      str([r["name"] for r in um["rows"]]))
+put(live_dir, "local_c7.json", child)            # the source loses its link
+ops_before = len(ccs.list_ops(env))
+target_before, label_before = app.undo_target, app.undo_btn.cget("text")
+app.live_choice = "held-for-this-check"
+app._apply_worker(um, None, env)                 # inline: the real press path
+settle()
+check("an apply with nothing left to write journals no op",
+      len(ccs.list_ops(env)) == ops_before,
+      "%d -> %d" % (ops_before, len(ccs.list_ops(env))))
+check("  the window says the destination already holds the rows",
+      app.status.get()
+      == "Nothing to copy: the destination already holds these rows",
+      app.status.get())
+check("  no mutation ran: the identity answer is not spent",
+      app.live_choice == "held-for-this-check", repr(app.live_choice))
+check("  and Undo is left as it was",
+      app.undo_target is target_before
+      and app.undo_btn.cget("text") == label_before
+      and bool(app.undo_btn.winfo_manager()),
+      str(app.undo_btn.cget("text")))
+app.live_choice = ""
 tkroot.destroy()
 
 shutil.rmtree(root, ignore_errors=True)

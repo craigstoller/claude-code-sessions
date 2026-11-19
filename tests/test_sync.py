@@ -4206,3 +4206,457 @@ def test_sync_row_dropped_as_unchanged_is_not_counted_as_activity_unknown(
     assert [r["name"] for r in m["rows"]] == ["local_u.json"]
     assert sorted(t["unchanged"]) == ["Northwind board", "Northwind kickoff"]
     assert t["activity_unknown"] == ["Northwind notes v2"]
+
+
+# ------------------------- Task 8: sync apply re-resolves once, under the lock
+#
+# docs/specs/2026-11-17-carry-lineage-design.md, "sync", "Applying, once":
+# run_sync runs the lineage pass again after its guard and lock and before
+# new_op, against the stores as they are then. Each row's source row is read
+# again by name (the plan's Departure 2); only the link and the chain follow
+# the stores at apply time, every other byte is the plan's snapshot.
+
+def test_sync_apply_retargets_drops_or_gains_like_converge(two_account_env,
+                                                           tmp_path):
+    """Between the dry run and the apply the destination gains a row for
+    C1's parent under the source's own filename (retargeted), loses its only
+    row for C2's parent (dropped), and gains a row for C3's parent (gained).
+    Each change is noted on its row as converge notes it, the plan's record
+    is kept as lineage_planned, and the journal holds the final bytes."""
+    env, src, dst = two_account_env(tmp_path)
+    p2, p3, c2, c3 = "sid-parent-2", "sid-parent-3", "sid-child-2", "sid-child-3"
+    _transcripts(env, LP, LC, p2, p3, c2, c3)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_p2.json", p2, "Northwind board")
+    _lrow(src, "local_p3.json", p3, "Northwind notes")
+    _lrow(src, "local_c1.json", LC, "ACME-REVIEW one",
+          spawnedFrom=_side("local_p"))
+    _lrow(src, "local_c2.json", c2, "ACME-REVIEW two",
+          spawnedFrom=_side("local_p2"))
+    _lrow(src, "local_c3.json", c3, "ACME-REVIEW three",
+          spawnedFrom=_side("local_p3"))
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    _lrow(dst, "local_q2.json", p2, "Northwind board")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    by = _by_name(m)
+    assert sorted(by) == ["local_c1.json", "local_c2.json", "local_c3.json"]
+    assert _post(by["local_c1.json"])["spawnedFrom"]["sessionId"] == "local_q"
+    assert _post(by["local_c2.json"])["spawnedFrom"]["sessionId"] == "local_q2"
+    assert "spawnedFrom" not in _post(by["local_c3.json"])
+    plan = {n: json.dumps(r["lineage"]) for n, r in by.items()}
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff")
+    os.remove(os.path.join(dst, "local_q2.json"))
+    _lrow(dst, "local_r3.json", p3, "Northwind notes")
+    assert ct.run_sync(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    on = _by_name(op.manifest)
+    c1, c2r, c3r = on["local_c1.json"], on["local_c2.json"], on["local_c3.json"]
+    assert _post(c1)["spawnedFrom"] == {"sessionId": "local_p", "taskId": LTASK}
+    assert c1["lineage"]["parent_row"] == "local_p"
+    assert _codes(c1) == ["lineage_retargeted"]
+    assert "spawnedFrom" not in _post(c2r)
+    assert c2r["lineage"]["parent_row"] == ""
+    assert _codes(c2r) == ["parent_not_in_account", "lineage_dropped"]
+    assert _post(c3r)["spawnedFrom"] == {"sessionId": "local_r3",
+                                         "taskId": LTASK}
+    assert _codes(c3r) == ["lineage_gained"]
+    for r in (c1, c2r, c3r):
+        assert json.dumps(r["lineage_planned"]) == plan[r["name"]]
+    assert ct._lineage_summary(op.manifest["rows"])["changes"] == {
+        "changed": 1, "dropped": 1, "gained": 1}
+    assert ct._sync_shape_error(op.manifest) is None
+    for r in op.manifest["rows"]:
+        with open(r["dest_path"], "rb") as fh:
+            assert fh.read() == ct.unb64(r["post_b64"])
+
+
+@pytest.mark.parametrize("how", ["repointed", "deleted"])
+def test_sync_apply_source_row_repointed_since_the_plan_keeps_no_link(
+        two_account_env, tmp_path, how):
+    """After the dry run the source's row for the child opens another
+    conversation, or is gone. It is no holder any more: the row keeps
+    neither its link nor its chain, says lineage_source_changed beside the
+    chain and change codes, and every other byte is the plan's snapshot, the
+    plan's title included. The after-apply lines count it by that reason."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ)
+    chain = {"firstSessionId": "local_p", "depth": 1}
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"), startChain=chain)
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    r, = m["rows"]
+    planned_post = _post(r)
+    assert planned_post["spawnedFrom"] == {"sessionId": "local_q",
+                                           "taskId": LTASK}
+    assert planned_post["startChain"] == {"firstSessionId": "local_q",
+                                          "depth": 1}
+    planned = json.dumps(r["lineage"])
+    if how == "repointed":
+        _lrow(src, "local_c.json", LQ, "ACME-REVIEW side task v2",
+              spawnedFrom=_side("local_p"), startChain=chain)
+    else:
+        os.remove(os.path.join(src, "local_c.json"))
+    assert ct.run_sync(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    r, = op.manifest["rows"]
+    post = _post(r)
+    assert post == {k: v for k, v in planned_post.items()
+                    if k not in ("spawnedFrom", "startChain")}
+    assert list(post) == [k for k in planned_post
+                          if k not in ("spawnedFrom", "startChain")]
+    assert r["lineage"]["parent_row"] == "" and r["lineage"]["root_row"] == ""
+    assert _codes(r) == ["lineage_source_changed", "lineage_chain_dropped",
+                         "lineage_dropped"]
+    for n in r["lineage"]["notes"]:
+        assert "ACME" not in n["detail"] and "Northwind" not in n["detail"]
+        assert LC not in n["detail"]
+    assert LC[:8] in r["lineage"]["notes"][0]["detail"]
+    assert json.dumps(r["lineage_planned"]) == planned
+    assert ct._lineage_apply_lines(op.manifest["rows"]) == [
+        "links   : 1 left out (the source row changed since the plan 1); "
+        "since the plan: 1 dropped",
+        "chains  : 1 left out"]
+    assert ct._sync_shape_error(op.manifest) is None
+    with open(r["dest_path"], "rb") as fh:
+        assert fh.read() == ct.unb64(r["post_b64"])
+
+
+def test_sync_apply_source_row_changed_on_an_unlinked_row_adds_no_note(
+        two_account_env, tmp_path):
+    """Two rows carry no link at the dry run: one whose source has none, and
+    one whose link was left out (no row for the parent in the destination).
+    Both source rows change before the apply. Neither named a parent or a
+    root, so neither gets lineage_source_changed: each is written with the
+    plan's bytes exactly, and has nothing to say about a link."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ, LR)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_a.json", LQ, "ACME-REVIEW plain")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    by = _by_name(m)
+    assert by["local_a.json"]["lineage"] == ct._lineage_empty()
+    assert _codes(by["local_c.json"]) == ["parent_not_in_account"]
+    plan = {n: r["post_b64"] for n, r in by.items()}
+    _lrow(src, "local_a.json", LR, "ACME-REVIEW plain")
+    os.remove(os.path.join(src, "local_c.json"))
+    assert ct.run_sync(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    assert sorted(r["name"] for r in op.manifest["rows"]) == [
+        "local_a.json", "local_c.json"]
+    for r in op.manifest["rows"]:
+        assert r["post_b64"] == plan[r["name"]]
+        assert _codes(r) == []
+        assert r["lineage"] == ct._lineage_empty()
+        assert "lineage_planned" not in r
+    assert ct._sync_shape_error(op.manifest) is None
+
+
+def test_sync_verbatim_apply_skips_the_pass_and_keeps_order(two_account_env,
+                                                            tmp_path,
+                                                            monkeypatch):
+    """--verbatim never runs the apply-time pass. The source's child loses
+    its link after the dry run, and still the journal holds the plan's
+    bytes, the link copied as it was, in selection's order (the newer child
+    first), with no lineage on any row."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    link = _side("local_p")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=link)
+    m = ct.plan_sync(env, ct.SyncFlags(verbatim=True))
+    plan = [(r["name"], r["post_b64"]) for r in m["rows"]]
+    assert [n for n, _ in plan] == ["local_c.json", "local_p.json"]
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5)
+    calls = []
+    real = ct._sync_lineage
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(ct, "_sync_lineage", spy)
+    assert ct.run_sync(env, m) == "completed"
+    assert calls == []
+    op = ct.list_ops(env)[-1]
+    assert [(r["name"], r["post_b64"]) for r in op.manifest["rows"]] == plan
+    assert _post(op.manifest["rows"][0])["spawnedFrom"] == link
+    for r in op.manifest["rows"]:
+        assert "lineage" not in r and "lineage_planned" not in r
+    assert ct._sync_shape_error(op.manifest) is None
+
+
+def test_sync_apply_drops_a_refresh_that_became_a_no_op(two_account_env,
+                                                        tmp_path):
+    """At the dry run the child's refresh changes only its link. The source
+    row loses that link before the apply, so the refresh would now write the
+    bytes the destination's row already holds: it is dropped from the op,
+    and counted as unchanged. The journal never holds a refresh whose
+    post_b64 equals its pre_b64, and the other refresh is written."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"), model="m")
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task", model="m")
+    _lrow(src, "local_n.json", LQ, "Northwind notes v2", lastActivityAt=2)
+    _lrow(dst, "local_n.json", LQ, "Northwind notes")
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert sorted(r["name"] for r in m["rows"]) == ["local_c.json",
+                                                    "local_n.json"]
+    with open(os.path.join(dst, "local_c.json"), "rb") as fh:
+        child_bytes = fh.read()
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", model="m")
+    assert ct.run_sync(env, m) == "completed"
+    assert [r["name"] for r in m["rows"]] == ["local_n.json"]
+    op = ct.list_ops(env)[-1]
+    assert [r["name"] for r in op.manifest["rows"]] == ["local_n.json"]
+    for r in op.manifest["rows"]:
+        assert r["post_b64"] != r["pre_b64"]
+    with open(os.path.join(dst, "local_c.json"), "rb") as fh:
+        assert fh.read() == child_bytes
+    assert "ACME-REVIEW side task" in m["tally"]["unchanged"]
+    assert ct._sync_shape_error(op.manifest) is None
+
+
+def test_sync_apply_dropped_parent_turns_a_kept_childs_link_to_existing(
+        two_account_env, tmp_path):
+    """The parent is itself a side session, and its refresh only adds the
+    link to the grandparent, so the child added beside it names the
+    parent's row as planned. The parent's source row loses that link before
+    the apply: its refresh is dropped, and the child, kept, now names the
+    parent's row as existing. The journal passes the shape check, and the
+    op, interrupted after the child landed, recovers forward and undoes."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LG, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_g.json", LG, "Northwind board")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff",
+          spawnedFrom=_side("local_g"))
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    by = _by_name(m)
+    assert sorted(by) == ["local_c.json", "local_p.json"]
+    assert by["local_c.json"]["lineage"]["parent_planned"] is True
+    with open(os.path.join(dst, "local_p.json"), "rb") as fh:
+        parent_bytes = fh.read()
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+
+    def hook(point):
+        if point == "sync-write-before-save":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    c, = op.manifest["rows"]
+    assert c["name"] == "local_c.json"
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_p", "taskId": LTASK}
+    assert c["lineage"]["parent_row"] == "local_p"
+    assert c["lineage"]["parent_planned"] is False
+    assert "lineage_planned" not in c
+    assert ct._sync_shape_error(op.manifest) is None
+    assert "forward" in ct.classify_op(env, op)["resolutions"]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert ct.undo_sync(env, op) == "undone"
+    assert not os.path.exists(os.path.join(dst, "local_c.json"))
+    with open(os.path.join(dst, "local_p.json"), "rb") as fh:
+        assert fh.read() == parent_bytes
+
+
+@pytest.mark.parametrize("target", ["parent", "root"])
+@pytest.mark.parametrize("how", ["deleted", "repointed"])
+def test_sync_apply_no_op_refresh_whose_row_was_deleted_or_repointed_refuses(
+        two_account_env, tmp_path, target, how):
+    """The parent's (or the chain root's) refresh only adds a link at the dry
+    run, and the child added beside it names that row as planned. Before the
+    apply the source loses that link, so the refresh would write nothing -
+    and the destination's row is gone, or opens another conversation.
+    Equality with the plan's pre-image says nothing about the store now, so
+    run_sync refuses before anything is journaled, and no child is
+    written."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LG, LP, LC, LQ, LR)
+    for store in (src, dst):
+        _lrow(store, "local_g.json", LG, "Northwind board")
+        _lrow(store, "local_x.json", LR, "Northwind other parent")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff",
+          spawnedFrom=_side("local_g"))
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff")
+    if target == "parent":
+        _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+              spawnedFrom=_side("local_p"))
+    else:
+        _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+              spawnedFrom=_side("local_x"),
+              startChain={"firstSessionId": "local_p", "depth": 2})
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    lin = _by_name(m)["local_c.json"]["lineage"]
+    assert lin["parent_planned" if target == "parent" else "root_planned"] \
+        is True
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    if how == "deleted":
+        os.remove(os.path.join(dst, "local_p.json"))
+    else:
+        _lrow(dst, "local_p.json", LQ, "Northwind kickoff")
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_sync(env, m)
+    assert str(exc.value) == ("the destination's row local_p changed since "
+                              "the plan; plan again")
+    assert ct.list_ops(env) == []
+    assert not os.path.exists(os.path.join(dst, "local_c.json"))
+    assert ct.read_lock(env) is None
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_sync_apply_that_leaves_nothing_journals_no_op_and_exits_0(
+        two_account_env, tmp_path, monkeypatch, capsys, as_json):
+    """The plan's one row is a refresh that changes only its link. The source
+    loses that link after the dry run, so the apply-time pass leaves nothing
+    to write: no op is journaled and the run is a success. Under --json it
+    says `result: "unchanged"`; otherwise it prints the line below and no
+    `copied :` line. The account-email memo is still written."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task")
+    with open(os.path.join(dst, "local_c.json"), "rb") as fh:
+        child_bytes = fh.read()
+    real, real_memo = ct.run_sync, ct.remember_account_email
+    memo = []
+
+    def late(env_, m_):
+        assert [r["name"] for r in m_["rows"]] == ["local_c.json"]
+        _lrow(src, "local_c.json", LC, "ACME-REVIEW side task")
+        return real(env_, m_)
+
+    def remember(*a):
+        memo.append(a[1:])
+        return real_memo(*a)
+    monkeypatch.setattr(ct, "run_sync", late)
+    monkeypatch.setattr(ct, "remember_account_email", remember)
+    argv = ["--update", "--apply"] + (["--json"] if as_json else [])
+    rc, lines = _sync_main(env, monkeypatch, capsys, *argv)
+    assert rc == 0
+    assert ct.list_ops(env) == []
+    assert memo == [("aaaaaaaa-0000-0000-0000-000000000001",
+                     "me@example.com")]
+    with open(os.path.join(dst, "local_c.json"), "rb") as fh:
+        assert fh.read() == child_bytes
+    if as_json:
+        rep = json.loads("\n".join(lines))
+        assert rep["result"] == "unchanged"
+        assert rep["rows"] == []
+        assert "ACME-REVIEW side task" in rep["tally"]["unchanged"]
+    else:
+        assert "nothing to write: the destination already holds these rows" \
+            in lines
+        assert not any(ln.startswith("copied") for ln in lines)
+        assert not any(ln.startswith("refreshed") for ln in lines)
+
+
+def test_sync_after_apply_trailer_prints_the_links_lines(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """The after-apply lines sit beside `copied :` and `refreshed :`, over
+    the written rows: carried, left out by the underlying reason, then what
+    changed since the plan, and the chains. The dry-run lines above them
+    still say what the plan would carry."""
+    env, src, dst = two_account_env(tmp_path)
+    p2, c2 = "sid-parent-2", "sid-child-2"
+    _transcripts(env, LP, LC, p2, c2, LQ)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+        _lrow(store, "local_p2.json", p2, "Northwind board")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW one",
+          spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_p", "depth": 1})
+    _lrow(src, "local_d.json", c2, "ACME-REVIEW two",
+          spawnedFrom=_side("local_p2"))
+    _lrow(src, "local_n.json", LQ, "Northwind notes v2", lastActivityAt=2)
+    _lrow(dst, "local_n.json", LQ, "Northwind notes")
+    real = ct.run_sync
+
+    def late(env_, m_):
+        os.remove(os.path.join(dst, "local_p2.json"))   # D's parent row goes
+        return real(env_, m_)
+    monkeypatch.setattr(ct, "run_sync", late)
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update", "--apply")
+    assert rc == 0
+    assert "links   : 2 to carry" in lines
+    assert "chains  : 1 to carry" in lines
+    i = lines.index("copied     : 2")
+    assert lines[i + 1:i + 5] == [
+        "refreshed  : 1",
+        "links   : 1 carried, 1 left out (no row for the parent in that "
+        "account 1); since the plan: 1 dropped",
+        "chains  : 1 carried",
+        "result     : completed"]
+
+
+def test_sync_journal_holds_the_final_bytes_and_order(two_account_env,
+                                                      tmp_path, monkeypatch):
+    """At the dry run the child's source row carries no link, so the newer
+    child keeps selection's place ahead of its parent. The source row gains
+    the link before the apply: the child now names the parent's planned row,
+    so the rows are re-sorted before new_op. The journal holds the final
+    bytes in the final order, the parent is written first, and a cycle of
+    links the destination gained meanwhile is counted again."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ, LR)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert [r["name"] for r in m["rows"]] == ["local_c.json", "local_p.json"]
+    assert m["lineage_cycles"] == 0
+    plan_c = json.dumps(_by_name(m)["local_c.json"]["lineage"])
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_x.json", LQ, "Loop one", spawnedFrom=_side("local_y"))
+    _lrow(dst, "local_y.json", LR, "Loop two", spawnedFrom=_side("local_x"))
+    journaled, written = {}, []
+    real_new_op, real_write = ct.new_op, ct.atomic_write
+
+    def spy_new_op(env_, manifest):
+        journaled["rows"] = [(r["name"], r["post_b64"])
+                             for r in manifest["rows"]]
+        journaled["cycles"] = manifest["lineage_cycles"]
+        return real_new_op(env_, manifest)
+
+    def spy_write(path, data):
+        name = os.path.basename(path)
+        if name.startswith("local_"):          # rows only, not the journal
+            written.append(name)
+        return real_write(path, data)
+    monkeypatch.setattr(ct, "new_op", spy_new_op)
+    monkeypatch.setattr(ct, "atomic_write", spy_write)
+    assert ct.run_sync(env, m) == "completed"
+    assert [n for n, _ in journaled["rows"]] == ["local_p.json",
+                                                 "local_c.json"]
+    c = _by_name(m)["local_c.json"]
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_p", "taskId": LTASK}
+    assert c["lineage"]["parent_row"] == "local_p"
+    assert c["lineage"]["parent_planned"] is True
+    assert _codes(c) == ["lineage_gained"]
+    assert json.dumps(c["lineage_planned"]) == plan_c
+    assert journaled["cycles"] == 1
+    on_record = ct.list_ops(env)[-1].manifest
+    assert on_record["lineage_cycles"] == 1
+    assert [(r["name"], r["post_b64"]) for r in on_record["rows"]] == \
+        journaled["rows"]
+    assert written == ["local_p.json", "local_c.json"]
+    for r in on_record["rows"]:
+        with open(r["dest_path"], "rb") as fh:
+            assert fh.read() == ct.unb64(r["post_b64"])
+    assert ct._sync_shape_error(on_record) is None
