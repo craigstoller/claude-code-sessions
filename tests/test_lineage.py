@@ -397,3 +397,300 @@ def test_note_details_name_ids_by_8_chars_and_no_titles():
     res = resolve([h], stores, dest_with(), alive=(long_pa,))
     for n in res["lineage"]["notes"]:
         assert "ACME-REVIEW" not in n["detail"]
+
+
+# ---------------------------------------------------------------- Task 2
+# Cycles, write order and the row rewrite.
+
+import base64
+import json
+
+
+def link_row(account, sid, cli, link=None, chain=None, planned=False):
+    extra = {}
+    if link is not None:
+        extra["spawnedFrom"] = {"sessionId": link, "taskId": "task_7f"}
+    if chain is not None:
+        extra["startChain"] = {"firstSessionId": chain, "depth": 1}
+    return row(account, sid, cli, planned=planned, **extra)
+
+
+def prop(child, parent=None, root=None, parent_row="", root_row="",
+         dropped=None):
+    """A hand-built _lineage_resolve result: child conversation `child`
+    proposing an edge to conversation `parent` and `root`."""
+    link = {"sessionId": parent_row or "r_" + str(parent),
+            "taskId": "task_7f"} if parent else None
+    chain = {"firstSessionId": root_row or "r_" + str(root),
+             "depth": 1} if root else None
+    return {
+        "child": child, "link": link, "chain": chain,
+        "edges": {"parent": parent, "root": root},
+        "lineage": {
+            "parent_session": parent or "",
+            "parent_row": link["sessionId"] if link else "",
+            "parent_planned": False,
+            "root_session": root or "",
+            "root_row": chain["firstSessionId"] if chain else "",
+            "root_planned": False,
+            "carried_keys": ["sessionId", "taskId"] if link else [],
+            "dropped_keys": list(dropped or []),
+            "notes": [],
+        }}
+
+
+def note_codes(res):
+    return [n["code"] for n in res["lineage"]["notes"]]
+
+
+def existing_of(*rows):
+    return ct._lineage_existing_edges(ct._lineage_index(list(rows)))
+
+
+def test_two_account_cycle_drops_the_later_parent_edge():
+    # Account B: Q already links to P. Proposed: P -> Q (closes). The
+    # proposed edge is the one dropped.
+    ex = existing_of(link_row("acct_b", "local_q", "cli_q", link="local_p"),
+                     row("acct_b", "local_p", "cli_p"))
+    assert ex == {"cli_q": {"cli_p"}}
+    res = {("acct_b", "local_p.json"): prop("cli_p", parent="cli_q")}
+    n = ct._lineage_drop_cycles(res, ex)
+    r = res[("acct_b", "local_p.json")]
+    assert n == 0
+    assert r["link"] is None and r["edges"]["parent"] is None
+    assert note_codes(r) == ["lineage_cycle"]
+
+
+def test_three_account_cycle():
+    # Three conversations; two proposed edges are fine, the third closes the
+    # loop. Edges go in order of the child's conversation id.
+    res = {
+        ("acct_b", "z.json"): prop("cli_c", parent="cli_a"),
+        ("acct_b", "y.json"): prop("cli_b", parent="cli_c"),
+        ("acct_b", "x.json"): prop("cli_a", parent="cli_b"),
+    }
+    ct._lineage_drop_cycles(res, {})
+    dropped = [k for k, v in res.items() if v["link"] is None]
+    # cli_a first: a->b kept; cli_b: b->c kept; cli_c: c->a closes.
+    assert dropped == [("acct_b", "z.json")]
+    assert note_codes(res[("acct_b", "z.json")]) == ["lineage_cycle"]
+
+
+def test_root_edge_never_evicts_a_parent_edge():
+    res = {
+        ("acct_b", "c.json"): prop("cli_c", parent="cli_x", root="cli_r"),
+        ("acct_b", "r.json"): prop("cli_r", parent="cli_c"),
+    }
+    ct._lineage_drop_cycles(res, {})
+    c = res[("acct_b", "c.json")]
+    r = res[("acct_b", "r.json")]
+    assert c["link"] is not None and r["link"] is not None
+    assert c["chain"] is None and c["edges"]["root"] is None
+    assert note_codes(c) == ["lineage_chain_dropped"]
+    assert c["lineage"]["root_row"] == "" and c["lineage"]["root_session"] == ""
+
+
+def test_a_proposed_edge_joining_an_existing_cycle_is_dropped():
+    ex = existing_of(
+        link_row("acct_b", "local_p", "cli_p", link="local_q"),
+        link_row("acct_b", "local_q", "cli_q", link="local_p"))
+    res = {("acct_b", "n.json"): prop("cli_n", parent="cli_p"),
+           ("acct_b", "m.json"): prop("cli_p", parent="cli_n")}
+    n = ct._lineage_drop_cycles(res, ex)
+    assert n == 1
+    # n -> p is fine (p does not reach n); p -> n then closes via n -> p.
+    assert res[("acct_b", "n.json")]["link"] is not None
+    assert res[("acct_b", "m.json")]["link"] is None
+    assert note_codes(res[("acct_b", "m.json")]) == ["lineage_cycle"]
+
+
+def test_existing_cycle_counted_once_even_when_no_proposed_edge_touches_it():
+    ex = existing_of(
+        link_row("acct_b", "local_p", "cli_p", link="local_q"),
+        link_row("acct_b", "local_q", "cli_q", chain="local_p"),
+        link_row("acct_b", "local_s", "cli_s", link="local_s"),
+        link_row("acct_b", "local_t", "cli_t", link="local_p"))
+    assert ct._lineage_drop_cycles({}, ex) == 2
+    assert ct._lineage_drop_cycles(
+        {("acct_b", "a.json"): prop("cli_a", parent="cli_t")}, ex) == 2
+
+
+def test_planned_rows_links_never_enter_the_existing_graph():
+    ex = existing_of(
+        link_row("acct_b", "local_p", "cli_p", link="local_q", planned=True),
+        row("acct_b", "local_q", "cli_q"))
+    assert ex == {}
+    # A planned row's old link, which would close q -> p -> q, is absent.
+    ex = existing_of(
+        link_row("acct_b", "local_p", "cli_p", link="local_q", planned=True),
+        link_row("acct_b", "local_q", "cli_q", link="local_p"))
+    assert ex == {"cli_q": {"cli_p"}}
+
+
+def test_existing_edges_union_every_row_of_a_conversation():
+    ex = existing_of(
+        row("acct_b", "local_c1", "cli_c"),
+        link_row("acct_b", "local_p1", "cli_p", link="local_c1"),
+        link_row("acct_b", "local_p2", "cli_p", link="local_q1"),
+        row("acct_b", "local_q1", "cli_q"))
+    assert ex == {"cli_p": {"cli_c", "cli_q"}}
+    res = {("acct_b", "local_c1.json"): prop("cli_c", parent="cli_p")}
+    # cli_c -> cli_p: p reaches c through the first row, so it closes.
+    ct._lineage_drop_cycles(res, ex)
+    assert note_codes(res[("acct_b", "local_c1.json")]) == ["lineage_cycle"]
+    # p reaches q only through the second row's edge.
+    res = {("acct_b", "q.json"): prop("cli_q", parent="cli_p")}
+    ct._lineage_drop_cycles(res, ex)
+    assert note_codes(res[("acct_b", "q.json")]) == ["lineage_cycle"]
+
+
+def test_dropping_an_edge_clears_link_and_lineage_together():
+    ex = {"cli_p": {"cli_c"}}
+    r = prop("cli_c", parent="cli_p", root="cli_r",
+             dropped=["title", "startChain.extra"])
+    r["lineage"]["parent_planned"] = True
+    r["lineage"]["root_planned"] = True
+    res = {("acct_b", "c.json"): r}
+    ct._lineage_drop_cycles(res, ex)
+    lin = r["lineage"]
+    assert r["link"] is None and r["chain"] is None
+    assert r["edges"] == {"parent": None, "root": None}
+    assert lin["parent_session"] == lin["parent_row"] == ""
+    assert lin["root_session"] == lin["root_row"] == ""
+    assert lin["parent_planned"] is False and lin["root_planned"] is False
+    assert lin["carried_keys"] == [] and lin["dropped_keys"] == []
+    assert note_codes(r) == ["lineage_cycle", "lineage_chain_dropped"]
+
+
+def test_dropping_a_root_edge_keeps_the_link_and_its_dropped_keys():
+    ex = {"cli_r": {"cli_c"}}
+    r = prop("cli_c", parent="cli_p", root="cli_r",
+             dropped=["title", "startChain.extra"])
+    res = {("acct_b", "c.json"): r}
+    ct._lineage_drop_cycles(res, ex)
+    assert r["link"] is not None and r["chain"] is None
+    assert r["lineage"]["dropped_keys"] == ["title"]
+    assert r["lineage"]["parent_row"] != ""
+    assert note_codes(r) == ["lineage_chain_dropped"]
+
+
+def test_one_conversation_in_two_accounts_gets_two_independent_results():
+    ex = {"cli_p": {"cli_c"}}
+    rb = {("acct_b", "c.json"): prop("cli_c", parent="cli_p")}
+    ra = {("acct_a", "c.json"): prop("cli_c", parent="cli_p")}
+    ct._lineage_drop_cycles(rb, ex)
+    ct._lineage_drop_cycles(ra, {})
+    assert rb[("acct_b", "c.json")]["link"] is None
+    assert ra[("acct_a", "c.json")]["link"] is not None
+
+
+def test_drop_cycles_does_not_mutate_the_existing_graph():
+    ex = {"cli_p": {"cli_c"}}
+    ct._lineage_drop_cycles(
+        {("acct_b", "n.json"): prop("cli_n", parent="cli_p")}, ex)
+    assert ex == {"cli_p": {"cli_c"}}
+
+
+def test_deep_chain_does_not_recurse():
+    ex = {"c%d" % i: {"c%d" % (i + 1)} for i in range(3000)}
+    res = {("a", "x.json"): prop("c3000", parent="c0")}
+    assert ct._lineage_drop_cycles(res, ex) == 0
+    assert res[("a", "x.json")]["link"] is None
+    ex["c3000"] = {"c0"}
+    assert ct._lineage_drop_cycles({}, ex) == 1
+
+
+def test_resolve_result_names_the_child_conversation():
+    h = holder_row()
+    res = resolve([h], store_a(h), dest_with(DEST_PARENT))
+    assert res["child"] == "cli_c"
+
+
+def wrow(name, parent=None, root=None, store="/s", parent_planned=True,
+         root_planned=True):
+    r = {"store_path": store, "name": name + ".json"}
+    if parent or root:
+        r["lineage"] = {"parent_row": parent or "",
+                        "parent_planned": bool(parent and parent_planned),
+                        "root_row": root or "",
+                        "root_planned": bool(root and root_planned)}
+    return r
+
+
+WKEY = lambda r: (r["store_path"], r["name"])
+
+
+def names(rows):
+    return [r["name"][:-5] for r in rows]
+
+
+def test_write_order_parents_and_roots_first_stable_ties():
+    rows = [wrow("a", parent="b"), wrow("b", parent="c", root="d"),
+            wrow("c"), wrow("e"), wrow("d")]
+    out = ct._lineage_write_order(rows, WKEY)
+    assert names(out) == ["c", "d", "b", "a", "e"]
+    assert ct._lineage_write_order([wrow("x"), wrow("y")], WKEY) == \
+        [wrow("x"), wrow("y")]
+
+
+def test_write_order_ignores_unplanned_other_store_and_missing_targets():
+    rows = [wrow("a", parent="b", parent_planned=False), wrow("b"),
+            wrow("c", parent="b", store="/other"), wrow("d", parent="zz")]
+    assert names(ct._lineage_write_order(rows, WKEY)) == ["a", "b", "c", "d"]
+
+
+def test_write_order_terminates_on_a_forced_cycle():
+    rows = [wrow("a", parent="b"), wrow("b", parent="a"), wrow("c"),
+            wrow("d", parent="a")]
+    out = ct._lineage_write_order(rows, WKEY)
+    assert names(out) == ["c", "a", "b", "d"]
+    assert len(out) == 4
+
+
+def test_write_order_survives_malformed_lineage():
+    rows = [{"store_path": "/s", "name": "a.json", "lineage": "x"},
+            {"store_path": "/s", "name": "b.json", "lineage": None}]
+    assert ct._lineage_write_order(rows, WKEY) == rows
+
+
+def b64j(d):
+    return base64.b64encode(
+        json.dumps(d, separators=(",", ":")).encode()).decode("ascii")
+
+
+def raw(s):
+    return base64.b64decode(s).decode()
+
+
+def test_rewrite_post_keeps_key_position_and_touches_nothing_else():
+    d = {"a": 1, "spawnedFrom": {"sessionId": "x", "taskId": "t",
+                                 "title": "Northwind"},
+         "m": [1, {"k": "v"}], "startChain": {"firstSessionId": "r",
+                                              "depth": 2, "z": 1},
+         "z": "end"}
+    out = ct._lineage_rewrite_post(
+        b64j(d), {"sessionId": "local_pb", "taskId": "t"},
+        {"firstSessionId": "local_rb", "depth": 2})
+    assert raw(out) == (
+        '{"a":1,"spawnedFrom":{"sessionId":"local_pb","taskId":"t"},'
+        '"m":[1,{"k":"v"}],'
+        '"startChain":{"firstSessionId":"local_rb","depth":2},"z":"end"}')
+
+
+def test_rewrite_post_appends_a_new_key_and_pops_a_removed_one():
+    d = {"a": 1, "spawnedFrom": {"sessionId": "x", "taskId": "t"}, "b": 2}
+    out = ct._lineage_rewrite_post(
+        b64j(d), None, {"firstSessionId": "r", "depth": 1})
+    assert raw(out) == ('{"a":1,"b":2,'
+                        '"startChain":{"firstSessionId":"r","depth":1}}')
+    out = ct._lineage_rewrite_post(b64j({"a": 1}), None, None)
+    assert raw(out) == '{"a":1}'
+
+
+def test_rewrite_post_is_idempotent_and_keeps_non_ascii_as_today():
+    d = {"title": "café", "spawnedFrom": {"sessionId": "x"}}
+    link = {"sessionId": "y", "taskId": "t"}
+    once = ct._lineage_rewrite_post(b64j(d), link, None)
+    assert ct._lineage_rewrite_post(once, link, None) == once
+    assert json.loads(base64.b64decode(once))["title"] == "café"
+    assert "\\u00e9" in raw(once)
