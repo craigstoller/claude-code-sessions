@@ -3037,7 +3037,8 @@ def test_anonymized_plan_leaks_no_title_label_or_path(
             assert set(lin) == LINEAGE_KEYS
             assert lin["parent_row"] in ("local_p2", "local_p3")
             assert lin["root_row"] == lin["parent_row"]
-            flat = json.dumps(lin)
+            # Unescaped, so the ellipsis after a shortened id is not "\\".
+            flat = json.dumps(lin, ensure_ascii=False)
             assert "\\" not in flat and "/" not in flat and "@" not in flat
 
         # Every note's detail, in lineage and lineage_planned, goes through

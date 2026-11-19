@@ -603,13 +603,20 @@ def _merge_hold_models(fresh, previous):
 def _plan_summary_lines(m):
     """The converge plan summary: the manifest's completeness line and
     per-destination row counts - the same facts `_print_converge_report`
-    prints, condensed for a pane that renders holds as widgets below."""
+    prints, condensed for a pane that renders holds as widgets below.
+
+    The Level tab's lineage branch is the plan's `links :` line, with its
+    left-out reasons, under the completeness line; the CLI builds it, so the
+    two never word it differently. A plan carrying no link shows no line."""
     lines = []
     c = m.get("complete") or {}
     lines.append("complete{0} : {1} of {2}  ->  {3} of {2}   ({4} held)".format(
         " (scoped)" if c.get("scoped") else "", c.get("now"), c.get("of"),
         c.get("after"), c.get("held")))
     rows = m.get("rows") or []
+    links = ccs._lineage_links_line(ccs._lineage_summary(rows))
+    if links:
+        lines.append(links)
     for d in m.get("destinations") or []:
         mine = [r for r in rows if r.get("account") == d.get("account")]
         if mine:

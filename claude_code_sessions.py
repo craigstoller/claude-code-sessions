@@ -4109,6 +4109,15 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "displaced_session", "displaced_turns", "distinguishable",
     "dup_conversation", "dup_title",
     "duplicate_titles", "encoding", "encoding_recent", "exit_code",
+    # Lineage (docs/specs/2026-11-17-carry-lineage-design.md): the per-row
+    # record and its notes, the manifest's format marker and cycle count,
+    # the link report, and sync's link and chain changes. Every one of them
+    # must stay a key when a title is literally "lineage".
+    "lineage", "lineage_planned", "lineage_format", "lineage_cycles",
+    "parent_session", "parent_row", "parent_planned", "root_session",
+    "root_row", "root_planned", "carried_keys", "dropped_keys", "code",
+    "link_report", "dangling", "redirected", "unchecked", "target", "kind",
+    "error", "link_change", "chain_change",
     "filtered", "from_session", "held", "held_older", "held_orphan",
     "held_orphan_detail", "held_same", "held_unknown", "holder_titles",
     "holders", "holds", "identity_disagreement", "in_all_accounts",
@@ -15253,6 +15262,128 @@ def _lineage_rewrite_post(post_b64, link, chain):
     return b64(json.dumps(data, separators=(",", ":")).encode())
 
 
+# Reporting: what an op's rows carry, counted from their `lineage` records.
+
+def _lineage_empty():
+    """The record of a row that carries neither a link nor a chain."""
+    return {"parent_session": "", "parent_row": "", "parent_planned": False,
+            "root_session": "", "root_row": "", "root_planned": False,
+            "carried_keys": [], "dropped_keys": [], "notes": []}
+
+
+def _lineage_codes(lin):
+    """The note codes of one `lineage` record, in order, each once. Never
+    raises."""
+    notes = lin.get("notes") if isinstance(lin, dict) else None
+    out = []
+    for n in notes if isinstance(notes, list) else ():
+        c = n.get("code") if isinstance(n, dict) else None
+        if isinstance(c, str) and c not in out:
+            out.append(c)
+    return out
+
+
+def _lineage_row_reason(lin):
+    """The code that left this row's link out, or "" when none did: the first
+    of its notes counted in LINEAGE_LEFT_OUT (a row has one such reason; an
+    apply-time change code sits beside it, never in its place)."""
+    for c in _lineage_codes(lin):
+        if c in LINEAGE_LEFT_OUT:
+            return c
+    return ""
+
+
+def _lineage_summary(rows):
+    """Counts over the given rows' `lineage` records:
+    {"links": {"carried", "left_out": {code: n}}, "chains": {"carried",
+    "left_out"}, "changes": {"changed", "dropped", "gained"}}. A link is
+    carried when the record names its row; it is left out by the row's
+    reason code (LINEAGE_LEFT_OUT only), counted once per row. A chain is left
+    out when the row says lineage_chain_dropped. Rows without a record count
+    for nothing. The caller picks the rows (the plan's, or the written ones).
+    Never raises."""
+    links = {"carried": 0, "left_out": {}}
+    chains = {"carried": 0, "left_out": 0}
+    changes = {"changed": 0, "dropped": 0, "gained": 0}
+    change_of = {"lineage_retargeted": "changed",
+                 "lineage_dropped": "dropped", "lineage_gained": "gained"}
+    for r in rows or ():
+        lin = r.get("lineage") if isinstance(r, dict) else None
+        if not isinstance(lin, dict):
+            continue
+        if isinstance(lin.get("parent_row"), str) and lin["parent_row"]:
+            links["carried"] += 1
+        if isinstance(lin.get("root_row"), str) and lin["root_row"]:
+            chains["carried"] += 1
+        reason = _lineage_row_reason(lin)
+        if reason:
+            links["left_out"][reason] = links["left_out"].get(reason, 0) + 1
+        codes = _lineage_codes(lin)
+        if "lineage_chain_dropped" in codes:
+            chains["left_out"] += 1
+        for c in codes:
+            if c in change_of:
+                changes[change_of[c]] += 1
+    return {"links": links, "chains": chains, "changes": changes}
+
+
+def _lineage_reasons(left_out):
+    """'<phrase> K, <phrase> K': the most frequent reason first, ties in the
+    note-code table's order."""
+    order = list(LINEAGE_PHRASES)
+    items = [(c, n) for c, n in (left_out or {}).items()
+             if isinstance(n, int) and n > 0]
+    items.sort(key=lambda cn: (-cn[1], order.index(cn[0])
+                               if cn[0] in order else len(order), str(cn[0])))
+    return ", ".join("{0} {1}".format(LINEAGE_PHRASES.get(c, c), n)
+                     for c, n in items)
+
+
+def _lineage_links_line(summary, carried="to carry"):
+    """`links   : N to carry, M left out (<reasons>)`, each part only when
+    its count is nonzero; "" when there is nothing to say. CARRIED is the
+    verb ("to carry" in a plan, "carried" after an apply)."""
+    links = (summary or {}).get("links") or {}
+    n = links.get("carried") or 0
+    left = links.get("left_out") or {}
+    m = sum(v for v in left.values() if isinstance(v, int))
+    parts = []
+    if n:
+        parts.append("{0} {1}".format(n, carried))
+    if m:
+        parts.append("{0} left out ({1})".format(m, _lineage_reasons(left)))
+    return "links   : " + ", ".join(parts) if parts else ""
+
+
+def _lineage_chains_line(summary, carried="to carry"):
+    """`chains  : N to carry, M left out`, printed only when some source
+    carried a chain; "" otherwise."""
+    chains = (summary or {}).get("chains") or {}
+    n = chains.get("carried") or 0
+    m = chains.get("left_out") or 0
+    parts = []
+    if n:
+        parts.append("{0} {1}".format(n, carried))
+    if m:
+        parts.append("{0} left out".format(m))
+    return "chains  : " + ", ".join(parts) if parts else ""
+
+
+def _lineage_plan_lines(m):
+    """The plan's lineage lines, from a manifest (public or not): links,
+    chains, and the existing cycles its destinations already hold. Lineage
+    is a branch of its own: it reads the rows' `lineage` and the manifest's
+    `lineage_cycles`, never the title notes."""
+    s = _lineage_summary(m.get("rows") or [])
+    lines = [ln for ln in (_lineage_links_line(s), _lineage_chains_line(s))
+             if ln]
+    cycles = m.get("lineage_cycles")
+    if isinstance(cycles, int) and not isinstance(cycles, bool) and cycles > 0:
+        lines.append("cycles  : {0} already present, left as they are"
+                     .format(cycles))
+    return lines
+
+
 # ------------------------------------------------------------- 9. converge
 # "Every conversation some sidebar can open should be openable from every
 # sidebar." Purely additive: for every (eligible conversation, destination
@@ -15799,6 +15930,97 @@ def _converge_title(recs, facts):
     return title, source, len(distinct) > 1, holder_titles
 
 
+def _converge_row_key(r):
+    """A converge row's place for the write order: (store directory, row
+    filename)."""
+    return (r["store_path"], r["name"])
+
+
+def _converge_held_by_account(holds):
+    """{account: {conversation id: hold reason}} from the plan's holds, the
+    lineage pass's `held` input per destination."""
+    out = {}
+    for h in holds or ():
+        if isinstance(h, dict) and h.get("account") and h.get("session"):
+            out.setdefault(h["account"], {})[h["session"]] = \
+                h.get("reason") or ""
+    return out
+
+
+def _converge_lineage(records, conversations, rows, held_by_account, tids):
+    """The lineage pass over converge's rows (spec, "The lineage pass" and
+    "converge"): give each row the link and chain it should carry into its
+    destination, rewrite its post_b64 to match, and set its `lineage`.
+    Returns the number of link cycles the destinations already hold, summed
+    over accounts (each reported once, never touched).
+
+    RECORDS are the scanned rows (_retitle_scan), CONVERSATIONS the same rows
+    by cliSessionId, ROWS the rows the op will write, HELD_BY_ACCOUNT
+    {account: {conversation id: reason}} and TIDS the conversations with a
+    transcript (a set, or a predicate). Per destination account B, B's
+    after-state is indexed once - its existing rows plus the rows planned
+    into it, as planned rows decoded from their post_b64 - and each holder
+    account's own store once for the whole pass. Every row into B is
+    resolved, cycles are dropped over B's graph, then the bytes are
+    rewritten. A row whose bytes need no change keeps them exactly. The
+    graph work is iterative throughout (_lineage_drop_cycles)."""
+    exists = tids if callable(tids) else getattr(tids, "__contains__", None)
+    if exists is None:
+        exists = (lambda _sid: False)
+    held_by_account = held_by_account if isinstance(held_by_account,
+                                                    dict) else {}
+    own = {}            # account -> its existing rows, as LineageRows
+    as_lineage = {}     # id(record) -> its LineageRow
+    for rec in records or ():
+        lr = LineageRow(rec.account, rec.name, rec.data)
+        own.setdefault(rec.account, []).append(lr)
+        as_lineage[id(rec)] = lr
+    holder_index = {acct: _lineage_index(rs) for acct, rs in own.items()}
+
+    into = {}           # account -> [(row, its decoded post-image or None)]
+    for r in rows or ():
+        try:
+            data = json.loads(unb64(r["post_b64"]))
+        except Exception:
+            data = None
+        into.setdefault(r.get("account") or "", []).append(
+            (r, data if isinstance(data, dict) else None))
+
+    cycles = 0
+    for acct in sorted(set(own) | set(into)):
+        mine = into.get(acct, [])
+        dest = _lineage_index(own.get(acct, []) + [
+            LineageRow(acct, r["name"], d, planned=True)
+            for r, d in mine if d is not None])
+        held = held_by_account.get(acct)
+        held = held if isinstance(held, dict) else {}
+        results = {}
+        for r, d in mine:
+            if d is None:
+                continue
+            holders = [as_lineage.get(id(rec))
+                       or LineageRow(rec.account, rec.name, rec.data)
+                       for rec in conversations.get(r["session"], ())
+                       if rec.account != acct]
+            results[(acct, r["name"])] = _lineage_resolve(
+                r["session"], r["name"], holders, holder_index, dest,
+                held=held, transcript_exists=exists)
+        # Every destination counts its own cycles, rows planned into it or
+        # not: the cycles line reports what any destination already holds.
+        cycles += _lineage_drop_cycles(results, _lineage_existing_edges(dest))
+        for r, d in mine:
+            res = results.get((acct, r["name"]))
+            if res is None:
+                r["lineage"] = _lineage_empty()
+                continue
+            if (res["link"] is not None or res["chain"] is not None
+                    or "spawnedFrom" in d or "startChain" in d):
+                r["post_b64"] = _lineage_rewrite_post(
+                    r["post_b64"], res["link"], res["chain"])
+            r["lineage"] = res["lineage"]
+    return cycles
+
+
 def plan_converge(env, flags):
     """Build a converge manifest. Pure planning - writes nothing.
 
@@ -16044,6 +16266,17 @@ def plan_converge(env, flags):
                          "is_update": False, "written": False})
             planned_titles.setdefault(acct, {})[k] = sid
 
+    # The lineage pass, now that the rows are final (holds and collisions
+    # removed) and every new row's id is minted: each row carries its side
+    # session's link and chain, translated into its destination, against the
+    # whole store - --only narrows the rows, never what a link may name. The
+    # rows are then put in write order, parents and roots first; a store with
+    # no links keeps today's order and bytes exactly. Lineage notes live in
+    # the rows' `lineage`, never in `notes` (the title-disagreement branch).
+    lineage_cycles = _converge_lineage(
+        records, conversations, rows, _converge_held_by_account(holds), tids)
+    rows = _lineage_write_order(rows, _converge_row_key)
+
     # Truthful completeness math: projected from the pairs that will actually
     # be written, never a promised full house. A short conversation with any
     # held pair stays short.
@@ -16069,6 +16302,7 @@ def plan_converge(env, flags):
                       "held": held_conversations,
                       "scoped": bool(only_sid)},
          "dead_excluded": dead_excluded,
+         "lineage_format": LINEAGE_FORMAT, "lineage_cycles": lineage_cycles,
          "notes": notes, "holds": holds, "rows": rows}
     if dis:
         m["identity_disagreement"] = {"oauth": dis[0], "config": dis[1]}
@@ -16616,6 +16850,15 @@ def _public_converge_manifest(env, m):
                 r["holders"] = [_scrub_label(x) for x in r["holders"]]
             if isinstance(r.get("skip_detail"), str):
                 r["skip_detail"] = _scrub(r["skip_detail"])
+            # Lineage notes name ids only (by 8 characters), never a title,
+            # label or path - by construction. Scrubbed anyway, as hold
+            # details are, in the record and in the plan's kept copy.
+            for key in ("lineage", "lineage_planned"):
+                lin = r.get(key)
+                notes = lin.get("notes") if isinstance(lin, dict) else None
+                for n in notes if isinstance(notes, list) else ():
+                    if isinstance(n, dict):
+                        n["detail"] = _scrub(n.get("detail"))
     # A runnable measured remedy is DERIVED here, at emit time, from the
     # structured fields anonymize_report has already run over - so
     # anonymizing suggested_title anonymizes the command by construction
@@ -16669,6 +16912,9 @@ def _print_converge_report(say, m):
             if r.get("skipped"):
                 line += "   [{0}: {1}]".format(r["skipped"],
                                                r.get("skip_detail", ""))
+            reason = _lineage_row_reason(r.get("lineage"))
+            if reason:
+                line += "   [link: {0}]".format(LINEAGE_PHRASES[reason])
             say(line)
         say("")
     for note in m.get("notes", []):
@@ -16721,6 +16967,10 @@ def _print_converge_report(say, m):
         say("({0} dead conversation(s) excluded from the count - rows exist "
             "but the transcript is gone; 'doctor' reports them)"
             .format(m["dead_excluded"]))
+    # The lineage branch: what the rows would carry, after the count it sits
+    # beside (and its dead-conversation footnote, which belongs to it).
+    for line in _lineage_plan_lines(m):
+        say(line)
 
 
 def _identity_warning_lines(env, m):
