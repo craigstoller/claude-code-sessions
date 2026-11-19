@@ -785,14 +785,14 @@ here.
 | Windows 11 + Claude Desktop 3.6556.2 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: read-only paths and `converge --apply` verified 2026-10-23, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 4.4212.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor`, `alignment` and `converge --apply` verified 2026-11-01, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 5.1231.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor` and `alignment` verified read-only 2026-11-10. Needs 0.16.3 or later to find the store | read-only + mutations, `--apply` not yet run on this build |
-| Windows 11 + Claude Desktop 6.6395.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | from 0.17.0: `doctor` and `realign --apply` verified 2026-11-17, the apply with the app closed; after the app reopened, `doctor` and a fresh `realign` plan found every rewritten row opening the live copy and no set-aside copy back in its old folder. Needs 0.16.3 or later to find the store | read-only + mutations |
+| Windows 11 + Claude Desktop 6.6395.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | from 0.17.0: `doctor` and `realign --apply` verified 2026-11-17, the apply with the app closed; after the app reopened, `doctor` and a fresh `realign` plan found every rewritten row opening the live copy and no set-aside copy back in its old folder. From 0.18.0: `converge --apply` with carried links verified 2026-11-19, the apply with the app closed; the app nested both children opened, and after a reopen every carried link and chain read back as written. Needs 0.16.3 or later to find the store | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds of the MSIX that Anthropic signs and
 distributes itself from claude.ai - most recently Claude Desktop 6.6395.0.0 with Claude Code
-CLI 2.1.326 for `doctor` and the last `--apply` run, a `realign`; `converge --apply` last ran
-on 4.4212.0.0 with CLI 2.1.309. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
+CLI 2.1.326 for `doctor` and the last two `--apply` runs, a `realign` on 2026-11-17 and a
+`converge` on 2026-11-19. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
 This tool does not look in that package's folder and has never been run against it.
 On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
@@ -1281,6 +1281,35 @@ window into `journaled`/`completed`/`rolled_back`.
   the process's DPI over 96. Verified at 250 % and in a faithful 100 % run, and every other
   GUI harness passes in an aware process. 150 %, a common laptop setting, is untested; Tk 8.6
   is unchanged.
+- **0.18.0 keeps a side session under its parent in every account.** A side session's row names
+  its parent's row (`spawnedFrom`) and its chain's first row (`startChain`), each by an id that
+  exists only in that account. `converge` used to write its rows without either, and `sync`
+  copied both as they stood, so a copied link named a row the destination does not have. Both
+  commands now write them translated to the destination's own rows, the link as `{sessionId,
+  taskId}`. On the machine it was built on, probes found that the app hides a child whose link
+  lacks `taskId` and nests it when the link has both keys, for the app's side-session links and
+  for its older `{sessionId, taskId, title}` links, one candidate each. Only those measured
+  shapes and this tool's own output are carried. Any other link is left out with its reason, as
+  are the cases "Side sessions keep their parent" above lists: holders that disagree, a parent
+  the account lacks, a link that would close a cycle. A parent created in the same run is
+  written first. The apply resolves every link again under the lock, and the journal keeps the
+  final link per row. Recovery never resolves again. When a pending row's parent was not
+  written, or its row is gone or now opens another conversation, `converge` skips that row and
+  `sync` stops offering to go forward. `undo` and
+  `recover --back` remove children before their parents and report any link they leave
+  dangling, or naming a row that now opens another conversation; the window's Undo shows the
+  same lines. A
+  `spawnedFrom` or `startChain` that is not an object, a null say, counts as no link. Before
+  the release, a `converge --apply` on that machine created 20 rows and carried 20 links and 18
+  chains. The app nested both children opened, one whose source link also carried
+  `sharedFolder` and one with `userFork`, and after a reopen every carried link and chain read
+  back as written. A child with the older link shape written by a release run, and a child
+  `sync` added, have not been looked at in the app. `sync` now decodes its stores a second time
+  for the links. On a store of about 3,000 rows (400 MB) its dry run took about 30% longer and
+  peaked at 879 MB against 229 MB, and with `--update` at 1.13 GB against 452 MB. A fix is
+  planned. `converge` recovery also keeps a row that landed before a hard kill: it records the
+  row as written before re-checking anything, so `undo` still removes it, even after the app
+  has rewritten it.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
