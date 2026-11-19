@@ -3483,15 +3483,16 @@ def recover_op(env, op, direction):
                     "can be run from it. Nothing was changed."
                     .format(m.get("op_id"), bad))
             if direction == "forward":
+                # Rows that landed before the kill are recorded first, so the
+                # recheck below never re-judges one against its own file.
+                _converge_mark_landed(op, m)
                 pending = [r for r in m["rows"]
                            if not r.get("written") and not r.get("skipped")]
-                if all(_sync_row_drift(r) == "match" for r in pending):
+                if not pending:
                     # Every write landed (or none were pending); only the
                     # completion marker is missing. Journal-only, so no
                     # mutation guard and no recheck - the same asymmetry the
                     # repoint and retitle arms document.
-                    for r in pending:
-                        r["written"] = True
                     save_manifest(op)
                     set_status(op, "completed")
                     rotate_ops(env)
@@ -3520,6 +3521,10 @@ def recover_op(env, op, direction):
             # the conversations keep their rows elsewhere.
             deletable, residue, residue_paths = [], [], []
             stray_ids = {id(r) for r, _ in stray}
+            # A landed row whose flag was lost is this op's like any written
+            # row: removed if it still holds our bytes, recorded as residue if
+            # the app has rewritten it since - never dropped silently.
+            _converge_mark_landed(op, m, skip_ids=stray_ids)
             for r in m["rows"]:
                 if id(r) in stray_ids:
                     continue                  # recorded below, never read
@@ -15645,6 +15650,39 @@ def _converge_write_rows(op, m, roots):
         save_manifest(op)
         if i < len(rows) - 1:
             _maybe_crash("converge-mid-write")
+
+
+def _converge_mark_landed(op, m, skip_ids=frozenset()):
+    """Record as written every pending row whose write already landed, and
+    save the record if any changed. Run first by both directions of recover.
+
+    The window is the one _converge_write_rows leaves between atomic_write and
+    save_manifest: a hard kill there puts this op's row on disk with its flag
+    unset. Before this ran, forward recovery that found other rows still to
+    write went straight to _converge_recheck, which saw the landed file's own
+    conversation in the account and marked the row `already_present` - so it
+    stayed `written: false`, and undo, which only removes written rows, never
+    reached it.
+
+    A row has landed when the file at its dest_path holds exactly its
+    post-image, or when it holds a row whose `sessionId` is the minted filename
+    stem (_row_is_ours): the app may rewrite a landed row before recovery runs,
+    and that uuid4 was minted by this op, so no other writer can have put it
+    there. A file at the minted path without that stem is not this op's and is
+    never marked. Rows in SKIP_IDS (stores this version does not read) are not
+    looked at. Returns the number of rows marked.
+    """
+    marked = 0
+    for r in m["rows"]:
+        if r.get("written") or r.get("skipped") or id(r) in skip_ids:
+            continue
+        state = _sync_row_drift(r)
+        if state == "match" or (state == "drifted" and _row_is_ours(r)):
+            r["written"] = True
+            marked += 1
+    if marked:
+        save_manifest(op)
+    return marked
 
 
 def execute_converge_op(env, op):

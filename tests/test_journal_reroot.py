@@ -894,6 +894,8 @@ _ROW_READERS = {
     "_retitle_contained": "itself a check against the discovered roots",
     "_retitle_write_rows": "checks each row with _retitle_contained first",
     "_converge_write_rows": "checks the discovered roots, after _converge_recheck",
+    "_converge_mark_landed": "recover_op refuses forward on an unresolved row first, "
+                             "and passes back's unresolved rows in to be skipped",
     "_realign_write_rows": "checks each row with _retitle_contained first",
     "_realign_copy_contained": "a transcript copy against the projects root, not a row",
     "_realign_forward_blockers": "classify_op gates before dispatching to the realign classifier",
