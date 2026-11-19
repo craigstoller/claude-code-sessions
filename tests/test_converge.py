@@ -3229,3 +3229,532 @@ def test_large_deep_store_plans_correctly_without_recursion():
                 assert pos[(r["store_path"], lin[ref] + ".json")] < i
     assert [r["session"] for r in ordered
             if r["session"] in deep] == deep
+
+
+# ------------------------- carry the link (apply: re-resolved once, under lock)
+# docs/specs/2026-11-17-carry-lineage-design.md, "converge", "Applying, once":
+# after its pair-skip decisions the recheck runs the lineage pass again against
+# the store as it now is plus the rows still to be written. A row whose link or
+# chain came out differently is rewritten with its record, the difference is
+# noted beside the underlying reason, the plan's record is kept as
+# lineage_planned, and the rows are re-sorted - all before new_op.
+
+LR = "0bbb0000-6666-4000-8000-00000000000b"   # a chain root, held by A1
+SENT_TITLE = "SENTINEL-LINK-TITLE-7Q"
+SENT_VALUE = "SENTINEL-LINK-VALUE-8R"
+SENT_CHAIN = "SENTINEL-CHAIN-VALUE-9S"
+
+
+def codes(lin):
+    return [n["code"] for n in lin["notes"]]
+
+
+def rm_transcript(env, sid):
+    os.unlink(os.path.join(env.projects_root, "C--p", sid + ".jsonl"))
+
+
+def on_disk(r):
+    with open(r["dest_path"], encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def holder_row(env, name):
+    return os.path.join(env.store_candidates[0], A1, O1, name + ".json")
+
+
+def test_apply_retargets_when_the_planned_parent_row_appeared_elsewhere(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The plan creates P's row in A3 and links C's new A3 row to it. A row
+    for P then appears in A3 under another name: P's planned row is skipped
+    as already_present, and C's link is retargeted to the row that appeared,
+    never left naming a row that will not be written."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    planned_parent = rows_by(m, LP)[A3]
+    planned_stem = planned_parent["name"][:-len(".json")]
+    assert rows_by(m, LC)[A3]["lineage"]["parent_row"] == planned_stem
+    write_row(env, 0, A3, O3, "local_q3",
+              lrow(LP, "local_q3", "Northwind kickoff"))
+    assert ct.run_converge(env, m) == "completed"
+    assert planned_parent["skipped"] == "already_present"
+    child = rows_by(m, LC)[A3]
+    assert child["written"] is True and "skipped" not in child
+    assert on_disk(child)["spawnedFrom"] == {"sessionId": "local_q3",
+                                             "taskId": TASK}
+    lin = child["lineage"]
+    assert lin["parent_row"] == "local_q3" and lin["parent_planned"] is False
+    assert lin["parent_session"] == LP
+    assert codes(lin) == ["lineage_retargeted"]
+    assert child["lineage_planned"]["parent_row"] == planned_stem
+    assert child["lineage_planned"]["parent_planned"] is True
+    assert codes(child["lineage_planned"]) == []
+    # A2's copy linked to A2's own parent row in the plan and still does.
+    other = rows_by(m, LC)[A2]
+    assert codes(other["lineage"]) == [] and "lineage_planned" not in other
+    assert on_disk(other)["spawnedFrom"] == {"sessionId": "local_p2",
+                                             "taskId": TASK}
+
+
+def test_apply_drops_when_the_parents_transcript_left(
+        mkenv, tmp_path, write_transcript, write_row):
+    """P's transcript leaves the disk between the dry run and the apply.
+    Each child row is still written, without the link or the chain, and
+    carries the underlying reason beside lineage_dropped."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row,
+                    chain={"firstSessionId": "local_p1", "depth": 1})
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert all("spawnedFrom" in post_of(r) for r in m["rows"])
+    rm_transcript(env, LP)
+    assert ct.run_converge(env, m) == "completed"
+    for acct in (A2, A3):
+        child = rows_by(m, LC)[acct]
+        assert child["written"] is True
+        data = on_disk(child)
+        assert "spawnedFrom" not in data and "startChain" not in data
+        lin = child["lineage"]
+        assert codes(lin) == ["lineage_parent_dead", "lineage_chain_dropped",
+                              "lineage_dropped"]
+        assert lin["parent_row"] == "" and lin["root_row"] == ""
+        planned = child["lineage_planned"]
+        assert planned["parent_row"] == planned["root_row"] == \
+            "local_p" + NUM[acct]
+    s = ct._lineage_summary([r for r in m["rows"] if r["written"]])
+    assert s["links"] == {"carried": 0,
+                          "left_out": {"lineage_parent_dead": 2}}
+    assert s["chains"] == {"carried": 0, "left_out": 2}
+    assert s["changes"] == {"changed": 0, "dropped": 2, "gained": 0}
+
+
+def test_apply_gains_a_link_when_a_parent_row_appeared_since_the_dry_run(
+        mkenv, tmp_path, write_transcript, write_row):
+    """--only C, and no destination holds P, so the dry run carries no link.
+    A row for P then appears in A2: C's A2 row gains its link. A3 still has
+    no row for P and keeps the plan's reason, with no change noted."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=())
+    m = ct.plan_converge(env, ct.ConvergeFlags(only=LC[:8]))
+    assert {r["session"] for r in m["rows"]} == {LC}
+    assert all(codes(r["lineage"]) == ["parent_not_in_account"]
+               for r in m["rows"])
+    write_row(env, 0, A2, O2, "local_p2",
+              lrow(LP, "local_p2", "Northwind kickoff"))
+    assert ct.run_converge(env, m) == "completed"
+    gained = rows_by(m, LC)[A2]
+    assert on_disk(gained)["spawnedFrom"] == {"sessionId": "local_p2",
+                                              "taskId": TASK}
+    assert codes(gained["lineage"]) == ["lineage_gained"]
+    assert gained["lineage"]["parent_row"] == "local_p2"
+    assert gained["lineage_planned"]["parent_row"] == ""
+    assert codes(gained["lineage_planned"]) == ["parent_not_in_account"]
+    still = rows_by(m, LC)[A3]
+    assert still["written"] is True
+    assert "spawnedFrom" not in on_disk(still)
+    assert codes(still["lineage"]) == ["parent_not_in_account"]
+    assert "lineage_planned" not in still
+    s = ct._lineage_summary([r for r in m["rows"] if r["written"]])
+    assert s["changes"] == {"changed": 0, "dropped": 0, "gained": 1}
+
+
+def test_apply_reports_a_parent_skipped_as_held_title_collision_by_that_reason(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Another conversation takes P's chosen title in A3 after the dry run,
+    so the recheck holds P's planned row there. C's A3 row, planned to link
+    to it, is reported by that hold's reason code - never by the hold's
+    detail, which quotes a title."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert rows_by(m, LC)[A3]["lineage"]["parent_planned"] is True
+    write_row(env, 0, A3, O3, "local_x3",
+              lrow(LX, "local_x3", "Northwind kickoff"))
+    assert ct.run_converge(env, m) == "completed"
+    assert rows_by(m, LP)[A3]["skipped"] == "held_title_collision"
+    child = rows_by(m, LC)[A3]
+    assert child["written"] is True and "skipped" not in child
+    assert "spawnedFrom" not in on_disk(child)
+    lin = child["lineage"]
+    assert codes(lin) == ["parent_pair_held", "lineage_dropped"]
+    detail = lin["notes"][0]["detail"]
+    assert "held_title_collision" in detail and "Northwind" not in detail
+    assert child["lineage_planned"]["parent_planned"] is True
+
+
+def chained_holdings(env, write_transcript, write_row, root_in=(A2, A3),
+                     depth=2):
+    """linked_holdings (P in A2 and A3), with C's A1 row also carrying a
+    chain rooted at R (LR): a third conversation held by A1 and by each
+    account in ROOT_IN, as local_r<n>."""
+    linked_holdings(env, write_transcript, write_row,
+                    chain={"firstSessionId": "local_r1", "depth": depth})
+    write_transcript(env, "C--p", LR, t_entries())
+    write_row(env, 0, A1, O1, "local_r1", lrow(LR, "local_r1", "Northwind root"))
+    for acct in root_in:
+        stem = "local_r" + NUM[acct]
+        write_row(env, 0, acct, ORG[acct], stem,
+                  lrow(LR, stem, "Northwind root"))
+
+
+@pytest.mark.parametrize("case", ["gained", "dropped", "moved", "depth"])
+def test_apply_chain_gained_dropped_or_moved_alone_is_classified(
+        mkenv, tmp_path, write_transcript, write_row, case):
+    """The link stays the same and only the chain changes since the dry run:
+    a root row that appeared (gained), one that left (lineage_chain_dropped),
+    one replaced by another row of the root (moved) and a source depth that
+    changed are each classified by the chain alone."""
+    env = _monotonic_now(mkenv(tmp_path))
+    chained_holdings(env, write_transcript, write_row,
+                     root_in=(A3,) if case == "gained" else (A2, A3))
+    m = ct.plan_converge(env, ct.ConvergeFlags(only=LC[:8]))
+    a2 = os.path.join(env.store_candidates[0], A2, O2)
+    want = {"firstSessionId": "local_r2", "depth": 2}
+    if case == "gained":
+        assert "startChain" not in post_of(rows_by(m, LC)[A2])
+        write_row(env, 0, A2, O2, "local_r2",
+                  lrow(LR, "local_r2", "Northwind root"))
+        code, n_changed = "lineage_gained", 1
+    elif case == "dropped":
+        os.unlink(os.path.join(a2, "local_r2.json"))
+        want, code, n_changed = None, "lineage_chain_dropped", 1
+    elif case == "moved":
+        os.unlink(os.path.join(a2, "local_r2.json"))
+        write_row(env, 0, A2, O2, "local_s2",
+                  lrow(LR, "local_s2", "Northwind root"))
+        want = {"firstSessionId": "local_s2", "depth": 2}
+        code, n_changed = "lineage_retargeted", 1
+    else:
+        _app_touches(holder_row(env, "local_c1"),
+                     startChain={"firstSessionId": "local_r1", "depth": 3})
+        want = {"firstSessionId": "local_r2", "depth": 3}
+        code, n_changed = "lineage_retargeted", 2
+    assert ct.run_converge(env, m) == "completed"
+    child = rows_by(m, LC)[A2]
+    data = on_disk(child)
+    assert data["spawnedFrom"] == {"sessionId": "local_p2", "taskId": TASK}
+    assert data.get("startChain") == want
+    assert child["lineage"]["parent_row"] == "local_p2"
+    assert child["lineage"]["root_row"] == (want or {}).get(
+        "firstSessionId", "")
+    assert codes(child["lineage"]) == [code]
+    assert child["lineage_planned"]["parent_row"] == "local_p2"
+    third = rows_by(m, LC)[A3]
+    if case == "depth":
+        assert on_disk(third)["startChain"] == {"firstSessionId": "local_r3",
+                                                "depth": 3}
+        assert codes(third["lineage"]) == ["lineage_retargeted"]
+    else:
+        assert on_disk(third)["startChain"] == {"firstSessionId": "local_r3",
+                                                "depth": 2}
+        assert codes(third["lineage"]) == [] and \
+            "lineage_planned" not in third
+    changed = [r for r in m["rows"] if "lineage_planned" in r]
+    assert len(changed) == n_changed
+    s = ct._lineage_summary([r for r in m["rows"] if r["written"]])
+    assert s["links"]["carried"] == 2 and not s["links"]["left_out"]
+    # A dropped chain is counted on the chains line, never as a changed link.
+    assert s["changes"]["dropped"] == 0
+    if case == "dropped":
+        assert s["chains"] == {"carried": 1, "left_out": 1}
+        assert s["changes"] == {"changed": 0, "dropped": 0, "gained": 0}
+
+
+def test_apply_task_id_change_on_the_same_parent_is_retargeted(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The holder's link keeps its parent and takes another taskId after
+    the dry run. `lineage` holds no taskId, so only the decoded bytes can
+    see the change: it is lineage_retargeted, and the new taskId is
+    written."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    _app_touches(holder_row(env, "local_c1"),
+                 spawnedFrom=side_link("local_p1", taskId="task_8g"))
+    assert ct.run_converge(env, m) == "completed"
+    for acct in (A2, A3):
+        child = rows_by(m, LC)[acct]
+        assert on_disk(child)["spawnedFrom"] == {
+            "sessionId": "local_p" + NUM[acct], "taskId": "task_8g"}
+        assert codes(child["lineage"]) == ["lineage_retargeted"]
+        planned = dict(child["lineage_planned"], notes=[])
+        assert dict(child["lineage"], notes=[]) == planned
+
+
+def assert_lineage_agrees(rows):
+    """The constraints' binding rule over one op's rows: `lineage` names the
+    parent and root rows exactly as the bytes carry them, and a *_planned
+    flag is true exactly when another row of the op has that name in the
+    same store. lineage_planned is history, checked for shape alone."""
+    names = {(r["store_path"], r["name"]) for r in rows}
+    for r in rows:
+        data = json.loads(ct.unb64(r["post_b64"]))
+        lin = r["lineage"]
+        assert set(lin) == LINEAGE_KEYS
+        for ref, flag, key, field in (
+                ("parent_row", "parent_planned", "spawnedFrom", "sessionId"),
+                ("root_row", "root_planned", "startChain",
+                 "firstSessionId")):
+            carried = data.get(key)
+            assert bool(lin[ref]) == (carried is not None), (r["name"], ref)
+            if carried is not None:
+                assert lin[ref] == carried[field]
+            in_op = bool(lin[ref]) and lin[ref] + ".json" != r["name"] and \
+                (r["store_path"], lin[ref] + ".json") in names
+            assert lin[flag] is in_op, (r["name"], flag)
+        if "lineage_planned" in r:
+            assert set(r["lineage_planned"]) == LINEAGE_KEYS
+
+
+def test_lineage_and_post_b64_agree_after_apply_and_planned_is_kept(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A row for P appears in A3 after the dry run: C's A3 row is retargeted
+    in both its link and its chain. In the journal every row's record agrees
+    with its bytes, only the changed row keeps the plan's record, and every
+    unchanged row keeps the plan's bytes exactly."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,),
+                    chain={"firstSessionId": "local_p1", "depth": 1})
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    plan = {r["name"]: (r["post_b64"], json.dumps(r["lineage"]))
+            for r in m["rows"]}
+    write_row(env, 0, A3, O3, "local_q3",
+              lrow(LP, "local_q3", "Northwind kickoff"))
+    assert ct.run_converge(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    rows = op.manifest["rows"]
+    assert_lineage_agrees(rows)
+    changed = [r for r in rows if "lineage_planned" in r]
+    assert [(r["session"], r["account"]) for r in changed] == [(LC, A3)]
+    retargeted = changed[0]
+    assert codes(retargeted["lineage"]) == ["lineage_retargeted"]
+    post = post_of(retargeted)
+    assert post["spawnedFrom"] == {"sessionId": "local_q3", "taskId": TASK}
+    assert post["startChain"] == {"firstSessionId": "local_q3", "depth": 1}
+    # The kept record is the plan's, exactly.
+    assert json.dumps(retargeted["lineage_planned"]) == \
+        plan[retargeted["name"]][1]
+    for r in rows:
+        if r is not retargeted:
+            assert r["post_b64"] == plan[r["name"]][0]
+        if r.get("written"):
+            with open(r["dest_path"], "rb") as fh:
+                assert fh.read() == ct.unb64(r["post_b64"])
+
+
+def test_journal_holds_the_final_bytes_and_order(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """At the dry run C's holder row carries no link, so C's A3 row keeps
+    its sid place ahead of P's planned A3 row. The link appears before the
+    apply: C's A3 row now names P's planned row, so the rows are re-sorted
+    before new_op - the journal holds the final bytes in the final order,
+    and the parent is written first. A cycle of links that appeared in A2
+    meanwhile is counted again, too."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    write_row(env, 0, A1, O1, "local_c1",
+              lrow(LC, "local_c1", "ACME-REVIEW side task"))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert [(r["session"], r["account"]) for r in m["rows"]] == \
+        [(LC, A2), (LC, A3), (LP, A3)]
+    assert not any("spawnedFrom" in post_of(r) for r in m["rows"])
+    assert m["lineage_cycles"] == 0
+    write_row(env, 0, A1, O1, "local_c1",
+              lrow(LC, "local_c1", "ACME-REVIEW side task",
+                   spawnedFrom=side_link("local_p1")))
+    write_row(env, 0, A2, O2, "local_x2",
+              lrow(LX, "local_x2", "Northwind loop one",
+                   spawnedFrom=side_link("local_y2")))
+    write_row(env, 0, A2, O2, "local_y2",
+              lrow(LY, "local_y2", "Northwind loop two",
+                   spawnedFrom=side_link("local_x2")))
+    journaled, written = {}, []
+    real_new_op, real_write = ct.new_op, ct.atomic_write
+
+    def spy_new_op(env_, manifest):
+        journaled["rows"] = [(r["session"], r["account"], r["post_b64"])
+                             for r in manifest["rows"]]
+        journaled["cycles"] = manifest["lineage_cycles"]
+        return real_new_op(env_, manifest)
+
+    def spy_write(path, data):
+        name = os.path.basename(path)
+        if name.startswith("local_"):          # rows only, not the journal
+            written.append(name)
+        return real_write(path, data)
+    monkeypatch.setattr(ct, "new_op", spy_new_op)
+    monkeypatch.setattr(ct, "atomic_write", spy_write)
+    assert ct.run_converge(env, m) == "completed"
+    final = [(LC, A2), (LP, A3), (LC, A3)]
+    assert [(s, a) for s, a, _ in journaled["rows"]] == final
+    parent, child = rows_by(m, LP)[A3], rows_by(m, LC)[A3]
+    stem = parent["name"][:-len(".json")]
+    assert post_of(child)["spawnedFrom"] == {"sessionId": stem,
+                                             "taskId": TASK}
+    assert codes(child["lineage"]) == ["lineage_gained"]
+    assert journaled["cycles"] == 1
+    assert ct.list_ops(env)[-1].manifest["lineage_cycles"] == 1
+    # What new_op journaled is what was written, row for row and in order.
+    on_record = ct.list_ops(env)[-1].manifest["rows"]
+    assert [(r["session"], r["account"], r["post_b64"])
+            for r in on_record] == journaled["rows"]
+    assert written == [r["name"] for r in on_record]
+    for r in on_record:
+        with open(r["dest_path"], "rb") as fh:
+            assert fh.read() == ct.unb64(r["post_b64"])
+
+
+def test_after_apply_trailer_prints_the_links_lines(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, capsys):
+    """The after-apply lines sit under `created :` and count the written
+    rows: carried, left out by the underlying reason, then what changed
+    since the plan. The dry run above them still says what the plan would
+    carry."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,),
+                    chain={"firstSessionId": "local_p1", "depth": 1})
+    real = ct.run_converge
+
+    def late(env_, m_):
+        # A collision for P's chosen title in A3, after the dry run printed.
+        write_row(env, 0, A3, O3, "local_x3",
+                  lrow(LX, "local_x3", "Northwind kickoff"))
+        return real(env_, m_)
+    monkeypatch.setattr(ct, "run_converge", late)
+    rc = ct.cmd_converge(env, cv_ns(apply=True))
+    out = capsys.readouterr().out
+    assert rc == 3                           # the apply-time hold
+    lines = out.splitlines()
+    assert "links   : 2 to carry" in lines
+    assert "chains  : 2 to carry" in lines
+    created = lines.index("created : 2 row(s)")
+    assert lines[created + 1] == (
+        "links   : 1 carried, 1 left out (the parent's own row is held in "
+        "this plan 1); since the plan: 1 dropped")
+    assert lines[created + 2] == "chains  : 1 carried, 1 left out"
+    assert lines[created + 3].startswith("skipped : " + LP[:8])
+    # Every part of the line, in its order, each only when nonzero.
+
+    def row(parent_row, *cs):
+        return {"written": True, "lineage": dict(
+            ct._lineage_empty(), parent_row=parent_row,
+            notes=[{"code": c, "detail": ""} for c in cs])}
+    assert ct._lineage_apply_lines([
+        row("local_a", "lineage_retargeted"), row("local_b", "lineage_gained"),
+        row("", "lineage_parent_dead", "lineage_dropped")]) == [
+        "links   : 2 carried, 1 left out (the parent's transcript is gone "
+        "1); since the plan: 1 changed, 1 dropped, 1 gained"]
+    assert ct._lineage_apply_lines([row("local_a")]) == \
+        ["links   : 1 carried"]
+    assert ct._lineage_apply_lines([row("")]) == []
+
+
+def test_a_row_is_never_skipped_over_its_link(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The plan creates P's row in A3 and links C's A3 row to it; P's
+    transcript then leaves the disk. P's own row is skipped as
+    transcript_gone, and C's rows are still written, each without the link
+    and with its reason - none is skipped for its link."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert rows_by(m, LC)[A3]["lineage"]["parent_planned"] is True
+    rm_transcript(env, LP)
+    assert ct.run_converge(env, m) == "completed"
+    assert [(r["session"], r["skipped"]) for r in m["rows"]
+            if r.get("skipped")] == [(LP, "transcript_gone")]
+    for acct in (A2, A3):
+        child = rows_by(m, LC)[acct]
+        assert child["written"] is True and "skipped" not in child
+        assert "spawnedFrom" not in on_disk(child)
+        assert codes(child["lineage"]) == ["lineage_parent_dead",
+                                           "lineage_dropped"]
+    assert_lineage_agrees(ct.list_ops(env)[-1].manifest["rows"])
+
+
+def test_recheck_defaults_to_no_relink(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Recovery's call never re-resolves: `relink` defaults to False, a
+    recheck without it leaves every row's bytes, record and place alone,
+    and forward recovery never runs the pass."""
+    import inspect
+    param = inspect.signature(ct._converge_recheck).parameters["relink"]
+    assert param.default is False
+    env = _monotonic_now(mkenv(tmp_path / "recheck"))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    before = [(r["name"], r["post_b64"], json.dumps(r["lineage"]))
+              for r in m["rows"]]
+    write_row(env, 0, A3, O3, "local_q3",
+              lrow(LP, "local_q3", "Northwind kickoff"))
+    ct._converge_recheck(env, m)
+    assert rows_by(m, LP)[A3]["skipped"] == "already_present"
+    assert [(r["name"], r["post_b64"], json.dumps(r["lineage"]))
+            for r in m["rows"]] == before
+    assert not any("lineage_planned" in r for r in m["rows"])
+
+    env2 = _monotonic_now(mkenv(tmp_path / "recover"))
+    _m2, op = _crash_after_first_row(env2, write_transcript, write_row)
+
+    def never(*_a, **_k):
+        raise AssertionError("recovery ran the lineage pass")
+    monkeypatch.setattr(ct, "_converge_lineage", never)
+    assert ct.recover_op(env2, op, "forward") == "completed"
+
+
+def test_no_source_link_value_reaches_the_plan_or_the_apply_output(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, capsys):
+    """Task 3's review, pinned: the source holder's link carries its own
+    title and a value under an unknown key, and its chain an extra key.
+    Their names are recorded as dropped; their values never reach the dry
+    run's text or --json, either anonymized, the after-apply --json (whose
+    retargeted row carries lineage_planned), or a written row."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    write_row(env, 0, A1, O1, "local_c1", lrow(
+        LC, "local_c1", "ACME-REVIEW side task",
+        spawnedFrom=side_link("local_p1", title=SENT_TITLE,
+                              zzLinkExtra=SENT_VALUE),
+        startChain={"firstSessionId": "local_p1", "depth": 1,
+                    "zzChainExtra": SENT_CHAIN}))
+    sentinels = (SENT_TITLE, SENT_VALUE, SENT_CHAIN)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert rows_by(m, LC)[A2]["lineage"]["dropped_keys"] == [
+        "sideSession", "title", "zzLinkExtra", "startChain.zzChainExtra"]
+    outputs = {}
+    assert ct.cmd_converge(env, cv_ns()) == 0
+    outputs["dry run"] = capsys.readouterr().out
+    assert ct.cmd_converge(env, cv_ns(json=True)) == 0
+    outputs["dry run --json"] = capsys.readouterr().out
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    try:
+        assert ct.cmd_converge(env, cv_ns(anonymize=True)) == 0
+        outputs["--anonymize"] = capsys.readouterr().out
+        assert ct.cmd_converge(env, cv_ns(anonymize=True, json=True)) == 0
+        outputs["--anonymize --json"] = capsys.readouterr().out
+    finally:
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
+    real = ct.run_converge
+
+    def late(env_, m_):
+        write_row(env, 0, A3, O3, "local_q3",
+                  lrow(LP, "local_q3", "Northwind kickoff"))
+        return real(env_, m_)
+    monkeypatch.setattr(ct, "run_converge", late)
+    assert ct.cmd_converge(env, cv_ns(apply=True, json=True)) == 0
+    outputs["apply --json"] = capsys.readouterr().out
+    payload = json.loads(outputs["apply --json"])
+    assert payload["result"] == "completed"
+    assert any("lineage_planned" in r for r in payload["rows"])
+    for name, text in outputs.items():
+        # Not vacuous: each output does carry the link's report.
+        assert "links   :" in text or '"lineage"' in text, name
+        assert not any(s in text for s in sentinels), name
+    written = [r for r in payload["rows"] if r.get("written")]
+    assert len(written) == 2
+    for r in written:
+        with open(r["dest_path"], encoding="utf-8") as fh:
+            text = fh.read()
+        assert "spawnedFrom" in text
+        assert not any(s in text for s in sentinels), r["name"]
