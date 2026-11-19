@@ -3,7 +3,9 @@ of ~/.claude/projects, answered from one listing of it, with exactly
 find_transcripts' results - the same hits, in the same order, as the same
 strings, and the same exceptions."""
 import os
+import pathlib
 import random
+import shutil
 
 import pytest
 
@@ -186,41 +188,46 @@ def test_a_folder_that_cannot_be_listed_is_asked_per_file(projects,
     assert len(in_locked) == 3                # every lookup, as today
 
 
-@pytest.mark.skipif(os.name != "nt", reason="a Windows device name")
-def test_a_folder_named_nul_is_asked_per_file(projects):
-    """A real folder whose listing fails while os.path.isfile still finds
-    the file in it: on Windows, a folder named NUL, made through the \\\\?\\
-    prefix. Ruling it out would lose a transcript find_transcripts finds."""
-    folder = os.path.join(projects, "NUL")
-    raw_folder = "\\\\?\\" + folder
-    raw_file = raw_folder + "\\s-1.jsonl"
+@pytest.mark.skipif(os.name != "nt", reason="Windows path normalisation")
+@pytest.mark.parametrize("odd, twin", [("NUL", None),
+                                       ("C--ACME ", "C--ACME"),
+                                       ("C--ACME.", "C--ACME"),
+                                       ("C--ACME..", "C--ACME")])
+def test_a_folder_its_plain_path_lists_otherwise_is_asked_per_file(
+        projects, odd, twin):
+    """Folders whose plain path os.listdir may list as another folder, or
+    not at all, while os.path.isfile reaches the file inside through a
+    middle path component. On a Windows Python whose os.listdir normalises
+    the path first (CPython gh-150880, in 3.13 and 3.14), os.listdir of
+    "C--ACME " lists its twin "C--ACME", and of a folder named NUL fails;
+    older ones list them as they are. Made through the \\\\?\\ prefix. The
+    index answers as find_transcripts does on either kind of Python."""
+    if twin:
+        os.mkdir(os.path.join(projects, twin))         # empty
+    raw_folder = "\\\\?\\" + os.path.join(projects, odd)
     os.mkdir(raw_folder)
     try:
-        with open(raw_file, "w", encoding="utf-8") as fh:
+        with open(raw_folder + "\\s-1.jsonl", "w", encoding="utf-8") as fh:
             fh.write("{}\n")
-        with pytest.raises(OSError):
-            os.listdir(folder)
-        assert ct.find_transcripts(projects, "s-1") == \
-            [os.path.join(folder, "s-1.jsonl")]
         _assert_same(projects, ["s-1", "S-1", "s-2"])
     finally:
-        if os.path.exists(raw_file):
-            os.remove(raw_file)
-        os.rmdir(raw_folder)
+        shutil.rmtree(raw_folder)
 
 
-def test_index_of_a_bytes_root_fails_as_find_transcripts_does(projects):
-    """A root this was never meant for fails in the index's own listing
-    differently from find_transcripts; the lookup still fails with
-    find_transcripts' own error, not the index's."""
-    _touch(os.path.join(projects, "C--Northwind", "s-1.jsonl"))
+def test_index_of_a_root_that_is_not_a_str(projects):
+    """A root this was never meant for goes to find_transcripts as it is,
+    whatever its folders hold: bytes, over an empty folder and over a
+    transcript, and a pathlib path. And a str root with a NUL in it fails
+    as find_transcripts fails."""
+    os.makedirs(os.path.join(projects, "C--empty"))
     broot = os.fsencode(projects)
-    with pytest.raises(TypeError) as own:
-        ct._TranscriptIndex(broot)._build()
-    with pytest.raises(TypeError) as scan:
-        ct.find_transcripts(broot, "s-1")
-    assert str(own.value) != str(scan.value)
-    _assert_same(broot, ["s-1", "s-2"])
+    _assert_same(broot, ["s-1", "s-2", 5])
+    _touch(os.path.join(projects, "C--Northwind", "s-1.jsonl"))
+    _assert_same(broot, ["s-1", "s-2", 5])
+    _assert_same(pathlib.Path(projects), ["s-1", "S-1", "s-2", 5])
+    _assert_same(projects + "\x00x", ["s-1", 5])
+    assert _outcome(ct._TranscriptIndex(projects + "\x00x").find,
+                    "s-1")[1] is ValueError
 
 
 def test_a_transcript_gone_since_the_listing_is_not_found(projects):

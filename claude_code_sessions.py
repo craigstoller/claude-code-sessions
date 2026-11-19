@@ -632,16 +632,19 @@ class _TranscriptIndex:
       (_INDEXED_SESSION_ID), and so is every name this compares, so this
       keeps both an exact match and what a case-insensitive file system
       folds onto one;
-    - a folder whose listing fails, or which holds a name that is not ASCII
-      (which a file system may fold or normalise onto an ASCII one), is
-      never ruled out: every lookup asks os.path.isfile there, as
-      find_transcripts does. A listing can fail where os.path.isfile still
-      finds the file: on Windows, a folder named NUL. So is a folder whose
-      own name is not ASCII or ends in '.' or ' ', defensively: os.listdir
-      and os.path.isfile both reach a folder through the same middle path
-      component, so its name has not been seen to matter;
-    - an id that is not a str, or not plain, goes to find_transcripts
-      itself, so it answers, or fails, exactly as it always has.
+    - a folder whose listing fails, whose own name ends in '.' or ' ' or is
+      not ASCII, or which holds a name that is not ASCII (which a file
+      system may fold or normalise onto an ASCII one), is never ruled out:
+      every lookup asks os.path.isfile there, as find_transcripts does.
+      The folder's own name matters on Windows Pythons whose os.listdir
+      normalises the path before listing it (CPython gh-150880, in 3.13
+      and 3.14; seen on 3.14.10): os.listdir of "C--x " then lists "C--x",
+      and of a folder named NUL fails, while os.path.isfile still reaches
+      the file inside, through a middle path component that is not
+      normalised so. The non-ASCII name is defensive;
+    - a root or an id that is not a str, or an id that is not plain, goes
+      to find_transcripts itself, so it answers, or fails, exactly as it
+      always has.
     A root that does not exist indexes as empty, as find_transcripts reads
     it. A root that cannot be listed for any other reason is not indexed:
     each lookup goes to find_transcripts, which raises, and the next one
@@ -688,7 +691,7 @@ class _TranscriptIndex:
         self._entries, self._holding, self._always = entries, holding, always
 
     def find(self, session_id):
-        if type(session_id) is not str \
+        if type(self.root) is not str or type(session_id) is not str \
                 or not _INDEXED_SESSION_ID.fullmatch(session_id):
             return find_transcripts(self.root, session_id)
         if self._entries is None:
@@ -698,9 +701,8 @@ class _TranscriptIndex:
                 # A root that cannot be listed, or a listing this cannot
                 # read: find_transcripts answers, or raises, as it always
                 # has, and nothing is kept from the attempt. Any exception,
-                # not only OSError: a root this was never meant for (bytes,
-                # say) fails here differently from find_transcripts, and
-                # find_transcripts' own failure is the one to keep.
+                # not only OSError: whatever stopped the listing here,
+                # find_transcripts' own outcome is the one to keep.
                 return find_transcripts(self.root, session_id)
         at = self._holding.get((session_id + ".jsonl").upper(), ())
         if self._always:

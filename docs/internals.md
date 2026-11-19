@@ -1214,18 +1214,21 @@ same, byte for byte.
   app writes as `cliSessionId` are. Any other id, including one that is not a string, goes to
   `find_transcripts` itself, and answers or fails as it always has.
 - A folder the listing cannot vouch for is asked of every id, as `find_transcripts` asks it:
-  one whose listing fails, and one holding a name that is not ASCII, which a file system may
-  fold or normalise onto an ASCII one. A folder that cannot be listed therefore keeps today's
-  per-file answer, rather than a guess in either direction. That matters: on Windows a folder
-  named `NUL` refuses `os.listdir` while `os.path.isfile` still finds the file in it. A folder
-  whose own name is not ASCII or ends in `.` or a space is asked of every id too, defensively,
-  since both calls reach a folder through the same middle path component.
+  one whose listing fails, one whose own name ends in `.` or a space or is not ASCII, and one
+  holding a name that is not ASCII, which a file system may fold or normalise onto an ASCII
+  one. A folder that cannot be listed therefore keeps today's per-file answer, rather than a
+  guess in either direction. The folder's own name matters on a Windows Python whose
+  `os.listdir` normalises the path before listing it (CPython gh-150880, in 3.13 and 3.14; seen
+  on 3.14.10). There `os.listdir` of `C--x ` lists `C--x`, and of a folder named `NUL` fails,
+  while `os.path.isfile` still reaches the file inside, through a middle path component that is
+  not normalised so. A non-ASCII folder name is asked of every id defensively.
 - A projects folder that does not exist indexes as empty, as `find_transcripts` reads it. One
   that cannot be listed for another reason is not indexed: each lookup goes to
-  `find_transcripts`, which raises where it raised before.
-- The build lists every folder whatever the plan's size, and a plan that looks nothing up
-  builds nothing. On the machine measured, one build took 0.05 s and one scan 0.02 s, so a plan
-  of three or more lookups gains.
+  `find_transcripts`, which raises where it raised before. A root that is not a string goes to
+  `find_transcripts` too.
+- The build lists every folder whatever the plan's size, and its cost grows with the number of
+  entries in them; a plan that looks nothing up builds nothing. On the machine measured, one
+  build took 0.05 s and one scan 0.02 s, so a plan of three or more lookups gains.
 - The listing is the plan's snapshot. A transcript removed since is no hit; one written since is
   not seen by that plan. Apply time does not use the index: under the lock, `_sync_relink`'s
   lineage pass looks its parents' and roots' transcripts up afresh with `find_transcripts`, as
