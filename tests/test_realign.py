@@ -843,31 +843,50 @@ def test_a_damaged_record_is_refused_by_undo_and_recover(world):
 # test does not catch a missing op-type branch. Fails until a new one is
 # listed.
 _OP_TYPE_BRANCHES = {
-    "rotate_ops": "names it",
-    "classify_op": "names it",
-    "recover_op": "names it",
-    "gather_doctor": "names it",
-    "cmd_undo": "names it",
-    "undo_realign": "names it",
-    "_collides": "names it",
-    "plan_realign": "names it",
-    "_release_candidates": "names it",
-    "_journal_rows": "realign rows take the last branch, a per-row store_path",
-    "_unresolved_rows": "tells moves apart; realign rows carry `written`",
-    "_realign_claimed_later": "names it",
-    "plan_undo": "undo of a move only",
-    "undo_new_row": "its own type",
-    "undo_sync": "its own type",
-    "undo_repoint": "its own type",
-    "undo_retitle": "its own type",
-    "undo_converge": "its own type",
-    "_sync_paths_claimed_elsewhere": "sync claimants by bytes; a realign "
-                                     "write is drift to sync's undo",
-    "_live_override_note": "only sync records a live override note",
-    "_lineage_row_store": "reads a converge or sync row's store, for the "
-                          "lineage check; a realign op carries no lineage",
-    "cmd_recover": "prints the rows converge's forward recovery skipped "
-                   "over their link; a realign op has no such skip",
+    "rotate_ops": ("names it",
+                   "pending: Task 7 adds relink to the claimants"),
+    "classify_op": ("names it", "pending: Task 9 adds the relink arm"),
+    "recover_op": ("names it", "pending: Task 9 adds the relink arm"),
+    "gather_doctor": ("names it",
+                      "reads a relink op as any other, by status and "
+                      "rollback_residue; a relink creates no row to vanish "
+                      "and sets no copy aside"),
+    "cmd_undo": ("names it", "pending: Task 8 adds the relink arm"),
+    "undo_realign": ("names it", "its own type"),
+    "_collides": ("names it",
+                  "pending: Task 7 makes relink one of rotate_ops' claimants"),
+    "plan_realign": ("names it",
+                     "a relink writes no key realign plans from; an "
+                     "unfinished relink is in nonterminal_ops already"),
+    "_release_candidates": ("names it",
+                            "only realign holds copies to release"),
+    "_journal_rows": ("realign rows take the last branch, a per-row "
+                      "store_path",
+                      "relink rows take the last branch, a per-row "
+                      "store_path"),
+    "_unresolved_rows": ("tells moves apart; realign rows carry `written`",
+                         "tells moves apart; relink rows carry written"),
+    "_realign_claimed_later": ("names it",
+                               "pending: Task 7 passes over a relink"),
+    "plan_undo": ("undo of a move only", "undo of a move only"),
+    "undo_new_row": ("its own type", "its own type"),
+    "undo_sync": ("its own type", "its own type"),
+    "undo_repoint": ("its own type", "its own type"),
+    "undo_retitle": ("its own type", "its own type"),
+    "undo_converge": ("its own type", "its own type"),
+    "_sync_paths_claimed_elsewhere": (
+        "sync claimants by bytes; a realign write is drift to sync's undo",
+        "sync claimants by bytes; a relink write is drift to sync's undo"),
+    "_live_override_note": ("only sync records a live override note",
+                            "only sync records a live override note"),
+    "_lineage_row_store": (
+        "reads a converge or sync row's store, for the lineage check; a "
+        "realign op carries no lineage",
+        "a relink row's store_path is read by its non-sync branch, as a "
+        "converge row's"),
+    "cmd_recover": ("prints the rows converge's forward recovery skipped "
+                    "over their link; a realign op has no such skip",
+                    "pending: Task 9 prints relink's skipped rows"),
 }
 
 
@@ -893,19 +912,23 @@ def _op_type_branches(path):
             is_op_type(s) or (isinstance(s, ast.Name) and s.id in bound)
             for s in [n.left] + n.comparators) for n in ast.walk(fn))
         if hit:
-            out[fn.name] = any(isinstance(n, ast.Constant) and n.value == "realign"
-                               for n in ast.walk(fn))
+            out[fn.name] = tuple(
+                any(isinstance(n, ast.Constant) and n.value == word
+                    for n in ast.walk(fn)) for word in ("realign", "relink"))
     return out
 
 
-def test_every_op_type_branch_names_realign_or_says_why_not():
+def test_every_op_type_branch_names_realign_and_relink_or_says_why_not():
+    # The relink column exists because the AST check only notices a new
+    # branching function, not a missing arm in an old one.
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     found = _op_type_branches(os.path.join(root, "claude_code_sessions.py"))
     assert set(found) == set(_OP_TYPE_BRANCHES)
     for name, names_it in found.items():
-        assert names_it == (_OP_TYPE_BRANCHES[name] == "names it"), name
+        want = tuple(col == "names it" for col in _OP_TYPE_BRANCHES[name])
+        assert names_it == want, name
     gui = _op_type_branches(os.path.join(root, "claude_code_sessions_gui.py"))
-    assert gui == {"_find_undoable_op": True}
+    assert gui == {"_find_undoable_op": (True, False)}
 
 
 # ------------------------------------------- the code review's findings

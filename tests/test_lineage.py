@@ -379,7 +379,7 @@ def test_lineage_record_has_every_field_with_its_type_and_no_repeated_code():
     assert set(ct.LINEAGE_LEFT_OUT) <= set(ct.LINEAGE_PHRASES)
     assert "lineage_chain_dropped" not in ct.LINEAGE_LEFT_OUT
     assert "existing_cycle" not in ct.LINEAGE_LEFT_OUT
-    assert len(ct.LINEAGE_LEFT_OUT) == 11
+    assert len(ct.LINEAGE_LEFT_OUT) == 13
 
 
 def test_note_details_name_ids_by_8_chars_and_no_titles():
@@ -730,7 +730,11 @@ def test_note_codes_phrases_and_left_out_set_match_the_table_exactly():
         ("lineage_task_disagree", "holders disagree on taskId"),
         ("lineage_cycle", "it would close a cycle"),
         ("lineage_source_changed", "the source row changed since the plan"),
+        ("own_link_differs", "the row's own link names no usable row"),
+        ("lineage_no_app_link", "no app-written link backs it"),
         ("lineage_chain_dropped", "the chain was left out"),
+        ("own_chain_differs",
+         "the row's own chain disagrees with its holders'"),
         ("existing_cycle", "the account already holds a cycle of links"),
         ("lineage_retargeted", "changed since the plan"),
         ("lineage_dropped", "dropped since the plan"),
@@ -740,7 +744,8 @@ def test_note_codes_phrases_and_left_out_set_match_the_table_exactly():
         "lineage_parent_disagree", "lineage_self", "lineage_parent_dead",
         "parent_not_in_account", "parent_pair_held", "parent_row_drifted",
         "lineage_variant", "lineage_no_task", "lineage_task_disagree",
-        "lineage_cycle", "lineage_source_changed"))
+        "lineage_cycle", "lineage_source_changed", "own_link_differs",
+        "lineage_no_app_link"))
 
 
 # ------------------------------------------------ shape checks (Task 5)
