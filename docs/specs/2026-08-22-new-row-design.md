@@ -83,6 +83,8 @@ no business asserting. A documented template inherits nothing by accident.
 | `spawnedFrom` | omitted entirely |
 | remaining fields | documented defaults, listed in the implementation |
 
+*(Note, 2026-11-19: `new-row` still writes no link, and the row above is unchanged. `converge` and `sync` add a translated `spawnedFrom`, and a `startChain` where the source has one, to a row after it is synthesized, as `docs/specs/2026-11-17-carry-lineage-design.md` describes. They do it in a pass of their own, so this template stays link-free and `new-row` keeps omitting the field.)*
+
 The exact template is part of the implementation and must be written out in one place with a
 comment per field. **Unknown future fields are omitted**, not given a guessed default: a field this
 tool does not understand, filled with a plausible-looking value, is the false assertion the

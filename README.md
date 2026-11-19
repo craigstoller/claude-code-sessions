@@ -420,6 +420,18 @@ is always a preview will misread `sync --apply --json`.
   grants** across the account boundary unchanged. The permission half is the more
   security-relevant of the two: use `--verbatim` only when you actually want the second account
   to inherit what the first one had allowed.
+- **A row's link to its parent is translated, not copied.** A row `sync` adds carries the same
+  translated link and chain that `converge` writes (see `converge`, below), or none, and the plan
+  prints the same `links   :` and `chains  :` lines. A refresh replaces the whole row, link
+  included, so the destination's own link is dropped or translated, never merged. A refresh that
+  drops it or points it at another row says so, one line per row (`link    : local_c1 loses its
+  link`, `link    : local_c1 now links to another row`, and `chain   :` for the chain), and the
+  fields line leaves the link out so it is reported once. One exception: a destination link that
+  already names the same row and `taskId` is kept as it is. In the window the sync pane shows the
+  same lines. An apply that ends with nothing to write says "Nothing to copy: the destination
+  already holds these rows" and leaves Undo as it was.
+  **`--verbatim` copies links as they are**, so a link may name a row that does not exist in the
+  destination. Such an add is counted: `links   : 2 copied verbatim (not translated)`.
 - **It needs the app closed too, the same as `move`, `undo`, and `recover` - regardless of which
   file resolved the signed-in account.** `sync` only ever writes the store you are *not* signed
   into, and re-checks that at the moment it writes, not just when it planned; that re-check
@@ -575,6 +587,59 @@ a row someone has repointed, and a row someone has retitled since - presence it 
 stopped being redundant is presence it leaves alone. `doctor`'s vanished-row check watches
 converge-created rows the same way it watches `new-row`'s, with the same journal-retention
 window.
+
+**Side sessions keep their parent.** A side session's row names its parent's row (`spawnedFrom`),
+and a row deep in a chain of them names the chain's first row (`startChain`). Both name a row by
+its id in the same account, so a copy would point at a row the other account does not have.
+`converge` and `sync` therefore write them translated. The link becomes
+`{"sessionId": <that account's own row for the parent>, "taskId": <copied unchanged>}`, and the
+chain becomes `{"firstSessionId": <that account's own row for the root>, "depth": <copied>}`.
+Everything else in the source link (`title`, `sideSession`, `name`, `sharedFolder`, `wakeParent`,
+`pendingPop` and any key this tool has not seen) is left behind and recorded. The `taskId` is not
+optional: on the one side session measured per link shape, a link without it hid the child from
+the sidebar, and a link with it nested the child under its parent. Only the link shapes that were
+measured are carried: an app-written side-session link, the older `{sessionId, taskId, title}`,
+and this tool's own output, so a carried link can be carried again.
+
+The row is still created when its link is left out, and the plan says why. A link is left out
+when the holders disagree on the parent or on `taskId`; when it names the conversation itself;
+when the parent's transcript is gone; when that account has no row for the parent, or the
+parent's own row is held in this plan, or its row there opens another conversation; when the
+link's shape is not one that was measured; or when it would close a cycle. A link is written only
+to a row that will exist, including a parent created in the same run, which is written first.
+The plan reports it:
+
+```
+links   : 4 to carry, 1 left out (holders disagree on the parent 1)
+chains  : 2 to carry
+cycles  : 1 already present, left as they are
+```
+
+Each part prints only when its count is not zero, the most frequent reason first. A row whose
+link was left out carries `[link: <reason>]` on its own line. The apply resolves every link
+again under the lock, against the store as it then stands, and its last lines say what changed
+since the plan: `links   : 4 carried, 1 left out (...); since the plan: 1 changed, 1 gained`.
+`changed` and `dropped` count links the plan had, `gained` one it did not. The journal records
+the final link per row, and recovery never resolves again. It writes the journaled bytes, skips
+a row (`parent_not_written`) whose planned parent it did not write, and skips one
+(`parent_changed`) whose parent's row is gone or now opens another conversation.
+
+`undo` can leave a link dangling. When a row it created has become the last pointer to its
+conversation, `undo` keeps it, while it still removes the parent row the same operation created.
+It says so, for `undo` of a `converge`, a `sync` or a `new-row`, and for `recover --back` and a
+finished `recover --forward`:
+
+```
+link left dangling: local_c1.json (its parent's row was removed)
+```
+
+A child whose parent's row is missing is listed on its own and opens, which was measured. A
+chain root's row that is missing is reported the same way ("its chain root's row"), but how the
+app shows that was not measured. `link redirected: ... (its parent's row now opens another
+conversation)` names a link whose target row survives and now opens a different conversation,
+and `links not checked: N could not be read` counts what the report could not read. The report
+covers rows that link to a row the command removed, and for `recover --forward` the operation's
+own targets. It is not a check of every link in the store.
 
 **`realign`** - point every account's row of a split conversation at the folder holding its
 live transcript copy:

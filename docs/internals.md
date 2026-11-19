@@ -995,6 +995,162 @@ Each of these was a real defect. They are stated as rules because each one gener
   window session, is cleared on apply, and is changeable from a button beside Refresh —
   visible state rather than state re-demanded on every replan.
 
+##### Carrying the parent-child link (design `docs/specs/2026-11-17-carry-lineage-design.md`)
+
+*(the code is the `_lineage_*` functions, `_converge_lineage`, `_sync_lineage`, `_link_report`; pinned by
+`tests/` and the `tools/check_*.py` scripts that pin report text)*
+
+A side session's row carries `spawnedFrom`, which names its parent's row by `sessionId` (the
+filename stem) in the same account, and sometimes `startChain`, which names the chain's first row
+the same way. `converge` and `sync` write rows into accounts that may hold the parent under
+another row id, or not at all. The lineage pass writes the link translated, or leaves it out
+with a reason.
+
+**The pass.** It runs when the plan is built, so the dry run can say what it would carry, and once
+more under the lock before the op is journaled. The second run is final: the journal holds the
+exact bytes, and recovery never resolves again. The input is each destination account's state
+after the op as planned: its rows, less the rows the op replaces, plus the op's planned rows with
+their planned bytes. `_lineage_index` builds that index once per account (by filename, by row id
+and by conversation, counting only rows whose `sessionId` equals their stem), and the graph walk
+is iterative, so a deep store cannot reach the recursion limit. For each row `_lineage_resolve`
+does, in order:
+
+1. Collect each holder's `spawnedFrom` that names a row in the holder's own store, with a
+   readable `cliSessionId`. That row's conversation is the parent P. Anything else yields nothing
+   for that holder and never raises.
+2. Holders must agree on one P, which is not the child's own conversation and has a transcript on
+   disk: `lineage_parent_disagree`, `lineage_self`, `lineage_parent_dead` otherwise.
+3. Pick a template holder among those whose link is a cleared variant with a usable `taskId`:
+   `lineage_variant` when none is cleared, `lineage_no_task` when the cleared ones have no
+   `taskId`. Every holder with a usable `taskId` must give the same one, cleared or not:
+   `lineage_task_disagree`.
+4. Find the parent's row in the account's after-state: a row whose conversation is P and whose
+   `sessionId` equals its stem. For `sync` the row with the source parent's filename comes first.
+   Then unarchived before archived, existing before planned, the latest activity, the greatest
+   filename. None gives `parent_not_in_account`, or `parent_pair_held` when the parent's own pair
+   is held in this plan. A row of that name that opens another conversation gives
+   `parent_row_drifted`.
+5. Write exactly `{"sessionId": T, "taskId": <copied>}`. Every other key is dropped and recorded.
+6. Resolve `startChain` on its own: its sources must agree on a root R (not the child, with a
+   transcript) and on an integer `depth` of at least 1, and R must have a row in the account. A
+   chain that fails any of that is left out with `lineage_chain_dropped`, and so is the chain of
+   a row whose link was left out.
+7. Add the proposed edges to the account's graph, parent edges first and then root edges, and
+   drop any that would close a cycle (`lineage_cycle`; `lineage_chain_dropped` for a root).
+
+**The cleared variants, and why those.** `{sessionId, taskId}` is what a trial showed the app
+nests. The three shapes carried are an app-written side-session link (`sideSession: true`), the
+older app-written link that is exactly `{sessionId, taskId, title}` (a second trial cleared it),
+and this tool's own output. Without the last, a link the tool wrote would be refused the next time
+it was a source: a third account, a `sync` onward, a `sync --update` back. Other variants (forks,
+an older-shape link that also carries `pendingPop`) carry nothing until a trial clears them. `_lineage_variant_ok`
+tests the shape and `_lineage_task_ok` the `taskId`, and the two are separate so a note can say
+which failed.
+
+**Evidence behind `taskId`.** Phase 0 measured one candidate per variant, with the app closed
+and journaled pre-images. A link with only `sessionId`, or with `sessionId` and one of `title`,
+`sideSession` or `name`, hid the child from the sidebar. `sessionId` with `taskId` nested it, with
+the translated `startChain` as well, and the app kept the link as written. A link to a missing
+parent left the child listed on its own, and it opened. That is one candidate per variant, so it
+is one measurement each. The release's acceptance check is the second: `converge --apply`, then
+open a carried side session in an account that lacked it; one older-variant child; one `sync`
+add. If it disagrees, the carried set goes back to the maintainer, and nothing else changes it.
+
+**Row identity versus conversation nodes.** A row is identified by `(account, name)`, and its
+row id is the filename stem. The link graph's nodes are conversations, one graph per
+destination account, since two rows of one conversation in an account are one holding. `converge`
+plans one conversation into several accounts, so every result, edge and note is keyed by the row
+and never by conversation alone. Cycles are found per account over conversations, and the write
+order is over the op's rows. A cycle the account already holds is counted once per account
+(`lineage_cycles`, the plan's `cycles :` line), left as it is, and never a row note.
+
+**Write order.** `_lineage_write_order` sorts a stable topological order: a row whose link or
+chain names a planned row of the same store comes after it. An interrupted run can leave a
+parent without its child, and never a child naming a row not yet written. Rows in a cycle are
+appended in input order. `undo` and `recover --back` reverse in the opposite order, children
+first, for converge and sync alike, so an interrupted reversal never leaves a child naming a
+removed row. That includes a journal from 0.17.0, which was not written in link order. In a
+`sync`, the single sequence puts adds and refreshes together, where it once removed every add
+before restoring any refresh. The consequence is that when several rows are each the last pointer
+to their conversation, the survivor that `undo` keeps follows reverse write order.
+
+**Recovery never resolves again.** The pending rows keep their journaled bytes. Recovery checks,
+and so never writes a link that names a row that is not there:
+- `parent_not_written`: the journaled link or chain names a planned row of this op that
+  recovery is skipping for any reason, so a skip carries down a planned chain.
+- `parent_changed`: the target is a planned row already written, or a row that existed before the
+  op, and it is gone, cannot be read, or opens a conversation other than the journaled
+  `parent_session` or `root_session`. A target it cannot settle fails closed as this.
+
+A planned target that is still pending is not checked, because write order writes it first (a
+pending refresh may open another conversation until it is written). `converge` skips the row by
+the reason, and it stays short for the next `converge`, which plans it afresh. `sync` has no
+per-row skip, so `classify_sync_op` treats either answer as drift, withdraws forward and offers
+`back`. The shipped defect that a landed row was marked `already_present` and lost to `undo` is
+fixed first: before either direction runs, a pending row that has landed (its bytes match, or its
+file's `sessionId` is the minted stem) is marked written and saved.
+
+**The link report's scope.** After the writes, forward recovery, `undo` and `recover --back`
+scan the op's own stores, one direct-child read each, and never `load_rows`, which takes store
+roots and globs further down. `removed` and `restored` are `(store, row id)` pairs, since `sync`
+keeps filenames and one id can name healthy rows in other stores.
+- Dangling: a row whose `spawnedFrom` or `startChain` names a row this command removed from the
+  same store. It reads only the stores and what the command removed, never the journal's lineage,
+  so a journal from 0.17.0 gets it too.
+- Redirected: a written row, not removed or restored, that still carries the link this op wrote
+  and whose target now opens another conversation. Only rows with a `lineage` take part. A
+  restored row is never compared with this op's link, including a row an interrupted earlier run
+  already restored.
+- Forward recovery (`forward=True`) removes nothing, so it checks the op's own targets instead
+  and reports an absent one as dangling: the target deleted in the crash window. Without
+  `forward`, a target already missing is not this command's doing and is not reported.
+- It is not every broken link in the store. Unreadable rows and targets are counted as `links not
+  checked`, and a report that fails prints `links not checked: the link report failed (...)`
+  instead. It never raises and never fails the command it reports for. It is saved to the
+  journal as `link_report`.
+
+**`lineage_format` and old journals.** Every `converge` and `sync` op this version journals
+carries `lineage_format: 1`, and each row a `lineage`:
+`parent_session`, `parent_row`, `parent_planned`, `root_session`, `root_row`, `root_planned`,
+`carried_keys`, `dropped_keys`, `notes`. When the apply-time pass changed a row, `lineage_planned`
+holds the plan's. A journal without the key runs exactly as before: no shape check of lineage and
+no dependency checks, so a pending op from 0.17.0 recovers as it did, and a `--verbatim` link
+needs no `lineage`. Its `undo` or `recover --back` still gets the dangling part of the report; the
+redirected part and forward recovery's check of the op's own targets need a `lineage`, so they do
+not fire. In an op with the key, `lineage` must agree with the bytes: `parent_row` is non-empty
+exactly when the decoded `post_b64` has `spawnedFrom`, and equals its `sessionId`, and `root_row`
+is bound to `startChain` the same way. The `*_planned` flags mean another row of the op has that
+name in the same store. `lineage_planned` is checked for shape alone, since after a retarget, gain
+or drop it disagrees with the final bytes by design. A row without `lineage` is valid only when
+its image has neither key, or the op is `--verbatim`. An unreadable or missing `post_b64` is never
+a shape error, in an old journal or a new one: the readers fail such a row closed, so a stuck op
+keeps `back`, and the bytes check runs only on rows whose bytes decode.
+
+**The writer bound.** The guarantee holds while the desktop app is closed (the RULING 4 guard,
+which `converge` and `sync` already run) and this tool's lock is held. A store changed by anything
+else between the apply-time pass and the write is outside it. Recovery's dependency checks and
+the link report are how such a change is caught.
+
+**This build's departures from the spec.**
+1. `sync` keeps a destination link that already names the same row and `taskId`, instead of
+   rewriting it to the bare two keys. That stops a round trip stripping keys from the original
+   account's row. It narrows the whole-row rule (L4) for this one key.
+2. `sync`'s apply-time pass re-reads the source row rather than keeping its raw link in the plan,
+   so no source connector state enters the journal or `--json`.
+3. The dangling report covers rows that link to a row the command removed, plus, for forward
+   recovery, the op's own targets.
+4. The window's Level tab shows lineage as the `links :` line with its reasons, since the window
+   renders no per-row notes of any kind. Its sync pane shows the same `link :` and `chain :`
+   change lines as the CLI.
+5. `sync` keeps today's identity test ahead of the age holds. Taken literally, the spec's order
+   would report a byte-identical row under `--newer-only` as held, not unchanged. It writes
+   nothing either way.
+6. `run_sync` refuses, before it journals, when a refresh that became a no-op at apply time finds
+   its destination row changed. The spec does not cover it, and treating that row as existing
+   could leave a child linking to a row that is gone.
+7. Three converge helpers were renamed so `sync` shares them: `_lineage_dependency_skip`,
+   `_lineage_rows_by_name`, `_op_link_report`.
+
 ##### When the app orphans a conversation, and nothing here can stop it (2026-08-21)
 
 The first incident where **no guard in this tool was applicable**, and the most instructive so
