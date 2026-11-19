@@ -5636,3 +5636,292 @@ def test_sync_resumed_reversal_after_the_childs_restore_reports_no_redirection(
     saved = _journal_of(env, op)
     assert saved["link_report"]["redirected"] == []
     assert saved["link_report"] == EMPTY_LINKS
+
+
+# ------------------------- R26: sync's planning decodes each store once
+#
+# docs/internals.md, "Reading each store once". The lineage pass holds rows
+# as only the keys it reads (_lineage_light), takes its source index from
+# selection's own read of the source, and takes the duplicate census from
+# its one read of the destination. Nothing a plan says changes.
+
+def _decode_once_stores(env, src, dst):
+    """A source with a linked, chained child among plain adds and one
+    refresh, and a destination holding the parent under another row and a
+    bulky connector config on most rows."""
+    bulk = [{"name": "Northwind", "url": "https://example.com/" + "x" * 400}]
+    _transcripts(env, LP, LC, LR, "sid-add", "sid-e")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff",
+          remoteMcpServersConfig=bulk)
+    _lrow(src, "local_r.json", LR, "Northwind root")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_r", "depth": 1},
+          remoteMcpServersConfig=bulk)
+    _lrow(src, "local_a.json", "sid-add", "ACME onboarding",
+          remoteMcpServersConfig=bulk)
+    _lrow(src, "local_e.json", "sid-e", "Northwind retro v2", lastActivityAt=7)
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff",
+          remoteMcpServersConfig=bulk)
+    _lrow(dst, "local_e.json", "sid-e", "Northwind retro", lastActivityAt=3)
+
+
+def _store_files(*stores):
+    return {os.path.normcase(os.path.realpath(os.path.join(s, n)))
+            for s in stores for n in os.listdir(s)
+            if n.startswith("local_") and n.endswith(".json")}
+
+
+@pytest.mark.parametrize("flags", [
+    ct.SyncFlags(), ct.SyncFlags(update=True), ct.SyncFlags(verbatim=True)],
+    ids=["add", "update", "verbatim"])
+def test_sync_planning_decodes_each_store_row_once(two_account_env, tmp_path,
+                                                   monkeypatch, flags):
+    """Every row file of the source and the destination is decoded exactly
+    once while planning: selection's read of the source serves the lineage
+    pass, and the pass's read of the destination serves the duplicate
+    census. A refresh's pre-image is read as bytes, as before."""
+    env, src, dst = two_account_env(tmp_path)
+    _decode_once_stores(env, src, dst)
+    reads = {}
+    real = ct.read_json
+
+    def spy(path):
+        k = os.path.normcase(os.path.realpath(path))
+        reads[k] = reads.get(k, 0) + 1
+        return real(path)
+    monkeypatch.setattr(ct, "read_json", spy)
+    m = ct.plan_sync(env, flags)
+    assert m["rows"]
+    rows = {k: n for k, n in reads.items() if k in _store_files(src, dst)}
+    assert set(rows) == _store_files(src, dst)
+    assert set(rows.values()) == {1}
+
+
+def test_sync_lineage_pass_holds_only_the_keys_it_reads(two_account_env,
+                                                        tmp_path,
+                                                        monkeypatch):
+    """The pass, at planning and again under the lock, is handed the
+    stores' rows as only _LINEAGE_ROW_KEYS, never whole rows."""
+    env, src, dst = two_account_env(tmp_path)
+    _decode_once_stores(env, src, dst)
+    seen = []
+    real = ct._sync_lineage
+
+    def spy(rows, sources, source_store, dest_store, *a, **k):
+        seen.append((list(source_store), list(dest_store)))
+        return real(rows, sources, source_store, dest_store, *a, **k)
+    monkeypatch.setattr(ct, "_sync_lineage", spy)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert ct.run_sync(env, m) == "completed"
+    assert len(seen) == 2                      # the plan, then the relink
+    for source_store, dest_store in seen:
+        assert source_store and dest_store
+        for _rid, d in source_store + dest_store:
+            assert set(d) <= set(ct._LINEAGE_ROW_KEYS)
+    assert any("remoteMcpServersConfig" in ct.read_json(os.path.join(src, n))
+               for n in os.listdir(src))
+
+
+def _resolver_stores(env, src, dst):
+    """Rows that exercise every key the pass reads: the parent held twice
+    (unarchived wins over a later archived row), the chain root held twice
+    (the later activity wins), a row whose sessionId is not its stem, a
+    parent row that opens another conversation, and two cycles the
+    destination already holds, one through a chain."""
+    _transcripts(env, LP, LC, LR, LG, LQ, "sid-d")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_r.json", LR, "Northwind root")
+    _lrow(src, "local_g.json", LG, "Northwind planning")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_r", "depth": 2})
+    _lrow(src, "local_d.json", "sid-d", "ACME-REVIEW follow-up",
+          spawnedFrom=_side("local_g"))
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(dst, "local_z.json", LP, "Northwind kickoff", lastActivityAt=9,
+          isArchived=True)
+    _lrow(dst, "local_w.json", LP, "Northwind kickoff", lastActivityAt=99,
+          sessionId="local_elsewhere")
+    _lrow(dst, "local_r1.json", LR, "Northwind root", lastActivityAt=2)
+    _lrow(dst, "local_r2.json", LR, "Northwind root", lastActivityAt=7)
+    _lrow(dst, "local_g.json", LQ, "Northwind other")
+    _lrow(dst, "local_x.json", "sid-x", "Loop one", spawnedFrom=_side("local_y"))
+    _lrow(dst, "local_y.json", "sid-y", "Loop two", spawnedFrom=_side("local_x"))
+    _lrow(dst, "local_u.json", "sid-u", "Chain loop one",
+          startChain={"firstSessionId": "local_v", "depth": 1})
+    _lrow(dst, "local_v.json", "sid-v", "Chain loop two",
+          spawnedFrom=_side("local_u"))
+
+
+@pytest.mark.parametrize("update", [False, True], ids=["add", "update"])
+def test_sync_light_rows_plan_exactly_what_whole_rows_plan(
+        two_account_env, tmp_path, monkeypatch, update):
+    """The pass reads nothing a light row leaves out: with _lineage_light
+    made the identity, so the pass sees whole rows, the plan and the journal
+    are the same, byte for byte."""
+    env, src, dst = two_account_env(tmp_path)
+    _resolver_stores(env, src, dst)
+    flags = ct.SyncFlags(only="ACME", update=update)
+    light = ct.plan_sync(env, flags)
+    with monkeypatch.context() as mp:
+        mp.setattr(ct, "_lineage_light", lambda d: d)
+        whole = ct.plan_sync(env, flags)
+    assert json.dumps(light, sort_keys=True) == json.dumps(whole, sort_keys=True)
+    by = _by_name(light)
+    c, d = by["local_c.json"], by["local_d.json"]
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_q", "taskId": LTASK}
+    assert _post(c)["startChain"] == {"firstSessionId": "local_r2", "depth": 2}
+    assert "spawnedFrom" not in _post(d)
+    assert _codes(d) == ["parent_row_drifted"]
+    assert light["lineage_cycles"] == 2
+    # And again under the lock: the journal holds the same rows either way.
+    journals = []
+    real_new_op = ct.new_op
+
+    def spy_new_op(env_, manifest):
+        journals.append(json.dumps(manifest["rows"], sort_keys=True))
+        return real_new_op(env_, manifest)
+    monkeypatch.setattr(ct, "new_op", spy_new_op)
+    assert ct.run_sync(env, light) == "completed"
+    assert ct.undo_sync(env, ct.list_ops(env)[-1]) == "undone"
+    monkeypatch.setattr(ct, "_lineage_light", lambda d: d)
+    assert ct.run_sync(env, whole) == "completed"
+    assert len(journals) == 2 and journals[0] == journals[1]
+
+
+def test_sync_planning_looks_up_each_transcript_once(two_account_env,
+                                                     tmp_path, monkeypatch):
+    """A conversation's transcript is looked up once while planning: the
+    pass reuses selection's answer for a parent or root that is itself a
+    candidate. Under the lock the pass looks again, afresh."""
+    env, src, dst = two_account_env(tmp_path)
+    _decode_once_stores(env, src, dst)
+    looked = []
+    real = ct.find_transcripts
+
+    def spy(root, sid):
+        looked.append(sid)
+        return real(root, sid)
+    monkeypatch.setattr(ct, "find_transcripts", spy)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert LP in looked and LR in looked
+    assert sorted(looked) == sorted(set(looked))
+    del looked[:]
+    assert ct.run_sync(env, m) == "completed"
+    assert LP in looked and LR in looked
+
+
+def test_sync_refresh_loss_decodes_each_image_once(monkeypatch):
+    """A refresh's field loss and its link and chain change lines come from
+    one decode of each image, and say what they said before."""
+    pre = {"sessionId": "local_e", "cliSessionId": "sid-e", "title": "Old",
+           "remoteMcpServersConfig": [{"name": "Northwind"}],
+           "chromePermissionMode": "ask",
+           "spawnedFrom": {"sessionId": "local_q", "taskId": LTASK},
+           "startChain": {"firstSessionId": "local_r", "depth": 1}}
+    post = {"sessionId": "local_e", "cliSessionId": "sid-e", "title": "New",
+            "chromePermissionMode": None,
+            "spawnedFrom": {"sessionId": "local_k", "taskId": LTASK}}
+
+    def blob(d):
+        return json.dumps(d, separators=(",", ":")).encode("utf-8")
+    r = {"is_update": True, "pre_b64": ct.b64(blob(pre)),
+         "post_b64": ct.b64(blob(post))}
+    calls = []
+    real = json.loads
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(json, "loads", spy)
+    ct._sync_refresh_loss(r)
+    monkeypatch.undo()
+    assert len(calls) == 2
+    assert r["dest_dropped"] == ["remoteMcpServersConfig"]
+    assert r["dest_reset"] == ["chromePermissionMode"]
+    assert r["link_change"] == "retargeted" and r["chain_change"] == "dropped"
+    for bad in ({"is_update": True, "pre_b64": None, "post_b64": "e30="},
+                {"is_update": True, "pre_b64": ct.b64(b"{"),
+                 "post_b64": "e30="}):
+        ct._sync_refresh_loss(bad)
+        assert bad["dest_dropped"] is None and bad["dest_reset"] is None
+        assert bad["link_change"] is None and bad["chain_change"] is None
+
+
+def test_sync_scan_census_matches_the_census_it_stands_in_for(tmp_path):
+    """The destination scan's census is _destination_census's own answer,
+    and stands in for it only when it read every row the census reads: an
+    unreadable row or one that is not an object is skipped by both, while a
+    store it cannot list leaves the census to read the store itself."""
+    store = str(tmp_path / "store")
+    os.makedirs(store)
+    _lrow(store, "local_a.json", "sid-a", "  Northwind kickoff ")
+    _lrow(store, "local_b.json", "", "ACME onboarding")
+    _lrow(store, "local_c.json", "sid-c", None)
+    with open(os.path.join(store, "local_bad.json"), "w") as fh:
+        fh.write("{")
+    with open(os.path.join(store, "local_list.json"), "w") as fh:
+        fh.write("[1]")
+    with open(os.path.join(store, "deleted_sid-z"), "w") as fh:
+        fh.write("")
+    census = {}
+    rows, unread = ct._lineage_store_rows(store, light=True, census=census)
+    assert sorted(i for i, _ in rows) == ["local_a", "local_b", "local_c"]
+    assert unread == 2
+    assert census["whole"] is True
+    assert (census["sids"], census["keys"]) == ct._destination_census(store)
+    census = {}
+    assert ct._lineage_store_rows(str(tmp_path / "missing"),
+                                  census=census) == ([], 0)
+    assert census["whole"] is False
+
+
+def test_sync_census_reads_the_store_when_the_scan_left_a_row_out(
+        two_account_env, tmp_path, monkeypatch):
+    """A destination row the containment test refuses is not in the pass's
+    index, but the duplicate census, which reads every row by its name,
+    still finds it, as it did when it read the store on its own."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    real = ct.ensure_contained
+
+    def contained(path, roots):
+        if os.path.basename(path) == "local_q.json":
+            raise ct.LayoutError("resolves outside every recognized root")
+        return real(path, roots)
+    monkeypatch.setattr(ct, "ensure_contained", contained)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    r = _by_name(m)["local_p.json"]
+    assert r["dup_conversation"] is True and r["dup_title"] is True
+    assert m["tally"]["dup_conversation"] == ["Northwind kickoff"]
+
+
+def test_sync_source_row_the_containment_test_refuses_is_no_link_target(
+        two_account_env, tmp_path, monkeypatch):
+    """Selection's read of the source serves the pass through the same
+    containment test the pass's own read made: a source parent row that
+    resolves outside the store is still copied, as selection copies it, but
+    names no conversation to its child's link."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    real = ct.ensure_contained
+
+    def contained(path, roots):
+        if os.path.basename(path) == "local_p.json" \
+                and os.path.dirname(os.path.realpath(path)) == \
+                os.path.realpath(src):
+            raise ct.LayoutError("resolves outside every recognized root")
+        return real(path, roots)
+    monkeypatch.setattr(ct, "ensure_contained", contained)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    by = _by_name(m)
+    assert set(by) == {"local_p.json", "local_c.json"}
+    c = by["local_c.json"]
+    assert "spawnedFrom" not in _post(c)
+    assert c["lineage"] == ct._lineage_empty()
