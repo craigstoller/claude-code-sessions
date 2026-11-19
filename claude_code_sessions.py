@@ -15262,6 +15262,123 @@ def _lineage_rewrite_post(post_b64, link, chain):
     return b64(json.dumps(data, separators=(",", ":")).encode())
 
 
+# Apply time: what the pass run again under the lock changed since the plan,
+# row by row (spec, "converge", "Applying, once").
+
+def _lineage_pair(post_b64):
+    """(spawnedFrom, startChain) of a row's post-image, each a dict or None.
+    Never raises."""
+    try:
+        data = json.loads(unb64(post_b64))
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    sf, sc = data.get("spawnedFrom"), data.get("startChain")
+    return (sf if isinstance(sf, dict) else None,
+            sc if isinstance(sc, dict) else None)
+
+
+def _lineage_same(a, b, keys):
+    """True when two links (or two chains) agree on KEYS, in value and type
+    alike, so a depth of True never equals 1."""
+    return all(type(a.get(k)) is type(b.get(k)) and a.get(k) == b.get(k)
+               for k in keys)
+
+
+def _lineage_change(before, after, planned, now):
+    """(code, detail) for how one row's link and chain changed between the
+    plan and the apply-time pass, or None when they did not.
+
+    BEFORE and AFTER are the row's (spawnedFrom, startChain) pairs decoded
+    from its post_b64 before and after the pass; the bytes decide, because
+    `lineage` holds neither taskId nor depth. PLANNED and NOW are the row's
+    `lineage` records then and now, read only to name the conversations in
+    the detail. The link decides first: another row or taskId is
+    lineage_retargeted, a link lost lineage_dropped, a new one
+    lineage_gained. Only an unchanged link lets the chain decide: lost is
+    lineage_chain_dropped, new lineage_gained, another root row or depth
+    lineage_retargeted. A change only in notes or their detail is none.
+    Never raises."""
+    def conv(lin, key):
+        v = lin.get(key) if isinstance(lin, dict) else None
+        return _lineage_short(v) if isinstance(v, str) and v else "?"
+
+    try:
+        (l0, c0), (l1, c1) = before, after
+        if l0 is not None and l1 is not None:
+            if not _lineage_same(l0, l1, ("sessionId", "taskId")):
+                p0 = conv(planned, "parent_session")
+                p1 = conv(now, "parent_session")
+                if p0 != p1:
+                    detail = "the link now names parent {0}, not {1}".format(
+                        p1, p0)
+                elif not _lineage_same(l0, l1, ("sessionId",)):
+                    detail = ("the link to parent {0} now names another of "
+                              "its rows".format(p1))
+                else:
+                    detail = ("the link to parent {0} now carries another "
+                              "taskId".format(p1))
+                return "lineage_retargeted", detail
+        elif l0 is not None:
+            return "lineage_dropped", (
+                "the link to parent {0} was dropped since the plan".format(
+                    conv(planned, "parent_session")))
+        elif l1 is not None:
+            return "lineage_gained", (
+                "a link to parent {0} was gained since the plan".format(
+                    conv(now, "parent_session")))
+        if c0 is not None and c1 is not None:
+            if _lineage_same(c0, c1, ("firstSessionId", "depth")):
+                return None
+            r0, r1 = conv(planned, "root_session"), conv(now, "root_session")
+            if r0 != r1:
+                detail = "the chain now names root {0}, not {1}".format(r1, r0)
+            elif not _lineage_same(c0, c1, ("firstSessionId",)):
+                detail = ("the chain to root {0} now names another of its "
+                          "rows".format(r1))
+            else:
+                detail = "the chain to root {0} now has another depth".format(
+                    r1)
+            return "lineage_retargeted", detail
+        if c0 is not None:
+            return "lineage_chain_dropped", (
+                "the chain to root {0} was dropped since the plan".format(
+                    conv(planned, "root_session")))
+        if c1 is not None:
+            return "lineage_gained", (
+                "a chain to root {0} was gained since the plan".format(
+                    conv(now, "root_session")))
+    except Exception:
+        pass
+    return None
+
+
+def _lineage_record_change(r, before, planned):
+    """Record on row R what the apply-time pass changed since the plan.
+
+    BEFORE is the row's (spawnedFrom, startChain) decoded from its post_b64
+    before the pass rewrote it, PLANNED its `lineage` record then. A change
+    puts its code into the row's new `lineage` notes, beside the underlying
+    reason's code (once: a dropped chain's lineage_chain_dropped is often
+    there already, with its reason), and keeps the plan's record as
+    `lineage_planned`. Returns the code, or "" when nothing changed."""
+    lin = r.get("lineage")
+    change = _lineage_change(before, _lineage_pair(r.get("post_b64")),
+                             planned, lin)
+    if change is None or not isinstance(lin, dict):
+        return ""
+    code, detail = change
+    if not isinstance(lin.get("notes"), list):
+        lin["notes"] = []
+    if all(not isinstance(n, dict) or n.get("code") != code
+           for n in lin["notes"]):
+        lin["notes"].append({"code": code, "detail": detail})
+    r["lineage_planned"] = (json.loads(json.dumps(planned))
+                            if isinstance(planned, dict) else _lineage_empty())
+    return code
+
+
 # Reporting: what an op's rows carry, counted from their `lineage` records.
 
 def _lineage_empty():
@@ -15382,6 +15499,26 @@ def _lineage_plan_lines(m):
         lines.append("cycles  : {0} already present, left as they are"
                      .format(cycles))
     return lines
+
+
+def _lineage_apply_lines(rows):
+    """The after-apply lines over the rows an apply wrote (the caller picks
+    them): `links   : N carried, M left out (<reasons>)`, then on the same
+    line `; since the plan: R changed, D dropped, G gained`, and `chains  :
+    N carried, M left out`. Each part only when its count is nonzero, and a
+    line with nothing to say is not given. The left-out reasons are the
+    underlying ones, never lineage_dropped."""
+    s = _lineage_summary(rows)
+    links = _lineage_links_line(s, carried="carried")
+    changes = s.get("changes") or {}
+    since = ", ".join("{0} {1}".format(changes[k], k)
+                      for k in ("changed", "dropped", "gained")
+                      if changes.get(k))
+    if since:
+        since = "since the plan: " + since
+        links = links + "; " + since if links else "links   : " + since
+    return [ln for ln in (links, _lineage_chains_line(s, carried="carried"))
+            if ln]
 
 
 # ------------------------------------------------------------- 9. converge
@@ -15957,13 +16094,17 @@ def _converge_lineage(records, conversations, rows, held_by_account, tids):
     RECORDS are the scanned rows (_retitle_scan), CONVERSATIONS the same rows
     by cliSessionId, ROWS the rows the op will write, HELD_BY_ACCOUNT
     {account: {conversation id: reason}} and TIDS the conversations with a
-    transcript (a set, or a predicate). Per destination account B, B's
-    after-state is indexed once - its existing rows plus the rows planned
-    into it, as planned rows decoded from their post_b64 - and each holder
-    account's own store once for the whole pass. Every row into B is
-    resolved, cycles are dropped over B's graph, then the bytes are
-    rewritten. A row whose bytes need no change keeps them exactly. The
-    graph work is iterative throughout (_lineage_drop_cycles)."""
+    transcript (a set, or a predicate). The pass runs over every account
+    that has records or rows planned into it, B, and counts B's existing
+    cycles whether or not any row goes into B. B's after-state is indexed
+    once - its existing rows plus the rows planned into it, as planned rows
+    decoded from their post_b64 - and each holder account's own store once
+    for the whole pass. Every row into B is resolved, cycles are dropped
+    over B's graph, then the bytes are rewritten. A row whose bytes need no
+    change keeps them exactly. The graph work is iterative throughout
+    (_lineage_drop_cycles). plan_converge runs it once; _converge_recheck
+    runs it again under the lock, with relink, over the rows still to be
+    written."""
     exists = tids if callable(tids) else getattr(tids, "__contains__", None)
     if exists is None:
         exists = (lambda _sid: False)
@@ -16331,11 +16472,17 @@ def _converge_shape_error(m):
     return None
 
 
-def _converge_recheck(env, m, ignore_own_paths=False):
+def _converge_recheck(env, m, ignore_own_paths=False, relink=False):
     """Every apply-time guard and per-pair revalidation, under the operation
     lock, BEFORE the op record exists. Raises Refusal; MARKS apply-time skips
     on the manifest's rows (`skipped` + `skip_detail`) rather than returning
     anything.
+
+    RELINK is the first apply's, and only run_converge passes it: after the
+    pair-skip decisions the lineage pass runs once more (_converge_relink),
+    so the journal new_op writes holds the final links, bytes and order.
+    Recovery leaves it False and never re-resolves: every row keeps its
+    journaled post_b64.
 
     Runs pre-journal for the same reason run_retitle's recheck does, with the
     spec's own sharpening: a zero-write apply - store already complete,
@@ -16448,6 +16595,48 @@ def _converge_recheck(env, m, ignore_own_paths=False):
         if k:
             acct_titles.setdefault(acct, {}).setdefault(k, (r["session"],
                                                             r["name"]))
+    if relink:
+        _converge_relink(env, m, records)
+
+
+def _converge_relink(env, m, records):
+    """The lineage pass again, once, under the lock and before new_op (spec,
+    "converge", "Applying, once"; L3), over RECORDS - the store as the
+    recheck just scanned it - and the rows still to be written.
+
+    The recheck's own skips join the plan's holds as the pass's held input,
+    {account: {session: skip reason}}, so a planned parent the recheck
+    dropped is reported by its real reason and a skipped row is not in the
+    after-state. Each row's link and chain are resolved afresh, its post_b64
+    and `lineage` rewritten together; a change since the plan is noted on
+    the row (_lineage_record_change), the plan's record kept as
+    `lineage_planned`. The row itself is never skipped over its link. The
+    existing-cycle count is taken again, and the rows are re-sorted into
+    write order, because a rewritten link can make a row depend on one that
+    sorted after it."""
+    held = _converge_held_by_account(m.get("holds"))
+    for r in m["rows"]:
+        if r.get("skipped") and r.get("account") and r.get("session"):
+            held.setdefault(r["account"], {})[r["session"]] = r["skipped"]
+    live = [r for r in m["rows"]
+            if not r.get("written") and not r.get("skipped")]
+    # The plan's link and chain, decoded before the pass rewrites the bytes:
+    # `lineage` holds neither taskId nor depth, so the change test reads
+    # these, not the record.
+    before = [(r, _lineage_pair(r.get("post_b64")), r.get("lineage"))
+              for r in live]
+    conversations = {}
+    for rec in records:
+        sid = rec.data.get("cliSessionId") or ""
+        if sid:
+            conversations.setdefault(sid, []).append(rec)
+    tids = {os.path.splitext(os.path.basename(p))[0]
+            for _, p in iter_transcripts(env.projects_root)}
+    m["lineage_cycles"] = _converge_lineage(records, conversations, live,
+                                            held, tids)
+    for r, pair, planned in before:
+        _lineage_record_change(r, pair, planned)
+    m["rows"][:] = _lineage_write_order(m["rows"], _converge_row_key)
 
 
 def _converge_write_rows(op, m, roots):
@@ -16573,12 +16762,14 @@ def run_converge(env, manifest):
     "unchanged" WITHOUT creating an op. Nothing durable happened, there is
     nothing to undo, and a journal entry would be residue for recover to
     clean up after a command that touched nothing (spec, "Applying" step 5).
+    This is the one caller that asks the re-check to re-resolve links
+    (relink), so the op is journaled with its final links, bytes and order.
     """
     _guard_mutation(env, "create rows in", NEW_ROW_STORE,
                     because=NEW_ROW_GUARD_WHY)
     acquire_lock(env, "converge")
     try:
-        _converge_recheck(env, manifest)
+        _converge_recheck(env, manifest, relink=True)
         if not any(not r.get("written") and not r.get("skipped")
                    for r in manifest["rows"]):
             return "unchanged"
@@ -17097,6 +17288,11 @@ def cmd_converge(env, ns):
     created = sum(1 for r in m["rows"] if r.get("written"))
     say("result  : {0}".format(final))
     say("created : {0} row(s)".format(created))
+    # What the written rows carry, as the apply-time pass left them, and
+    # what changed since the dry run printed above.
+    for line in _lineage_apply_lines([r for r in m["rows"]
+                                      if r.get("written")]):
+        say(line)
     for r in m["rows"]:
         if r.get("skipped"):
             say("skipped : {0} -> {1}: {2} - {3}".format(
