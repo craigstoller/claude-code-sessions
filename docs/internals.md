@@ -1147,6 +1147,49 @@ which `converge` and `sync` already run) and this tool's lock is held. A store c
 else between the apply-time pass and the write is outside it. Recovery's dependency checks and
 the link report are how such a change is caught.
 
+**Reading each store once (R26, after 0.18.0).** 0.18.0's `sync` planning decoded both stores
+twice. Selection read the source. The lineage pass then read the source again and the
+destination through `_lineage_store_rows`, and held both whole beside selection's copy. The
+duplicate census then read the destination again. Planning now reads each store once, and the
+plan is the same, byte for byte:
+- The pass holds rows as only the keys it reads, `_LINEAGE_ROW_KEYS`: `sessionId` and
+  `cliSessionId` for the index, `spawnedFrom` and `startChain` for the links and the existing
+  graph, `isArchived` and `lastActivityAt` for the pick. `_lineage_light` keeps each one the
+  row has, so every lookup answers as it would of the whole row.
+- Its source index is selection's own read (`select_sync_rows`'s `decoded`), passed through the
+  same containment test a read of the store makes, so a row that leaves the store is still
+  copied and is still no link target.
+- Its one read of the destination also takes the duplicate census, and stands in for
+  `_destination_census` only when it read every row that census reads (`census["whole"]`). A
+  store it could not list, a row that leaves the store, or a read failure `read_json` does not
+  name sends the census back to its own read.
+- A transcript is looked up once per conversation: the pass reuses selection's answers.
+- A refresh's images are decoded once for its field loss and its change lines.
+
+What is read again, on purpose: `_other_pointers` still reads every account's store when a plan
+swaps a conversation, as before 0.18.0. At apply time, under the lock, everything is read again,
+because the stores may have changed since the plan. `_sync_relink` reads both stores (as light
+rows) and looks transcripts up afresh, `_sync_recheck_reachability` reads every store, and the
+write loop reads each destination row before writing it. Recovery still never resolves.
+
+Measured 2026-11-19 on a store of about 3,000 rows and 400 MB, whose largest row is 1.3 MB. The
+runs were dry runs from one account of about 1,000 rows into another, three each, interleaved,
+under one interpreter. The figure is the median time and the process's peak working set:
+
+| | `sync` | `sync --update` |
+|---|---|---|
+| 0.18.0 | 22.0 s, 882 MB | 37.9 s, 1,130 MB |
+| reading each store once | 18.3 s, 236 MB | 32.0 s, 470 MB |
+| 0.17.0, a second batch | 14.5 s, 229 MB | 26.1 s, 453 MB |
+| reading each store once, the same batch | 15.3 s, 236 MB | 29.1 s, 469 MB |
+
+The two batches ran minutes apart, and times moved by up to 3 s between them, so compare within
+a batch. Every run of 0.18.0 and of this build printed the same report, and their `--json` plans
+are identical, with and without `--update` and `--verbatim`. Under a profiler, `--update` now decodes as many row files as 0.17.0 does, and
+the remaining 1 s (4%) is the containment test of each destination row, step 3's comparison and
+the pass itself. Most of both builds' time, about 21 s of 28 s under the profiler, is
+`find_transcripts`, once per candidate, which 0.17.0 spends too.
+
 **This build's departures from the spec.**
 1. `sync` keeps a destination link that already names the same row and `taskId`, instead of
    rewriting it to the bare two keys. That stops a round trip stripping keys from the original

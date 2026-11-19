@@ -17623,8 +17623,8 @@ def _lineage_target(store_path, row_id):
 # conversation (_lineage_index), the link and the chain (the resolver and the
 # existing-edge graph), and the pick's archive state and activity
 # (_lineage_pick). sync's pass holds its stores' rows as only these
-# (_lineage_light), so it never holds a whole store at once: a row runs to
-# 1 MB of connector config, and the pass needs a few hundred bytes of it.
+# (_lineage_light), so it never holds a whole store at once: a row can run
+# past 1 MB, and the pass needs a few hundred bytes of it.
 _LINEAGE_ROW_KEYS = ("sessionId", "cliSessionId", "spawnedFrom", "startChain",
                      "isArchived", "lastActivityAt")
 
