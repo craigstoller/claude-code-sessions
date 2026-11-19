@@ -724,3 +724,286 @@ def test_note_codes_phrases_and_left_out_set_match_the_table_exactly():
         "parent_not_in_account", "parent_pair_held", "parent_row_drifted",
         "lineage_variant", "lineage_no_task", "lineage_task_disagree",
         "lineage_cycle", "lineage_source_changed"))
+
+
+# ------------------------------------------------ shape checks (Task 5)
+
+def b64post(**extra):
+    d = {"sessionId": "local_c", "cliSessionId": "cli_c"}
+    d.update(extra)
+    return ct.b64(json.dumps(d, separators=(",", ":")).encode())
+
+
+def lin(**kw):
+    d = ct._lineage_empty()
+    d.update(kw)
+    return d
+
+
+LINK = {"sessionId": "local_p", "taskId": "task_7f"}
+CHAIN = {"firstSessionId": "local_r", "depth": 1}
+
+
+def jrow(name, post=None, lineage=None, planned=None, store="/s"):
+    r = {"name": name, "dest_path": store + "/" + name, "store_path": store,
+         "post_b64": post if post is not None else b64post()}
+    if lineage is not None:
+        r["lineage"] = lineage
+    if planned is not None:
+        r["lineage_planned"] = planned
+    return r
+
+
+def jman(rows, op_type="converge", **kw):
+    d = {"op_type": op_type, "lineage_format": 1, "rows": rows}
+    d.update(kw)
+    return d
+
+
+def parent_row():
+    return jrow("local_p.json")
+
+
+def root_row():
+    return jrow("local_r.json")
+
+
+def good_child():
+    return jrow("local_c.json",
+                b64post(spawnedFrom=LINK, startChain=CHAIN),
+                lin(parent_session="cli_p", parent_row="local_p",
+                    parent_planned=True, root_session="cli_r",
+                    root_row="local_r", root_planned=True,
+                    carried_keys=["sessionId", "taskId"]))
+
+
+def good_op():
+    return jman([parent_row(), root_row(), good_child()])
+
+
+def test_a_well_formed_new_format_manifest_has_no_shape_error():
+    assert ct._lineage_shape_error(good_op()) is None
+    assert ct._lineage_shape_error(jman([parent_row()])) is None
+
+
+def test_no_lineage_format_means_no_lineage_check_at_all():
+    m = good_op()
+    del m["lineage_format"]
+    m["rows"][2]["lineage"] = "junk"
+    m["lineage_cycles"] = -4
+    assert ct._lineage_shape_error(m) is None
+
+
+@pytest.mark.parametrize("fmt", [2, 0, "1", True, None, 1.0, [1]])
+def test_unknown_lineage_format_is_a_shape_error(fmt):
+    m = good_op()
+    m["lineage_format"] = fmt
+    err = ct._lineage_shape_error(m)
+    assert err == "its 'lineage_format' is not one this version reads"
+
+
+def _set(key, value):
+    def mut(r):
+        r["lineage"][key] = value
+    return mut
+
+
+def _drop(key):
+    def mut(r):
+        del r["lineage"][key]
+    return mut
+
+
+def _planned_of(change):
+    def mut(r):
+        r["lineage_planned"] = lin(parent_row="local_p", parent_planned=True)
+        change(r["lineage_planned"])
+    return mut
+
+
+DAMAGE = [
+    lambda r: r.__setitem__("lineage", "x"),
+    lambda r: r.__setitem__("lineage", None),
+    lambda r: r.__setitem__("lineage", []),
+    _drop("notes"), _drop("parent_row"), _drop("carried_keys"),
+    _set("parent_planned", "yes"), _set("root_planned", 1),
+    _set("parent_session", 5), _set("root_row", None),
+    _set("carried_keys", "sessionId"), _set("dropped_keys", [1]),
+    _set("carried_keys", {"a": 1}),
+    _set("notes", "n"), _set("notes", ["x"]),
+    _set("notes", [{"code": 1, "detail": "d"}]),
+    _set("notes", [{"code": "lineage_self"}]),
+    _set("notes", [{"code": "lineage_self", "detail": "d"},
+                   {"code": "lineage_self", "detail": "e"}]),
+    lambda r: r.__setitem__("lineage_planned", []),
+    lambda r: r.__setitem__("lineage_planned", "x"),
+    _planned_of(lambda p: p.pop("notes")),
+    _planned_of(lambda p: p.__setitem__("parent_planned", None)),
+]
+
+
+@pytest.mark.parametrize("mut", DAMAGE)
+def test_damaged_lineage_is_a_shape_error_never_an_exception(mut):
+    c = good_child()
+    mut(c)
+    err = ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
+    assert isinstance(err, str) and err
+
+
+@pytest.mark.parametrize("cycles", [-1, True, False, "1", 1.5, None, [1]])
+def test_damaged_lineage_cycles_is_a_shape_error(cycles):
+    m = good_op()
+    m["lineage_cycles"] = cycles
+    assert ct._lineage_shape_error(m)
+
+
+@pytest.mark.parametrize("cycles", [0, 1, 40])
+def test_good_lineage_cycles_passes(cycles):
+    m = good_op()
+    m["lineage_cycles"] = cycles
+    assert ct._lineage_shape_error(m) is None
+
+
+@pytest.mark.parametrize("rows", [5, "x", None, {}, [5], [None], [[]],
+                                  [{"post_b64": 3, "lineage": {}}]])
+def test_a_wrecked_rows_field_never_raises(rows):
+    err = ct._lineage_shape_error(jman(rows))
+    assert err is None or isinstance(err, str)
+    if not isinstance(rows, list):
+        assert isinstance(err, str)
+
+
+def _with(mut):
+    c = good_child()
+    mut(c)
+    return jman([parent_row(), root_row(), c])
+
+
+DISAGREE = {
+    "empty parent_row, link in the bytes":
+        lambda c: c["lineage"].__setitem__("parent_row", ""),
+    "another row id":
+        lambda c: c["lineage"].__setitem__("parent_row", "local_z"),
+    "parent_row but no link in the bytes":
+        lambda c: c.__setitem__("post_b64", b64post(startChain=CHAIN)),
+    "empty root_row, chain in the bytes":
+        lambda c: c["lineage"].__setitem__("root_row", ""),
+    "another root id":
+        lambda c: c["lineage"].__setitem__("root_row", "local_z"),
+    "root_row but no chain in the bytes":
+        lambda c: c.__setitem__("post_b64", b64post(spawnedFrom=LINK)),
+    "a link the lineage cannot read":
+        lambda c: c.__setitem__("post_b64", b64post(
+            spawnedFrom="local_p", startChain=CHAIN)),
+    "a chain the lineage cannot read":
+        lambda c: c.__setitem__("post_b64", b64post(
+            spawnedFrom=LINK, startChain={"depth": 1})),
+    "post_b64 that is not base64 json":
+        lambda c: c.__setitem__("post_b64", "!!!"),
+}
+
+
+@pytest.mark.parametrize("why", sorted(DISAGREE))
+def test_lineage_that_disagrees_with_the_bytes_is_a_shape_error(why):
+    err = ct._lineage_shape_error(_with(DISAGREE[why]))
+    assert isinstance(err, str) and err, why
+
+
+def test_a_planned_target_not_in_the_op_is_a_shape_error():
+    c = good_child()
+    assert ct._lineage_shape_error(jman([root_row(), c]))        # no parent
+    assert ct._lineage_shape_error(jman([parent_row(), c]))      # no root
+    other = parent_row()
+    other["store_path"] = "/t"
+    other["dest_path"] = "/t/local_p.json"
+    assert ct._lineage_shape_error(jman([other, root_row(), c]))  # other store
+
+
+def test_planned_false_is_not_held_to_the_rows():
+    c = good_child()
+    c["lineage"]["parent_planned"] = False
+    c["lineage"]["root_planned"] = False
+    assert ct._lineage_shape_error(jman([c])) is None
+
+
+def test_sync_rows_find_a_planned_target_by_the_directory_of_dest_path():
+    def srow(name, store, **kw):
+        r = jrow(name, store=store, **kw)
+        del r["store_path"]
+        return r
+    c = srow("local_c.json", "/d", post=b64post(spawnedFrom=LINK),
+             lineage=lin(parent_session="cli_p", parent_row="local_p",
+                         parent_planned=True))
+    ok = jman([srow("local_p.json", "/d"), c], op_type="sync")
+    assert ct._lineage_shape_error(ok) is None
+    elsewhere = jman([srow("local_p.json", "/e"), c], op_type="sync")
+    assert ct._lineage_shape_error(elsewhere)
+
+
+def test_a_retargeted_gained_or_dropped_row_has_a_plan_that_disagrees_by_design():
+    # lineage agrees with the bytes; lineage_planned is the plan's record and
+    # says something else entirely. Shape alone is checked for it.
+    planned_link = lin(parent_session="cli_z", parent_row="local_z",
+                       parent_planned=True, carried_keys=["sessionId"],
+                       notes=[{"code": "lineage_retargeted", "detail": "d"}])
+    retargeted = good_child()
+    retargeted["lineage_planned"] = planned_link
+    gained = good_child()
+    gained["lineage_planned"] = lin()
+    dropped = jrow("local_d.json", b64post(), lin(),
+                   planned=lin(parent_session="cli_p", parent_row="local_p",
+                               parent_planned=True,
+                               carried_keys=["sessionId", "taskId"]))
+    m = jman([parent_row(), root_row(), retargeted, dropped])
+    assert ct._lineage_shape_error(m) is None
+    m = jman([parent_row(), root_row(), gained])
+    assert ct._lineage_shape_error(m) is None
+
+
+def test_a_new_format_linked_row_without_lineage_is_a_shape_error():
+    c = good_child()
+    del c["lineage"]
+    assert ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
+    chained = jrow("local_c.json", b64post(startChain=CHAIN))
+    assert ct._lineage_shape_error(jman([chained]))
+
+
+def test_an_unlinked_row_needs_no_lineage_and_a_verbatim_one_never_does():
+    assert ct._lineage_shape_error(jman([jrow("local_c.json")])) is None
+    c = good_child()
+    del c["lineage"]
+    assert ct._lineage_shape_error(
+        jman([c], op_type="sync", verbatim=True)) is None
+    assert ct._lineage_shape_error(jman([c], op_type="sync"))
+
+
+def test_converge_shape_error_reads_a_damaged_lineage_as_a_damaged_record():
+    def full(r):
+        r.update({"account": "acct_b", "session": "cli_c",
+                  "title": "Northwind"})
+        return r
+    rows = [full(parent_row()), full(root_row()), full(good_child())]
+    m = jman(rows)
+    assert ct._converge_shape_error(m) is None
+    rows[2]["lineage"] = "junk"
+    assert "lineage" in ct._converge_shape_error(m)
+
+
+def test_sync_shape_error_checks_rows_and_their_strings():
+    def srow(**kw):
+        r = {"name": "local_a.json", "dest_path": "/d/local_a.json",
+             "post_b64": b64post()}
+        r.update(kw)
+        return r
+    assert ct._sync_shape_error({"rows": [srow()]}) is None
+    assert ct._sync_shape_error({"rows": []}) is None
+    for bad in ({"rows": 3}, {}, {"rows": [4]}, {"rows": [srow(name=1)]},
+                {"rows": [srow(dest_path=None)]},
+                {"rows": [srow(post_b64=7)], "lineage_format": 1},
+                {"rows": [{"name": "a", "dest_path": "b"}],
+                 "lineage_format": 1}):
+        assert isinstance(ct._sync_shape_error(bad), str), bad
+    # An older journal is not held to a post_b64: a stuck op keeps its 'back'.
+    assert ct._sync_shape_error({"rows": [srow(post_b64=7)]}) is None
+    m = {"rows": [srow(lineage="junk")], "lineage_format": 1}
+    assert "lineage" in ct._sync_shape_error(m)

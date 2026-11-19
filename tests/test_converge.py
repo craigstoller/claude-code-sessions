@@ -3758,3 +3758,111 @@ def test_no_source_link_value_reaches_the_plan_or_the_apply_output(
             text = fh.read()
         assert "spawnedFrom" in text
         assert not any(s in text for s in sentinels), r["name"]
+
+
+# ------------------------------------------- journals from before lineage
+
+def as_0_17(op):
+    """Rewrite a journal the way 0.17.0 wrote it: no lineage_format, no
+    lineage_cycles, and no per-row lineage or lineage_planned."""
+    m = op.manifest
+    for k in ("lineage_format", "lineage_cycles"):
+        m.pop(k, None)
+    for r in m["rows"]:
+        r.pop("lineage", None)
+        r.pop("lineage_planned", None)
+    ct.save_manifest(op)
+    return op
+
+
+def test_a_0_17_converge_journal_pending_goes_forward_and_back(
+        mkenv, tmp_path, write_transcript, write_row):
+    for leg in ("fwd", "back"):
+        env = _monotonic_now(mkenv(tmp_path / leg))
+        m, op = _crash_after_first_row(env, write_transcript, write_row)
+        as_0_17(op)
+        assert "lineage_format" not in op.manifest
+        c = ct.classify_op(env, op)
+        assert sorted(c["resolutions"]) == ["back", "forward"]
+        if leg == "fwd":
+            assert ct.recover_op(env, op, "forward") == "completed"
+            assert all(r["written"] for r in op.manifest["rows"])
+        else:
+            assert ct.recover_op(env, op, "back") == "rolled_back"
+            assert store_rows(env, A2, O2) == ["local_s2.json", "local_s3.json"]
+
+
+def test_a_0_17_converge_journal_completed_undoes(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = converged(env, write_transcript, write_row)
+    as_0_17(op)
+    assert ct.undo_converge(env, op) == "undone"
+    assert store_rows(env, A2, O2) == ["local_s2.json", "local_s3.json"]
+    assert store_rows(env, A3, O3) == ["local_s3.json"]
+
+
+def test_recover_listing_and_doctor_accept_old_journals(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row)
+    as_0_17(op)
+    ns = types.SimpleNamespace(op_id=None, verbose=True)
+    assert ct.cmd_recover(env, ns) == 1
+    out = capsys.readouterr().out
+    assert op.manifest["op_id"] in out and "back" in out
+    assert "damaged" not in out
+    rep = ct.gather_doctor(env)
+    assert "damaged" not in json.dumps(rep)
+
+
+def test_damaged_lineage_in_a_converge_op_is_a_damaged_record_not_a_crash(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   setup=linked_holdings)
+    for r in op.manifest["rows"]:
+        r["lineage"] = "junk"
+    ct.save_manifest(op)
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == [] and "damaged" in c["note"]
+    with pytest.raises(ct.Refusal):
+        ct.recover_op(env, op, "forward")
+    ns = types.SimpleNamespace(op_id=None, verbose=True)
+    assert ct.cmd_recover(env, ns) == 1
+    assert "damaged" in capsys.readouterr().out
+    ct.gather_doctor(env)
+
+
+def test_a_new_format_linked_row_without_lineage_is_a_damaged_converge_record(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   setup=linked_holdings)
+    linked = [r for r in op.manifest["rows"] if "spawnedFrom" in post_of(r)]
+    assert linked
+    del linked[0]["lineage"]
+    ct.save_manifest(op)
+    assert ct._converge_shape_error(op.manifest)
+    assert ct.classify_op(env, op)["resolutions"] == []
+
+
+def test_a_retargeted_gained_or_dropped_row_passes_classify_recover_and_undo(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   setup=linked_holdings)
+    # lineage agrees with the bytes; the plan's record says otherwise.
+    for r in op.manifest["rows"]:
+        r["lineage_planned"] = {
+            "parent_session": "cli_z", "parent_row": "local_z",
+            "parent_planned": True, "root_session": "", "root_row": "",
+            "root_planned": False, "carried_keys": ["sessionId"],
+            "dropped_keys": [],
+            "notes": [{"code": "lineage_retargeted", "detail": "d"}]}
+    ct.save_manifest(op)
+    assert ct._converge_shape_error(op.manifest) is None
+    c = ct.classify_op(env, op)
+    assert sorted(c["resolutions"]) == ["back", "forward"]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert ct.undo_converge(env, op) == "undone"

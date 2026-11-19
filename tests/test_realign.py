@@ -864,6 +864,8 @@ _OP_TYPE_BRANCHES = {
     "_sync_paths_claimed_elsewhere": "sync claimants by bytes; a realign "
                                      "write is drift to sync's undo",
     "_live_override_note": "only sync records a live override note",
+    "_lineage_row_store": "reads a converge or sync row's store, for the "
+                          "lineage check; a realign op carries no lineage",
 }
 
 

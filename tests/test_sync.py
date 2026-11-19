@@ -3496,3 +3496,119 @@ def test_repoint_live_takes_the_other_spelling_too(two_account_env, tmp_path):
     hits = ct._repoint_store(env, ct.RepointFlags(live=_other_spelling(dst)))
     assert [os.path.normcase(p) for _a, _o, p in hits] == \
         [os.path.normcase(dst)]
+
+
+# ------------------------------------- Task 5: old journals, damaged manifests
+
+def _as_0_17_sync(m):
+    """A sync manifest as 0.17.0 wrote it: no lineage fields at all."""
+    m = dict(m)
+    for k in ("lineage_format", "lineage_cycles"):
+        m.pop(k, None)
+    m["rows"] = [{k: v for k, v in r.items()
+                  if k not in ("lineage", "lineage_planned")}
+                 for r in m["rows"]]
+    return m
+
+
+def _verbatim_link_plan(env, src, dst):
+    _row(src, "local_0.json", "sid-0", "Northwind",
+         {"spawnedFrom": {"sessionId": "local_zz", "taskId": "task_7f",
+                          "title": "ACME-REVIEW", "sideSession": True}})
+    _transcript(env, "sid-0")
+    m = _as_0_17_sync(ct.plan_sync(env, ct.SyncFlags(verbatim=True)))
+    assert m["verbatim"] is True
+    assert json.loads(ct.unb64(m["rows"][0]["post_b64"]))["spawnedFrom"][
+        "sessionId"] == "local_zz"
+    return m
+
+
+def test_a_0_17_sync_journal_with_a_verbatim_link_recovers_and_undoes(
+        two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    m = _verbatim_link_plan(env, src, dst)
+    op = ct.new_op(env, m)                     # pending, as 0.17.0 left it
+    assert sorted(ct.classify_op(env, op)["resolutions"]) == ["back", "forward"]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    with open(os.path.join(dst, "local_0.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["spawnedFrom"]["sessionId"] == "local_zz"
+    assert ct.undo_sync(env, op) == "undone"
+    assert not os.path.exists(os.path.join(dst, "local_0.json"))
+    # and a second pending one goes back
+    op2 = ct.new_op(env, _as_0_17_sync(ct.plan_sync(
+        env, ct.SyncFlags(verbatim=True))))
+    assert ct.recover_op(env, op2, "back") == "rolled_back"
+
+
+@pytest.mark.parametrize("damage", [
+    lambda m: m.__setitem__("rows", 5),
+    lambda m: m.__setitem__("rows", [5, None]),
+    lambda m: (m.__setitem__("lineage_format", 1),
+               m["rows"][0].__setitem__("post_b64", 7)),
+    lambda m: m["rows"][0].__setitem__("dest_path", None),
+    lambda m: m["rows"][0].__setitem__("name", ["x"]),
+    lambda m: (m.__setitem__("lineage_format", 1),
+               m["rows"][0].__setitem__("lineage", "junk")),
+    lambda m: m.__setitem__("lineage_format", 2),
+])
+def test_a_damaged_sync_manifest_is_a_shape_error_in_classify_and_undo(
+        two_account_env, tmp_path, damage):
+    import types
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    damage(m)
+    op = ct.new_op(env, m)
+    for fn in (ct.classify_sync_op, ct.classify_op):
+        c = fn(env, op)
+        assert c["resolutions"] == [] and "damaged" in c["note"]
+    ct.cmd_recover(env, types.SimpleNamespace(
+        op_id=None, verbose=True))                  # the listing survives
+    with pytest.raises(ct.Refusal, match="damaged"):
+        ct.recover_op(env, op, "forward")
+    with pytest.raises(ct.Refusal, match="damaged"):
+        ct.recover_op(env, op, "back")
+    ct.set_status(op, "completed")
+    assert ct.classify_sync_op(env, op)["resolutions"] == []
+    with pytest.raises(ct.Refusal, match="damaged"):
+        ct.undo_sync(env, op)
+    ct.gather_doctor(env)
+
+
+def test_a_damaged_sync_op_in_an_unresolved_store_is_still_a_shape_error(
+        two_account_env, tmp_path):
+    env, src, dst = two_account_env(tmp_path)
+    _prepared(env, src, dst, n=1)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    m["rows"][0]["dest_path"] = os.path.join(str(tmp_path), "elsewhere",
+                                             "local_0.json")
+    op = ct.new_op(env, m)
+    assert ct.classify_op(env, op)["resolutions"] == ["back"]
+    m["rows"][0]["name"] = None
+    op2 = ct.new_op(env, m)
+    c = ct.classify_op(env, op2)
+    assert c["resolutions"] == [] and "damaged" in c["note"]
+
+
+def test_a_damaged_pending_op_does_not_crash_a_later_commands_rotation(
+        mkenv, tmp_path):
+    env = mkenv(tmp_path)
+    live = os.path.join(str(tmp_path), "d", "local_a.json")
+    # A pending sync whose rows are partly junk, and one retitle likewise.
+    ct.new_op(env, {"op_type": "sync", "rows": [5, None, "x",
+                                                  {"dest_path": live}]})
+    ct.new_op(env, {"op_type": "retitle", "rows": [[], {"dest_path": 3}]})
+    # More than ten finished ops, the oldest claiming the live path and also
+    # carrying junk rows, so _collides has to step over them.
+    oldest = ct.new_op(env, {"op_type": "sync", "rows": [
+        7, {"dest_path": live, "written": True}]})
+    ct.set_status(oldest, "completed")
+    for i in range(11):
+        o = ct.new_op(env, {"op_type": "sync", "rows": [
+            "junk", {"dest_path": "/z/%d.json" % i, "written": True}]})
+        ct.set_status(o, "completed")
+    pruned = ct.rotate_ops(env)
+    assert oldest.manifest["op_id"] not in pruned
+    assert os.path.isdir(oldest.op_dir)
+    m = {"op_id": "zzz", "op_type": "sync", "rows": []}
+    assert isinstance(ct._sync_paths_claimed_elsewhere(env, m), set)
