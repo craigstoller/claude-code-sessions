@@ -3504,8 +3504,11 @@ def recover_op(env, op, direction):
                     # Every write landed (or none were pending); only the
                     # completion marker is missing. Journal-only, so no
                     # mutation guard and no recheck - the same asymmetry the
-                    # repoint and retitle arms document.
+                    # repoint and retitle arms document. The link report still
+                    # runs (it only reads): a target deleted in the crash
+                    # window can leave a landed row's link dangling.
                     set_status(op, "completed")
+                    _converge_link_report(op, m, forward=True)
                     rotate_ops(env)
                     return "completed"
                 _guard_mutation(env, "create rows in", NEW_ROW_STORE,
@@ -3516,11 +3519,30 @@ def recover_op(env, op, direction):
                 # now is. A pair whose destination gained a row in the window
                 # becomes an already_present skip; a pair that held at plan
                 # time is not in `rows` and stays unwritten even if its
-                # collision has since cleared.
+                # collision has since cleared. `relink` stays False: recovery
+                # never re-resolves a link, and every row keeps its journaled
+                # post_b64.
                 _converge_recheck(env, m, ignore_own_paths=True)
+                # Then each pending row's journaled link and chain are
+                # re-checked, never re-resolved, in write order, so a skip
+                # carries down a planned chain: a planned target now skipped
+                # makes it parent_not_written, and a written or existing one
+                # that is gone or opens another conversation parent_changed.
+                # An op journaled before lineage has no dependency checks.
+                if m.get("lineage_format") == 1:
+                    by_name = _converge_rows_by_name(m)
+                    for r in m["rows"]:
+                        if r.get("written") or r.get("skipped"):
+                            continue
+                        skip = _converge_dependency_skip(m, r, by_name)
+                        if skip:
+                            r["skipped"], r["skip_detail"] = skip
                 save_manifest(op)         # the skips just decided are durable
                 set_status(op, "journaled")
                 final = execute_converge_op(env, op)
+                # execute_converge_op has saved the completed op; the report
+                # is saved again, before rotation.
+                _converge_link_report(op, m, forward=True)
                 rotate_ops(env)
                 return final
             # 'back' must always terminate - it is the only exit from a stuck
@@ -3531,12 +3553,15 @@ def recover_op(env, op, direction):
             # same window the retitle arm documents). The rows are pointers;
             # the conversations keep their rows elsewhere.
             deletable, residue, residue_paths = [], [], []
+            removed = set()
             stray_ids = {id(r) for r, _ in stray}
             # A landed row whose flag was lost is this op's like any written
             # row: removed if it still holds our bytes, recorded as residue if
             # the app has rewritten it since - never dropped silently.
             _converge_mark_landed(op, m, skip_ids=stray_ids)
-            for r in m["rows"]:
+            # Children before parents, as undo: reverse write order, so an
+            # interrupted reversal never leaves a child naming a removed row.
+            for r in reversed(m["rows"]):
                 if id(r) in stray_ids:
                     continue                  # recorded below, never read
                 state = _sync_row_drift(r)
@@ -3574,6 +3599,9 @@ def recover_op(env, op, direction):
                         residue.append("could not remove {0!r}: {1}".format(
                             r.get("name"), exc))
                         residue_paths.append(r["dest_path"])
+                    else:
+                        removed.add((r["store_path"],
+                                     _lineage_stem(r["name"])))
             if residue:
                 _add_residue(m, "; ".join(residue), residue_paths)
             # Every unresolved row but a skipped one, which was never
@@ -3583,6 +3611,10 @@ def recover_op(env, op, direction):
             if m.get("rollback_residue"):
                 save_manifest(op)
             set_status(op, "rolled_back")
+            # After the whole reversal: a row left in place (drifted, or
+            # unremovable) or any other surviving row whose link names a row
+            # this removed is reported. Unresolved stores are never read.
+            _converge_link_report(op, m, skip_ids=stray_ids, removed=removed)
             rotate_ops(env)
             return "rolled_back"
         if m.get("op_type") == "repoint":
@@ -5937,6 +5969,10 @@ def cmd_undo(env, ns):
     if prior.manifest.get("undo_collision_note"):
         line = "note: " + prior.manifest["undo_collision_note"]
         print(line if ns.verbose else redact(env, line))
+    # The link report, after every other line (spec, "undo"): links this
+    # reversal left dangling or redirected, and what it could not check.
+    for line in _link_report_lines(prior.manifest.get("link_report")):
+        print(line if ns.verbose else redact(env, line))
     # undo_sync's own terminal status is "undone" (it mutates the completed
     # sync op in place rather than journaling a fresh reversal op the way
     # run_undo/execute_op do) - "completed" remains the success value for
@@ -6030,6 +6066,10 @@ def cmd_recover(env, ns):
         # it is the correct outcome rather than something needing attention.
         line = "[observed] rollback deliberately changed nothing: {0}".format(
             matches[0].manifest["rollback_declined"])
+        print(line if ns.verbose else redact(env, line))
+    # The link report, after every other line: what forward recovery or a
+    # rollback left dangling or redirected, and what it could not check.
+    for line in _link_report_lines(matches[0].manifest.get("link_report")):
         print(line if ns.verbose else redact(env, line))
     return 0
 
@@ -8707,6 +8747,13 @@ def undo_new_row(env, op):
         except OSError as exc:
             raise Refusal("could not remove the row: {0}".format(exc))
         set_status(op, "undone")
+        # The link report, for the one row this removed (spec, "undo").
+        # new-row itself writes no link, but a later op, or the app, may have
+        # linked a row to this one. Its store passed the resolution gate
+        # above; the op carries no lineage, so only the dangling part runs.
+        _record_link_report(op, _link_report(
+            [], [m["store_path"]],
+            removed={(m["store_path"], _lineage_stem(r["name"]))}))
         rotate_ops(env)
         return "undone"
     finally:
@@ -16630,6 +16677,265 @@ def _lineage_shape_error(m):
         return "its lineage could not be read"
 
 
+# Recovery and reversal read link targets and report what they left (spec,
+# "converge", "Recovery", and "undo"). Every function here never raises.
+
+_LINEAGE_ROW_ID = re.compile(r"local_[A-Za-z0-9-]+")
+
+
+def _lineage_target(store_path, row_id):
+    """The one reader of a link target, the row ROW_ID names in STORE_PATH:
+    ("present", data), ("absent", None) or ("unreadable", None) - named
+    states, as _sync_row_drift gives them, never a bare sentinel. NEVER
+    RAISES.
+
+    An id that is not local_ followed by letters, digits and hyphens is
+    "unreadable" without a read: it has no separator, dot or traversal, so
+    an id out of a journal or a row can never name a file outside the store.
+    The file must then resolve, through ensure_contained, to a direct child
+    of STORE_PATH. A row that is not a JSON object is "unreadable" too.
+    Callers pass only the store of a row the op's resolution gate
+    (_unresolved_rows) resolved."""
+    try:
+        if not isinstance(store_path, str) or not store_path \
+                or not isinstance(row_id, str) \
+                or not _LINEAGE_ROW_ID.fullmatch(row_id):
+            return "unreadable", None
+        real = ensure_contained(os.path.join(store_path, row_id + ".json"),
+                                [store_path])
+        if os.path.normcase(os.path.dirname(real)) != \
+                os.path.normcase(os.path.realpath(store_path)):
+            return "unreadable", None
+        try:
+            with open(real, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return "absent", None
+        if not isinstance(data, dict):
+            return "unreadable", None
+        return "present", data
+    except Exception:
+        return "unreadable", None
+
+
+def _lineage_store_rows(store_path):
+    """([(row id, data)], unread) for every local_*.json directly in
+    STORE_PATH, and the number of them it could not read. NEVER RAISES.
+
+    One store only. load_rows is not used here: it takes store ROOTS and
+    globs two levels down, so it would read every other account's store
+    too. Each file goes through ensure_contained, as a direct child of
+    STORE_PATH, and read_json; one that leaves the store, cannot be read or
+    is not a JSON object is counted, not returned. A store that is not there
+    holds no rows; one that cannot be listed counts as one unread. Callers
+    pass only stores of rows the op's resolution gate (_unresolved_rows)
+    resolved, so a row in an unresolved store is never read here."""
+    rows, unread = [], 0
+    try:
+        if not isinstance(store_path, str) or not store_path:
+            return [], 0
+        try:
+            names = sorted(os.listdir(store_path))
+        except FileNotFoundError:
+            return [], 0
+        except OSError:
+            return [], 1
+        home = os.path.normcase(os.path.realpath(store_path))
+        for name in names:
+            if not (name.startswith("local_") and name.endswith(".json")):
+                continue
+            try:
+                real = ensure_contained(os.path.join(store_path, name),
+                                        [store_path])
+                if os.path.normcase(os.path.dirname(real)) != home:
+                    raise LayoutError("not a direct child of the store")
+                data = read_json(real)
+            except Exception:
+                unread += 1
+                continue
+            if not isinstance(data, dict):
+                unread += 1
+                continue
+            rows.append((name[:-len(".json")], data))
+        return rows, unread
+    except Exception:
+        return rows, unread + 1
+
+
+_LINK_KINDS = (
+    # (kind, row key, its target id, lineage's row field, lineage's session)
+    ("parent", "spawnedFrom", "sessionId", "parent_row", "parent_session"),
+    ("root", "startChain", "firstSessionId", "root_row", "root_session"),
+)
+
+
+def _link_target_id(data, key, inner):
+    """The non-empty string id a row's link (or chain) names, or None."""
+    v = data.get(key) if isinstance(data, dict) else None
+    t = v.get(inner) if isinstance(v, dict) else None
+    return t if isinstance(t, str) and t else None
+
+
+def _link_report(op_rows, stores, removed=frozenset(), restored=frozenset(),
+                 *, forward=False):
+    """The links a recovery or a reversal left behind, after its writes:
+    {"dangling": [{"row", "target", "kind"}], "redirected": [...],
+    "unchecked": n}, `kind` "parent" or "root". NEVER RAISES, and never fails
+    the command it reports for: any failure gives {"error": <one sentence>},
+    which undo and recover print as their "link report failed" line.
+
+    STORES are the resolved store paths of the op's rows. Each is scanned
+    once, through _lineage_store_rows, AFTER the command's writes - never
+    from a census taken before them, so a row this command removed is never
+    read as surviving. REMOVED and RESTORED are (store path, row id) pairs:
+    the rows this command removed, and those it put back to a pre-image.
+    Pairs, not bare ids, because sync keeps filenames across accounts, so
+    one id can name healthy rows in other stores.
+
+    - Dangling: a row in a store whose spawnedFrom.sessionId or
+      startChain.firstSessionId names an id REMOVED from that same store.
+      That part reads the stores and REMOVED only, never the journal's
+      lineage, so a journal from before lineage gets it too. Forward
+      recovery removes nothing; with FORWARD it instead checks each written
+      row of OP_ROWS that still carries its journaled link or chain, through
+      _lineage_target, and an absent target is dangling - the crash-window
+      deletion. Without FORWARD a target that was already missing is no
+      doing of this command and is not reported.
+    - Redirected: a written row of OP_ROWS, in neither REMOVED nor RESTORED,
+      that still carries the link this op wrote (its current
+      spawnedFrom.sessionId is lineage["parent_row"], and the same for the
+      chain), whose target exists but opens a conversation other than the
+      journaled one. A restored row carries no expectation from this op,
+      even when its pre-image names the same row id. Only rows with a
+      `lineage` take part, so for an old journal the caller passes none.
+    - Unchecked: the rows and targets it needed and could not read - every
+      row of a store this command removed a row from, and elsewhere the
+      op's own rows and their targets."""
+    def key(p):
+        return os.path.normcase(os.path.realpath(p))
+
+    def pairs(items):
+        out = set()
+        for it in items or ():
+            if isinstance(it, tuple) and len(it) == 2 \
+                    and all(isinstance(x, str) and x for x in it):
+                out.add((key(it[0]), it[1]))
+        return out
+
+    try:
+        gone, kept_back = pairs(removed), pairs(restored)
+        touched = {s for s, _ in gone}
+        scanned, unchecked = {}, 0
+        for s in stores or ():
+            if not isinstance(s, str) or not s:
+                continue
+            k = key(s)
+            if k in scanned:
+                continue               # each store is scanned once
+            found, unread = _lineage_store_rows(s)
+            scanned[k] = (s, dict(found))
+            if k in touched:
+                unchecked += unread
+        dangling, redirected, said = [], [], set()
+
+        def add(out, k, row, target, kind):
+            if (id(out), k, row, kind) not in said:
+                said.add((id(out), k, row, kind))
+                out.append({"row": row, "target": target, "kind": kind})
+
+        for k in sorted(scanned):
+            index = scanned[k][1]
+            for row in sorted(index):
+                for kind, field, inner, _f, _s in _LINK_KINDS:
+                    t = _link_target_id(index[row], field, inner)
+                    if t is not None and (k, t) in gone and t not in index:
+                        add(dangling, k, row, t, kind)
+        for r in op_rows or ():
+            lin = r.get("lineage") if isinstance(r, dict) else None
+            if not isinstance(lin, dict) or not r.get("written"):
+                continue
+            name, dest = r.get("name"), r.get("dest_path")
+            if not isinstance(name, str) or not name.endswith(".json") \
+                    or not isinstance(dest, str) or not dest:
+                continue
+            row, k = name[:-len(".json")], key(os.path.dirname(dest))
+            if k not in scanned or (k, row) in gone or (k, row) in kept_back:
+                continue
+            store, index = scanned[k]
+            data = index.get(row)
+            if data is None:
+                if k in touched:
+                    continue           # the scan counted it, if unreadable
+                state, data = _lineage_target(store, row)
+                if state == "unreadable":
+                    unchecked += 1
+                if state != "present":
+                    continue
+            for kind, field, inner, row_field, session_field in _LINK_KINDS:
+                want = lin.get(row_field)
+                if not isinstance(want, str) or not want \
+                        or _link_target_id(data, field, inner) != want:
+                    continue           # no link of ours left to check
+                if (k, want) in gone:
+                    continue           # dangling, from the scan above
+                state, target = _lineage_target(store, want)
+                if state == "unreadable":
+                    unchecked += 1
+                elif state == "absent":
+                    if forward:
+                        add(dangling, k, row, want, kind)
+                else:
+                    sess = lin.get(session_field)
+                    if isinstance(sess, str) and sess \
+                            and _lineage_cli(target) != sess:
+                        add(redirected, k, row, want, kind)
+        return {"dangling": dangling, "redirected": redirected,
+                "unchecked": unchecked}
+    except Exception as exc:
+        return {"error": "an unexpected {0} while reading the stores".format(
+            type(exc).__name__)}
+
+
+def _record_link_report(op, report):
+    """Set REPORT as the op's `link_report` and save the manifest, so the
+    report is on disk and not only in memory. Callers do this after their
+    writes and before rotate_ops. A save that fails leaves the report in
+    memory for the command to print: the report never fails the command it
+    reports for, whose own status is already saved."""
+    op.manifest["link_report"] = report
+    try:
+        save_manifest(op)
+    except Exception:
+        pass
+
+
+def _link_report_lines(rep):
+    """undo's and recover's lines for a link report, each part only when it
+    has something to say. Never raises."""
+    out = []
+    try:
+        if not isinstance(rep, dict):
+            return out
+        if "error" in rep:
+            return ["links not checked: the link report failed ({0})".format(
+                rep["error"])]
+        for key, shape in (
+                ("dangling", "link left dangling: {0} ({1} was removed)"),
+                ("redirected", "link redirected: {0} ({1} now opens another "
+                               "conversation)")):
+            for e in rep.get(key) or ():
+                if isinstance(e, dict):
+                    out.append(shape.format(
+                        e.get("row"), "its chain root's row"
+                        if e.get("kind") == "root" else "its parent's row"))
+        n = rep.get("unchecked")
+        if type(n) is int and n > 0:
+            out.append("links not checked: {0} could not be read".format(n))
+    except Exception:
+        pass
+    return out
+
+
 def _sync_shape_error(m):
     """A sentence naming what is wrong with this sync manifest, or None.
 
@@ -16927,6 +17233,100 @@ def _converge_mark_landed(op, m, skip_ids=frozenset()):
     return marked
 
 
+def _converge_rows_by_name(m):
+    """{(store, filename): row} over a converge op's rows, the store as
+    _lineage_row_store gives it - the index a planned link target is found
+    by."""
+    return {(_lineage_row_store(m, x), x["name"]): x
+            for x in _journal_dict_rows(m) if isinstance(x.get("name"), str)}
+
+
+def _converge_dependency_skip(m, r, by_name=None):
+    """("parent_not_written" | "parent_changed", detail) when pending row R
+    must not be written because of the row its journaled link or chain
+    names; None otherwise. Recovery's forward check (spec, "converge",
+    "Recovery never re-resolves, and never writes an orphan"): it re-checks
+    the journaled target and never resolves again. NEVER RAISES - a target it
+    cannot settle fails closed, as parent_changed, and the row stays short
+    for the next converge to plan afresh.
+
+    - parent_not_written: the target is a planned row of this op
+      (`parent_planned` / `root_planned`) that is now skipped, for any
+      reason. Rows are checked in write order and each skip is marked before
+      the next row is checked, so the skip carries down a planned chain.
+    - parent_changed: the target is a planned row already written, or a row
+      that existed before the op, and it is absent, unreadable, or opens a
+      conversation other than the journaled `parent_session` (or
+      `root_session`).
+
+    A planned target still pending is not checked: write order writes it
+    first. BY_NAME is _converge_rows_by_name(m), built once by the caller."""
+    try:
+        lin = r.get("lineage")
+        if not isinstance(lin, dict):
+            return None
+        if by_name is None:
+            by_name = _converge_rows_by_name(m)
+        store = _lineage_row_store(m, r)
+        for what, row_field, planned_field, session_field in (
+                ("parent", "parent_row", "parent_planned", "parent_session"),
+                ("chain root", "root_row", "root_planned", "root_session")):
+            target = lin.get(row_field)
+            if not isinstance(target, str) or not target:
+                continue
+            sess = lin.get(session_field)
+            conv = _lineage_short(sess) if isinstance(sess, str) and sess \
+                else "?"
+            planned = by_name.get((store, target + ".json")) \
+                if lin.get(planned_field) is True else None
+            if planned is not None and planned is not r:
+                if planned.get("skipped"):
+                    return "parent_not_written", (
+                        "its {0} {1}'s row planned in this operation was not "
+                        "written ({2}), so its link would name a row that "
+                        "does not exist".format(what, conv,
+                                                planned.get("skipped")))
+                if not planned.get("written"):
+                    continue           # pending: written first, in write order
+            state, data = _lineage_target(r.get("store_path"), target)
+            if state == "absent":
+                return "parent_changed", (
+                    "its {0} {1}'s row is gone since this operation was "
+                    "journaled".format(what, conv))
+            if state != "present":
+                return "parent_changed", (
+                    "its {0} {1}'s row could not be read, so its link cannot "
+                    "be checked".format(what, conv))
+            cli = _lineage_cli(data)
+            if cli != sess:
+                return "parent_changed", (
+                    "its {0}'s row now opens {1}, not {2}".format(
+                        what, _lineage_short(cli) if cli else "nothing",
+                        conv))
+        return None
+    except Exception:
+        return "parent_changed", "its link's target could not be checked"
+
+
+def _converge_link_report(op, m, skip_ids=frozenset(), removed=frozenset(),
+                          forward=False):
+    """Make, set and save a converge op's link report (_link_report), after
+    the command's writes: over the stores of its rows, less the rows in
+    SKIP_IDS (rows in a store the resolution gate did not resolve), with
+    REMOVED the (store path, row id) pairs this command removed.
+
+    An op journaled before lineage (no `lineage_format`) passes no rows, so
+    its reversal gets the dangling part alone, read from the stores; and its
+    forward recovery runs exactly as before, with no report at all."""
+    new = m.get("lineage_format") == 1
+    if forward and not new:
+        return
+    rows = _journal_dict_rows(m)
+    stores = [r.get("store_path") for r in rows if id(r) not in skip_ids]
+    _record_link_report(op, _link_report(rows if new else [], stores,
+                                         removed=removed, forward=forward))
+
+
 def execute_converge_op(env, op):
     """journaled -> writing -> completed. N rows, all adds.
 
@@ -17038,11 +17438,15 @@ def undo_converge(env, op):
         # checks containment row by row, after earlier rows are already gone,
         # so an uncontained later row refused with the op left 'completed' and
         # part of it undone. One unresolved row stops the whole undo.
-        stray = _unresolved_rows(_journal_discovery(env, "undo"), m, written_only=True)
+        disc = _journal_discovery(env, "undo")
+        stray = _unresolved_rows(disc, m, written_only=True)
         if stray:
             raise Refusal("cannot undo {0}: {1}. This version can neither check "
                           "nor change them, so nothing was changed."
                           .format(m["op_id"], _unresolved_clause(stray)))
+        # A row never written may still sit in a store the gate does not
+        # resolve; the link report never reads that store.
+        unresolved = {id(r) for r, _ in _unresolved_rows(disc, m)}
         roots = _retitle_roots(env)
         # The pointer census the last-pointer rule reads. load_rows is
         # best-effort (it collects unreadable rows instead of raising), and
@@ -17055,8 +17459,15 @@ def undo_converge(env, op):
             if row.cli_session_id:
                 pointers.setdefault(row.cli_session_id, set()).add(
                     os.path.normcase(os.path.realpath(row.path)))
-        deleted, already_gone, skips = 0, 0, []
-        for r in m["rows"]:
+        deleted, already_gone, skips, removed = 0, 0, [], set()
+        # Children before parents (spec, "undo"): the rows are met in
+        # reverse write order - m["rows"] is write order for an op journaled
+        # with lineage - so an interrupted undo leaves a parent without its
+        # child, never a child naming a row already removed. The last-pointer
+        # rule keeps the row of a conversation met LAST, so when all of one
+        # conversation's rows would go, the one that stays is the one
+        # written first.
+        for r in reversed(m["rows"]):
             if not r.get("written"):
                 continue
             real = ensure_contained(r["dest_path"], roots)
@@ -17115,6 +17526,7 @@ def undo_converge(env, op):
                               "could not remove it: {0}".format(exc)))
                 continue
             pointers.get(r["session"], set()).discard(key)
+            removed.add((r["store_path"], _lineage_stem(r["name"])))
             deleted += 1
         m["undo_report"] = {
             "deleted": deleted, "already_gone": already_gone,
@@ -17122,6 +17534,11 @@ def undo_converge(env, op):
                          "session": r.get("session"), "reason": reason,
                          "detail": detail} for r, reason, detail in skips]}
         set_status(op, "undone")
+        # After the whole reversal, from the rows that survive (spec,
+        # "undo"): a surviving row, from this op or any other, that links
+        # to a row this undo removed, and a kept row of this op whose link's
+        # target now opens another conversation.
+        _converge_link_report(op, m, skip_ids=unresolved, removed=removed)
         rotate_ops(env)
         return "undone"
     finally:
