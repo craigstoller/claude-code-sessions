@@ -9186,6 +9186,14 @@ def _sync_same_apart_from_lineage(pre, post):
             == {k: v for k, v in b.items() if k not in skip})
 
 
+def _sync_source_linked(data):
+    """True when a source row carries spawnedFrom or startChain, whatever
+    their values: plan_sync's step 1 leaves such a row to the lineage pass,
+    even when its bytes already equal the destination's. Never raises."""
+    return isinstance(data, dict) and ("spawnedFrom" in data
+                                       or "startChain" in data)
+
+
 def _sync_link_name(data, key, inner):
     """The filename the source row's link (or chain) names, the one the
     destination's pick prefers for sync; "" when it names none."""
@@ -9529,9 +9537,10 @@ def plan_sync(env, flags):
     The rows are planned in the spec's order (docs/specs/2026-11-17-carry-
     lineage-design.md, "sync", "Restructured planning"):
     1. each candidate's transformed bytes. A refresh whose bytes already
-       equal the destination's is unchanged here, before the age holds, so
-       a byte-identical row is never reported as held (the plan's Departure
-       6);
+       equal the destination's, and whose source carries neither spawnedFrom
+       nor startChain, is unchanged here, before the age holds, so such a
+       row is never reported as held (the plan's Departure 6, narrowed). A
+       linked one goes on to step 3, so its link is translated;
     2. --newer-only's age holds. Each held refresh is recorded in
        tally["held_sessions"] by the conversation its source opens;
     3. a refresh equal to the destination's row apart from spawnedFrom and
@@ -9564,14 +9573,21 @@ def plan_sync(env, flags):
     for cand in picked:
         blob, removed, reset = transform_row(cand["data"], verbatim)
         pre = cand.get("pre")
-        if pre is not None and pre == blob:
+        if pre is not None and pre == blob \
+                and (verbatim or not _sync_source_linked(cand["data"])):
             # Step 1. A refresh that would write the identical bytes is not a
             # refresh. Dropping it here keeps the plan honest about what
             # --update will actually overwrite, and keeps a no-op run from
             # journaling one. It stays ahead of the age holds below, so such
             # a row is reported unchanged, never held: it writes nothing
             # either way, so the after-state the lineage pass sees is the
-            # same.
+            # same. Only for a row whose source carries neither a link nor a
+            # chain (the plan's Departure 6, narrowed): identical bytes that
+            # carry the source account's link may name a row the destination
+            # lacks, so such a row takes the spec's path, provisional at step
+            # 3 and decided at step 6 on its translated bytes. A --verbatim
+            # row copies its link as it is, so identical bytes stay
+            # unchanged here.
             tally["unchanged"].append(cand["title"])
             continue
         # Which way does this refresh move the row? Only meaningful when both

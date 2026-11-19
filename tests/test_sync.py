@@ -4183,6 +4183,60 @@ def test_sync_newer_only_byte_identical_row_is_unchanged_not_held(
     assert t["held_sessions"] == {}
 
 
+def test_sync_byte_identical_linked_child_is_translated_not_unchanged(
+        two_account_env, tmp_path):
+    """Departure 6, narrowed (R21): the exact-identity exit ahead of the age
+    holds is only for a row whose source carries neither spawnedFrom nor
+    startChain. The destination's child is byte-identical to the
+    transformed source row, so it carries the source account's link, to
+    local_p, a filename the destination does not hold; the parent's row
+    there is local_q. The child takes the spec's path, provisionally
+    unchanged and then decided on its translated bytes, and is written with
+    the link to local_q. An unlinked byte-identical row is still unchanged,
+    before the holds; under --newer-only the linked child meets the holds
+    first, as the spec orders them."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, "sid-u")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    for store in (src, dst):
+        _lrow(store, "local_c.json", LC, "ACME-REVIEW side task",
+              lastActivityAt=5, spawnedFrom=_side("local_p"))
+        _lrow(store, "local_u.json", "sid-u", "ACME-REVIEW notes",
+              lastActivityAt=4)
+    child = os.path.join(dst, "local_c.json")
+    pre = _bytes(child)
+    held = ct.plan_sync(env, ct.SyncFlags(update=True, newer_only=True,
+                                          only="ACME"))
+    t = held["tally"]
+    assert held["rows"] == []
+    assert t["unchanged"] == ["ACME-REVIEW notes"]
+    assert t["held_same"] == ["ACME-REVIEW side task"]
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, only="ACME"))
+    assert m["tally"]["unchanged"] == ["ACME-REVIEW notes"]
+    assert [r["name"] for r in m["rows"]] == ["local_c.json"]
+    r, = m["rows"]
+    assert r["is_update"] and ct.unb64(r["pre_b64"]) == pre
+    assert _post(r)["spawnedFrom"] == {"sessionId": "local_q",
+                                       "taskId": LTASK}
+    assert r["lineage"]["parent_row"] == "local_q"
+    assert r["lineage"]["parent_planned"] is False
+    assert r["link_change"] == "retargeted"
+    assert ct.run_sync(env, m) == "completed"
+    with open(child, encoding="utf-8") as fh:
+        assert json.load(fh)["spawnedFrom"] == {"sessionId": "local_q",
+                                                "taskId": LTASK}
+    # Under --verbatim the link is copied as it is, so identical bytes are
+    # still unchanged at step 1.
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          lastActivityAt=5, spawnedFrom=_side("local_p"))
+    v = ct.plan_sync(env, ct.SyncFlags(update=True, verbatim=True,
+                                       only="ACME"))
+    assert v["rows"] == []
+    assert sorted(v["tally"]["unchanged"]) == ["ACME-REVIEW notes",
+                                               "ACME-REVIEW side task"]
+
+
 def test_sync_row_dropped_as_unchanged_is_not_counted_as_activity_unknown(
         two_account_env, tmp_path):
     """Neither side of the parent's refresh has a readable lastActivityAt.
