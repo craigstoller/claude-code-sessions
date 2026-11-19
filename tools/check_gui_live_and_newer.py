@@ -390,6 +390,39 @@ check("  and the filtered empty state uses the same vocabulary",
                           "dorm@example.com's sidebar", app.status.get())
 app.only_var.set("")
 
+# ------------- carry-lineage (Task 7). a refresh that loses or moves a link
+# plan_sync leaves spawnedFrom and startChain out of dest_dropped and says so
+# in link_change and chain_change instead. The pane prints the CLI report's
+# own lines in its overwrite block, or the window would hide the loss.
+FAKE_ROWS[:] = [
+    {"name": "local_c.json", "title": "ACME-REVIEW side task",
+     "is_update": True, "session_id": "s1", "pre_b64": "e30=",
+     "post_b64": "e30=", "written": False, "dest_dropped": [],
+     "dest_reset": [], "link_change": "dropped", "chain_change": None},
+    {"name": "local_d.json", "title": "Northwind second task",
+     "is_update": True, "session_id": "s2", "pre_b64": "e30=",
+     "post_b64": "e30=", "written": False, "dest_dropped": [],
+     "dest_reset": [], "link_change": "retargeted",
+     "chain_change": "dropped"}]
+app.refresh()
+settle()
+pane_lines = app.text.get("1.0", "end").splitlines()
+want = ["link    : local_c loses its link",
+        "link    : local_d now links to another row",
+        "chain   : local_d loses its chain"]
+check("the pane says when a refresh drops or moves the destination's link",
+      all(w in pane_lines for w in want), "\n".join(pane_lines))
+over = [i for i, l in enumerate(pane_lines) if l.startswith("!! OVERWRITING")]
+copy = [i for i, l in enumerate(pane_lines) if l.startswith("to copy")]
+check("  in the overwrite block, in the CLI's words",
+      over and copy and all(over[0] < pane_lines.index(w) < copy[0]
+                            for w in want if w in pane_lines)
+      and [l for l in pane_lines if l.startswith(("link    :", "chain   :"))]
+      == ccs._sync_change_lines(FAKE_ROWS))
+FAKE_ROWS[:] = []
+app.refresh()
+settle()
+
 # ------------------- GUI polish (Change 3). the tab strip and the role lines
 tabs = [app.nb.tab(t, "text") for t in app.nb.tabs()]
 check("the tabs read Level | Health | One session",

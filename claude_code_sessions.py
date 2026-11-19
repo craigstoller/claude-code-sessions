@@ -15953,20 +15953,33 @@ _SYNC_CHANGE_LINES = {
 }
 
 
-def _sync_lineage_lines(m):
-    """A sync plan's lineage lines, from its public manifest: the links,
-    chains and cycles lines as converge prints them, then one line per
-    refresh that loses or moves the destination's own link or chain, then
-    how many links --verbatim adds copy untranslated. Never raises."""
+def _sync_change_lines(rows):
+    """One line per refresh in ROWS that loses or moves the destination's
+    own link or chain (its link_change, chain_change): `link    : <row>
+    loses its link` and the like, `<row>` the row id. The CLI report and the
+    window's sync pane both print these. Never raises."""
+    lines = []
     try:
-        lines = _lineage_plan_lines(m)
-        for r in m.get("rows") or []:
+        for r in rows or ():
             if not isinstance(r, dict):
                 continue
             for key in ("link_change", "chain_change"):
                 shape = _SYNC_CHANGE_LINES.get((key, r.get(key)))
                 if shape:
                     lines.append(shape.format(_lineage_stem(r.get("name"))))
+    except Exception:
+        pass
+    return lines
+
+
+def _sync_lineage_lines(m):
+    """A sync plan's lineage lines, from its public manifest: the links,
+    chains and cycles lines as converge prints them, then one line per
+    refresh that loses or moves the destination's own link or chain
+    (_sync_change_lines), then how many links --verbatim adds copy
+    untranslated. Never raises."""
+    try:
+        lines = _lineage_plan_lines(m) + _sync_change_lines(m.get("rows"))
         tally = m.get("tally") if isinstance(m.get("tally"), dict) else {}
         n = len(tally.get("verbatim_links") or [])
         if n:

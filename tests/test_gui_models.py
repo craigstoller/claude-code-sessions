@@ -966,3 +966,60 @@ def test_sync_status_line_counts_row_files_not_sessions():
     # Without an email the destination is its id prefix.
     anon = dict(empty, dest_email="")
     assert gui._sync_status(anon, "") == "No row files to add to bbbb2222's sidebar"
+
+
+def _sync_pane_lines(env, manifest):
+    """The lines the One-session pane shows for MANIFEST: its real
+    _show_plan, run on a stand-in window that records what show() is given,
+    so no tkinter is needed."""
+    from unittest import mock
+    app = mock.MagicMock()
+    app.env = env
+    app.consent_var.get.return_value = False
+    gui.SyncApp._show_plan(app, "", manifest, None, {})
+    shown = [c.args[0] for c in app.show.call_args_list]
+    assert len(shown) == 1
+    return shown[0]
+
+
+def test_sync_pane_says_when_a_refresh_drops_or_moves_the_destinations_link(
+        two_account_env, tmp_path):
+    """Task 7 takes spawnedFrom and startChain out of dest_dropped, so the
+    pane's "fields their row loses" line no longer names them. The pane
+    says so instead, beside that line in its overwrite block, with the CLI
+    report's own lines: a refresh whose source has no link drops the
+    destination's, and one whose source names another root moves its
+    chain."""
+    import test_sync as ts
+    env, src, dst = two_account_env(tmp_path)
+    ts._transcripts(env, ts.LP, ts.LC, ts.LQ, ts.LR)
+    for store in (src, dst):
+        ts._lrow(store, "local_p.json", ts.LP, "Northwind kickoff")
+        ts._lrow(store, "local_r.json", ts.LR, "Northwind board")
+    ts._lrow(src, "local_c.json", ts.LC, "ACME-REVIEW side task",
+             lastActivityAt=2)
+    ts._lrow(dst, "local_c.json", ts.LC, "ACME-REVIEW side task",
+             spawnedFrom={"sessionId": "local_p", "taskId": ts.LTASK},
+             zzDestOnly=1)
+    ts._lrow(src, "local_d.json", ts.LQ, "ACME-REVIEW second task",
+             lastActivityAt=2, spawnedFrom=ts._side("local_p"),
+             startChain={"firstSessionId": "local_r", "depth": 2})
+    ts._lrow(dst, "local_d.json", ts.LQ, "ACME-REVIEW second task",
+             spawnedFrom={"sessionId": "local_p", "taskId": ts.LTASK},
+             startChain={"firstSessionId": "local_p", "depth": 1})
+    m = ts.ct.plan_sync(env, ts.ct.SyncFlags(update=True))
+    lines = _sync_pane_lines(env, m)
+    block = lines[lines.index(next(ln for ln in lines
+                                   if ln.startswith("!! OVERWRITING"))):
+                  lines.index(next(ln for ln in lines
+                                   if ln.startswith("to copy")))]
+    assert "link    : local_c loses its link" in block
+    assert "chain   : local_d now has another chain root" in block
+    # Beside the fields line, which names the destination's own field but
+    # not the link, so the loss is said once.
+    loses = block.index("   fields their row loses: zzDestOnly")
+    assert block.index("link    : local_c loses its link") > loses
+    assert not any("spawnedFrom" in ln or "startChain" in ln for ln in lines)
+    # The same lines, from the same helper, as the CLI report prints.
+    assert ts.ct._sync_change_lines(m["rows"]) == [
+        ln for ln in block if ln.startswith(("link    :", "chain   :"))]

@@ -3187,6 +3187,10 @@ class SyncApp:
             if unknown:
                 lines.append("   {0} row(s) could not be compared field by field -"
                              " the whole row is still replaced.".format(unknown))
+            # The destination's own link and chain are left out of the fields
+            # list above, so a loss is said once: here, by the CLI's own lines
+            # (one per refresh that drops or moves them), beside the others.
+            lines += ccs._sync_change_lines(refreshes)
             lines.append("")
         lines += ["{0:<38}: {1}".format("to copy", len(adds)), ""]
         for r in adds:
