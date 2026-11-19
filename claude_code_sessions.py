@@ -14650,6 +14650,352 @@ def _print_sync_report(say, manifest):
         say("   ... and {0} more".format(len(adds) - 15))
 
 
+# ------------------------------------------------------------- lineage
+# The parent link (spawnedFrom) and chain (startChain) a side session's row
+# carries, translated into the destination account's own rows. This section is
+# the pure resolver: it reads rows already in memory, writes nothing, and never
+# raises on a malformed row (spec: docs/specs/2026-11-17-carry-lineage-design.md,
+# "The lineage pass", steps 1 to 6). Callers (converge, sync) wire it in.
+
+LINEAGE_FORMAT = 1
+
+# Note code -> the phrase the reports use.
+LINEAGE_PHRASES = {
+    "lineage_parent_disagree": "holders disagree on the parent",
+    "lineage_self": "the link names the conversation itself",
+    "lineage_parent_dead": "the parent's transcript is gone",
+    "parent_not_in_account": "no row for the parent in that account",
+    "parent_pair_held": "the parent's own row is held in this plan",
+    "parent_row_drifted":
+        "that account's row for the parent opens another conversation",
+    "lineage_variant": "not a cleared link variant",
+    "lineage_no_task": "no usable taskId",
+    "lineage_task_disagree": "holders disagree on taskId",
+    "lineage_cycle": "it would close a cycle",
+    "lineage_source_changed": "the source row changed since the plan",
+    "lineage_chain_dropped": "the chain was left out",
+    "existing_cycle": "the account already holds a cycle of links",
+    "lineage_retargeted": "changed since the plan",
+    "lineage_dropped": "dropped since the plan",
+    "lineage_gained": "gained since the plan",
+}
+
+# The codes that count as "link left out".
+LINEAGE_LEFT_OUT = frozenset((
+    "lineage_parent_disagree", "lineage_self", "lineage_parent_dead",
+    "parent_not_in_account", "parent_pair_held", "parent_row_drifted",
+    "lineage_variant", "lineage_no_task", "lineage_task_disagree",
+    "lineage_cycle", "lineage_source_changed",
+))
+
+
+@dataclasses.dataclass(frozen=True)
+class LineageRow:
+    """One row of one account's store, as the resolver sees it. `name` is the
+    filename; its row id is the filename stem. `planned` marks a row the op has
+    not written yet."""
+    account: str
+    name: str
+    data: dict
+    planned: bool = False
+
+
+def _lineage_variant_ok(link):
+    """True for a link shape the probes cleared for carrying: an app-written
+    side-session link (`sideSession: true`, any other keys), the older
+    app-written {sessionId, taskId, title} with a non-empty string title, or
+    this tool's own {sessionId, taskId}. Never raises."""
+    if not isinstance(link, dict):
+        return False
+    if link.get("sideSession") is True:
+        return True
+    keys = set(link)
+    if keys == {"sessionId", "taskId", "title"}:
+        t = link.get("title")
+        return isinstance(t, str) and t != ""
+    return keys == {"sessionId", "taskId"}
+
+
+def _lineage_task_ok(link):
+    """True when the link's taskId is a non-empty string. Never raises."""
+    if not isinstance(link, dict):
+        return False
+    t = link.get("taskId")
+    return isinstance(t, str) and t != ""
+
+
+def _lineage_stem(name):
+    n = name if isinstance(name, str) else ""
+    return n[:-5] if n.endswith(".json") else n
+
+
+def _lineage_cli(data):
+    """The row's cliSessionId when it is a non-empty string, else None."""
+    if not isinstance(data, dict):
+        return None
+    c = data.get("cliSessionId")
+    return c if isinstance(c, str) and c != "" else None
+
+
+class LineageIndex:
+    """Lookups over one store's LineageRows. `by_id` and `by_cli` hold only
+    rows whose sessionId equals their filename stem; `by_name` holds every row
+    with a dict body."""
+
+    def __init__(self):
+        self.by_id = {}
+        self.by_name = {}
+        self.by_cli = {}
+
+
+def _lineage_index(rows):
+    idx = LineageIndex()
+    for r in rows or ():
+        d = getattr(r, "data", None)
+        if not isinstance(d, dict) or not isinstance(r.name, str):
+            continue
+        idx.by_name[r.name] = r
+        stem = _lineage_stem(r.name)
+        if d.get("sessionId") != stem:
+            continue
+        idx.by_id[stem] = r
+        cli = _lineage_cli(d)
+        if cli is not None:
+            idx.by_cli.setdefault(cli, []).append(r)
+    return idx
+
+
+def _lineage_pick(rows, prefer_name=""):
+    """The one row to use among several of one conversation: the preferred
+    filename, then an unarchived row, an existing row before a planned one, the
+    greatest lastActivityAt (missing counts as 0), the greatest filename and
+    the greatest account. None for no rows. Never raises."""
+    best = None
+    best_key = None
+    for r in rows or ():
+        d = r.data if isinstance(r.data, dict) else {}
+        key = (
+            bool(prefer_name) and r.name == prefer_name,
+            d.get("isArchived") is not True,
+            not r.planned,
+            _activity_of(d) or 0,
+            r.name,
+            r.account,
+        )
+        if best_key is None or key > best_key:
+            best, best_key = r, key
+    return best
+
+
+def _lineage_short(x):
+    return str(x)[:8]
+
+
+def _lineage_has(fn, sid):
+    try:
+        return bool(fn(sid))
+    except Exception:
+        return False
+
+
+def _lineage_named_conversation(holder, holder_index, sid):
+    """(conversation id, named row) when `sid` is a string naming a
+    stem-checked row of the holder's own store whose cliSessionId is a
+    non-empty string, else (None, None)."""
+    if not isinstance(sid, str):
+        return None, None
+    idx = holder_index.get(holder.account) if isinstance(holder_index, dict) \
+        else None
+    row = idx.by_id.get(sid) if idx is not None else None
+    cli = _lineage_cli(row.data) if row is not None else None
+    if cli is None:
+        return None, None
+    return cli, row
+
+
+def _lineage_resolve(child_sid, child_name, holders, holder_index, dest, *,
+                     held, transcript_exists, prefer_parent_name="",
+                     prefer_root_name=""):
+    """Resolve the link and chain one row of conversation `child_sid` should
+    carry into the destination described by `dest`. Returns {"link", "chain",
+    "lineage", "edges"}; `link` and `chain` are dicts or None, `edges` names
+    the parent and root conversations actually carried. Never raises."""
+    notes = []
+
+    def note(code, detail):
+        if all(n["code"] != code for n in notes):
+            notes.append({"code": code, "detail": detail})
+
+    link = None
+    chain = None
+    carried_keys = []
+    dropped_keys = []
+    edges = {"parent": None, "root": None}
+    parent_row = root_row = None
+
+    holders = [h for h in (holders or ()) if isinstance(h.data, dict)]
+    held = held if isinstance(held, dict) else {}
+
+    # Step 1: source links.
+    yielded = []  # (holder, P, parent row in the holder's store)
+    for h in holders:
+        sf = h.data.get("spawnedFrom")
+        if not isinstance(sf, dict):
+            continue
+        p, prow = _lineage_named_conversation(
+            h, holder_index, sf.get("sessionId"))
+        if p is not None:
+            yielded.append((h, p, prow))
+
+    chain_sources = [h for h in holders
+                     if isinstance(h.data.get("startChain"), dict)]
+
+    # Steps 2 to 5: the link.
+    parent = None
+    if yielded:
+        distinct = {p for _, p, _ in yielded}
+        if len(distinct) > 1:
+            note("lineage_parent_disagree",
+                 "holders name {0} different parents".format(len(distinct)))
+        else:
+            parent = next(iter(distinct))
+            if parent == child_sid:
+                note("lineage_self", "the link of {0} names itself".format(
+                    _lineage_short(child_sid)))
+                parent = None
+            elif not _lineage_has(transcript_exists, parent):
+                note("lineage_parent_dead",
+                     "no transcript for parent {0}".format(
+                         _lineage_short(parent)))
+                parent = None
+
+    if parent is not None:
+        parent_of = {id(h): prow for h, _, prow in yielded}
+        yielders = [h for h, _, _ in yielded]
+        eligible = [h for h in yielders
+                    if _lineage_variant_ok(h.data["spawnedFrom"])
+                    and _lineage_task_ok(h.data["spawnedFrom"])]
+        template = None
+        if not eligible:
+            if not any(_lineage_variant_ok(h.data["spawnedFrom"])
+                       for h in yielders):
+                note("lineage_variant",
+                     "the link to {0} is not a cleared variant".format(
+                         _lineage_short(parent)))
+            else:
+                note("lineage_no_task",
+                     "the link to {0} has no usable taskId".format(
+                         _lineage_short(parent)))
+        else:
+            tasks = {h.data["spawnedFrom"]["taskId"] for h in yielders
+                     if _lineage_task_ok(h.data["spawnedFrom"])}
+            if len(tasks) > 1:
+                note("lineage_task_disagree",
+                     "holders give {0} different taskIds for parent {1}"
+                     .format(len(tasks), _lineage_short(parent)))
+            else:
+                template = _lineage_pick(eligible)
+
+        if template is not None:
+            target = _lineage_pick(dest.by_cli.get(parent, []),
+                                   prefer_parent_name)
+            if target is None:
+                if parent in held:
+                    note("parent_pair_held",
+                         "the row for parent {0} is held: {1}".format(
+                             _lineage_short(parent), held[parent]))
+                else:
+                    tname = parent_of[id(template)].name
+                    other = dest.by_name.get(tname)
+                    ocli = _lineage_cli(other.data) if other is not None \
+                        else None
+                    if ocli is not None and ocli != parent:
+                        note("parent_row_drifted",
+                             "the row for parent {0} opens {1}".format(
+                                 _lineage_short(parent),
+                                 _lineage_short(ocli)))
+                    else:
+                        note("parent_not_in_account",
+                             "no row for parent {0} in the account".format(
+                                 _lineage_short(parent)))
+            else:
+                tlink = template.data["spawnedFrom"]
+                parent_row = target
+                link = {"sessionId": _lineage_stem(target.name),
+                        "taskId": tlink["taskId"]}
+                carried_keys = ["sessionId", "taskId"]
+                dropped_keys = sorted(
+                    str(k) for k in tlink if k not in ("sessionId", "taskId"))
+                edges["parent"] = parent
+
+    # Step 6: the chain.
+    if chain_sources:
+        reason = None
+        if link is None:
+            reason = "the parent link was left out"
+        roots = set()
+        depths = []
+        extra = set()
+        for h in (chain_sources if reason is None else ()):
+            sc = h.data["startChain"]
+            r, _ = _lineage_named_conversation(
+                h, holder_index, sc.get("firstSessionId"))
+            if r is None:
+                reason = "a chain source does not name a known row"
+                break
+            roots.add(r)
+            depths.append(sc.get("depth"))
+            extra.update(str(k) for k in sc
+                         if k not in ("firstSessionId", "depth"))
+        if reason is None:
+            if len(roots) > 1:
+                reason = "chain sources name different roots"
+            elif any(type(d) is not int or d < 1 for d in depths):
+                reason = "the chain depth is not an integer of at least 1"
+            elif len(set(depths)) > 1:
+                reason = "chain sources give different depths"
+        if reason is None:
+            root = next(iter(roots))
+            if root == child_sid:
+                reason = "the chain root is the conversation itself"
+            elif not _lineage_has(transcript_exists, root):
+                reason = "no transcript for chain root {0}".format(
+                    _lineage_short(root))
+            else:
+                rrow = _lineage_pick(dest.by_cli.get(root, []),
+                                     prefer_root_name)
+                if rrow is None:
+                    reason = "no row for chain root {0} in the account"\
+                        .format(_lineage_short(root))
+                elif rrow.name == child_name:
+                    reason = "the chain root's row is the row itself"
+                else:
+                    root_row = rrow
+        if reason is not None:
+            note("lineage_chain_dropped", reason)
+            root_row = None
+        else:
+            chain = {"firstSessionId": _lineage_stem(root_row.name),
+                     "depth": depths[0]}
+            edges["root"] = root
+            dropped_keys = dropped_keys + ["startChain." + k
+                                           for k in sorted(extra)]
+
+    lineage = {
+        "parent_session": edges["parent"] or "",
+        "parent_row": _lineage_stem(parent_row.name) if link else "",
+        "parent_planned": bool(link and parent_row.planned),
+        "root_session": edges["root"] or "",
+        "root_row": _lineage_stem(root_row.name) if chain else "",
+        "root_planned": bool(chain and root_row.planned),
+        "carried_keys": carried_keys,
+        "dropped_keys": dropped_keys,
+        "notes": notes,
+    }
+    return {"link": link, "chain": chain, "lineage": lineage,
+            "edges": edges}
+
+
 # ------------------------------------------------------------- 9. converge
 # "Every conversation some sidebar can open should be openable from every
 # sidebar." Purely additive: for every (eligible conversation, destination
