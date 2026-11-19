@@ -7468,8 +7468,16 @@ def _row_is_refresh(r):
     return bool(r.get("is_update")) or r.get("pre_b64") is not None
 
 
-def select_sync_rows(env, source, dest, flags):
+def select_sync_rows(env, source, dest, flags, found=None, decoded=None):
     """Which source rows are eligible to copy, and why the rest were skipped.
+
+    Two optional dicts carry what this read learns on to the lineage pass,
+    so plan_sync reads nothing twice (docs/internals.md, "Reading each store
+    once"). FOUND gets, by conversation, whether its transcript exists, for
+    each one looked up here, and an answer already in it is used rather than
+    looked up again. DECODED gets every local_*.json of the source as
+    _lineage_store_rows takes it: the row as _lineage_light makes it, or
+    None when it could not be read or is not an object.
 
     A row qualifies only if: it is a local_*.json row (not a tombstone or
     other sidecar), it is absent from the destination by filename, its
@@ -7524,10 +7532,16 @@ def select_sync_rows(env, source, dest, flags):
             d = read_json(p)
         except LayoutError:
             tally["unreadable"].append(name)
+            if decoded is not None:
+                decoded[name] = None
             continue
         if not isinstance(d, dict):
             tally["unreadable"].append(name)
+            if decoded is not None:
+                decoded[name] = None
             continue
+        if decoded is not None:
+            decoded[name] = _lineage_light(d)
         entries.append({"name": name, "src_path": p, "data": d,
                         "session_id": d.get("cliSessionId") or "",
                         # The row's OTHER id: the filename stem, which is the
@@ -7554,6 +7568,17 @@ def select_sync_rows(env, source, dest, flags):
                         # input is a warning nobody can act on.
                         "last_activity": _activity_of(d)})
     overridden = _resolve_tombstone_overrides(entries, tombs, flags.include_deleted)
+
+    def has_transcript(sid):
+        # The lineage pass asks this of a parent or a root, which is often a
+        # row selected here, so an answer is kept for it in FOUND. Only a
+        # string id is kept: any other value fails in find_transcripts, as
+        # it always has.
+        if found is None or not isinstance(sid, str):
+            return bool(find_transcripts(env.projects_root, sid))
+        if sid not in found:
+            found[sid] = bool(find_transcripts(env.projects_root, sid))
+        return found[sid]
 
     picked = []
     for e in entries:
@@ -7586,7 +7611,7 @@ def select_sync_rows(env, source, dest, flags):
             # this the refresh silently regresses a destination that was used
             # more recently than the source.
             e["pre_activity"] = _row_activity(pre)
-        if not sid or not find_transcripts(env.projects_root, sid):
+        if not sid or not has_transcript(sid):
             tally["no_transcript"].append(title)
             continue
         overrode = False
@@ -9096,6 +9121,13 @@ def _refresh_field_loss(pre, post):
         b = json.loads(post.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, AttributeError):
         return None, None
+    return _refresh_field_loss_of(a, b)
+
+
+def _refresh_field_loss_of(a, b):
+    """_refresh_field_loss of rows already decoded: A and B are the decoded
+    PRE and POST, and (None, None) unless both are JSON objects. Reads
+    them only."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None, None
     dropped = sorted(k for k in a if k not in b)
@@ -9226,7 +9258,8 @@ def _sync_lineage(rows, sources, source_store, dest_store, held, exists, *,
     SOURCES maps a row's name to its source row (a dict): the row's one
     holder, and the link template. A row without one gets no link and no
     note. SOURCE_STORE and DEST_STORE are [(row id, data)] as
-    _lineage_store_rows reads them: the source store is the holders' index,
+    _lineage_store_rows reads them, whole rows or light ones alike (the pass
+    reads only _LINEAGE_ROW_KEYS): the source store is the holders' index,
     and the destination's after-state is its rows with each of ROWS
     replaced by, or added as, its decoded post_b64, planned. A planned
     row's links are never read; a row this op does not write (held, or
@@ -9341,23 +9374,25 @@ def _sync_refresh_loss(r):
     `dest_reset` (_refresh_field_loss, None for "could not tell"), leaving
     spawnedFrom and startChain out of the dropped list, and `link_change`
     and `chain_change`, which report those two once. An add is left as it
-    is. Never raises."""
+    is. Each image is decoded once, for all four: as _refresh_field_loss
+    would decode it, so a row it reads as "could not tell" reads so to the
+    change lines too. Never raises."""
     if not r.get("is_update"):
         return
     try:
         pre, post = _sync_pre_image(r), unb64(r["post_b64"])
     except Exception:
         pre = post = None
-    dropped, reset = _refresh_field_loss(pre, post)
+    try:
+        a = json.loads(pre.decode("utf-8"))
+        b = json.loads(post.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        a = b = None
+    dropped, reset = _refresh_field_loss_of(a, b)
     if dropped is not None:
         dropped = [k for k in dropped
                    if k not in ("spawnedFrom", "startChain")]
     r["dest_dropped"], r["dest_reset"] = dropped, reset
-    try:
-        a = json.loads(pre.decode("utf-8"))
-        b = json.loads(post.decode("utf-8"))
-    except Exception:
-        a = b = None
     r["link_change"] = _sync_ref_change(a, b, "spawnedFrom", ("sessionId",))
     r["chain_change"] = _sync_ref_change(a, b, "startChain",
                                          ("firstSessionId", "depth"))
@@ -9438,7 +9473,8 @@ def _sync_relink(env, m):
     links, bytes and order. run_sync calls it for every op but a --verbatim
     one, which copies links as they are.
 
-    1. The source and destination stores are read again.
+    1. The source and destination stores are read again, as light rows
+       (_lineage_light).
     2. Step 5 of plan_sync runs again. Each row's source row is read again
        by name from the source store (the plan's Departure 2: no source
        link is kept in the plan), and must still open the row's
@@ -9473,8 +9509,12 @@ def _sync_relink(env, m):
     tally = m.get("tally") if isinstance(m.get("tally"), dict) else {}
     held = tally.get("held_sessions")
     held = held if isinstance(held, dict) else {}
-    source_store, _unread = _lineage_store_rows(m.get("source_path"))
-    dest_store, _unread = _lineage_store_rows(m.get("dest_path"))
+    # Both stores are read again here, under the lock, and nothing of the
+    # plan's reads is reused: they may have changed since. Light rows, as in
+    # planning, and transcripts looked up afresh below.
+    source_store, _unread = _lineage_store_rows(m.get("source_path"),
+                                                light=True)
+    dest_store, _unread = _lineage_store_rows(m.get("dest_path"), light=True)
     now = {rid + ".json": d for rid, d in source_store}
     sources, changed = {}, {}
     for w in work:
@@ -9562,10 +9602,19 @@ def plan_sync(env, flags):
     The rows then come back in write order, parents and roots first; under
     --verbatim they keep selection's order and carry no `lineage`. No source
     link or chain is kept on a row or on the manifest: the pass reads the
-    source rows in memory only."""
+    source rows in memory only.
+
+    Each store is decoded once (docs/internals.md, "Reading each store
+    once"). Selection's read of the source is the pass's source index, its
+    transcript answers the pass's own, and the pass's one read of the
+    destination, as light rows, is also the census of the adds' duplicates
+    whenever it read every row that census would."""
     source, dest = resolve_sync_endpoints(env, flags.to or None,
                                           flags.live or None)
-    picked, tally = select_sync_rows(env, source, dest, flags)
+    found = {}            # conversation -> its transcript exists
+    decoded = {}          # source filename -> its light row, or None
+    picked, tally = select_sync_rows(env, source, dest, flags,
+                                     found=found, decoded=decoded)
     verbatim = bool(flags.verbatim)
     held = tally["held_sessions"]
     rows = []
@@ -9802,21 +9851,26 @@ def plan_sync(env, flags):
     # Steps 5 and 6: the lineage pass over the rows that survive, against the
     # destination as planned, then the refreshes it left byte-identical. Under
     # --verbatim links are copied as they are, so neither runs; the existing
-    # cycles are still counted, for the manifest's lineage_cycles.
-    dest_store, _unread = _lineage_store_rows(dest.path)
+    # cycles are still counted, for the manifest's lineage_cycles. The one
+    # read of the destination keeps light rows, and takes the census below.
+    census = {}
+    dest_store, _unread = _lineage_store_rows(dest.path, light=True,
+                                              census=census)
     if verbatim:
         lineage_cycles = _sync_lineage(rows, {}, [], dest_store, held, None,
                                        dest_account=dest.account_uuid,
                                        resolve=False)
     else:
-        found = {}
-
         def exists(sid):
-            # The same test selection makes of a row's own transcript.
+            # The same test selection makes of a row's own transcript, and
+            # its answer when it made it.
             if sid not in found:
                 found[sid] = bool(find_transcripts(env.projects_root, sid))
             return found[sid]
-        source_store, _unread = _lineage_store_rows(source.path)
+        # Selection's read of the source, through the same containment test
+        # a read of the store here would make: not read again.
+        source_store, _unread = _lineage_store_rows(source.path, light=True,
+                                                    decoded=decoded)
         lineage_cycles = _sync_lineage(
             rows, sources, source_store, dest_store, held, exists,
             source_account=source.account_uuid,
@@ -9856,10 +9910,14 @@ def plan_sync(env, flags):
     # ~78. This annotates, and the tally counts; nothing about what is
     # written or refused changes. Refresh rows are not assessed - a refresh
     # duplicates its own conversation by definition. One read of the
-    # destination, and only when there is an add to assess.
+    # destination, and only when there is an add to assess: the lineage
+    # pass's, when it read every row this census reads, and else its own.
     adds = [r for r in rows if not r.get("is_update")]
     if adds:
-        dest_sids, dest_keys = _destination_census(dest.path)
+        if census.get("whole") is True:
+            dest_sids, dest_keys = census["sids"], census["keys"]
+        else:
+            dest_sids, dest_keys = _destination_census(dest.path)
         for r in adds:
             sid = r.get("session_id") or ""
             k = title_key(r.get("title"))
@@ -17561,7 +17619,25 @@ def _lineage_target(store_path, row_id):
         return "unreadable", None
 
 
-def _lineage_store_rows(store_path):
+# The keys of a store row the lineage pass reads: the stem test and the
+# conversation (_lineage_index), the link and the chain (the resolver and the
+# existing-edge graph), and the pick's archive state and activity
+# (_lineage_pick). sync's pass holds its stores' rows as only these
+# (_lineage_light), so it never holds a whole store at once: a row runs to
+# 1 MB of connector config, and the pass needs a few hundred bytes of it.
+_LINEAGE_ROW_KEYS = ("sessionId", "cliSessionId", "spawnedFrom", "startChain",
+                     "isArchived", "lastActivityAt")
+
+
+def _lineage_light(data):
+    """A row's decoded object DATA as only the _LINEAGE_ROW_KEYS it has, each
+    with its own value (not a copy), so every `.get` the pass makes of the
+    row answers as it would of the whole row. A new dict; DATA is not
+    changed."""
+    return {k: data[k] for k in _LINEAGE_ROW_KEYS if k in data}
+
+
+def _lineage_store_rows(store_path, light=False, decoded=None, census=None):
     """([(row id, data)], unread) for every local_*.json directly in
     STORE_PATH, and the number of them it could not read. NEVER RAISES.
 
@@ -17572,17 +17648,36 @@ def _lineage_store_rows(store_path):
     is not a JSON object is counted, not returned. A store that is not there
     holds no rows; one that cannot be listed counts as one unread. Callers
     pass only stores of rows the op's resolution gate (_unresolved_rows)
-    resolved, so a row in an unresolved store is never read here."""
+    resolved, so a row in an unresolved store is never read here.
+
+    sync's planning reads each store once (docs/internals.md, "Reading each
+    store once"), through three keywords. LIGHT returns each row as
+    _lineage_light makes it. DECODED is what a caller already read from
+    STORE_PATH: {filename: data, or None for a row it could not read or that
+    is not an object}, for every local_*.json it listed. The store is then
+    neither listed nor read again; each name still goes through the
+    containment test, and its data is taken as it is. CENSUS, a dict, is
+    given what _destination_census would find in the same read: "sids" and
+    "keys", and "whole", True only when this read stands in for that one
+    exactly - the store was listed, every row is a direct child of it, and
+    each was read, or refused as read_json refuses (which the census skips
+    too)."""
     rows, unread = [], 0
+    sids, keys, whole = set(), set(), True
+    if isinstance(census, dict):
+        census.update(sids=sids, keys=keys, whole=False)
     try:
         if not isinstance(store_path, str) or not store_path:
             return [], 0
-        try:
-            names = sorted(os.listdir(store_path))
-        except FileNotFoundError:
-            return [], 0
-        except OSError:
-            return [], 1
+        if decoded is not None:
+            names = sorted(decoded)
+        else:
+            try:
+                names = sorted(os.listdir(store_path))
+            except FileNotFoundError:
+                return [], 0
+            except OSError:
+                return [], 1
         home = os.path.normcase(os.path.realpath(store_path))
         for name in names:
             if not (name.startswith("local_") and name.endswith(".json")):
@@ -17592,14 +17687,36 @@ def _lineage_store_rows(store_path):
                                         [store_path])
                 if os.path.normcase(os.path.dirname(real)) != home:
                     raise LayoutError("not a direct child of the store")
-                data = read_json(real)
             except Exception:
+                whole = False          # the census reads such a row by name
                 unread += 1
                 continue
+            if decoded is not None:
+                data = decoded[name]
+            else:
+                try:
+                    data = read_json(real)
+                except LayoutError:
+                    unread += 1        # the census skips this row too
+                    continue
+                except Exception:
+                    whole = False      # the census would not catch this
+                    unread += 1
+                    continue
             if not isinstance(data, dict):
                 unread += 1
                 continue
-            rows.append((name[:-len(".json")], data))
+            if isinstance(census, dict):
+                sid = data.get("cliSessionId")
+                if isinstance(sid, str) and sid:
+                    sids.add(sid)
+                k = title_key(data.get("title"))
+                if k:
+                    keys.add(k)
+            rows.append((name[:-len(".json")],
+                         _lineage_light(data) if light else data))
+        if isinstance(census, dict):
+            census["whole"] = whole and decoded is None
         return rows, unread
     except Exception:
         return rows, unread + 1
