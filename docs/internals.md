@@ -1198,6 +1198,57 @@ extra is the containment test of each destination row, step 3's comparison and t
 Most of both builds' time, about 21 s of 28 s under the profiler, is `find_transcripts`, once
 per candidate, which 0.17.0 spends too.
 
+**One index of the projects folder per plan (after R26).** `find_transcripts` lists
+`~/.claude/projects` and asks `os.path.isfile` of `<folder>/<id>.jsonl` in every project folder,
+and `sync` planning called it for every candidate row, with 836 folders on the machine
+measured. Planning now looks transcripts up in one index per plan, `_TranscriptIndex`, built at
+its first lookup from one listing of the projects folder and one of each folder in it.
+Selection, the lineage pass, and a swap's overlap and sizes all ask it, and the plan is the
+same, byte for byte.
+- The index only rules folders out. A lookup still asks `os.path.isfile` of the path
+  `find_transcripts` builds, from the id as asked, in each folder it keeps, in the same sorted
+  order. So the hits are the same strings, a filename in another case answers as the file
+  system answers it, and a `.jsonl` that is a directory is no hit.
+- A folder is ruled out for an id only when none of its names equals `<id>.jsonl`, ignoring
+  ASCII case, and only for an id made of ASCII letters, digits, `-` and `_`, as the UUIDs the
+  app writes as `cliSessionId` are. Any other id, including one that is not a string, goes to
+  `find_transcripts` itself, and answers or fails as it always has.
+- A folder the listing cannot vouch for is asked of every id, as `find_transcripts` asks it:
+  one whose listing fails, one whose own name is not ASCII or ends in `.` or a space, and one
+  holding a name that is not ASCII, which a file system may fold or normalise onto an ASCII
+  one. A folder that cannot be listed therefore keeps today's per-file answer, rather than a
+  guess in either direction.
+- A projects folder that does not exist indexes as empty, as `find_transcripts` reads it. One
+  that cannot be listed for another reason is not indexed: each lookup goes to
+  `find_transcripts`, which raises where it raised before. A plan that looks nothing up lists
+  nothing.
+- The listing is the plan's snapshot. A transcript removed since is no hit; one written since is
+  not seen by that plan. Apply time does not use the index: `_sync_relink` and the write loop
+  look transcripts up afresh, under the lock, as before. So do every other command and
+  recovery.
+
+Measured 2026-11-19 on the same machine and stores as the table above, with 836 project
+folders: dry runs from one account of about 1,000 rows into another, three each, interleaved,
+under one interpreter. The figure is the median time and the process's peak working set:
+
+| | `sync` | `sync --update` |
+|---|---|---|
+| reading each store once (R26) | 17.1 s, 237 MB | 28.3 s, 470 MB |
+| one index per plan | 2.6 s, 237 MB | 8.8 s, 470 MB |
+
+That is 85% off `sync`'s median and 69% off `--update`'s. The runs spread over 15.3 to 19.4 s
+and 2.5 to 3.3 s for `sync`, and 28.1 to 32.1 s and 8.2 to 9.3 s for `--update`; the peaks
+moved by under 2 MB. Every run of both builds printed the same report. Their `--json` plans are
+identical, with and without `--update` and `--verbatim`. A first pass of one plan per build
+differed in every mode, and a second pass of four, alternating the builds, put that down to the
+live store changing between runs: in three modes all four were identical, and under `--update`
+the R26 build's first plan differed from its own second plan in the same places as from the new
+build's, while the other three were identical.
+
+Under the profiler, `sync` now answers 687 lookups in 0.08 s, after 0.05 s building the index
+from 837 listings, and most of its 2.5 s is decoding the stores' rows. Most of `--update`'s
+8.6 s is decoding JSON, rows and the swapped transcripts alike, and `_other_pointers`.
+
 **This build's departures from the spec.**
 1. `sync` keeps a destination link that already names the same row and `taskId`, instead of
    rewriting it to the bare two keys. That stops a round trip stripping keys from the original
