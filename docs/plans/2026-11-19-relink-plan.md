@@ -200,13 +200,14 @@ Revisions). Round 3's fixes are applied and **not re-reviewed**, the review loop
 - **A name already taken.** 0.18.0's apply-time lineage pass is also called "relink":
   `_converge_recheck(..., relink=False)`, `_converge_relink` and `_sync_relink`. They are unrelated
   to this command; leave them as they are, and prefix every new name `relink`/`_relink_`.
-- **Rebase with `claude/transcript-index`.** Another session is building, from cf93614, a per-plan
-  transcript index for `sync` planning (`_TranscriptIndex`, measured against `find_transcripts`;
-  observed 2026-11-19 in its worktree's uncommitted tests). `relink` calls neither: it builds its
-  transcript set once per plan through `_relink_tids(env)` (`iter_transcripts`, as `plan_converge`
-  does), and changes no lineage function that branch is likely to touch. Whichever lands second
-  rebases; the expected conflicts are textual, in `README.md` and `docs/internals.md`. If that
-  branch lands first with a shared index, `_relink_tids` is the one place to switch to it.
+- **Bring `main` in first.** The per-plan transcript index for `sync` planning
+  (`_TranscriptIndex`, `_transcript_finder`) landed on `main` at 00cfc0f on 2026-11-19, after
+  this branch left cf93614. It changed `load_rows`, `select_sync_rows`, `_row_is_refresh`,
+  `_displaced_overlap`, `_displaced_sizes`, `_sync_relink` and `cmd_new_row`, and this plan
+  consumes none of them. Before Task 1, merge `main` into `claude/relink` and run the suite and
+  the check scripts on the result. `relink` builds its transcript set once per plan through
+  `_relink_tids(env)` (`iter_transcripts`, as `plan_converge` does); switching it to the new
+  index is not part of this plan.
 - **Commits:** the tests first, `test(relink): N tests, failing until ...`, then
   `feat(relink): ...` or `fix(<scope>): ...`, then `docs: ...`. No attribution trailers. No push.
   The version bump and the run sheet belong to the release (the maintainer's call).
