@@ -5258,6 +5258,67 @@ def test_sync_undo_reports_dangling_links_to_removed_rows(
 
 
 @pytest.mark.parametrize("leg", ["undo", "back"])
+def test_sync_resumed_reversal_reports_a_link_to_a_parent_an_earlier_run_removed(
+        two_account_env, tmp_path, monkeypatch, capsys, leg):
+    """A first sync added the parent's row and two others; a second added
+    the child, linking to the parent's row. Reversing the first is cut short
+    with no crash: one row cannot be removed, so _sync_reverse_all removes
+    the parent's row, attempts the rest and then refuses, and no report is
+    saved. The resumed reversal finds the parent's row already gone. That
+    earlier removal counts as this reversal's, so the report names the
+    second op's surviving child, as the first run would have."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LR, LG)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_s.json", LR, "Northwind notes")
+    _lrow(src, "local_t.json", LG, "Northwind board")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m1 = ct.plan_sync(env, ct.SyncFlags(only="Northwind"))
+    assert [r["name"] for r in m1["rows"]] == [
+        "local_p.json", "local_s.json", "local_t.json"]
+    if leg == "undo":
+        assert ct.run_sync(env, m1) == "completed"
+        op1 = ct.list_ops(env)[-1]
+    else:
+        op1 = _sync_crash(env, m1, nth=2)        # two rows landed, one not
+    written = [r["name"] for r in op1.manifest["rows"] if r.get("written")]
+    assert "local_p.json" in written and len(written) >= 2
+    stuck = [n for n in written if n != "local_p.json"][0]
+    m2 = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    assert _post(m2["rows"][0])["spawnedFrom"]["sessionId"] == "local_p"
+    assert ct.run_sync(env, m2) == "completed"
+    real = os.unlink
+
+    def locked(path, *a, **k):
+        if os.path.basename(str(path)) == stuck:
+            raise PermissionError(13, "locked", str(path))
+        return real(path, *a, **k)
+    monkeypatch.setattr(ct.os, "unlink", locked)
+    with pytest.raises(ct.Refusal):
+        if leg == "undo":
+            ct.undo_sync(env, op1)
+        else:
+            ct.recover_op(env, op1, "back")
+    monkeypatch.setattr(ct.os, "unlink", real)
+    assert not os.path.exists(os.path.join(dst, "local_p.json"))
+    assert os.path.exists(os.path.join(dst, stuck))
+    saved = _journal_of(env, op1)
+    assert saved["status"] == ("completed" if leg == "undo" else "writing")
+    assert "link_report" not in saved
+    if leg == "undo":
+        assert ct.cmd_undo(env, _undo_ns(op1)) == 0
+    else:
+        assert ct.cmd_recover(env, _recover_ns(op1, "back")) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert not os.path.exists(os.path.join(dst, stuck))
+    assert os.path.exists(os.path.join(dst, "local_c.json"))
+    assert _journal_of(env, op1)["link_report"] == dict(EMPTY_LINKS, dangling=[
+        {"row": "local_c", "target": "local_p", "kind": "parent"}])
+    assert "link left dangling: local_c (its parent's row was removed)" in out
+
+
+@pytest.mark.parametrize("leg", ["undo", "back"])
 def test_sync_resumed_reversal_after_the_childs_restore_reports_no_redirection(
         two_account_env, tmp_path, monkeypatch, leg):
     """The scenario above, with the first reversal cut short where the

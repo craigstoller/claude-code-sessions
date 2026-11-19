@@ -3568,7 +3568,14 @@ def recover_op(env, op, direction):
                 if state == "match":
                     deletable.append(r)
                 elif state == "absent":
-                    continue                  # never landed, or already gone
+                    # Never landed, or already gone. A written row that is
+                    # gone counts as removed for the link report: an
+                    # earlier back, cut short, may have removed it, and a
+                    # surviving row linking to it now dangles.
+                    if r.get("written"):
+                        removed.add((r["store_path"],
+                                     _lineage_stem(r["name"])))
+                    continue
                 elif r.get("written"):
                     why = ("it exists but could not be read"
                            if state == "unreadable"
@@ -3733,17 +3740,20 @@ def recover_op(env, op, direction):
                 # blocking pending row is still never considered, because
                 # its state is drifted/deleted/unreadable rather than the
                 # "match" that would prove this op wrote it.
-                left_alone, already = [], []
+                left_alone, already, gone = [], [], []
                 (drifted, unreadable, removable,
                  restorable, claimed) = _sync_delete_targets(
-                     env, m, unresolved=left_alone, pristine=already)
+                     env, m, unresolved=left_alone, pristine=already,
+                     gone=gone)
                 # Children before parents, adds and refreshes in one
                 # sequence (spec, "undo"), so an interrupted reversal never
                 # leaves a child naming a row already removed. A row an
                 # earlier back, cut short, already put back counts as
-                # restored here too.
+                # restored here too, and an added row it already removed as
+                # removed.
                 steps, removed, restored = _sync_reversal(m, removable,
-                                                          restorable, already)
+                                                          restorable, already,
+                                                          gone)
                 _sync_reverse_all(steps)
                 # Rows in a store this version does not read were never read;
                 # recorded where doctor looks, so this close is not silent.
@@ -10749,7 +10759,8 @@ def _sync_paths_claimed_elsewhere(env, m):
     return out
 
 
-def _sync_delete_targets(env, m, unresolved=None, tally=None, pristine=None):
+def _sync_delete_targets(env, m, unresolved=None, tally=None, pristine=None,
+                         gone=None):
     """Rows THIS sync op actually wrote, classified for safe deletion.
 
     The resolution gate comes first, per row: a written row in a store this
@@ -10760,7 +10771,12 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None, pristine=None):
     pre-image is deliberately not put back. PRISTINE, when given, collects
     the written refresh rows found already back at their pre-image - put
     back by an earlier reversal that was cut short - so the link report
-    counts them as restored, as the run that restored them would have.
+    counts them as restored, as the run that restored them would have. GONE,
+    when given, collects the written ADDED rows found already absent - an
+    earlier reversal, cut short (a failed step makes _sync_reverse_all raise
+    after attempting the rest, and no report is saved), may have removed
+    them - so the link report counts them as removed and names a surviving
+    row whose link now dangles, as the run that removed them would have.
     Shared by undo_sync and recover_op's 'back' path, which react
     differently to a non-empty drifted/unreadable result: undo_sync refuses
     the whole operation (a surprise during a user-initiated reversal of a
@@ -10909,6 +10925,8 @@ def _sync_delete_targets(env, m, unresolved=None, tally=None, pristine=None):
             if tally is not None:
                 key = "not_restored" if _row_is_refresh(r) else "already_gone"
                 tally[key] = tally.get(key, 0) + 1
+            if gone is not None and not _row_is_refresh(r):
+                gone.append(r)
             continue
         elif state == "match":
             # "match" means the row still holds exactly what this op wrote. For
@@ -10974,7 +10992,7 @@ def _sync_unlink_all(paths):
             ", ".join("{0} ({1})".format(p, exc) for p, exc in failures)))
 
 
-def _sync_reversal(m, removable, restorable, already=()):
+def _sync_reversal(m, removable, restorable, already=(), gone=()):
     """(steps, removed, restored) for one reversal of sync op M: the list
     _sync_reverse_all takes, and the (store path, row id) pairs it removes
     and restores, for the link report. ALREADY is the rows
@@ -10982,7 +11000,10 @@ def _sync_reversal(m, removable, restorable, already=()):
     PRISTINE list): an earlier run of this reversal, cut short, restored
     them, so their pairs join RESTORED with no step - otherwise a resumed
     reversal would report as redirected a restored child whose pre-image
-    names the row id the op journaled.
+    names the row id the op journaled. GONE is the added rows it found
+    already absent (its GONE list): their pairs join REMOVED with no step,
+    so a resumed reversal still names a surviving row whose link dangles
+    on a row the earlier run removed.
 
     REMOVABLE paths and RESTORABLE (path, pre-image) pairs are
     _sync_delete_targets' results, which take each path from its row. Each
@@ -11007,6 +11028,7 @@ def _sync_reversal(m, removable, restorable, already=()):
             if i >= 0:
                 pairs.add(_sync_row_pair(rows[i]))
     restored.update(_sync_row_pair(r) for r in already)
+    removed.update(_sync_row_pair(r) for r in gone)
     steps.sort(key=lambda s: s[0], reverse=True)
     return [s for _, s in steps], removed, restored
 
@@ -11086,10 +11108,11 @@ def undo_sync(env, op):
                 "from it. Nothing was changed.".format(m.get("op_id"), bad))
         disc = _journal_discovery(env, "undo")
         tally = {"already_gone": 0, "not_restored": 0}
-        already = []
+        already, gone = [], []
         (drifted, unreadable, removable,
          restorable, claimed) = _sync_delete_targets(env, m, tally=tally,
-                                                     pristine=already)
+                                                     pristine=already,
+                                                     gone=gone)
         if drifted or unreadable:
             raise Refusal("these synced rows {0}; the other account may have opened "
                           "them. Refusing to change any of them."
@@ -11111,9 +11134,9 @@ def undo_sync(env, op):
         # leave every refreshed row stranded in its overwritten state - in
         # reverse write order, children before parents (spec, "undo"). A
         # row an earlier undo, cut short, already put back counts as
-        # restored here too.
+        # restored here too, and an added row it already removed as removed.
         steps, removed, restored = _sync_reversal(m, removable, restorable,
-                                                  already)
+                                                  already, gone)
         _sync_reverse_all(steps)
         # What happened, not just that it ended: a bare "undone" read the
         # same whether every row was reversed or none was (decision 7 of the
@@ -18289,6 +18312,10 @@ def undo_converge(env, op):
             state = _sync_row_drift(r)
             if state == "absent":
                 already_gone += 1
+                # Removed for the link report too: an earlier undo of this
+                # op, cut short, may have removed it, and a surviving row
+                # linking to it now dangles as that run would have said.
+                removed.add((r["store_path"], _lineage_stem(r["name"])))
                 continue
             if state == "unreadable":
                 skips.append((r, "unreadable",

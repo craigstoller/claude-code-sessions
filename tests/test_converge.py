@@ -4408,6 +4408,65 @@ def test_back_after_a_skipped_drifted_child_reports_dangling(
                                 if "left something behind" in x][0]
 
 
+@pytest.mark.parametrize("leg", ["undo", "back"])
+def test_a_resumed_reversal_reports_a_link_to_a_parent_an_earlier_run_removed(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch, capsys,
+        leg):
+    """The reversal leaves C's A3 row in place (curated, for undo; drifted,
+    for back) and is cut short right after it removes P's A3 row beneath
+    it, before any report is made. The resumed reversal finds P's row
+    already gone. That earlier removal counts as this reversal's, so the
+    report names the surviving child's dangling link, as the first run
+    would have."""
+    env = _monotonic_now(mkenv(tmp_path))
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    if leg == "undo":
+        assert ct.run_converge(env, m) == "completed"
+        op = ct.list_ops(env)[-1]
+        touch = {"title": "Northwind renamed"}
+    else:
+        op = crash_on(env, m, point="converge-before-complete")
+        touch = {"lastFocusedAt": 1_900_000_000_000}
+    parent, child = rows_by(op.manifest, LP)[A3], rows_by(op.manifest, LC)[A3]
+    _app_touches(child["dest_path"], **touch)
+    real = ct.os.unlink
+
+    def cut_short(path, *a, **k):
+        real(path, *a, **k)
+        if os.path.basename(str(path)) == parent["name"]:
+            raise SimulatedCrash()     # cut short right after the parent
+    monkeypatch.setattr(ct.os, "unlink", cut_short)
+    with pytest.raises(SimulatedCrash):
+        if leg == "undo":
+            ct.undo_converge(env, op)
+        else:
+            ct.recover_op(env, op, "back")
+    monkeypatch.setattr(ct.os, "unlink", real)
+    op_id = op.manifest["op_id"]
+    assert not os.path.exists(parent["dest_path"])
+    assert os.path.exists(child["dest_path"])
+    saved = journal_of(env, op_id)
+    assert saved["status"] == ("completed" if leg == "undo" else "writing")
+    assert "link_report" not in saved
+    if leg == "undo":
+        assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True,
+                                        op_id=op_id)) == 0
+    else:
+        assert ct.cmd_recover(env, recover_ns(op_id, "back")) == 0
+    out = capsys.readouterr().out.splitlines()
+    saved = journal_of(env, op_id)
+    assert saved["status"] == ("undone" if leg == "undo" else "rolled_back")
+    assert os.path.exists(child["dest_path"])
+    assert not os.path.exists(rows_by(op.manifest, LC)[A2]["dest_path"])
+    assert saved["link_report"] == {
+        "dangling": [{"row": stem(child), "target": stem(parent),
+                      "kind": "parent"}],
+        "redirected": [], "unchecked": 0}
+    assert "link left dangling: {0} (its parent's row was removed)".format(
+        stem(child)) in out
+
+
 def test_link_report_counts_unreadable_targets_and_never_raises(
         tmp_path, monkeypatch):
     store = tmp_path / "acct" / "org"
