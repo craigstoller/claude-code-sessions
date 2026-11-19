@@ -888,6 +888,42 @@ def test_a_foreign_file_at_the_minted_path_is_never_taken_as_landed(
     assert os.path.exists(first["dest_path"])
 
 
+def test_a_landed_row_missed_by_the_marking_pass_is_still_not_judged_against_itself(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """If the landed row could not be read for a moment when recovery marked
+    rows, the recheck that follows must still not count the row's own file as
+    'a row for it appeared': the write loop then finds this op's bytes there
+    and records it."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    monkeypatch.setattr(ct, "_converge_mark_landed",
+                        lambda op_, m_, skip_ids=frozenset(): 0)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert first["written"] is True and "skipped" not in first
+    assert ct.undo_converge(env, op) == "undone"
+    assert not os.path.exists(first["dest_path"])
+
+
+def test_a_row_repointed_after_the_crash_is_kept_by_undo(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Marking a landed row that someone repointed since is safe: undo's own
+    rule keeps a repointed row, as after any converge."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    _app_touches(first["dest_path"], cliSessionId=S3)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert first["written"] is True
+    assert ct.undo_converge(env, op) == "undone"
+    assert os.path.exists(first["dest_path"])
+    reasons = {s["name"]: s["reason"]
+               for s in op.manifest["undo_report"]["skipped"]}
+    assert reasons[first["name"]] == "repointed"
+
+
 def test_completion_marker_failure_recovers_journal_only(
         mkenv, tmp_path, write_transcript, write_row):
     env = _monotonic_now(mkenv(tmp_path))

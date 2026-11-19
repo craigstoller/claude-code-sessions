@@ -763,6 +763,28 @@ def test_a_half_unresolved_back_reverses_the_rest_and_reports_the_one(
     assert [u["path"] for u in rep["unresolved_rows"]] == [dest]
 
 
+def test_back_never_reads_an_unflagged_row_in_a_store_this_version_does_not_read(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """Back marks landed rows before deciding, but never one in a store this
+    version does not read: that row is left unread, unflagged, and reported."""
+    env, op, rows, dest = _half_stranded(mkenv, tmp_path, write_transcript, write_row, 0)
+    stray = [r for r in op.manifest["rows"] if r["dest_path"] == dest][0]
+    stray["written"] = False
+    ct.set_status(op, "writing")
+    pending = ct.nonterminal_ops(env)[0]
+    read, real = [], ct._sync_row_drift
+
+    def spy(r):
+        read.append(r.get("dest_path"))
+        return real(r)
+    monkeypatch.setattr(ct, "_sync_row_drift", spy)
+    assert ct.recover_op(env, pending, "back") == "rolled_back"
+    srow = [r for r in pending.manifest["rows"] if r["dest_path"] == dest][0]
+    assert dest not in read
+    assert not srow.get("written")
+    assert UNREAD in pending.manifest["rollback_residue"]
+
+
 def test_a_discovery_error_refuses_undo_and_recover_and_changes_nothing(
         mkenv, tmp_path, write_transcript, write_row):
     env, la, claude, old, op = new_rowed(mkenv, tmp_path, write_transcript, write_row)
