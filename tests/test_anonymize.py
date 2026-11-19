@@ -394,6 +394,106 @@ def test_sync_anonymize_covers_addresses_titles_and_images(
         "<account-")
 
 
+def _linked_sync(env, src, dst):
+    """A sync whose child carries a link and a chain into the destination.
+    The source link holds its own title and a value under an unknown key,
+    its chain an extra key, and the row a connector config: sentinel values
+    that must never be emitted. The parent is titled literally 'lineage'.
+    With --update --newer-only one refresh is held, so the in-memory tally
+    holds held_sessions; and the destination's own link on another refresh
+    is dropped, so that row carries link_change."""
+    from test_sync import LTASK, _lrow, _transcript
+    p = "abcdef01-9abc-def0-1234-56789abcdef0"
+    c = "abcdef02-9abc-def0-1234-56789abcdef0"
+    h = "abcdef03-9abc-def0-1234-56789abcdef0"
+    d = "abcdef04-9abc-def0-1234-56789abcdef0"
+    for sid in (p, c, h, d):
+        _transcript(env, sid)
+    _lrow(src, "local_p.json", p, "lineage")
+    _lrow(src, "local_c.json", c, "ACME-REVIEW side task",
+          spawnedFrom={"sessionId": "local_p", "taskId": LTASK,
+                       "title": SENT_TITLE, "sideSession": True,
+                       "zzLinkExtra": SENT_VALUE},
+          startChain={"firstSessionId": "local_p", "depth": 1,
+                      "zzChainExtra": SENT_CHAIN},
+          remoteMcpServersConfig=[{"name": SENT_MCP}])
+    _lrow(src, "local_h.json", h, "Northwind held", lastActivityAt=1)
+    _lrow(dst, "local_h.json", h, "Northwind held", lastActivityAt=9)
+    _lrow(src, "local_d.json", d, "Northwind follow-up", lastActivityAt=2)
+    _lrow(dst, "local_d.json", d, "Northwind follow-up",
+          spawnedFrom={"sessionId": "local_h", "taskId": LTASK})
+    return {"p": p, "c": c, "h": h}
+
+
+SENT_TITLE = "ZZ-SENTINEL-LINK-TITLE"
+SENT_VALUE = "ZZ-SENTINEL-LINK-VALUE"
+SENT_CHAIN = "ZZ-SENTINEL-CHAIN-VALUE"
+SENT_MCP = "ZZ-SENTINEL-CONNECTOR"
+SENTINELS = (SENT_TITLE, SENT_VALUE, SENT_CHAIN, SENT_MCP)
+
+
+def test_sync_json_and_anonymize_emit_no_source_link_and_no_unregistered_key(
+        two_account_env, tmp_path, capsys):
+    """sync's dry run, as text and as --json, with and without --anonymize:
+    no source link value (its title, an unknown key's value, a chain extra
+    key's value) and no source connector state is emitted, not even inside
+    a post_b64; held_sessions never leaves the in-memory tally; every
+    emitted key is registered; and under --anonymize no title, address or
+    home path is emitted, while the structural 'lineage' key survives a
+    title that is literally 'lineage'."""
+    env, src, dst = two_account_env(tmp_path)
+    ids = _linked_sync(env, src, dst)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, newer_only=True))
+    assert m["tally"]["held_sessions"] == {ids["h"]: "held_older"}
+    child = next(r for r in m["rows"] if r["name"] == "local_c.json")
+    assert child["lineage"]["dropped_keys"] == [
+        "sideSession", "title", "zzLinkExtra", "startChain.zzChainExtra"]
+    assert any(r.get("link_change") == "dropped" for r in m["rows"])
+
+    def sy(**kw):
+        return ns(to="", only="", update=True, newer_only=True,
+                  allow_orphan=False, include_deleted=(), verbatim=False,
+                  live="", apply=False, **kw)
+
+    outputs = {}
+    assert ct.cmd_sync(env, sy()) == 0
+    outputs["text"] = capsys.readouterr().out
+    assert ct.cmd_sync(env, sy(json=True)) == 0
+    outputs["json"] = capsys.readouterr().out
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    assert ct.cmd_sync(env, sy()) == 0
+    outputs["anon text"] = capsys.readouterr().out
+    assert ct.cmd_sync(env, sy(json=True)) == 0
+    outputs["anon json"] = capsys.readouterr().out
+    for name, text in outputs.items():
+        # Not vacuous: each output carries the link's report.
+        assert "links   :" in text or '"lineage"' in text, name
+        assert not any(s in text for s in SENTINELS), name
+        assert "held_sessions" not in text, name
+    for name in ("json", "anon json"):
+        payload = json.loads(outputs[name])
+        assert walk_fixed_keys(payload) == [], name
+        assert "held_sessions" not in payload["tally"], name
+        assert payload["lineage_format"] == 1, name
+        assert all(isinstance(r["lineage"], dict) for r in payload["rows"])
+        for r in payload["rows"]:
+            if "post_b64" in r:
+                body = ct.unb64(r["post_b64"]).decode("utf-8")
+                assert not any(s in body for s in SENTINELS), (name, r["name"])
+    plain = json.loads(outputs["json"])
+    assert any("post_b64" in r for r in plain["rows"])          # checked above
+    for name in ("anon text", "anon json"):
+        text = outputs[name]
+        for private in ("ACME-REVIEW", "Northwind", "me@example.com",
+                        env.home):
+            assert private not in text, (name, private)
+    anon = json.loads(outputs["anon json"])
+    assert any(r["title"].startswith("<session-") for r in anon["rows"])
+    # The in-memory manifest still holds held_sessions after all of that.
+    assert m["tally"]["held_sessions"] == {ids["h"]: "held_older"}
+
+
 def test_undo_preview_anonymizes_manifest_titles_and_addresses(
         mkenv, tmp_path, capsys):
     """undo previews print op-manifest values through the line pass only, and
@@ -832,6 +932,22 @@ def test_every_emitted_report_key_is_in_the_structural_set(
                "title": "Parked", "lastActivityAt": 9})
     ms = ct.plan_sync(env4, ct.SyncFlags())
     bad = walk_fixed_keys(ct._public_manifest(env4, ms), bad=bad)
+    # A sync that carries links (lineage records, a dropped destination
+    # link), holds a refresh (held_sessions, never emitted), and a verbatim
+    # one that counts the links it copies.
+    env6, src6, dst6 = two_account_env(tmp_path / "sync-lineage")
+    _linked_sync(env6, src6, dst6)
+    msl = ct._public_manifest(env6, ct.plan_sync(
+        env6, ct.SyncFlags(update=True, newer_only=True)))
+    msv = ct._public_manifest(env6, ct.plan_sync(
+        env6, ct.SyncFlags(verbatim=True)))
+    # Sanity, so the walk cannot pass vacuously.
+    assert msl["lineage_format"] == 1 and "held_sessions" not in msl["tally"]
+    assert any(r["lineage"]["parent_row"] for r in msl["rows"])
+    assert any(r.get("link_change") for r in msl["rows"])
+    assert msv["tally"]["verbatim_links"]
+    bad = walk_fixed_keys(msl, bad=bad)
+    bad = walk_fixed_keys(msv, bad=bad)
     # A converge that carries links (lineage records, a carried chain, a
     # left-out link with its note) and an account already holding a cycle.
     from test_converge import (linked_holdings, lrow, side_link, LD, LX, LY,

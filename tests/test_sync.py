@@ -3638,3 +3638,571 @@ def test_a_row_without_a_usable_title_and_bad_bytes_still_offers_back(
         assert ct.cmd_recover(env, types.SimpleNamespace(
             op_id=None, verbose=True)) == 1
         ct.set_status(op, "rolled_back")
+
+
+# ------------------------------------------- Task 7: sync carries the link
+#
+# docs/specs/2026-11-17-carry-lineage-design.md, "sync": planning runs in the
+# spec's seven steps, and the lineage pass gives each row its source's link
+# and chain, translated into the destination. Rows here are written as this
+# tool writes them (compact JSON, sessionId the filename stem), so a row
+# that says the same thing has the same bytes.
+
+LTASK = "task_7f"
+LP, LC, LG, LQ, LR = ("sid-parent", "sid-child", "sid-grand", "sid-other",
+                      "sid-root")
+
+
+def _lrow(store, name, sid, title, **extra):
+    """A row as this tool writes one: compact JSON whose sessionId is the
+    filename stem. Keyword arguments add keys in order, or replace them."""
+    d = {"sessionId": name[:-len(".json")], "cliSessionId": sid,
+         "cwd": "C:\\p", "title": title, "lastActivityAt": 1}
+    d.update(extra)
+    with open(os.path.join(store, name), "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(d, separators=(",", ":")))
+    return d
+
+
+def _side(target, **extra):
+    """An app-written side-session link to the row TARGET."""
+    d = {"sessionId": target, "taskId": LTASK, "title": "Northwind kickoff",
+         "sideSession": True}
+    d.update(extra)
+    return d
+
+
+def _transcripts(env, *sids):
+    for sid in sids:
+        _transcript(env, sid)
+
+
+def _post(r):
+    return json.loads(ct.unb64(r["post_b64"]))
+
+
+def _by_name(m):
+    return {r["name"]: r for r in m["rows"]}
+
+
+def _codes(r):
+    return [n["code"] for n in r["lineage"]["notes"]]
+
+
+def _sync_main(env, monkeypatch, capsys, *argv):
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    rc = ct.main(["sync"] + list(argv))
+    return rc, capsys.readouterr().out.splitlines()
+
+
+def _sign_in(env, account, org, email="bob@example.com"):
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": account,
+                                    "organizationUuid": org,
+                                    "emailAddress": email}}, fh)
+
+
+def test_sync_add_translates_the_link(two_account_env, tmp_path):
+    """The destination holds the parent under another row file. The add
+    carries the link translated to that row, in place and as exactly
+    {sessionId, taskId}; the source link's other keys are recorded by name,
+    and its values are kept nowhere in the plan."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    child = _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+                  spawnedFrom=_side("local_p", title="ZZ-LINK-TITLE"),
+                  model="m")
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    assert m["lineage_format"] == 1 and m["lineage_cycles"] == 0
+    assert [r["name"] for r in m["rows"]] == ["local_c.json"]
+    r = m["rows"][0]
+    post = _post(r)
+    assert post["spawnedFrom"] == {"sessionId": "local_q", "taskId": LTASK}
+    # In place: the key keeps its position, and nothing else changes.
+    assert list(post) == list(child)
+    assert {k: v for k, v in post.items() if k != "spawnedFrom"} == \
+        {k: v for k, v in child.items() if k != "spawnedFrom"}
+    assert r["lineage"] == {
+        "parent_session": LP, "parent_row": "local_q",
+        "parent_planned": False, "root_session": "", "root_row": "",
+        "root_planned": False, "carried_keys": ["sessionId", "taskId"],
+        "dropped_keys": ["sideSession", "title"], "notes": []}
+    assert r["link_change"] is None and r["chain_change"] is None
+    assert "ZZ-LINK-TITLE" not in json.dumps(m)
+    assert "ZZ-LINK-TITLE" not in ct.unb64(r["post_b64"]).decode("utf-8")
+
+
+def test_sync_add_with_no_parent_in_b_carries_no_link_and_says_so(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """Nothing in the destination opens the parent, and --only leaves the
+    parent's own row out of the plan: the add carries neither its link nor
+    its chain, and the report says why on the row's own line and on the
+    links and chains lines. A cycle of links the destination already holds
+    is reported once."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ, LR)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_p", "depth": 1})
+    _lrow(dst, "local_x.json", LQ, "Loop one", spawnedFrom=_side("local_y"))
+    _lrow(dst, "local_y.json", LR, "Loop two", spawnedFrom=_side("local_x"))
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    r, = m["rows"]
+    post = _post(r)
+    assert "spawnedFrom" not in post and "startChain" not in post
+    assert r["lineage"]["parent_row"] == "" and r["lineage"]["root_row"] == ""
+    assert _codes(r) == ["parent_not_in_account", "lineage_chain_dropped"]
+    assert m["lineage_cycles"] == 1
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--only", "ACME")
+    assert rc == 0
+    assert ("   ACME-REVIEW side task   [link: no row for the parent in that "
+            "account]") in lines
+    assert ("links   : 1 left out (no row for the parent in that "
+            "account 1)") in lines
+    assert "chains  : 1 left out" in lines
+    assert "cycles  : 1 already present, left as they are" in lines
+
+
+def test_sync_parent_removed_by_held_orphan_gives_no_link(two_account_env,
+                                                          tmp_path):
+    """The parent's refresh would hide the conversation the destination's
+    row opens now, so held_orphan holds it. That row counts as it stands,
+    opening the other conversation, so the child added beside it carries no
+    link, and the note names the hold rather than a missing row."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_p.json", LQ, "Northwind old thread")
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert m["tally"]["held_orphan"] == ["Northwind kickoff"]
+    assert m["tally"]["held_sessions"] == {LP: "held_orphan"}
+    r, = m["rows"]
+    assert r["name"] == "local_c.json"
+    assert "spawnedFrom" not in _post(r)
+    assert _codes(r) == ["parent_pair_held"]
+    assert "held_orphan" in r["lineage"]["notes"][0]["detail"]
+
+
+def test_sync_parent_synced_in_the_same_run_same_filename(two_account_env,
+                                                         tmp_path):
+    """The destination already opens the parent under another row file, and
+    this sync adds the source's own parent row too. The link names the row
+    with the source parent's filename, planned in this run, and the rows
+    come back parents first although selection lists the newer child
+    first."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff", lastActivityAt=9)
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json"]
+    c = _by_name(m)["local_c.json"]
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_p",
+                                       "taskId": LTASK}
+    assert c["lineage"]["parent_row"] == "local_p"
+    assert c["lineage"]["parent_planned"] is True
+    assert ct._sync_shape_error(m) is None
+
+
+def test_sync_parent_refreshed_into_another_conversation_is_not_chosen(
+        two_account_env, tmp_path):
+    """The destination's only row for the parent is the one this sync
+    refreshes into another conversation, so in the store as planned nothing
+    opens the parent: no link. Without --update that same row is the
+    parent's, and the link names it."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ)
+    _lrow(src, "local_p.json", LP, "ACME-REVIEW kickoff")
+    _lrow(src, "local_c.json", LC, "Northwind side task",
+          spawnedFrom=_side("local_p"))
+    _lrow(src, "local_x.json", LQ, "Northwind other thread")
+    _lrow(dst, "local_x.json", LP, "Northwind other thread")
+    m = ct.plan_sync(env, ct.SyncFlags(only="Northwind"))
+    assert _post(_by_name(m)["local_c.json"])["spawnedFrom"] == {
+        "sessionId": "local_x", "taskId": LTASK}
+    m = ct.plan_sync(env, ct.SyncFlags(only="Northwind", update=True))
+    by = _by_name(m)
+    assert by["local_x.json"]["swaps_conversation"] is True
+    c = by["local_c.json"]
+    assert "spawnedFrom" not in _post(c)
+    assert _codes(c) == ["parent_not_in_account"]
+
+
+def test_sync_newer_only_hold_on_the_parent_resolves_against_the_held_row(
+        two_account_env, tmp_path):
+    """--newer-only holds the parent's refresh (the destination's copy is
+    newer). The held row counts as it stands, so the child's link names it,
+    as an existing row; the hold is recorded by the conversation its source
+    opens, and the held row keeps its regressing entry."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff v2", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff", lastActivityAt=9)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, newer_only=True))
+    t = m["tally"]
+    assert t["held_older"] == ["Northwind kickoff v2"]
+    assert t["regressing"] == ["Northwind kickoff v2"]
+    assert t["held_sessions"] == {LP: "held_older"}
+    c, = m["rows"]
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_p",
+                                       "taskId": LTASK}
+    assert c["lineage"]["parent_planned"] is False
+
+
+def test_sync_link_only_refresh_is_written_not_discarded(two_account_env,
+                                                        tmp_path):
+    """The destination's child row equals the source's apart from the link,
+    which it lacks. Translated, the link is the refresh's one change, and
+    the refresh is written. The parent's rows are byte-identical, so that
+    refresh is unchanged."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"), model="m")
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task", model="m")
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert m["tally"]["unchanged"] == ["Northwind kickoff"]
+    c, = m["rows"]
+    assert c["name"] == "local_c.json" and c["is_update"] is True
+    post = _post(c)
+    assert post["spawnedFrom"] == {"sessionId": "local_p", "taskId": LTASK}
+    assert {k: v for k, v in post.items() if k != "spawnedFrom"} == \
+        json.loads(ct.unb64(c["pre_b64"]))
+    assert c["dest_dropped"] == [] and c["link_change"] is None
+
+
+def test_sync_link_only_refresh_still_vouches_in_held_orphan(
+        two_account_env, tmp_path, monkeypatch):
+    """A refresh that keeps its row's conversation and changes only the
+    link leaves that row opening what it opens now, so held_orphan does not
+    count it among the rows about to stop vouching (the doomed set). A
+    refresh that changes anything else still is. The source's own row
+    vouches for the same conversation as well, so the doomed set is what
+    this pins; the swap is not held either way."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LQ, LR)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task")
+    _lrow(src, "local_t.json", LR, "Northwind notes v2", lastActivityAt=2)
+    _lrow(dst, "local_t.json", LR, "Northwind notes")
+    _lrow(src, "local_x.json", LQ, "Northwind other thread")
+    _lrow(dst, "local_x.json", LC, "Northwind other thread")
+    seen = []
+    real = ct._other_pointers
+
+    def spy(env_, dest_path, doomed_rows=()):
+        seen.append(set(doomed_rows))
+        return real(env_, dest_path, doomed_rows)
+    monkeypatch.setattr(ct, "_other_pointers", spy)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert seen == [{"local_t.json", "local_x.json"}]
+    by = _by_name(m)
+    assert by["local_x.json"]["displaced_orphan"] is False
+    assert m["tally"]["held_orphan"] == []
+    assert "spawnedFrom" in _post(by["local_c.json"])
+
+
+def test_sync_dropped_unchanged_parent_turns_the_childs_link_to_existing(
+        two_account_env, tmp_path):
+    """The parent is itself a side session, and the destination's parent row
+    already carries the link this tool would write. Once translated, the
+    parent's refresh changes nothing and is dropped as unchanged. The child,
+    added beside it, named it as planned; it now names it as existing, and
+    the journal passes the shape check."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LG, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_g.json", LG, "Northwind board")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff",
+          spawnedFrom=_side("local_g"))
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff",
+          spawnedFrom={"sessionId": "local_g", "taskId": LTASK})
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert sorted(m["tally"]["unchanged"]) == ["Northwind board",
+                                               "Northwind kickoff"]
+    c, = m["rows"]
+    assert c["name"] == "local_c.json"
+    assert _post(c)["spawnedFrom"] == {"sessionId": "local_p",
+                                       "taskId": LTASK}
+    assert c["lineage"]["parent_row"] == "local_p"
+    assert c["lineage"]["parent_planned"] is False
+    assert ct._sync_shape_error(m) is None
+    op = ct.new_op(env, m)
+    assert sorted(ct.classify_op(env, op)["resolutions"]) == ["back",
+                                                              "forward"]
+
+
+def test_sync_refresh_that_drops_the_destinations_own_link_reports_it_once(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """The source's row has no link and the destination's has one, beside a
+    field of its own. The refresh replaces the whole row, so the
+    destination's link goes: link_change says so, and spawnedFrom is not
+    listed again among the fields the row loses. A destination link that
+    the source's translates to another row is retargeted."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LR)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+        _lrow(store, "local_q.json", LP, "Northwind kickoff copy")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=2)
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom={"sessionId": "local_p", "taskId": LTASK},
+          zzDestOnly=1)
+    _lrow(src, "local_d.json", LR, "ACME-REVIEW second task",
+          lastActivityAt=2, spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_d.json", LR, "ACME-REVIEW second task",
+          spawnedFrom={"sessionId": "local_q", "taskId": LTASK})
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    by = _by_name(m)
+    c, d = by["local_c.json"], by["local_d.json"]
+    assert c["link_change"] == "dropped" and c["chain_change"] is None
+    assert c["dest_dropped"] == ["zzDestOnly"]
+    assert d["link_change"] == "retargeted" and d["chain_change"] is None
+    assert _post(d)["spawnedFrom"] == {"sessionId": "local_p",
+                                       "taskId": LTASK}
+    assert d["dest_dropped"] == []
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update")
+    assert rc == 0
+    assert lines.count("link    : local_c loses its link") == 1
+    assert "link    : local_d now links to another row" in lines
+    assert [ln for ln in lines if "fields the destination's row loses" in ln] \
+        == ["   fields the destination's row loses: zzDestOnly"]
+    assert not any("spawnedFrom" in ln for ln in lines)
+
+
+@pytest.mark.parametrize("verbatim", [False, True])
+def test_sync_refresh_that_drops_or_moves_the_destinations_chain_reports_it(
+        two_account_env, tmp_path, monkeypatch, capsys, verbatim):
+    """The destination's chain is lost (the source's row has none) or moved
+    (the source's names another root and depth): chain_change says which,
+    with or without --verbatim, and the report prints one line for each.
+    The link names the same row throughout, so no link line."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LR, LQ)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+        _lrow(store, "local_r.json", LR, "Northwind board")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=2,
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom={"sessionId": "local_p", "taskId": LTASK},
+          startChain={"firstSessionId": "local_p", "depth": 1})
+    _lrow(src, "local_d.json", LQ, "ACME-REVIEW second task",
+          lastActivityAt=2, spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_r", "depth": 2})
+    _lrow(dst, "local_d.json", LQ, "ACME-REVIEW second task",
+          spawnedFrom={"sessionId": "local_p", "taskId": LTASK},
+          startChain={"firstSessionId": "local_p", "depth": 1})
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, verbatim=verbatim))
+    by = _by_name(m)
+    assert sorted(by) == ["local_c.json", "local_d.json"]
+    assert by["local_c.json"]["chain_change"] == "dropped"
+    assert by["local_d.json"]["chain_change"] == "retargeted"
+    for r in m["rows"]:
+        assert r["link_change"] is None
+        assert "startChain" not in (r["dest_dropped"] or [])
+    argv = ["--update"] + (["--verbatim"] if verbatim else [])
+    rc, lines = _sync_main(env, monkeypatch, capsys, *argv)
+    assert rc == 0
+    assert "chain   : local_c loses its chain" in lines
+    assert "chain   : local_d now has another chain root" in lines
+    assert not any(ln.startswith("link    :") for ln in lines)
+
+
+def test_sync_round_trip_keeps_the_destinations_link_and_bytes(
+        two_account_env, tmp_path):
+    """A -> B carries the link as {sessionId, taskId}. B -> A with --update
+    then finds A's own app-written link naming the same row with the same
+    taskId and keeps it as it is (Departure 1), so A's rows are left
+    byte-identical: the plan has nothing to write."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"),
+          startChain={"firstSessionId": "local_p", "depth": 1})
+    names = ("local_p.json", "local_c.json")
+    before = {}
+    for n in names:
+        with open(os.path.join(src, n), "rb") as fh:
+            before[n] = fh.read()
+    assert ct.run_sync(env, ct.plan_sync(env, ct.SyncFlags())) == "completed"
+    with open(os.path.join(dst, "local_c.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["spawnedFrom"] == {"sessionId": "local_p",
+                                                "taskId": LTASK}
+    _sign_in(env, DORMANT, DORMANT_ORG)          # now B is signed in
+    back = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert os.path.normcase(back["dest_path"]) == os.path.normcase(src)
+    assert back["rows"] == []
+    assert sorted(back["tally"]["unchanged"]) == ["ACME-REVIEW side task",
+                                                  "Northwind kickoff"]
+    for n in names:
+        with open(os.path.join(src, n), "rb") as fh:
+            assert fh.read() == before[n], n
+
+
+def test_sync_verbatim_copies_links_and_counts_them(two_account_env, tmp_path,
+                                                    monkeypatch, capsys):
+    """--verbatim copies the link and chain as they are, carries no lineage,
+    keeps selection's order, and counts the adds that copy a link for the
+    `copied verbatim` line."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    link = _side("local_p")
+    chain = {"firstSessionId": "local_p", "depth": 1}
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=link, startChain=chain)
+    m = ct.plan_sync(env, ct.SyncFlags(verbatim=True))
+    assert m["lineage_format"] == 1 and m["lineage_cycles"] == 0
+    assert [r["name"] for r in m["rows"]] == ["local_c.json", "local_p.json"]
+    assert all("lineage" not in r for r in m["rows"])
+    post = _post(m["rows"][0])
+    assert post["spawnedFrom"] == link and post["startChain"] == chain
+    assert m["tally"]["verbatim_links"] == ["ACME-REVIEW side task"]
+    assert ct._sync_shape_error(m) is None
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--verbatim")
+    assert rc == 0
+    assert "links   : 1 copied verbatim (not translated)" in lines
+    assert [ln for ln in lines if ln.startswith(("links   :", "chains  :"))] \
+        == ["links   : 1 copied verbatim (not translated)"]
+
+
+def test_sync_verbatim_update_replacing_a_link_is_reported_by_the_link_line(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """--verbatim --update copies the source's link over the destination's
+    own, which named another row: the link line reports it. It is a
+    refresh, not an add, so the copied-verbatim count does not take it."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=2,
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom={"sessionId": "local_q", "taskId": LTASK})
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, verbatim=True))
+    c, = m["rows"]
+    assert c["link_change"] == "retargeted"
+    assert _post(c)["spawnedFrom"] == _side("local_p")
+    assert m["tally"]["verbatim_links"] == []
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update", "--verbatim")
+    assert rc == 0
+    assert "link    : local_c now links to another row" in lines
+    assert not any(ln.startswith("links   :") for ln in lines)
+
+
+def test_sync_verbatim_help_text():
+    import argparse
+    p = ct.build_parser()
+    sub = next(a for a in p._actions
+               if isinstance(a, argparse._SubParsersAction))
+    act = next(a for a in sub.choices["sync"]._actions
+               if "--verbatim" in a.option_strings)
+    assert act.help == (
+        "copy rows unchanged instead of stripping connector config. Links to "
+        "a parent or chain root (spawnedFrom, startChain) are copied as is, "
+        "not translated, so they may name a row that does not exist in the "
+        "destination.")
+
+
+def test_sync_without_links_plans_the_same_post_b64_as_before(
+        two_account_env, tmp_path):
+    """A store with no link anywhere plans what it did before the lineage
+    pass: each row's post_b64 is the source row transformed, the rows keep
+    selection's order (newest first), and the tally is today's. A refresh of
+    a row the app serialised with spaces is still a refresh. Then: every
+    row's lineage is the empty record."""
+    env, src, dst = two_account_env(tmp_path)
+    for s in ("sid-a", "sid-b", "sid-c", "sid-d", "sid-e"):
+        _transcript(env, s)
+    data = {
+        "local_a.json": _row(src, "local_a.json", "sid-a", "Alpha", {
+            "lastActivityAt": 5,
+            "remoteMcpServersConfig": [{"name": "Northwind"}]}),
+        "local_b.json": _row(src, "local_b.json", "sid-b", "Bravo",
+                             {"lastActivityAt": 3}),
+        "local_c.json": _lrow(src, "local_c.json", "sid-c", "Charlie",
+                              lastActivityAt=4),
+        "local_d.json": _row(src, "local_d.json", "sid-d", "Delta",
+                             {"lastActivityAt": 2}),
+        "local_e.json": _row(src, "local_e.json", "sid-e", "Echo",
+                             {"lastActivityAt": 1}),
+    }
+    _row(dst, "local_b.json", "sid-b", "Bravo", {"lastActivityAt": 3})
+    _lrow(dst, "local_c.json", "sid-c", "Charlie", lastActivityAt=4)
+    _row(dst, "local_e.json", "sid-e", "Echo", {"lastActivityAt": 9})
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    assert [r["name"] for r in m["rows"]] == [
+        "local_a.json", "local_b.json", "local_d.json", "local_e.json"]
+    for r in m["rows"]:
+        assert r["post_b64"] == ct.b64(ct.transform_row(data[r["name"]])[0])
+    t = m["tally"]
+    assert t["unchanged"] == ["Charlie"] and t["regressing"] == ["Echo"]
+    assert t["activity_unknown"] == [] and t["swapping"] == []
+    assert [r["is_update"] for r in m["rows"]] == [False, True, False, True]
+    for r in m["rows"]:
+        assert r["lineage"] == ct._lineage_empty()
+        assert r["link_change"] is None and r["chain_change"] is None
+    assert m["lineage_format"] == 1 and m["lineage_cycles"] == 0
+
+
+def test_sync_newer_only_byte_identical_row_is_unchanged_not_held(
+        two_account_env, tmp_path):
+    """Exact identity stays ahead of the age holds (Departure 6): a row whose
+    bytes already match is unchanged, never held_same, and one with no
+    readable activity on either side is never held_unknown."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, "sid-a", "sid-b")
+    for store in (src, dst):
+        _lrow(store, "local_a.json", "sid-a", "Alpha", lastActivityAt=4)
+        _lrow(store, "local_b.json", "sid-b", "Bravo", lastActivityAt=None)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, newer_only=True))
+    t = m["tally"]
+    assert m["rows"] == []
+    assert sorted(t["unchanged"]) == ["Alpha", "Bravo"]
+    assert t["held_same"] == [] and t["held_unknown"] == []
+    assert t["activity_unknown"] == []
+    assert t["held_sessions"] == {}
+
+
+def test_sync_row_dropped_as_unchanged_is_not_counted_as_activity_unknown(
+        two_account_env, tmp_path):
+    """Neither side of the parent's refresh has a readable lastActivityAt.
+    Once its link is translated the refresh changes nothing and is dropped
+    as unchanged, so it is not counted among the refreshes whose direction
+    is unknown. A refresh that survives with unknown activity still is."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LG, LP, "sid-u")
+    for store in (src, dst):
+        _lrow(store, "local_g.json", LG, "Northwind board")
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=None,
+          spawnedFrom=_side("local_g"))
+    _lrow(dst, "local_p.json", LP, "Northwind kickoff", lastActivityAt=None,
+          spawnedFrom={"sessionId": "local_g", "taskId": LTASK})
+    _lrow(src, "local_u.json", "sid-u", "Northwind notes v2",
+          lastActivityAt=None)
+    _lrow(dst, "local_u.json", "sid-u", "Northwind notes",
+          lastActivityAt=None)
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    t = m["tally"]
+    assert [r["name"] for r in m["rows"]] == ["local_u.json"]
+    assert sorted(t["unchanged"]) == ["Northwind board", "Northwind kickoff"]
+    assert t["activity_unknown"] == ["Northwind notes v2"]
