@@ -311,6 +311,56 @@ check("  and Undo is left as it was",
       and bool(app.undo_btn.winfo_manager()),
       str(app.undo_btn.cget("text")))
 app.live_choice = ""
+
+# ------------- carry-lineage, final review: the window's Undo shows the link
+# report. A sync adds a parent's row; a row then appears in the destination
+# linking to it (another op, or the app). Undo, through the real press path,
+# removes the parent's row, and the window names the surviving row's
+# dangling link with the CLI's own line (ccs._link_report_lines), in the
+# sync tab's text and in the Level tab's note.
+with open(os.path.join(projects, ("%032d" % 9) + ".jsonl"), "w") as fh:
+    fh.write('{"type":"user"}\n')
+put(live_dir, "local_p9.json", {
+    "sessionId": "local_p9", "cliSessionId": "%032d" % 9, "cwd": projects,
+    "title": "Northwind board", "lastActivityAt": 1})
+bm = ccs.plan_sync(env, ccs.SyncFlags(only="Northwind board"))
+check("a sync that adds the parent's row is planned",
+      [r["name"] for r in bm["rows"]] == ["local_p9.json"],
+      str([r["name"] for r in bm["rows"]]))
+check("  and applies", ccs.run_sync(env, bm) == "completed")
+put(dorm_dir, "local_c9.json", {
+    "sessionId": "local_c9", "cliSessionId": "%032d" % 10, "cwd": projects,
+    "title": "ACME-REVIEW follow-up", "lastActivityAt": 1,
+    "spawnedFrom": {"sessionId": "local_p9", "taskId": "task_7f"}})
+
+
+class _Yes(object):
+    def askokcancel(self, *_a, **_k):
+        return True
+
+    def showwarning(self, *_a, **_k):
+        pass
+
+    def showerror(self, *_a, **_k):
+        pass
+
+
+gp.messagebox = _Yes()
+app._update_undo_button()
+check("Undo is offered for that sync",
+      app.undo_target is not None and app.undo_target["type"] == "sync"
+      and app.undo_target["op_id"] == bm["op_id"], str(app.undo_target))
+app.on_undo()
+settle()
+dangling = "link left dangling: local_c9 (its parent's row was removed)"
+shown = app.text.get("1.0", "end")
+check("  the undo removes the parent's row and keeps the linking row",
+      not os.path.exists(os.path.join(dorm_dir, "local_p9.json"))
+      and os.path.exists(os.path.join(dorm_dir, "local_c9.json")))
+check("  the sync tab's text names the dangling link, as the CLI prints it",
+      shown.strip().splitlines() == [dangling], repr(shown))
+check("  and the Level tab's note carries the same line",
+      dangling in app.level_detail.get(), app.level_detail.get())
 tkroot.destroy()
 
 shutil.rmtree(root, ignore_errors=True)

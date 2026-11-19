@@ -1023,3 +1023,50 @@ def test_sync_pane_says_when_a_refresh_drops_or_moves_the_destinations_link(
     # The same lines, from the same helper, as the CLI report prints.
     assert ts.ct._sync_change_lines(m["rows"]) == [
         ln for ln in block if ln.startswith(("link    :", "chain   :"))]
+
+
+def test_undo_outcome_shows_the_link_report_for_converge_and_sync(
+        monkeypatch):
+    """The window's Undo names the links an undo left dangling or
+    redirected, and what it could not check, with the CLI undo's own lines
+    (ccs._link_report_lines), for a converge and a sync undo alike: they
+    fill the sync tab's text and end the Level tab's note. No report, or
+    one with nothing to say, adds nothing, and a retitle has none."""
+    rep = {"dangling": [{"row": "local_c", "target": "local_p",
+                         "kind": "parent"}],
+           "redirected": [{"row": "local_d", "target": "local_r",
+                           "kind": "root"}],
+           "unchecked": 1}
+    want = gui.ccs._link_report_lines(rep)
+    assert want == [
+        "link left dangling: local_c (its parent's row was removed)",
+        "link redirected: local_d (its chain root's row now opens another "
+        "conversation)",
+        "links not checked: 1 could not be read"]
+    tallies = {"sync": {"removed": 1, "restored": 0, "already_gone": 0,
+                        "not_restored": 0},
+               "converge": {"deleted": 2, "already_gone": 0, "skipped": []}}
+    for kind, tally in tallies.items():
+        status, note, lines = gui._undo_outcome(kind, tally, rep)
+        bare = gui._undo_outcome(kind, tally, None)
+        assert bare[2] == [] and status == bare[0], kind
+        assert lines == want, kind
+        assert note == "  ".join([bare[1]] + want), kind
+        for empty in ({"dangling": [], "redirected": [], "unchecked": 0},
+                      "junk", 5):
+            assert gui._undo_outcome(kind, tally, empty) == bare, kind
+    assert gui._undo_outcome("sync", tallies["sync"])[:2] == \
+        gui._sync_undo_lines(tallies["sync"])
+    assert gui._undo_outcome("converge", tallies["converge"])[1] == \
+        "Undone - removed 2 row(s); 0 already gone."
+    failed = gui._undo_outcome("converge", tallies["converge"], {
+        "error": "an unexpected OSError while reading the stores"})
+    assert failed[2] == ["links not checked: the link report failed (an "
+                         "unexpected OSError while reading the stores)"]
+    assert gui._undo_outcome("retitle", None, None) == (
+        "Undone", "Undone - the previous titles are back.", [])
+    # The window reuses the CLI's renderer rather than a copy of it.
+    monkeypatch.setattr(gui.ccs, "_link_report_lines",
+                        lambda r: ["from the one renderer"])
+    assert gui._undo_outcome("sync", tallies["sync"], rep)[2] == [
+        "from the one renderer"]

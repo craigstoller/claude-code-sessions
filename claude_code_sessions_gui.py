@@ -971,6 +971,41 @@ def _sync_undo_lines(report):
             "Undone - nothing was left to reverse" + tail + ".")
 
 
+def _undo_outcome(kind, report, link_report=None):
+    """(status, note, lines) for a finished undo of KIND ("sync", "retitle"
+    or "converge"): the sync tab's status line, the note the Level tab's
+    next render carries, and the lines the sync tab's text shows.
+
+    REPORT is the op's `undo_report`. LINK_REPORT is its `link_report`, the
+    links the undo left dangling or redirected and what it could not check:
+    its lines are the CLI undo's own (ccs._link_report_lines, the one
+    renderer), shown in the text and ending the note, so the window names
+    such a link for converge and sync alike, as the terminal does. An op
+    with no report, or one with nothing to say, adds nothing."""
+    try:
+        lines = list(ccs._link_report_lines(link_report))
+    except Exception:
+        lines = []
+    if kind == "sync":
+        status, note = _sync_undo_lines(report)
+    elif kind == "retitle":
+        status, note = "Undone", "Undone - the previous titles are back."
+    else:
+        # Converge's undo is FORGIVING - it deletes what is still
+        # redundant and skips what became load-bearing - so a bare
+        # "undone" would hide exactly the rows it deliberately left.
+        rep = report or {}
+        status = "Undone"
+        note = "Undone - removed {0} row(s); {1} already gone{2}.".format(
+            rep.get("deleted", 0), rep.get("already_gone", 0),
+            "; {0} kept (see the CLI's undo report)".format(
+                len(rep.get("skipped") or []))
+            if rep.get("skipped") else "")
+    if lines:
+        note = "  ".join([note] + lines)
+    return status, note, lines
+
+
 def _changes_noun(n):
     return "{0} unapplied naming change{1}".format(n, "" if n == 1 else "s")
 
@@ -3829,7 +3864,11 @@ class SyncApp:
                     "converge": ccs.undo_converge}[kind]
             result = undo(env, ops[0])
             report = ops[0].manifest.get("undo_report")
-            self.root.after(0, self._undo_done, kind, result, report, None, env)
+            # The link report the undo saved beside its tally (converge and
+            # sync alike): links it left dangling or redirected.
+            links = ops[0].manifest.get("link_report")
+            self.root.after(0, self._undo_done, kind, result, report, None, env,
+                            links)
         except (ccs.Refusal, ccs.LayoutError) as exc:
             self.root.after(0, self._undo_done, kind, None, None,
                             ("refusal", str(exc)), env)
@@ -3837,7 +3876,7 @@ class SyncApp:
             self.root.after(0, self._undo_done, kind, None, None,
                             ("error", traceback.format_exc()), env)
 
-    def _undo_done(self, kind, result, report, problem, env=None):
+    def _undo_done(self, kind, result, report, problem, env=None, links=None):
         if self._mutation_over():
             return                       # the window was closing; it may now
         self.busy(False)                 # the recompute re-arms Undo itself
@@ -3862,33 +3901,22 @@ class SyncApp:
             self._render_sync_banner()
             self.refresh_level()
             return
+        # The sync tab said "Undoing..." at press time; every kind has to
+        # land that line somewhere, or a finished undo reads as in-flight
+        # forever on the one tab that was not watching. The link report's
+        # lines (_undo_outcome) end the Level tab's note and fill the sync
+        # tab's text.
+        status, note, lines = _undo_outcome(kind, report, links)
+        self.status.set(status)
         if kind == "sync":
-            status, note = _sync_undo_lines(report)
-            self.status.set(status)
             self.detail.set("Press Refresh to see the other account's sidebar as "
                             "it is now, and to plan again.")
-            self.show([])
-        elif kind == "retitle":
-            # The sync tab said "Undoing..." at press time; every kind has
-            # to land that line somewhere, or a finished undo reads as
-            # in-flight forever on the one tab that was not watching.
-            self.status.set("Undone")
-            self.detail.set("The store changed underneath this tab's plan - "
-                            "press Refresh to replan.")
-            note = "Undone - the previous titles are back."
+            self.show(lines)
         else:
-            self.status.set("Undone")
             self.detail.set("The store changed underneath this tab's plan - "
                             "press Refresh to replan.")
-            # Converge's undo is FORGIVING - it deletes what is still
-            # redundant and skips what became load-bearing - so a bare
-            # "undone" would hide exactly the rows it deliberately left.
-            rep = report or {}
-            note = "Undone - removed {0} row(s); {1} already gone{2}.".format(
-                rep.get("deleted", 0), rep.get("already_gone", 0),
-                "; {0} kept (see the CLI's undo report)".format(
-                    len(rep.get("skipped") or []))
-                if rep.get("skipped") else "")
+            if lines:
+                self.show(lines)
         self._update_undo_button()
         self._render_sync_banner()
         # Undo after any step triggers the same fresh replan/re-render as
