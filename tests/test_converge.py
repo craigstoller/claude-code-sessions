@@ -774,6 +774,120 @@ def test_hard_kill_window_back_goes_by_disk_evidence(
     assert not os.path.exists(first["dest_path"])
 
 
+def _app_touches(path, **changes):
+    """The desktop app rewriting a row in place - per-account state only, the
+    row's own sessionId and cliSessionId kept - as it does on focus."""
+    with open(path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    d.update(changes)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+
+
+def test_hard_kill_then_forward_keeps_the_landed_row_within_undo(
+        mkenv, tmp_path, write_transcript, write_row):
+    """The mixed recovery the 0.17.0 forward arm got wrong: one row landed
+    with its flag unset, the others never written. The landed row must be
+    recorded as written - not re-judged 'already_present' against its own
+    file - so a later undo still removes it."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    assert not first["written"] and os.path.exists(first["dest_path"])
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert first["written"] is True
+    assert "skipped" not in first
+    assert all(r["written"] for r in op.manifest["rows"])
+    assert ct.undo_converge(env, op) == "undone"
+    assert not os.path.exists(first["dest_path"])
+    assert store_rows(env, A2, O2) == ["local_s2.json", "local_s3.json"]
+    assert store_rows(env, A3, O3) == ["local_s3.json"]
+
+
+def test_hard_kill_then_app_rewrite_then_forward_knows_the_row_by_its_stem(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Same window, and the app then rewrote the landed row (focus time), so
+    its bytes no longer match the journal. The minted filename stem it still
+    carries as sessionId proves it is this op's row."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    _app_touches(first["dest_path"], lastFocusedAt=1_900_000_000_000)
+    assert ct._sync_row_drift(first) == "drifted"
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert first["written"] is True
+    assert "skipped" not in first
+    assert ct.undo_converge(env, op) == "undone"
+    assert not os.path.exists(first["dest_path"])
+
+
+def test_all_landed_one_app_rewritten_forward_is_journal_only(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Every row landed; the last flag never saved and the app rewrote that
+    row. Nothing is left to write, so forward is journal-only: no mutation
+    guard, no recheck, even with the app running."""
+    env = _monotonic_now(mkenv(tmp_path))
+    mixed_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    seen = {"n": 0}
+
+    def hook(p):
+        if p == "converge-write-before-save":
+            seen["n"] += 1
+            if seen["n"] == len(m["rows"]):
+                raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_converge(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    last = op.manifest["rows"][-1]
+    assert not last["written"]
+    _app_touches(last["dest_path"], lastFocusedAt=1_900_000_000_000)
+    env.process_lister = lambda: [(99999, "claude.exe")]
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert last["written"] is True and "skipped" not in last
+
+
+def test_hard_kill_then_app_rewrite_then_back_records_residue(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Back after the same window. The app-rewritten row is this op's (its
+    stem says so), so like any written row that no longer holds our bytes it
+    is left in place and recorded where doctor looks - not dropped silently
+    as somebody else's file."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    _app_touches(first["dest_path"], lastFocusedAt=1_900_000_000_000)
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert os.path.exists(first["dest_path"])
+    assert first["name"] in op.manifest["rollback_residue"]
+
+
+def test_a_foreign_file_at_the_minted_path_is_never_taken_as_landed(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A file at the minted path whose sessionId is not the minted stem was not
+    written by this op. Recovery must not mark it written, so undo can never
+    delete it."""
+    env = _monotonic_now(mkenv(tmp_path))
+    m, op = _crash_after_first_row(env, write_transcript, write_row,
+                                   point="converge-write-before-save")
+    first = op.manifest["rows"][0]
+    _app_touches(first["dest_path"], sessionId="local_someone_else")
+    assert not ct._row_is_ours(first)
+    try:
+        ct.recover_op(env, op, "forward")
+    except ct.Refusal:
+        pass                        # refusing is fine; marking it ours is not
+    assert not first.get("written")
+    assert os.path.exists(first["dest_path"])
+
+
 def test_completion_marker_failure_recovers_journal_only(
         mkenv, tmp_path, write_transcript, write_row):
     env = _monotonic_now(mkenv(tmp_path))
