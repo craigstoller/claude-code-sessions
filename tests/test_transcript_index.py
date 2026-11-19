@@ -196,12 +196,15 @@ def test_a_folder_that_cannot_be_listed_is_asked_per_file(projects,
 def test_a_folder_its_plain_path_lists_otherwise_is_asked_per_file(
         projects, odd, twin):
     """Folders whose plain path os.listdir may list as another folder, or
-    not at all, while os.path.isfile reaches the file inside through a
-    middle path component. On a Windows Python whose os.listdir normalises
-    the path first (CPython gh-150880, in 3.13 and 3.14), os.listdir of
-    "C--ACME " lists its twin "C--ACME", and of a folder named NUL fails;
-    older ones list them as they are. Made through the \\\\?\\ prefix. The
-    index answers as find_transcripts does on either kind of Python."""
+    not at all. On a Windows Python whose os.listdir normalises the path
+    first (CPython gh-150880, in later 3.13 and 3.14 patch releases and
+    3.15), os.listdir of "C--ACME " or "C--ACME.." lists its twin
+    "C--ACME", and of a folder named NUL fails, while os.path.isfile still
+    reaches the file inside through a middle path component; older ones
+    list them as they are. A single trailing dot is dropped by both calls
+    alike, so "C--ACME." only pins the equality. Made through the \\\\?\\
+    prefix. The index answers as find_transcripts does on either kind of
+    Python."""
     if twin:
         os.mkdir(os.path.join(projects, twin))         # empty
     raw_folder = "\\\\?\\" + os.path.join(projects, odd)

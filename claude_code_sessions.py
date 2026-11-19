@@ -637,11 +637,12 @@ class _TranscriptIndex:
       system may fold or normalise onto an ASCII one), is never ruled out:
       every lookup asks os.path.isfile there, as find_transcripts does.
       The folder's own name matters on Windows Pythons whose os.listdir
-      normalises the path before listing it (CPython gh-150880, in 3.13
-      and 3.14; seen on 3.14.10): os.listdir of "C--x " then lists "C--x",
-      and of a folder named NUL fails, while os.path.isfile still reaches
-      the file inside, through a middle path component that is not
-      normalised so. The non-ASCII name is defensive;
+      normalises the path before listing it (CPython gh-150880, in later
+      3.13 and 3.14 patch releases and 3.15; seen on 3.14.10): os.listdir
+      of "C--x " or "C--x.." then lists "C--x", and of a folder named NUL
+      fails, while os.path.isfile still reaches the file inside, through a
+      middle path component that is not normalised so. A single trailing
+      dot is dropped by both calls alike. The non-ASCII name is defensive;
     - a root or an id that is not a str, or an id that is not plain, goes
       to find_transcripts itself, so it answers, or fails, exactly as it
       always has.
