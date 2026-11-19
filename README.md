@@ -630,7 +630,7 @@ It says so, for `undo` of a `converge`, a `sync` or a `new-row`, and for `recove
 finished `recover --forward`:
 
 ```
-link left dangling: local_c1.json (its parent's row was removed)
+link left dangling: local_c1 (its parent's row was removed)
 ```
 
 A child whose parent's row is missing is listed on its own and opens, which was measured. A
