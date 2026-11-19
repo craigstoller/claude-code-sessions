@@ -4167,7 +4167,7 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "parent_session", "parent_row", "parent_planned", "root_session",
     "root_row", "root_planned", "carried_keys", "dropped_keys", "code",
     "link_report", "dangling", "redirected", "unchecked", "target", "kind",
-    "error", "link_change", "chain_change",
+    "error", "link_change", "chain_change", "verbatim_links",
     "filtered", "from_session", "held", "held_older", "held_orphan",
     "held_orphan_detail", "held_same", "held_unknown", "holder_titles",
     "holders", "holds", "identity_disagreement", "in_all_accounts",
@@ -5729,7 +5729,10 @@ def build_parser():
                          "ones; without this, such a refresh is held back and named "
                          "rather than silently hiding a conversation")
     sp.add_argument("--verbatim", action="store_true",
-                    help="copy rows unchanged instead of stripping connector config")
+                    help="copy rows unchanged instead of stripping connector "
+                         "config. Links to a parent or chain root (spawnedFrom, "
+                         "startChain) are copied as is, not translated, so they "
+                         "may name a row that does not exist in the destination.")
     sp.add_argument("--apply", action="store_true")
     sp.add_argument("--json", action="store_true")
     common(sp)
@@ -7454,7 +7457,13 @@ def select_sync_rows(env, source, dest, flags):
              # plan_sync (0.15.1). Reporting only: sync counts row files the
              # destination lacks, converge counts conversations it cannot
              # open, and the difference is exactly these rows.
-             "dup_conversation": [], "dup_title": []}
+             "dup_conversation": [], "dup_title": [],
+             # Filled in by plan_sync. held_sessions maps the conversation
+             # each held refresh's source opens to its hold, the lineage
+             # pass's `held` input; it is keyed by conversation ids, so
+             # _public_manifest never emits it. verbatim_links are the
+             # --verbatim adds that copy a link as is.
+             "held_sessions": {}, "verbatim_links": []}
     have = set(_listdir_or_refuse(dest.path, "the destination store"))
     tombs = _destination_tombstones(dest)
 
@@ -9104,19 +9113,250 @@ def _live_override_record(env, source):
             "config_path": _disagreeing_config_path(env, config_uuid)}
 
 
+# sync's share of the lineage pass (docs/specs/2026-11-17-carry-lineage-
+# design.md, "sync"). plan_sync runs it once; the helpers are separate so the
+# apply can run the same steps again under the lock.
+
+def _sync_row_key(r):
+    """A sync row's place for the write order: (store directory, row
+    filename). Every row of one sync op lives in its one destination
+    store."""
+    return (os.path.dirname(r["dest_path"]), r["name"])
+
+
+def _sync_same_apart_from_lineage(pre, post):
+    """True when two raw rows decode to JSON objects that are equal once
+    spawnedFrom and startChain are set aside: a refresh that keeps the row's
+    conversation and changes at most its link (step 3's provisionally
+    unchanged). Never raises."""
+    try:
+        a = json.loads(pre.decode("utf-8"))
+        b = json.loads(post.decode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False
+    skip = ("spawnedFrom", "startChain")
+    return ({k: v for k, v in a.items() if k not in skip}
+            == {k: v for k, v in b.items() if k not in skip})
+
+
+def _sync_link_name(data, key, inner):
+    """The filename the source row's link (or chain) names, the one the
+    destination's pick prefers for sync; "" when it names none."""
+    t = _link_target_id(data, key, inner)
+    return t + ".json" if t else ""
+
+
+def _sync_own_link(r):
+    """The spawnedFrom the destination's row carries now, from a refresh's
+    pre-image, when it is a dict; else None. Never raises."""
+    try:
+        data = json.loads(_sync_pre_image(r))
+    except Exception:
+        return None
+    sf = data.get("spawnedFrom") if isinstance(data, dict) else None
+    return sf if isinstance(sf, dict) else None
+
+
+def _sync_lineage(rows, sources, source_store, dest_store, held, exists, *,
+                  source_account="", dest_account="", resolve=True):
+    """Step 5 of sync's planning, the lineage pass: give each row the link
+    and chain its source row should carry into the destination, rewrite its
+    post_b64 to match, and set its `lineage`. Returns the number of link
+    cycles the destination already holds (reported once, never touched).
+
+    ROWS are the op's rows, each post_b64 the source's contents transformed.
+    SOURCES maps a row's name to its source row (a dict): the row's one
+    holder, and the link template. A row without one gets no link and no
+    note. SOURCE_STORE and DEST_STORE are [(row id, data)] as
+    _lineage_store_rows reads them: the source store is the holders' index,
+    and the destination's after-state is its rows with each of ROWS
+    replaced by, or added as, its decoded post_b64, planned. A planned
+    row's links are never read; a row this op does not write (held, or
+    unchanged) counts as it stands. HELD is {conversation: hold reason},
+    EXISTS whether a conversation has a transcript. The pick prefers the
+    filename the source's own link (or chain) names.
+
+    The carried link is {sessionId, taskId}, with one exception (the plan's
+    Departure 1): a refresh whose destination row already carries a link
+    naming the same row with the same taskId keeps that link as it is, and
+    its record then lists the kept link's keys as carried and drops none.
+    A row whose bytes need no change keeps them exactly.
+
+    RESOLVE=False only counts the existing cycles (--verbatim). Never
+    raises on a malformed row."""
+    holder_index = {source_account: _lineage_index(
+        [LineageRow(source_account, rid + ".json", d)
+         for rid, d in source_store or ()])}
+    planned = {}
+    for r in rows or ():
+        try:
+            d = json.loads(unb64(r["post_b64"]))
+        except Exception:
+            d = None
+        if isinstance(d, dict):
+            planned[r["name"]] = d
+    after = [LineageRow(dest_account, rid + ".json", d)
+             for rid, d in dest_store or () if rid + ".json" not in planned]
+    after += [LineageRow(dest_account, n, d, planned=True)
+              for n, d in planned.items()]
+    dest = _lineage_index(after)
+    results = {}
+    if resolve:
+        for r in rows or ():
+            name = r["name"]
+            if name not in planned:
+                continue
+            src = (sources or {}).get(name)
+            holders = ([LineageRow(source_account, name, src)]
+                       if isinstance(src, dict) else [])
+            results[(dest_account, name)] = _lineage_resolve(
+                r.get("session_id"), name, holders, holder_index, dest,
+                held=held, transcript_exists=exists,
+                prefer_parent_name=_sync_link_name(src, "spawnedFrom",
+                                                   "sessionId"),
+                prefer_root_name=_sync_link_name(src, "startChain",
+                                                 "firstSessionId"))
+    cycles = _lineage_drop_cycles(results, _lineage_existing_edges(dest))
+    if not resolve:
+        return cycles
+    for r in rows or ():
+        res = results.get((dest_account, r["name"]))
+        if res is None:
+            r["lineage"] = _lineage_empty()
+            continue
+        link, chain, lin = res["link"], res["chain"], res["lineage"]
+        if link is not None and r.get("is_update"):
+            own = _sync_own_link(r)
+            if own is not None and _lineage_same(own, link,
+                                                 ("sessionId", "taskId")):
+                link = own
+                lin["carried_keys"] = [str(k) for k in own]
+                lin["dropped_keys"] = [k for k in lin["dropped_keys"]
+                                       if str(k).startswith("startChain.")]
+        d = planned[r["name"]]
+        if (link is not None or chain is not None
+                or "spawnedFrom" in d or "startChain" in d):
+            r["post_b64"] = _lineage_rewrite_post(r["post_b64"], link, chain)
+        r["lineage"] = lin
+    return cycles
+
+
+def _sync_mark_existing(rows, names):
+    """NAMES are refreshes dropped from the op as unchanged. Each is still
+    in the destination, as it was, so a row whose `lineage` named one as a
+    planned parent or root now names it as existing. Never raises."""
+    for r in rows or ():
+        lin = r.get("lineage") if isinstance(r, dict) else None
+        if not isinstance(lin, dict):
+            continue
+        for row_field, planned in (("parent_row", "parent_planned"),
+                                   ("root_row", "root_planned")):
+            ref = lin.get(row_field)
+            if lin.get(planned) is True and isinstance(ref, str) \
+                    and ref + ".json" in names:
+                lin[planned] = False
+
+
+def _sync_ref_change(pre, post, key, fields):
+    """How a refresh changes the destination's own link (or chain): KEY of
+    the decoded rows PRE and POST. "dropped" when POST lacks it,
+    "retargeted" when it names another row (FIELDS, compared in value and
+    type alike, so a depth of True is not 1), else None. A destination value
+    that names no row (not a dict) can only be dropped. Never raises."""
+    if not isinstance(pre, dict) or key not in pre or not isinstance(post,
+                                                                    dict):
+        return None
+    if key not in post:
+        return "dropped"
+    old, new = pre[key], post[key]
+    if not isinstance(old, dict):
+        return None
+
+    def names(v):
+        return [(type(v.get(f)), v.get(f)) for f in fields] \
+            if isinstance(v, dict) else None
+    return "retargeted" if names(old) != names(new) else None
+
+
+def _sync_refresh_loss(r):
+    """Step 7: what a refresh does to the destination's row, measured on its
+    final post_b64 against its pre-image. Sets `dest_dropped` and
+    `dest_reset` (_refresh_field_loss, None for "could not tell"), leaving
+    spawnedFrom and startChain out of the dropped list, and `link_change`
+    and `chain_change`, which report those two once. An add is left as it
+    is. Never raises."""
+    if not r.get("is_update"):
+        return
+    try:
+        pre, post = _sync_pre_image(r), unb64(r["post_b64"])
+    except Exception:
+        pre = post = None
+    dropped, reset = _refresh_field_loss(pre, post)
+    if dropped is not None:
+        dropped = [k for k in dropped
+                   if k not in ("spawnedFrom", "startChain")]
+    r["dest_dropped"], r["dest_reset"] = dropped, reset
+    try:
+        a = json.loads(pre.decode("utf-8"))
+        b = json.loads(post.decode("utf-8"))
+    except Exception:
+        a = b = None
+    r["link_change"] = _sync_ref_change(a, b, "spawnedFrom", ("sessionId",))
+    r["chain_change"] = _sync_ref_change(a, b, "startChain",
+                                         ("firstSessionId", "depth"))
+
+
 def plan_sync(env, flags):
-    """Build the sync manifest. Pure planning - writes nothing."""
+    """Build the sync manifest. Pure planning - writes nothing.
+
+    The rows are planned in the spec's order (docs/specs/2026-11-17-carry-
+    lineage-design.md, "sync", "Restructured planning"):
+    1. each candidate's transformed bytes. A refresh whose bytes already
+       equal the destination's is unchanged here, before the age holds, so
+       a byte-identical row is never reported as held (the plan's Departure
+       6);
+    2. --newer-only's age holds. Each held refresh is recorded in
+       tally["held_sessions"] by the conversation its source opens;
+    3. a refresh equal to the destination's row apart from spawnedFrom and
+       startChain is provisionally unchanged, and kept;
+    4. held_orphan, whose doomed set leaves the provisional refreshes out:
+       such a row keeps its conversation, so it still vouches for it. Its
+       holds go into held_sessions too;
+    5. the lineage pass (_sync_lineage; not under --verbatim): each row
+       carries its source row's link and chain, translated into the
+       destination as planned;
+    6. a provisional refresh whose final bytes equal the destination's is
+       dropped as unchanged, and any row that named it as planned now names
+       it as existing;
+    7. each refresh's field loss, link_change and chain_change, on its final
+       bytes (_sync_refresh_loss), --verbatim or not.
+    The rows then come back in write order, parents and roots first; under
+    --verbatim they keep selection's order and carry no `lineage`. No source
+    link or chain is kept on a row or on the manifest: the pass reads the
+    source rows in memory only."""
     source, dest = resolve_sync_endpoints(env, flags.to or None,
                                           flags.live or None)
     picked, tally = select_sync_rows(env, source, dest, flags)
+    verbatim = bool(flags.verbatim)
+    held = tally["held_sessions"]
     rows = []
+    sources = {}          # row name -> its source row, for the lineage pass
+    pre_of = {}           # refresh name -> the destination's bytes now
+    provisional = set()   # step 3: refreshes equal apart from the link
+    info = []             # (row, title, unknown, regresses), selection order
     for cand in picked:
-        blob, removed, reset = transform_row(cand["data"], flags.verbatim)
+        blob, removed, reset = transform_row(cand["data"], verbatim)
         pre = cand.get("pre")
         if pre is not None and pre == blob:
-            # A refresh that would write the identical bytes is not a refresh.
-            # Dropping it here keeps the plan honest about what --update will
-            # actually overwrite, and keeps a no-op run from journaling one.
+            # Step 1. A refresh that would write the identical bytes is not a
+            # refresh. Dropping it here keeps the plan honest about what
+            # --update will actually overwrite, and keeps a no-op run from
+            # journaling one. It stays ahead of the age holds below, so such
+            # a row is reported unchanged, never held: it writes nothing
+            # either way, so the after-state the lineage pass sees is the
+            # same.
             tally["unchanged"].append(cand["title"])
             continue
         # Which way does this refresh move the row? Only meaningful when both
@@ -9125,29 +9365,25 @@ def plan_sync(env, flags):
         # as absent anywhere else in this module.
         pre_act = cand.get("pre_activity")
         src_act = cand.get("last_activity")
-        regresses = False
-        dest_dropped, dest_reset = (None, None)
+        regresses = unknown = False
+        hold = None
         if pre is not None:
-            dest_dropped, dest_reset = _refresh_field_loss(pre, blob)
             # Unknown on EITHER side is unknown, full stop. Only the destination
             # side used to reach this state; an unreadable source timestamp was
             # silently treated as age zero, which made every such row look like
             # a regression.
             if pre_act is None or src_act is None:
-                tally["activity_unknown"].append(cand["title"])
+                unknown = True
                 if flags.newer_only:
                     # Cannot show it is newer, so it is not sent. Tallied under
                     # its own heading rather than folded into "held back as
                     # older" - the user asked for newer, and "we could not tell"
                     # is a different answer from "it was older".
-                    tally["held_unknown"].append(cand["title"])
-                    continue
+                    hold = "held_unknown"
             elif pre_act > src_act:
                 regresses = True
-                tally["regressing"].append(cand["title"])
                 if flags.newer_only:
-                    tally["held_older"].append(cand["title"])
-                    continue
+                    hold = "held_older"
             elif pre_act == src_act and flags.newer_only:
                 # Same moment on both sides, so there is nothing newer to send -
                 # and "only what is newer" has to mean STRICTLY newer, not
@@ -9161,8 +9397,20 @@ def plan_sync(env, flags):
                 # timestamp-identical rows that the first version happily
                 # overwrote, carrying one account's model and permission choices
                 # into another to fix nothing at all.
-                tally["held_same"].append(cand["title"])
-                continue
+                hold = "held_same"
+        if hold:
+            # Step 2. A held row keeps its informational entry, as before;
+            # every other row gets its entry only if it survives step 6.
+            # held_sessions is the lineage pass's `held` input: by the
+            # conversation the held row's source opens, so a child whose
+            # parent this is can say the parent's own row was held.
+            if unknown:
+                tally["activity_unknown"].append(cand["title"])
+            if regresses:
+                tally["regressing"].append(cand["title"])
+            tally[hold].append(cand["title"])
+            held[cand["session_id"]] = hold
+            continue
         # Does this refresh change WHICH CONVERSATION the row opens? A row's
         # filename is the app's session id and survives a resume, while the
         # cliSessionId inside it names the transcript and changes on each new
@@ -9204,8 +9452,11 @@ def plan_sync(env, flags):
                      "activity_unknown": pre is not None
                      and (pre_act is None or src_act is None),
                      # what the DESTINATION's row loses, measured against its
-                     # own pre-image - not transform_row's source-side lists
-                     "dest_dropped": dest_dropped, "dest_reset": dest_reset,
+                     # own pre-image - not transform_row's source-side lists.
+                     # Filled in at step 7, on the final bytes, with whether
+                     # the destination's own link and chain are lost or moved.
+                     "dest_dropped": None, "dest_reset": None,
+                     "link_change": None, "chain_change": None,
                      "dest_path": os.path.join(dest.path, cand["name"]),
                      "post_b64": b64(blob), "session_id": cand["session_id"],
                      "title": cand["title"], "removed": removed, "reset": reset,
@@ -9214,6 +9465,15 @@ def plan_sync(env, flags):
                      # a deliberate deletion was overridden
                      "overrode_tombstone": bool(cand.get("overrode_tombstone")),
                      "written": False})
+        r = rows[-1]
+        sources[cand["name"]] = cand["data"]
+        if pre is not None:
+            pre_of[cand["name"]] = pre
+            info.append((r, cand["title"], unknown, regresses))
+            # Step 3: the same row apart from its link and chain keeps its
+            # conversation. Kept for now; step 6 decides on the final bytes.
+            if not verbatim and _sync_same_apart_from_lineage(pre, blob):
+                provisional.add(cand["name"])
 
     # Second pass, and only when it can matter: for every row that swaps which
     # conversation it opens, is the DISPLACED one still reachable from some
@@ -9223,12 +9483,17 @@ def plan_sync(env, flags):
     # until this pass existed the plan presented it identically to a title
     # update. Measured on a real machine: of 18 rows a --newer-only run would
     # have written, 6 swapped the conversation and 5 of those orphaned it.
+    # This is step 4, held_orphan.
     swap_rows = [r for r in rows if r["swaps_conversation"]]
+    orphan_held = set()        # id() of each row held_orphan holds
     if swap_rows:
         # Every row this plan will overwrite, not just the swapping ones: a
         # plain refresh also replaces its row wholesale, so it stops vouching
-        # for whatever it pointed at too.
-        doomed = {r["name"] for r in rows if r.get("is_update")}
+        # for whatever it pointed at too. Not a provisionally unchanged one
+        # (step 3): it opens the same conversation after the write, so it
+        # still vouches for it, as an unchanged row always has.
+        doomed = {r["name"] for r in rows
+                  if r.get("is_update") and r["name"] not in provisional}
         pointers = _other_pointers(env, dest.path, doomed)
         unreadable_store = None in pointers
         # How much of each displaced conversation survives in its replacement.
@@ -9295,9 +9560,57 @@ def plan_sync(env, flags):
                      "displaced_turns": r["displaced_turns"],
                      "incoming_turns": r["incoming_turns"],
                      "displaced_session": r["displaced_session"]})
+                held[r["session_id"]] = "held_orphan"
+                orphan_held.add(id(r))
                 continue
             kept.append(r)
         rows = kept
+    # Steps 5 and 6: the lineage pass over the rows that survive, against the
+    # destination as planned, then the refreshes it left byte-identical. Under
+    # --verbatim links are copied as they are, so neither runs; the existing
+    # cycles are still counted, for the manifest's lineage_cycles.
+    dest_store, _unread = _lineage_store_rows(dest.path)
+    if verbatim:
+        lineage_cycles = _sync_lineage(rows, {}, [], dest_store, held, None,
+                                       dest_account=dest.account_uuid,
+                                       resolve=False)
+    else:
+        found = {}
+
+        def exists(sid):
+            # The same test selection makes of a row's own transcript.
+            if sid not in found:
+                found[sid] = bool(find_transcripts(env.projects_root, sid))
+            return found[sid]
+        source_store, _unread = _lineage_store_rows(source.path)
+        lineage_cycles = _sync_lineage(
+            rows, sources, source_store, dest_store, held, exists,
+            source_account=source.account_uuid,
+            dest_account=dest.account_uuid)
+        gone = set()
+        kept = []
+        for r in rows:
+            if r["name"] in provisional \
+                    and unb64(r["post_b64"]) == pre_of[r["name"]]:
+                tally["unchanged"].append(r["title"])
+                gone.add(r["name"])
+            else:
+                kept.append(r)
+        rows = kept
+        _sync_mark_existing(rows, gone)
+    # Step 7, on the final bytes, verbatim or not.
+    for r in rows:
+        _sync_refresh_loss(r)
+    # The informational entries of the rows not held by age, in selection's
+    # order: a row dropped as unchanged above is never counted in them, and
+    # a row held_orphan holds keeps its entry, as a held row always has.
+    survivors = {id(r) for r in rows} | orphan_held
+    for r, title, unknown, regresses in info:
+        if id(r) in survivors:
+            if unknown:
+                tally["activity_unknown"].append(title)
+            if regresses:
+                tally["regressing"].append(title)
     # What the destination already holds, against every ADD (0.15.1, E).
     # Presence above is keyed on FILENAME, so a row for a conversation the
     # destination opens under a different local id is "absent" and copied -
@@ -9322,6 +9635,18 @@ def plan_sync(env, flags):
                 tally["dup_conversation"].append(_sync_row_title(r))
             if r["dup_title"]:
                 tally["dup_title"].append(_sync_row_title(r))
+    if verbatim:
+        # A --verbatim add that copies a link or chain names a row in the
+        # SOURCE account, which the destination may not hold: counted for
+        # the report's own line. A refresh that replaces the destination's
+        # link is reported by its link_change instead.
+        for r in adds:
+            if any(v is not None for v in _lineage_pair(r["post_b64"])):
+                tally["verbatim_links"].append(_sync_row_title(r))
+    else:
+        # Parents and roots before the rows that link to them. A store with
+        # no links keeps selection's order exactly.
+        rows = _lineage_write_order(rows, _sync_row_key)
     out = {"op_type": "sync",
            "source_account": source.account_uuid, "source_org": source.org_uuid,
            "source_email": source.email, "source_path": source.path,
@@ -9347,6 +9672,11 @@ def plan_sync(env, flags):
            # plan with --allow-orphan that happens to orphan nothing looks
            # identical to one without it.
            "allow_orphan": bool(flags.allow_orphan),
+           # Every sync this version journals, --verbatim or not: its rows
+           # carry `lineage` (a --verbatim op's do not), and the shape check
+           # holds them to their bytes. lineage_cycles counts the link
+           # cycles the destination already holds, left as they are.
+           "lineage_format": LINEAGE_FORMAT, "lineage_cycles": lineage_cycles,
            "rows": rows, "tally": tally}
     if source.resolved_from == "user":
         out["live_override"] = _live_override_record(env, source)
@@ -14358,6 +14688,14 @@ def _public_manifest(env, m):
     through anonymize() instead, where only registered values match.
     """
     out = dict(m)
+    if isinstance(out.get("tally"), dict):
+        # held_sessions (the lineage pass's held input) is keyed by
+        # conversation ids: the per-list title scrub below and
+        # anonymize_report's key pass would both mishandle it, and nothing
+        # outside the plan reads it. Never emitted, with or without
+        # --anonymize; the in-memory manifest keeps it.
+        out["tally"] = {k: v for k, v in out["tally"].items()
+                        if k != "held_sessions"}
     strip = ("pre_b64", "post_b64") if _ANONYMIZE else ("pre_b64",)
     out["rows"] = [{k: v for k, v in r.items() if k not in strip}
                    for r in m.get("rows", [])]
@@ -14371,6 +14709,7 @@ def _public_manifest(env, m):
         for pub_r, r in zip(out["rows"], m.get("rows", [])):
             if isinstance(r.get("title"), str) and r["title"].strip():
                 pub_r["title"] = _anon_label("session", r["title"])
+        _anon_lineage_notes(env, out["rows"])
     return out
 
 
@@ -14513,7 +14852,8 @@ def _live_override_note(m):
 
 def _print_sync_report(say, manifest):
     """The human-readable plan: both endpoints, then the skip tally, then
-    what --include-deleted is resurrecting, then what would be copied."""
+    what --include-deleted is resurrecting, then what would be copied, then
+    the lineage lines (_sync_lineage_lines)."""
     # Spec s5: name both endpoints, with emails, before doing anything.
     # dest_email is "" for every non-live account - the dormant account's
     # email isn't recorded anywhere on disk, so an unlabelled run always hits
@@ -14685,7 +15025,8 @@ def _print_sync_report(say, manifest):
                 mark = "  <- which copy is newer could not be determined"
             else:
                 mark = ""
-            say("   !! {0}{1}".format(r["title"], mark))
+            say("   !! {0}{1}{2}".format(r["title"], mark,
+                                         _lineage_row_tag(r.get("lineage"))))
             # A pointer swap is not a metadata refresh and must not read like
             # one: after this write that entry opens a DIFFERENT conversation.
             if r.get("swaps_conversation"):
@@ -14742,9 +15083,16 @@ def _print_sync_report(say, manifest):
 
     say("{0:36}: {1}".format("to copy", len(adds)))
     for r in adds[:15]:
-        say("   {0}{1}".format("!! " if r.get("overrode_tombstone") else "", r["title"]))
+        say("   {0}{1}{2}".format("!! " if r.get("overrode_tombstone") else "",
+                                  r["title"], _lineage_row_tag(r.get("lineage"))))
     if len(adds) > 15:
         say("   ... and {0} more".format(len(adds) - 15))
+    # The lineage branch, last: what the rows would carry, the refreshes that
+    # lose or move the destination's own link or chain (left out of the
+    # fields-lost line above, so each is reported once), and the links
+    # --verbatim copies as they are.
+    for line in _sync_lineage_lines(manifest):
+        say(line)
 
 
 # ------------------------------------------------------------- lineage
@@ -15587,6 +15935,46 @@ def _lineage_plan_lines(m):
         lines.append("cycles  : {0} already present, left as they are"
                      .format(cycles))
     return lines
+
+
+def _lineage_row_tag(lin):
+    """`   [link: <phrase>]` for a row whose link was left out, appended to
+    its own line in a plan report; "" otherwise."""
+    reason = _lineage_row_reason(lin)
+    return "   [link: {0}]".format(LINEAGE_PHRASES[reason]) if reason else ""
+
+
+_SYNC_CHANGE_LINES = {
+    ("link_change", "dropped"): "link    : {0} loses its link",
+    ("link_change", "retargeted"): "link    : {0} now links to another row",
+    ("chain_change", "dropped"): "chain   : {0} loses its chain",
+    ("chain_change", "retargeted"): "chain   : {0} now has another chain "
+                                    "root",
+}
+
+
+def _sync_lineage_lines(m):
+    """A sync plan's lineage lines, from its public manifest: the links,
+    chains and cycles lines as converge prints them, then one line per
+    refresh that loses or moves the destination's own link or chain, then
+    how many links --verbatim adds copy untranslated. Never raises."""
+    try:
+        lines = _lineage_plan_lines(m)
+        for r in m.get("rows") or []:
+            if not isinstance(r, dict):
+                continue
+            for key in ("link_change", "chain_change"):
+                shape = _SYNC_CHANGE_LINES.get((key, r.get(key)))
+                if shape:
+                    lines.append(shape.format(_lineage_stem(r.get("name"))))
+        tally = m.get("tally") if isinstance(m.get("tally"), dict) else {}
+        n = len(tally.get("verbatim_links") or [])
+        if n:
+            lines.append("links   : {0} copied verbatim (not translated)"
+                         .format(n))
+        return lines
+    except Exception:
+        return []
 
 
 def _lineage_apply_lines(rows):
@@ -17583,6 +17971,25 @@ def classify_converge_op(env, op):
                     .format(written, pending, skipped)}
 
 
+def _anon_lineage_notes(env, rows):
+    """Under --anonymize, the title scrub over every lineage note's detail,
+    in each row's record and in the plan's kept copy. Lineage notes name ids
+    only (by 8 characters), never a title, label or path - by construction.
+    Scrubbed anyway, as hold details are. ROWS are already the public
+    manifest's own copies (anonymize_report made them)."""
+    for r in rows or ():
+        if not isinstance(r, dict):
+            continue
+        for key in ("lineage", "lineage_planned"):
+            lin = r.get(key)
+            notes = lin.get("notes") if isinstance(lin, dict) else None
+            for n in notes if isinstance(notes, list) else ():
+                if isinstance(n, dict):
+                    d = n.get("detail")
+                    n["detail"] = anonymize(env, d) if isinstance(d, str) \
+                        else d
+
+
 def _public_converge_manifest(env, m):
     """The converge manifest with row post-images removed, for --json and the
     printed report - the same exposure rule as every sibling's public
@@ -17662,15 +18069,7 @@ def _public_converge_manifest(env, m):
                 r["holders"] = [_scrub_label(x) for x in r["holders"]]
             if isinstance(r.get("skip_detail"), str):
                 r["skip_detail"] = _scrub(r["skip_detail"])
-            # Lineage notes name ids only (by 8 characters), never a title,
-            # label or path - by construction. Scrubbed anyway, as hold
-            # details are, in the record and in the plan's kept copy.
-            for key in ("lineage", "lineage_planned"):
-                lin = r.get(key)
-                notes = lin.get("notes") if isinstance(lin, dict) else None
-                for n in notes if isinstance(notes, list) else ():
-                    if isinstance(n, dict):
-                        n["detail"] = _scrub(n.get("detail"))
+        _anon_lineage_notes(env, out["rows"])
     # A runnable measured remedy is DERIVED here, at emit time, from the
     # structured fields anonymize_report has already run over - so
     # anonymizing suggested_title anonymizes the command by construction
@@ -17724,10 +18123,7 @@ def _print_converge_report(say, m):
             if r.get("skipped"):
                 line += "   [{0}: {1}]".format(r["skipped"],
                                                r.get("skip_detail", ""))
-            reason = _lineage_row_reason(r.get("lineage"))
-            if reason:
-                line += "   [link: {0}]".format(LINEAGE_PHRASES[reason])
-            say(line)
+            say(line + _lineage_row_tag(r.get("lineage")))
         say("")
     for note in m.get("notes", []):
         if isinstance(note, str):
