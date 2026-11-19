@@ -3508,7 +3508,7 @@ def recover_op(env, op, direction):
                     # runs (it only reads): a target deleted in the crash
                     # window can leave a landed row's link dangling.
                     set_status(op, "completed")
-                    _converge_link_report(op, m, forward=True)
+                    _op_link_report(op, m, forward=True)
                     rotate_ops(env)
                     return "completed"
                 _guard_mutation(env, "create rows in", NEW_ROW_STORE,
@@ -3530,11 +3530,11 @@ def recover_op(env, op, direction):
                 # that is gone or opens another conversation parent_changed.
                 # An op journaled before lineage has no dependency checks.
                 if m.get("lineage_format") == 1:
-                    by_name = _converge_rows_by_name(m)
+                    by_name = _lineage_rows_by_name(m)
                     for r in m["rows"]:
                         if r.get("written") or r.get("skipped"):
                             continue
-                        skip = _converge_dependency_skip(m, r, by_name)
+                        skip = _lineage_dependency_skip(m, r, by_name)
                         if skip:
                             r["skipped"], r["skip_detail"] = skip
                 save_manifest(op)         # the skips just decided are durable
@@ -3542,7 +3542,7 @@ def recover_op(env, op, direction):
                 final = execute_converge_op(env, op)
                 # execute_converge_op has saved the completed op; the report
                 # is saved again, before rotation.
-                _converge_link_report(op, m, forward=True)
+                _op_link_report(op, m, forward=True)
                 rotate_ops(env)
                 return final
             # 'back' must always terminate - it is the only exit from a stuck
@@ -3614,7 +3614,7 @@ def recover_op(env, op, direction):
             # After the whole reversal: a row left in place (drifted, or
             # unremovable) or any other surviving row whose link names a row
             # this removed is reported. Unresolved stores are never read.
-            _converge_link_report(op, m, skip_ids=stray_ids, removed=removed)
+            _op_link_report(op, m, skip_ids=stray_ids, removed=removed)
             rotate_ops(env)
             return "rolled_back"
         if m.get("op_type") == "repoint":
@@ -3737,7 +3737,12 @@ def recover_op(env, op, direction):
                 (drifted, unreadable, removable,
                  restorable, claimed) = _sync_delete_targets(env, m,
                                                              unresolved=left_alone)
-                _sync_reverse_all(removable, restorable)
+                # Children before parents, adds and refreshes in one
+                # sequence (spec, "undo"), so an interrupted reversal never
+                # leaves a child naming a row already removed.
+                steps, removed, restored = _sync_reversal(m, removable,
+                                                          restorable)
+                _sync_reverse_all(steps)
                 # Rows in a store this version does not read were never read;
                 # recorded where doctor looks, so this close is not silent.
                 _add_residue(m, *_unresolved_residue(left_alone))
@@ -3781,12 +3786,30 @@ def recover_op(env, op, direction):
                         "back. The op is closed; re-run sync if the rows are "
                         "still wanted.")
                 set_status(op, "rolled_back")
+                # After the whole reversal, from the rows that survive: a
+                # row left in place (drifted, unreadable, claimed) or any
+                # other row whose link names a row this removed, and a kept
+                # row of this op whose target now opens another
+                # conversation. Unresolved stores are never read.
+                _op_link_report(op, m,
+                                skip_ids={id(r) for r, _ in left_alone},
+                                removed=removed, restored=restored)
                 rotate_ops(env)
                 return "rolled_back"
             # forward: re-enter execute_sync_op to finish the remaining writes.
+            # It writes the journaled bytes and never resolves a link again;
+            # classify_sync_op has already withdrawn forward when a pending
+            # row's link target is gone or opens another conversation.
             set_status(op, "journaled")
             final = execute_sync_op(env, op)
             if final == "completed":
+                # A target deleted or repointed in the crash window can still
+                # leave a landed row's link dangling or redirected, and the
+                # report names it - whether rows were still pending or every
+                # one had already landed. execute_sync_op has saved the
+                # completed op; the report is saved again, before rotation.
+                # An op journaled before lineage gets no report, as before.
+                _op_link_report(op, m, forward=True)
                 rotate_ops(env)
             return final
         if direction == "back":
@@ -10498,6 +10521,37 @@ def _drift_clause(changed, unreadable, deleted=()):
     return " and ".join(parts)
 
 
+def _sync_dependency_clauses(m, pending):
+    """["<row id>: <why>"] for each row of PENDING, in write order, whose
+    journaled link or chain no longer matches the row it names. Never
+    raises.
+
+    The rules are _lineage_dependency_skip's, re-checked, never resolved
+    again. A target is checked when it is a row this op has written, or a
+    row not in the op - one the destination already held, or one an age
+    hold kept or the plan dropped as unchanged; it mismatches when it is
+    gone, cannot be read, or opens a conversation other than the journaled
+    one. A target that is a pending row of the op, a pending refresh still
+    at its pre-image among them, is not checked: write order writes it
+    first. An op journaled before lineage (no `lineage_format`) has no
+    dependency checks, and a --verbatim op's rows carry no lineage to check.
+    classify_op's resolution gate has resolved every row before this runs,
+    so only stores it resolved are read."""
+    out = []
+    try:
+        if m.get("lineage_format") != 1:
+            return out
+        by_name = _lineage_rows_by_name(m)
+        for r in pending:
+            skip = _lineage_dependency_skip(m, r, by_name)
+            if skip:
+                out.append("{0}: {1}".format(_lineage_stem(r.get("name")),
+                                             skip[1]))
+    except Exception:
+        out.append("the links could not be checked")    # fails closed
+    return out
+
+
 def classify_sync_op(env, op):
     """Sync's recovery shape. Forward finishes the remaining writes, and
     reversing what was written is `undo`'s job - removing an added row, and
@@ -10537,6 +10591,13 @@ def classify_sync_op(env, op):
     as ["forward", "back"] with a note promising "forward finishes them".
     _sync_drift_titles now reports it as a third category (deleted), blocking
     for a refresh and still perfectly resumable for an add.
+
+    Lineage adds a fourth (spec, "sync", "Every dependency must still
+    match"): a pending row whose journaled link or chain names a row that is
+    gone, cannot be read, or opens a conversation other than the journaled
+    one. Forward never resolves again, so it would write that row with a
+    stale link; sync has no per-row skip, so 'back' alone is offered, and
+    the note names the row (_sync_dependency_clauses).
     """
     m = op.manifest
     # Before anything reads `rows`: a damaged record offers nothing, as a
@@ -10569,13 +10630,21 @@ def classify_sync_op(env, op):
                      "the identity files - forward/back will refuse until the "
                      "identity state is restored or resolves (RULING 5)")
     pend_changed, pend_unreadable, pend_deleted = _sync_drift_titles(pending)
-    if pend_changed or pend_unreadable or pend_deleted:
+    links = _sync_dependency_clauses(m, pending)
+    if pend_changed or pend_unreadable or pend_deleted or links:
         blocking = pend_changed + pend_unreadable + pend_deleted
         skip_changed, skip_unreadable, skip_deleted = _sync_drift_titles(written)
         skipped = skip_changed + skip_unreadable + skip_deleted
-        note = ("sync: destination row(s) {0}; it can no longer be rolled "
-                "forward - 'back' reverses the row(s) this op safely can"
-                .format(_drift_clause(pend_changed, pend_unreadable, pend_deleted)))
+        parts = []
+        if blocking:
+            parts.append("destination row(s) {0}".format(
+                _drift_clause(pend_changed, pend_unreadable, pend_deleted)))
+        if links:
+            parts.append("the journaled link of pending row(s) no longer "
+                         "matches its target ({0})".format("; ".join(links)))
+        note = ("sync: {0}; it can no longer be rolled forward - 'back' "
+                "reverses the row(s) this op safely can"
+                .format("; ".join(parts)))
         if skipped:
             note += ("; it will also skip {0} already-written row(s) it cannot "
                      "verify ({1})".format(len(skipped),
@@ -10885,31 +10954,68 @@ def _sync_unlink_all(paths):
             ", ".join("{0} ({1})".format(p, exc) for p, exc in failures)))
 
 
-def _sync_reverse_all(removable, restorable):
-    """Both halves of a reversal, in one pass that always attempts both.
+def _sync_reversal(m, removable, restorable):
+    """(steps, removed, restored) for one reversal of sync op M: the list
+    _sync_reverse_all takes, and the (store path, row id) pairs it removes
+    and restores, for the link report.
 
-    Each half already refuses to stop at its own first failure, for the stated
-    reason that a half-applied reversal with no record of the rest is the worst
-    outcome. Calling them in sequence quietly gave up exactly that guarantee
-    ACROSS the two: _sync_unlink_all raising on one locked added row meant
-    _sync_restore_all never ran at all, so every refreshed row stayed in its
-    overwritten state - held hostage by an unrelated file, and reported as a
-    failure to *remove* something, which does not hint that restores were
-    skipped. Deletions still go first (the simpler half, and the one whose
-    failure is most often transient), but a failure in either is collected and
-    both are attempted before anything is raised.
+    REMOVABLE paths and RESTORABLE (path, pre-image) pairs are
+    _sync_delete_targets' results, which take each path from its row. Each
+    is mapped back to that row's index in m["rows"] - write order: parents
+    and roots first for an op journaled with lineage, and the order execute
+    wrote for any other - and the steps are sorted by it, descending, so
+    children come before parents and a deleted add and a restored refresh
+    share one sequence (spec, "undo"). Rows in neither list are absent, and
+    shift nothing. A path two rows share (a damaged record) sorts at the
+    first of them. The caller has run _sync_shape_error, so every row is an
+    object with a string name and dest_path."""
+    rows = m["rows"]
+    where = {}
+    for i, r in enumerate(rows):
+        where.setdefault(r["dest_path"], i)
+    steps, removed, restored = [], set(), set()
+    for kind, items, pairs in (("remove", [(p,) for p in removable], removed),
+                               ("restore", list(restorable), restored)):
+        for item in items:
+            i = where.get(item[0], -1)
+            steps.append((i, (kind,) + tuple(item)))
+            if i >= 0:
+                pairs.add((os.path.dirname(rows[i]["dest_path"]),
+                           _lineage_stem(rows[i]["name"])))
+    steps.sort(key=lambda s: s[0], reverse=True)
+    return [s for _, s in steps], removed, restored
+
+
+def _sync_reverse_all(ops):
+    """Every step of a reversal, in one pass that always attempts them all.
+
+    OPS is one list, in reverse write order (_sync_reversal builds it), of
+    ("remove", path) and ("restore", path, pre_bytes) steps. One sequence
+    for both kinds, children before parents: an interrupted reversal leaves
+    a parent without its child, never a child naming a row already removed.
+    It used to remove every added row before restoring any refreshed one,
+    so a refreshed child linking to a parent the same op added could be
+    left naming a removed row (spec, "undo").
+
+    Each step is attempted even when an earlier one fails, for the stated
+    reason that a half-applied reversal with no record of the rest is the
+    worst outcome: a locked added row once held every refreshed row hostage
+    in its overwritten state, reported as a failure to *remove* something,
+    which does not hint that restores were skipped. Every failure is
+    collected and raised together.
     """
     failures = []
-    for p in removable:
-        try:
-            os.unlink(p)
-        except OSError as exc:
-            failures.append(("remove {0}".format(p), exc))
-    for path, blob in restorable:
-        try:
-            atomic_write(path, blob)
-        except OSError as exc:
-            failures.append(("restore {0}".format(path), exc))
+    for step in ops:
+        if step[0] == "remove":
+            try:
+                os.unlink(step[1])
+            except OSError as exc:
+                failures.append(("remove {0}".format(step[1]), exc))
+        else:
+            try:
+                atomic_write(step[1], step[2])
+            except OSError as exc:
+                failures.append(("restore {0}".format(step[1]), exc))
     if failures:
         raise Refusal("could not {0}".format(
             ", ".join("{0} ({1})".format(what, exc) for what, exc in failures)))
@@ -10930,6 +11036,10 @@ def undo_sync(env, op):
     Takes the single-instance lock first, before any of its own checks - the
     same discipline run_undo/run_move/run_sync/recover_op all use, so two
     concurrent 'undo --apply' runs can never race their unlinks.
+
+    Rows are reversed in reverse write order, children before parents, adds
+    and refreshes in one sequence (_sync_reversal), and the undo ends with
+    the link report (_op_link_report), which cmd_undo prints.
     """
     m = op.manifest
     acquire_lock(env, "undo-" + m["op_id"])
@@ -10944,7 +11054,7 @@ def undo_sync(env, op):
             raise Refusal(
                 "the record for {0} is damaged ({1}), so it cannot be undone "
                 "from it. Nothing was changed.".format(m.get("op_id"), bad))
-        _journal_discovery(env, "undo")
+        disc = _journal_discovery(env, "undo")
         tally = {"already_gone": 0, "not_restored": 0}
         (drifted, unreadable, removable,
          restorable, claimed) = _sync_delete_targets(env, m, tally=tally)
@@ -10965,9 +11075,11 @@ def undo_sync(env, op):
                 "in the app to reverse it: that removes the session from that "
                 "account altogether rather than putting back what was replaced."
                 .format(", ".join(claimed)))
-        # One pass, both halves always attempted - a locked added row must not
-        # leave every refreshed row stranded in its overwritten state.
-        _sync_reverse_all(removable, restorable)
+        # One pass, every step always attempted - a locked added row must not
+        # leave every refreshed row stranded in its overwritten state - in
+        # reverse write order, children before parents (spec, "undo").
+        steps, removed, restored = _sync_reversal(m, removable, restorable)
+        _sync_reverse_all(steps)
         # What happened, not just that it ended: a bare "undone" read the
         # same whether every row was reversed or none was (decision 7 of the
         # 2026-10-19 journal ruling). cmd_undo and the window print it.
@@ -10975,6 +11087,14 @@ def undo_sync(env, op):
                             "already_gone": tally["already_gone"],
                             "not_restored": tally["not_restored"]}
         set_status(op, "undone")
+        # After the whole reversal, from the rows that survive (spec,
+        # "undo"): a surviving row, from this op or any other, that links to
+        # a row this undo removed. A row it restored carries no expectation
+        # from this op. A row never written in a store the gate does not
+        # resolve is never read (one this op wrote has refused above).
+        _op_link_report(op, m,
+                        skip_ids={id(r) for r, _ in _unresolved_rows(disc, m)},
+                        removed=removed, restored=restored)
         rotate_ops(env)
         return "undone"
     finally:
@@ -17828,15 +17948,15 @@ def _converge_mark_landed(op, m, skip_ids=frozenset()):
     return marked
 
 
-def _converge_rows_by_name(m):
-    """{(store, filename): row} over a converge op's rows, the store as
-    _lineage_row_store gives it - the index a planned link target is found
-    by."""
+def _lineage_rows_by_name(m):
+    """{(store, filename): row} over a converge or sync op's rows, the store
+    as _lineage_row_store gives it - the index a planned link target is found
+    by. Never raises."""
     return {(_lineage_row_store(m, x), x["name"]): x
             for x in _journal_dict_rows(m) if isinstance(x.get("name"), str)}
 
 
-def _converge_dependency_skip(m, r, by_name=None):
+def _lineage_dependency_skip(m, r, by_name=None):
     """("parent_not_written" | "parent_changed", detail) when pending row R
     must not be written because of the row its journaled link or chain
     names; None otherwise. Recovery's forward check (spec, "converge",
@@ -17844,6 +17964,11 @@ def _converge_dependency_skip(m, r, by_name=None):
     the journaled target and never resolves again. NEVER RAISES - a target it
     cannot settle fails closed, as parent_changed, and the row stays short
     for the next converge to plan afresh.
+
+    converge skips the row by the reason; sync has no per-row skip, so
+    classify_sync_op takes any answer but None as drift that withdraws
+    forward (spec, "sync", "Every dependency must still match"). sync never
+    marks a row skipped, so a journal it wrote gives parent_changed only.
 
     - parent_not_written: the target is a planned row of this op
       (`parent_planned` / `root_planned`) that is now skipped, for any
@@ -17855,13 +17980,18 @@ def _converge_dependency_skip(m, r, by_name=None):
       `root_session`).
 
     A planned target still pending is not checked: write order writes it
-    first. BY_NAME is _converge_rows_by_name(m), built once by the caller."""
+    first. That covers a pending refresh still at its pre-image, which may
+    open another conversation until it is written. The target is read in
+    R's own store, as _lineage_row_store gives it: a converge row's
+    store_path, a sync row's directory, so a sync row's store_path, which
+    the resolution gate never checks, is never read. BY_NAME is
+    _lineage_rows_by_name(m), built once by the caller."""
     try:
         lin = r.get("lineage")
         if not isinstance(lin, dict):
             return None
         if by_name is None:
-            by_name = _converge_rows_by_name(m)
+            by_name = _lineage_rows_by_name(m)
         store = _lineage_row_store(m, r)
         for what, row_field, planned_field, session_field in (
                 ("parent", "parent_row", "parent_planned", "parent_session"),
@@ -17883,7 +18013,7 @@ def _converge_dependency_skip(m, r, by_name=None):
                                                 planned.get("skipped")))
                 if not planned.get("written"):
                     continue           # pending: written first, in write order
-            state, data = _lineage_target(r.get("store_path"), target)
+            state, data = _lineage_target(store, target)
             if state == "absent":
                 return "parent_changed", (
                     "its {0} {1}'s row is gone since this operation was "
@@ -17903,12 +18033,14 @@ def _converge_dependency_skip(m, r, by_name=None):
         return "parent_changed", "its link's target could not be checked"
 
 
-def _converge_link_report(op, m, skip_ids=frozenset(), removed=frozenset(),
-                          forward=False):
-    """Make, set and save a converge op's link report (_link_report), after
-    the command's writes: over the stores of its rows, less the rows in
-    SKIP_IDS (rows in a store the resolution gate did not resolve), with
-    REMOVED the (store path, row id) pairs this command removed.
+def _op_link_report(op, m, skip_ids=frozenset(), removed=frozenset(),
+                    restored=frozenset(), forward=False):
+    """Make, set and save a converge or sync op's link report
+    (_link_report), after the command's writes: over the stores of its rows
+    (_lineage_row_store: a converge row's store_path, a sync row's
+    directory), less the rows in SKIP_IDS (rows in a store the resolution
+    gate did not resolve), with REMOVED and RESTORED the (store path, row
+    id) pairs this command removed and put back to a pre-image.
 
     An op journaled before lineage (no `lineage_format`) passes no rows, so
     its reversal gets the dangling part alone, read from the stores; and its
@@ -17917,9 +18049,10 @@ def _converge_link_report(op, m, skip_ids=frozenset(), removed=frozenset(),
     if forward and not new:
         return
     rows = _journal_dict_rows(m)
-    stores = [r.get("store_path") for r in rows if id(r) not in skip_ids]
+    stores = [_lineage_row_store(m, r) for r in rows if id(r) not in skip_ids]
     _record_link_report(op, _link_report(rows if new else [], stores,
-                                         removed=removed, forward=forward))
+                                         removed=removed, restored=restored,
+                                         forward=forward))
 
 
 def execute_converge_op(env, op):
@@ -18133,7 +18266,7 @@ def undo_converge(env, op):
         # "undo"): a surviving row, from this op or any other, that links
         # to a row this undo removed, and a kept row of this op whose link's
         # target now opens another conversation.
-        _converge_link_report(op, m, skip_ids=unresolved, removed=removed)
+        _op_link_report(op, m, skip_ids=unresolved, removed=removed)
         rotate_ops(env)
         return "undone"
     finally:
