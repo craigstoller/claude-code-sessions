@@ -186,6 +186,43 @@ def test_a_folder_that_cannot_be_listed_is_asked_per_file(projects,
     assert len(in_locked) == 3                # every lookup, as today
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a Windows device name")
+def test_a_folder_named_nul_is_asked_per_file(projects):
+    """A real folder whose listing fails while os.path.isfile still finds
+    the file in it: on Windows, a folder named NUL, made through the \\\\?\\
+    prefix. Ruling it out would lose a transcript find_transcripts finds."""
+    folder = os.path.join(projects, "NUL")
+    raw_folder = "\\\\?\\" + folder
+    raw_file = raw_folder + "\\s-1.jsonl"
+    os.mkdir(raw_folder)
+    try:
+        with open(raw_file, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+        with pytest.raises(OSError):
+            os.listdir(folder)
+        assert ct.find_transcripts(projects, "s-1") == \
+            [os.path.join(folder, "s-1.jsonl")]
+        _assert_same(projects, ["s-1", "S-1", "s-2"])
+    finally:
+        if os.path.exists(raw_file):
+            os.remove(raw_file)
+        os.rmdir(raw_folder)
+
+
+def test_index_of_a_bytes_root_fails_as_find_transcripts_does(projects):
+    """A root this was never meant for fails in the index's own listing
+    differently from find_transcripts; the lookup still fails with
+    find_transcripts' own error, not the index's."""
+    _touch(os.path.join(projects, "C--Northwind", "s-1.jsonl"))
+    broot = os.fsencode(projects)
+    with pytest.raises(TypeError) as own:
+        ct._TranscriptIndex(broot)._build()
+    with pytest.raises(TypeError) as scan:
+        ct.find_transcripts(broot, "s-1")
+    assert str(own.value) != str(scan.value)
+    _assert_same(broot, ["s-1", "s-2"])
+
+
 def test_a_transcript_gone_since_the_listing_is_not_found(projects):
     """Every hit is checked on disk when it is asked for, so a transcript
     removed after the listing is no hit, as find_transcripts would say."""

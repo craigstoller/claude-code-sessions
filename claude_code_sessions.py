@@ -632,21 +632,28 @@ class _TranscriptIndex:
       (_INDEXED_SESSION_ID), and so is every name this compares, so this
       keeps both an exact match and what a case-insensitive file system
       folds onto one;
-    - a folder whose listing fails, whose own name is not ASCII or ends in
-      '.' or ' ', or which holds a name that is not ASCII (which a file
-      system may fold or normalise onto an ASCII one) is never ruled out:
-      every lookup asks os.path.isfile there, as find_transcripts does;
+    - a folder whose listing fails, or which holds a name that is not ASCII
+      (which a file system may fold or normalise onto an ASCII one), is
+      never ruled out: every lookup asks os.path.isfile there, as
+      find_transcripts does. A listing can fail where os.path.isfile still
+      finds the file: on Windows, a folder named NUL. So is a folder whose
+      own name is not ASCII or ends in '.' or ' ', defensively: os.listdir
+      and os.path.isfile both reach a folder through the same middle path
+      component, so its name has not been seen to matter;
     - an id that is not a str, or not plain, goes to find_transcripts
       itself, so it answers, or fails, exactly as it always has.
     A root that does not exist indexes as empty, as find_transcripts reads
     it. A root that cannot be listed for any other reason is not indexed:
     each lookup goes to find_transcripts, which raises, and the next one
-    tries the listing again.
+    tries the listing again. The build lists every folder whatever the
+    plan's size, and a plan that looks nothing up builds nothing.
 
     The listing is the plan's snapshot. A transcript removed since is no
     hit, since its os.path.isfile is asked at the lookup; one written since
-    is not seen by this plan. Apply time never uses an index: _sync_relink
-    and the write loop look transcripts up afresh, under the lock."""
+    is not seen by this plan. Apply time never uses an index: under the
+    lock, _sync_relink's lineage pass looks its parents' and roots'
+    transcripts up afresh with find_transcripts, and the write loop looks
+    none up."""
 
     def __init__(self, projects_root):
         self.root = projects_root
@@ -690,7 +697,10 @@ class _TranscriptIndex:
             except Exception:
                 # A root that cannot be listed, or a listing this cannot
                 # read: find_transcripts answers, or raises, as it always
-                # has, and nothing is kept from the attempt.
+                # has, and nothing is kept from the attempt. Any exception,
+                # not only OSError: a root this was never meant for (bytes,
+                # say) fails here differently from find_transcripts, and
+                # find_transcripts' own failure is the one to keep.
                 return find_transcripts(self.root, session_id)
         at = self._holding.get((session_id + ".jsonl").upper(), ())
         if self._always:

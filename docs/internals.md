@@ -1214,18 +1214,22 @@ same, byte for byte.
   app writes as `cliSessionId` are. Any other id, including one that is not a string, goes to
   `find_transcripts` itself, and answers or fails as it always has.
 - A folder the listing cannot vouch for is asked of every id, as `find_transcripts` asks it:
-  one whose listing fails, one whose own name is not ASCII or ends in `.` or a space, and one
-  holding a name that is not ASCII, which a file system may fold or normalise onto an ASCII
-  one. A folder that cannot be listed therefore keeps today's per-file answer, rather than a
-  guess in either direction.
+  one whose listing fails, and one holding a name that is not ASCII, which a file system may
+  fold or normalise onto an ASCII one. A folder that cannot be listed therefore keeps today's
+  per-file answer, rather than a guess in either direction. That matters: on Windows a folder
+  named `NUL` refuses `os.listdir` while `os.path.isfile` still finds the file in it. A folder
+  whose own name is not ASCII or ends in `.` or a space is asked of every id too, defensively,
+  since both calls reach a folder through the same middle path component.
 - A projects folder that does not exist indexes as empty, as `find_transcripts` reads it. One
   that cannot be listed for another reason is not indexed: each lookup goes to
-  `find_transcripts`, which raises where it raised before. A plan that looks nothing up lists
-  nothing.
+  `find_transcripts`, which raises where it raised before.
+- The build lists every folder whatever the plan's size, and a plan that looks nothing up
+  builds nothing. On the machine measured, one build took 0.05 s and one scan 0.02 s, so a plan
+  of three or more lookups gains.
 - The listing is the plan's snapshot. A transcript removed since is no hit; one written since is
-  not seen by that plan. Apply time does not use the index: `_sync_relink` and the write loop
-  look transcripts up afresh, under the lock, as before. So do every other command and
-  recovery.
+  not seen by that plan. Apply time does not use the index: under the lock, `_sync_relink`'s
+  lineage pass looks its parents' and roots' transcripts up afresh with `find_transcripts`, as
+  before, and the write loop looks none up. Every other command keeps `find_transcripts`.
 
 Measured 2026-11-19 on the same machine and stores as the table above, with 836 project
 folders: dry runs from one account of about 1,000 rows into another, three each, interleaved,
