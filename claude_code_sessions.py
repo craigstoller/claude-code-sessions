@@ -15706,7 +15706,10 @@ LINEAGE_PHRASES = {
     "lineage_task_disagree": "holders disagree on taskId",
     "lineage_cycle": "it would close a cycle",
     "lineage_source_changed": "the source row changed since the plan",
+    "own_link_differs": "the row's own link names no usable row",
+    "lineage_no_app_link": "no app-written link backs it",
     "lineage_chain_dropped": "the chain was left out",
+    "own_chain_differs": "the row's own chain disagrees with its holders'",
     "existing_cycle": "the account already holds a cycle of links",
     "lineage_retargeted": "changed since the plan",
     "lineage_dropped": "dropped since the plan",
@@ -15722,7 +15725,8 @@ LINEAGE_LEFT_OUT = frozenset((
     "lineage_parent_disagree", "lineage_self", "lineage_parent_dead",
     "parent_not_in_account", "parent_pair_held", "parent_row_drifted",
     "lineage_variant", "lineage_no_task", "lineage_task_disagree",
-    "lineage_cycle", "lineage_source_changed",
+    "lineage_cycle", "lineage_source_changed", "own_link_differs",
+    "lineage_no_app_link",
 ))
 
 
@@ -19071,6 +19075,91 @@ def cmd_converge(env, ns):
             "that clears it.")
         return 3
     return 0
+
+
+# ====== relink
+# Gives a row the link and chain its conversation already holds elsewhere
+# (docs/specs/2026-11-19-relink-design.md). Value helpers first; every
+# helper here never raises on a malformed row.
+
+RELINK_KEYS = ("spawnedFrom", "startChain")
+RELINK_CHAIN_CODES = frozenset(("lineage_chain_dropped", "own_chain_differs"))
+RELINK_LIST_CAP = 15
+RELINK_SKIP_REASONS = ("gone", "repointed", "unreadable", "changed_since_plan",
+                       "parent_changed", "lineage_cycle", "edges_unreadable")
+RELINK_JOURNAL_BYTE_BUDGET = 32 * 1024 * 1024
+
+
+def _relink_app_written(link):
+    """True for a link the app wrote: `sideSession` exactly True, or exactly
+    the keys sessionId, taskId and title with a non-empty string title. This
+    tool's own {sessionId, taskId} is not one."""
+    try:
+        if not isinstance(link, dict):
+            return False
+        if link.get("sideSession") is True:
+            return True
+        title = link.get("title")
+        return (set(link) == {"sessionId", "taskId", "title"}
+                and isinstance(title, str) and title != "")
+    except Exception:
+        return False
+
+
+def _relink_same(a, b):
+    """Equal as JSON with members in any order; True is not 1."""
+    try:
+        def dump(x):
+            return json.dumps(x, sort_keys=True, separators=(",", ":"))
+        return dump(a) == dump(b)
+    except Exception:
+        return False
+
+
+def _relink_row_bytes(d):
+    """The serialization realign, retitle and repoint write."""
+    return json.dumps(d, separators=(",", ":")).encode("utf-8")
+
+
+def _relink_sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _relink_apply_new(d, new):
+    """A copy of `d` with each key of `new` set, in RELINK_KEYS order: in
+    place when present, appended when absent."""
+    out = dict(d)
+    for k in RELINK_KEYS:
+        if k in new:
+            out[k] = new[k]
+    return out
+
+
+def _relink_apply_old(d, old, keys=None):
+    """A copy of `d` with each key of `old` (only those in `keys` when given)
+    popped when it was absent, else set in place to its old value."""
+    out = dict(d)
+    for k in old:
+        if keys is not None and k not in keys:
+            continue
+        if old[k]["present"]:
+            out[k] = old[k]["value"]
+        else:
+            out.pop(k, None)
+    return out
+
+
+def _relink_key_state(cur, key, old, new):
+    """"new" when `cur` holds `key` at `new`; "old" when it matches `old`
+    (absent, or present at the old value); else "other"."""
+    if key in cur and _relink_same(cur[key], new):
+        return "new"
+    if old["present"]:
+        if key in cur and _relink_same(cur[key], old["value"]):
+            return "old"
+    elif key not in cur:
+        return "old"
+    return "other"
 
 
 if __name__ == "__main__":
