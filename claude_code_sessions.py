@@ -7795,13 +7795,21 @@ def _destination_census(dest_path):
             continue
         if not isinstance(d, dict):
             continue
-        sid = d.get("cliSessionId")
-        if isinstance(sid, str) and sid:
-            sids.add(sid)
-        k = title_key(d.get("title"))
-        if k:
-            keys.add(k)
+        _census_note(d, sids, keys)
     return sids, keys
+
+
+def _census_note(d, sids, keys):
+    """Count the readable row D in a census: its cliSessionId into SIDS when
+    it is a non-empty string, its title_key into KEYS when non-empty. The
+    one rule for _destination_census and for the lineage pass's read of the
+    destination that stands in for it (_lineage_store_rows' CENSUS)."""
+    sid = d.get("cliSessionId")
+    if isinstance(sid, str) and sid:
+        sids.add(sid)
+    k = title_key(d.get("title"))
+    if k:
+        keys.add(k)
 
 
 # Bounds on the transcript comparison below. Transcripts reach tens of MB, so
@@ -9100,10 +9108,13 @@ def _length_clause(before, after):
     return "both conversations have {0} prose turns".format(before)
 
 
-def _refresh_field_loss(pre, post):
+def _refresh_field_loss_of(a, b):
     """(dropped, reset) top-level keys the DESTINATION's row loses when a
-    refresh replaces PRE with POST, or (None, None) if either side cannot be
-    parsed - "could not tell", never an empty list.
+    refresh replaces its pre-image with its post-image, A and B those two
+    rows decoded, or (None, None) unless both are JSON objects - "could not
+    tell", never an empty list. Reads them only. Until R26 this took the raw
+    bytes, as _refresh_field_loss; its one caller, _sync_refresh_loss, now
+    decodes each image once and shares the decode with the change lines.
 
     This is deliberately NOT transform_row's `removed`/`reset`, which the
     overwrite block used to print. Those describe what the transform took out
@@ -9116,18 +9127,6 @@ def _refresh_field_loss(pre, post):
     never had. The pre-image needed to answer the question properly is already
     in hand, so ask it of the two rows actually involved.
     """
-    try:
-        a = json.loads(pre.decode("utf-8"))
-        b = json.loads(post.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, AttributeError):
-        return None, None
-    return _refresh_field_loss_of(a, b)
-
-
-def _refresh_field_loss_of(a, b):
-    """_refresh_field_loss of rows already decoded: A and B are the decoded
-    PRE and POST, and (None, None) unless both are JSON objects. Reads
-    them only."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None, None
     dropped = sorted(k for k in a if k not in b)
@@ -9371,12 +9370,12 @@ def _sync_ref_change(pre, post, key, fields):
 def _sync_refresh_loss(r):
     """Step 7: what a refresh does to the destination's row, measured on its
     final post_b64 against its pre-image. Sets `dest_dropped` and
-    `dest_reset` (_refresh_field_loss, None for "could not tell"), leaving
-    spawnedFrom and startChain out of the dropped list, and `link_change`
-    and `chain_change`, which report those two once. An add is left as it
-    is. Each image is decoded once, for all four: as _refresh_field_loss
-    would decode it, so a row it reads as "could not tell" reads so to the
-    change lines too. Never raises."""
+    `dest_reset` (_refresh_field_loss_of, None for "could not tell"),
+    leaving spawnedFrom and startChain out of the dropped list, and
+    `link_change` and `chain_change`, which report those two once. An add
+    is left as it is. Each image is decoded once, for all four, so a row the
+    field loss reads as "could not tell" reads so to the change lines too:
+    an image that is not UTF-8 JSON, or a missing one. Never raises."""
     if not r.get("is_update"):
         return
     try:
@@ -9611,11 +9610,12 @@ def plan_sync(env, flags):
     whenever it read every row that census would."""
     source, dest = resolve_sync_endpoints(env, flags.to or None,
                                           flags.live or None)
+    verbatim = bool(flags.verbatim)
     found = {}            # conversation -> its transcript exists
-    decoded = {}          # source filename -> its light row, or None
+    # source filename -> its light row, or None; --verbatim runs no pass
+    decoded = None if verbatim else {}
     picked, tally = select_sync_rows(env, source, dest, flags,
                                      found=found, decoded=decoded)
-    verbatim = bool(flags.verbatim)
     held = tally["held_sessions"]
     rows = []
     sources = {}          # row name -> its source row, for the lineage pass
@@ -17651,12 +17651,13 @@ def _lineage_store_rows(store_path, light=False, decoded=None, census=None):
     resolved, so a row in an unresolved store is never read here.
 
     sync's planning reads each store once (docs/internals.md, "Reading each
-    store once"), through three keywords. LIGHT returns each row as
+    store once"), through three keywords. LIGHT returns each row it reads as
     _lineage_light makes it. DECODED is what a caller already read from
     STORE_PATH: {filename: data, or None for a row it could not read or that
     is not an object}, for every local_*.json it listed. The store is then
     neither listed nor read again; each name still goes through the
-    containment test, and its data is taken as it is. CENSUS, a dict, is
+    containment test, and its data is taken as it is, LIGHT or not (sync's
+    caller makes it light as it reads). CENSUS, a dict, is
     given what _destination_census would find in the same read: "sids" and
     "keys", and "whole", True only when this read stands in for that one
     exactly - the store was listed, every row is a direct child of it, and
@@ -17707,14 +17708,11 @@ def _lineage_store_rows(store_path, light=False, decoded=None, census=None):
                 unread += 1
                 continue
             if isinstance(census, dict):
-                sid = data.get("cliSessionId")
-                if isinstance(sid, str) and sid:
-                    sids.add(sid)
-                k = title_key(data.get("title"))
-                if k:
-                    keys.add(k)
+                _census_note(data, sids, keys)
+            # A row of DECODED is taken as the caller made it, light already.
             rows.append((name[:-len(".json")],
-                         _lineage_light(data) if light else data))
+                         _lineage_light(data) if light and decoded is None
+                         else data))
         if isinstance(census, dict):
             census["whole"] = whole and decoded is None
         return rows, unread

@@ -5767,7 +5767,7 @@ def test_sync_light_rows_plan_exactly_what_whole_rows_plan(
     with monkeypatch.context() as mp:
         mp.setattr(ct, "_lineage_light", lambda d: d)
         whole = ct.plan_sync(env, flags)
-    assert json.dumps(light, sort_keys=True) == json.dumps(whole, sort_keys=True)
+    assert json.dumps(light) == json.dumps(whole)       # key order included
     by = _by_name(light)
     c, d = by["local_c.json"], by["local_d.json"]
     assert _post(c)["spawnedFrom"] == {"sessionId": "local_q", "taskId": LTASK}
@@ -5780,7 +5780,7 @@ def test_sync_light_rows_plan_exactly_what_whole_rows_plan(
     real_new_op = ct.new_op
 
     def spy_new_op(env_, manifest):
-        journals.append(json.dumps(manifest["rows"], sort_keys=True))
+        journals.append(json.dumps(manifest["rows"]))
         return real_new_op(env_, manifest)
     monkeypatch.setattr(ct, "new_op", spy_new_op)
     assert ct.run_sync(env, light) == "completed"
@@ -5875,6 +5875,32 @@ def test_sync_scan_census_matches_the_census_it_stands_in_for(tmp_path):
     assert ct._lineage_store_rows(str(tmp_path / "missing"),
                                   census=census) == ([], 0)
     assert census["whole"] is False
+
+
+def test_sync_scan_census_gives_way_on_a_failure_read_json_does_not_name(
+        tmp_path, monkeypatch):
+    """A row whose read fails other than as read_json refuses (a
+    RecursionError from deeply nested JSON, say) is counted unread by the
+    scan, but the census would not have skipped it, so the scan's census
+    does not stand in for it: the census reads the store itself, and fails
+    as it always has."""
+    store = str(tmp_path / "store")
+    os.makedirs(store)
+    _lrow(store, "local_a.json", "sid-a", "Northwind kickoff")
+    _lrow(store, "local_deep.json", "sid-d", "ACME onboarding")
+    real = ct.read_json
+
+    def read(path):
+        if os.path.basename(path) == "local_deep.json":
+            raise RecursionError("maximum recursion depth exceeded")
+        return real(path)
+    monkeypatch.setattr(ct, "read_json", read)
+    census = {}
+    rows, unread = ct._lineage_store_rows(store, light=True, census=census)
+    assert [i for i, _ in rows] == ["local_a"] and unread == 1
+    assert census["whole"] is False
+    with pytest.raises(RecursionError):
+        ct._destination_census(store)
 
 
 def test_sync_census_reads_the_store_when_the_scan_left_a_row_out(
