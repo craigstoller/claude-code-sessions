@@ -3875,6 +3875,92 @@ def test_a_0_17_converge_journal_completed_undoes(
     assert store_rows(env, A3, O3) == ["local_s3.json"]
 
 
+def _tree(root):
+    """{relative path: bytes} for every file under ROOT."""
+    out = {}
+    for d, _dirs, files in os.walk(root):
+        for f in files:
+            p = os.path.join(d, f)
+            with open(p, "rb") as fh:
+                out[os.path.relpath(p, root)] = fh.read()
+    return out
+
+
+def test_a_hand_built_0_17_converge_journal_undoes_children_first(
+        mkenv, tmp_path, write_row, monkeypatch):
+    """R15 holds for a journal 0.17.0 wrote, built here by hand: no
+    lineage_format, no lineage_cycles, and no lineage on its rows, which
+    are in the order 0.17.0 journaled them, an order the lineage pass never
+    gave. Undo removes them in the reverse of m["rows"], and nothing else
+    changes: every other row file is byte-identical, the journal's rows are
+    as they were, and the manifest gains only its undo report and the
+    dangling part of the link report, which names nothing here."""
+    env = _monotonic_now(mkenv(tmp_path))
+    write_row(env, 0, A1, O1, "local_s1", lrow(S1, "local_s1", "ACME-REVIEW"))
+    write_row(env, 0, A1, O1, "local_s2",
+              lrow(S2, "local_s2", "Northwind kickoff"))
+    for acct in (A2, A3):
+        write_row(env, 0, acct, ORG[acct], "local_pad",
+                  lrow(PAD, "local_pad", "Padding"))
+    root = env.store_candidates[0]
+    rows = []
+    for n, (sid, title, acct) in enumerate((
+            (S1, "ACME-REVIEW", A3), (S2, "Northwind kickoff", A2),
+            (S1, "ACME-REVIEW", A2)), 1):
+        stem_ = "local_0a170000-0000-4000-8000-00000000000{0}".format(n)
+        store = os.path.join(root, acct, ORG[acct])
+        post = json.dumps(lrow(sid, stem_, title),
+                          separators=(",", ":")).encode()
+        with open(os.path.join(store, stem_ + ".json"), "wb") as fh:
+            fh.write(post)
+        rows.append({"name": stem_ + ".json", "account": acct,
+                     "org": ORG[acct], "label": acct[:8] + "/" + ORG[acct][:8],
+                     "store_path": store,
+                     "dest_path": os.path.join(store, stem_ + ".json"),
+                     "session": sid, "title": title, "title_source": "",
+                     "holders": [A1[:8]], "post_b64": ct.b64(post),
+                     "written": True})
+    op_id = "20260901T000000Z-0a17c0"
+    m = {"op_id": op_id, "op_type": "converge", "status": "completed",
+         "only": "", "live_asserted": "", "destinations": [], "holds": [],
+         "notes": [], "complete": {"now": 0, "of": 2, "after": 2, "held": 0},
+         "history": [{"status": s, "at": 1_700_000_000.0 + i}
+                     for i, s in enumerate(("journaled", "writing",
+                                            "completed"))],
+         "rows": rows}
+    os.makedirs(os.path.join(env.ops_dir, op_id))
+    with open(os.path.join(env.ops_dir, op_id, "manifest.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(m, fh)
+    op, = ct.list_ops(env)
+    assert "lineage_format" not in op.manifest
+    assert ct._converge_shape_error(op.manifest) is None
+    journaled = json.loads(json.dumps(op.manifest["rows"]))
+    before = _tree(root)
+    removed = []
+    real = ct.os.unlink
+
+    def spy(path, *a, **k):
+        if os.path.basename(str(path)).startswith("local_"):
+            removed.append(os.path.basename(str(path)))
+        return real(path, *a, **k)
+    monkeypatch.setattr(ct.os, "unlink", spy)
+    assert ct.undo_converge(env, op) == "undone"
+    monkeypatch.setattr(ct.os, "unlink", real)
+    assert removed == [r["name"] for r in reversed(journaled)]
+    gone = {os.path.relpath(r["dest_path"], root) for r in journaled}
+    assert _tree(root) == {k: v for k, v in before.items() if k not in gone}
+    saved = journal_of(env, op_id)
+    assert saved["rows"] == journaled
+    assert set(saved) - set(m) == {"undo_report", "link_report"}
+    assert saved["undo_report"] == {"deleted": 3, "already_gone": 0,
+                                    "skipped": []}
+    assert saved["link_report"] == EMPTY_REPORT
+    assert saved["status"] == "undone"
+    assert {k: saved[k] for k in m if k not in ("status", "history")} == \
+        {k: m[k] for k in m if k not in ("status", "history")}
+
+
 def test_recover_listing_and_doctor_accept_old_journals(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     env = _monotonic_now(mkenv(tmp_path))

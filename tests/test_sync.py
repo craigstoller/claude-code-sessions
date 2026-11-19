@@ -3540,6 +3540,112 @@ def test_a_0_17_sync_journal_with_a_verbatim_link_recovers_and_undoes(
     assert ct.recover_op(env, op2, "back") == "rolled_back"
 
 
+def _tree(root):
+    """{relative path: bytes} for every file under ROOT."""
+    out = {}
+    for d, _dirs, files in os.walk(root):
+        for f in files:
+            p = os.path.join(d, f)
+            with open(p, "rb") as fh:
+                out[os.path.relpath(p, root)] = fh.read()
+    return out
+
+
+def test_a_hand_built_0_17_sync_journal_undoes_children_first(
+        two_account_env, tmp_path, monkeypatch):
+    """R15 holds for a journal 0.17.0 wrote, built here by hand: no
+    lineage_format, no lineage_cycles, and no lineage, link_change or
+    chain_change on its rows, which are in the order 0.17.0 journaled them:
+    an add, a refresh, an add. Undo reverses them in one sequence, the
+    reverse of m["rows"] - the last add removed, the refresh restored, the
+    first add removed - not every add before every refresh, as 0.17.0's own
+    undo ran. Nothing else changes: the source store and the destination's
+    other row are byte-identical, the journal's rows are as they were, and
+    the manifest gains only its undo report and the dangling part of the
+    link report, which names nothing here."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, "sid-a", "sid-b", "sid-c", "sid-o")
+    _lrow(src, "local_a.json", "sid-a", "Northwind alpha", lastActivityAt=5)
+    _lrow(src, "local_b.json", "sid-b", "Northwind bravo v2", lastActivityAt=5)
+    _lrow(src, "local_c.json", "sid-c", "Northwind charlie", lastActivityAt=5)
+    _lrow(dst, "local_b.json", "sid-b", "Northwind bravo", lastActivityAt=1)
+    _lrow(dst, "local_o.json", "sid-o", "ACME-REVIEW other", lastActivityAt=1)
+    pre_b = _bytes(os.path.join(dst, "local_b.json"))
+    root = env.store_candidates[0]
+    before = _tree(root)
+    rows = []
+    for name in ("local_c.json", "local_b.json", "local_a.json"):
+        post = _bytes(os.path.join(src, name))
+        data = json.loads(post)
+        refresh = name == "local_b.json"
+        rows.append({
+            "name": name, "dest_path": os.path.join(dst, name),
+            "pre_b64": ct.b64(pre_b) if refresh else None,
+            "is_update": refresh, "swaps_conversation": False,
+            "displaced_session": None, "displaced_orphan": None,
+            "displaced_overlap": None, "displaced_turns": None,
+            "incoming_turns": None, "pre_activity": 1 if refresh else None,
+            "regresses": False, "activity_unknown": False,
+            "dest_dropped": [] if refresh else None,
+            "dest_reset": [] if refresh else None,
+            "post_b64": ct.b64(post), "session_id": data["cliSessionId"],
+            "title": data["title"], "removed": [], "reset": [],
+            "overrode_tombstone": False, "written": True})
+        with open(os.path.join(dst, name), "wb") as fh:
+            fh.write(post)
+    op_id = "20260901T000000Z-0a17d0"
+    m = {"op_id": op_id, "op_type": "sync", "status": "completed",
+         "source_path": src, "dest_path": dst,
+         "source_account": "aaaaaaaa-0000-0000-0000-000000000001",
+         "source_org": "bbbbbbbb-0000-0000-0000-000000000002",
+         "source_email": "me@example.com", "source_resolved_from": "oauth",
+         "dest_account": "cccccccc-0000-0000-0000-000000000003",
+         "dest_org": "dddddddd-0000-0000-0000-000000000004",
+         "dest_email": None, "dest_email_source": None, "update": True,
+         "verbatim": False, "newer_only": False, "allow_orphan": False,
+         "history": [{"status": s, "at": 1_700_000_000.0 + i}
+                     for i, s in enumerate(("journaled", "writing",
+                                            "completed"))],
+         "rows": rows}
+    os.makedirs(os.path.join(env.ops_dir, op_id))
+    with open(os.path.join(env.ops_dir, op_id, "manifest.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(m, fh)
+    op, = ct.list_ops(env)
+    assert "lineage_format" not in op.manifest
+    assert ct._sync_shape_error(op.manifest) is None
+    journaled = json.loads(json.dumps(op.manifest["rows"]))
+    steps = []
+    real_unlink, real_write = os.unlink, ct.atomic_write
+
+    def unlink(path, *a, **k):
+        if os.path.basename(str(path)).startswith("local_"):
+            steps.append(("remove", os.path.basename(str(path))))
+        return real_unlink(path, *a, **k)
+
+    def write(path, data):
+        if os.path.basename(path).startswith("local_"):
+            steps.append(("restore", os.path.basename(path)))
+        return real_write(path, data)
+    monkeypatch.setattr(ct.os, "unlink", unlink)
+    monkeypatch.setattr(ct, "atomic_write", write)
+    assert ct.undo_sync(env, op) == "undone"
+    monkeypatch.setattr(ct.os, "unlink", real_unlink)
+    monkeypatch.setattr(ct, "atomic_write", real_write)
+    assert steps == [("remove", "local_a.json"), ("restore", "local_b.json"),
+                     ("remove", "local_c.json")]
+    assert _tree(root) == before
+    saved = _journal_of(env, op)
+    assert saved["rows"] == journaled
+    assert set(saved) - set(m) == {"undo_report", "link_report"}
+    assert saved["undo_report"] == {"removed": 2, "restored": 1,
+                                    "already_gone": 0, "not_restored": 0}
+    assert saved["link_report"] == EMPTY_LINKS
+    assert saved["status"] == "undone"
+    assert {k: saved[k] for k in m if k not in ("status", "history")} == \
+        {k: m[k] for k in m if k not in ("status", "history")}
+
+
 @pytest.mark.parametrize("damage", [
     lambda m: m.__setitem__("rows", 5),
     lambda m: m.__setitem__("rows", [5, None]),
