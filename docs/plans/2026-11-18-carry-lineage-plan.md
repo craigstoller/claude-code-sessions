@@ -985,6 +985,8 @@ These are this plan's calls, recorded so the spec's authority can be checked aga
    byte-identical row as `held_same` or `held_unknown` instead of `unchanged`. Such a row writes
    nothing either way, so the after-state the lineage pass sees is the same; only the report's
    heading differs, and today's is kept. The spec's provisional test still follows the holds.
+   The build narrowed this to rows whose source carries no link or chain (R21); see "Build notes
+   (2026-11-19)" under "Revisions".
 7. **`run_sync` refuses when a refresh that became a no-op finds its destination row changed**
    (Task 8, step 5). The spec does not cover it. Treating that row as existing could leave a
    child linking to a row that is gone.
@@ -1101,3 +1103,24 @@ acceptance check runs on the maintainer's machine, with the app closed:
   split-brain" (Neon). The body is the plan's snapshot, as `run_sync` writes today, and the link
   reflects the stores under the lock, as in `converge`. That is the spec's design, now stated in
   Task 8.
+- **Build notes (2026-11-19).** What the build changed from the text above, recorded here rather
+  than by rewriting it:
+  - Helpers renamed during the build, because `sync` uses them too:
+    - `_converge_dependency_skip` is `_lineage_dependency_skip`. `classify_sync_op` calls it,
+      and takes any answer but `None` as drift that withdraws forward;
+    - `_converge_rows_by_name` is `_lineage_rows_by_name`;
+    - `_converge_link_report` is `_op_link_report`, which makes, sets and saves the report for
+      either command's op.
+  - `_link_report` gained a keyword-only flag, `forward`. Forward recovery passes it, and the
+    report then checks each written row's own journaled targets, an absent one counting as
+    dangling. A reversal passes `removed` instead.
+  - Departure 6 is narrowed (R21). The exact identity test ahead of the age holds now applies
+    only to a row whose source carries neither `spawnedFrom` nor `startChain`. A row whose
+    source carries either follows the spec's path: provisionally unchanged at step 3, and
+    decided at step 6 on its translated bytes. So a byte-identical child that carries a link the
+    destination cannot use is written with the translated link. Under `--newer-only` such a
+    row meets the age holds first, in the spec's order. A `--verbatim` row copies its link as
+    is, so its identical bytes are still unchanged at step 1.
+  - A shortened row id keeps its `local_` prefix and the first 8 characters after it (R18), so
+    the Global Constraints' "first 8 characters" now holds for conversation ids and other values,
+    and a row id no longer prints as the prefix and 2 characters.

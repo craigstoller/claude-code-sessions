@@ -1084,7 +1084,9 @@ and so never writes a link that names a row that is not there:
 
 A planned target that is still pending is not checked, because write order writes it first (a
 pending refresh may open another conversation until it is written). `converge` skips the row by
-the reason, and it stays short for the next `converge`, which plans it afresh. `sync` has no
+the reason, and it stays short for the next `converge`, which plans it afresh. `recover
+--forward` prints each such row in the `skipped :` line `converge` prints for a skipped row
+(`_converge_skip_line`, the one shape for both). `sync` has no
 per-row skip, so `classify_sync_op` treats either answer as drift, withdraws forward and offers
 `back`. The shipped defect that a landed row was marked `already_present` and lost to `undo` is
 fixed first: before either direction runs, a pending row that has landed (its bytes match, or its
@@ -1096,7 +1098,11 @@ roots and globs further down. `removed` and `restored` are `(store, row id)` pai
 keeps filenames and one id can name healthy rows in other stores.
 - Dangling: a row whose `spawnedFrom` or `startChain` names a row this command removed from the
   same store. It reads only the stores and what the command removed, never the journal's lineage,
-  so a journal from 0.17.0 gets it too.
+  so a journal from 0.17.0 gets it too. A row the op added that the reversal finds already gone
+  counts as removed: an earlier run, cut short, may have removed it, and in `sync` that happens
+  with no crash at all, since `_sync_reverse_all` attempts every step, then raises the failures
+  together, and no report is saved. `_sync_delete_targets` collects such rows in its `gone`
+  out-list, as it collects `pristine` ones, and the converge reversals add them inline.
 - Redirected: a written row, not removed or restored, that still carries the link this op wrote
   and whose target now opens another conversation. Only rows with a `lineage` take part. A
   restored row is never compared with this op's link, including a row an interrupted earlier run
@@ -1108,6 +1114,14 @@ keeps filenames and one id can name healthy rows in other stores.
   checked`, and a report that fails prints `links not checked: the link report failed (...)`
   instead. It never raises and never fails the command it reports for. It is saved to the
   journal as `link_report`.
+- The window's Undo shows the same lines, from `_link_report_lines` itself, for a copy and a
+  converge alike (`_undo_outcome`): in the sync tab's text and at the end of the Level tab's
+  note.
+
+After a `converge --apply`, `--verbose` lists the links the after-apply `links :` line counts:
+one line per written row whose link or chain was left out or changed since the plan, its row id,
+its account label and each reason's phrase (`_lineage_row_lines`). The rows come from the public
+manifest, so a label is scrubbed wherever the rest of `converge`'s output is.
 
 **`lineage_format` and old journals.** Every `converge` and `sync` op this version journals
 carries `lineage_format: 1`, and each row a `lineage`:
@@ -1142,9 +1156,14 @@ the link report are how such a change is caught.
 4. The window's Level tab shows lineage as the `links :` line with its reasons, since the window
    renders no per-row notes of any kind. Its sync pane shows the same `link :` and `chain :`
    change lines as the CLI.
-5. `sync` keeps today's identity test ahead of the age holds. Taken literally, the spec's order
-   would report a byte-identical row under `--newer-only` as held, not unchanged. It writes
-   nothing either way.
+5. `sync` keeps today's identity test ahead of the age holds, for a row whose source carries
+   neither `spawnedFrom` nor `startChain`. Taken literally, the spec's order would report such a
+   byte-identical row under `--newer-only` as held, not unchanged. It writes nothing either way.
+   A row whose source carries either takes the spec's path (narrowed in the final review, R21):
+   identical bytes that carry the source account's link may name a row the destination lacks,
+   so the row is provisionally unchanged at step 3 and decided at step 6 on its translated
+   bytes, and written when the link changes. Under `--newer-only` it meets the age holds first.
+   A `--verbatim` row copies its link as is, so its identical bytes stay unchanged.
 6. `run_sync` refuses, before it journals, when a refresh that became a no-op at apply time finds
    its destination row changed. The spec does not cover it, and treating that row as existing
    could leave a child linking to a row that is gone.

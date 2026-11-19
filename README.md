@@ -427,7 +427,11 @@ is always a preview will misread `sync --apply --json`.
   drops it or points it at another row says so, one line per row (`link    : local_c1 loses its
   link`, `link    : local_c1 now links to another row`, and `chain   :` for the chain), and the
   fields line leaves the link out so it is reported once. One exception: a destination link that
-  already names the same row and `taskId` is kept as it is. In the window the sync pane shows the
+  already names the same row and `taskId` is kept as it is. A refresh whose bytes already match
+  the destination's row is reported unchanged, unless the source row carries a link or a chain:
+  then the link is translated first, and the row is written when the translated link differs, so
+  a copy that names a row in the source account is corrected. (Under `--newer-only` such a row
+  meets the age holds first, like any refresh.) In the window the sync pane shows the
   same lines. An apply that ends with nothing to write says "Nothing to copy: the destination
   already holds these rows" and leaves Undo as it was.
   **`--verbatim` copies links as they are**, so a link may name a row that does not exist in the
@@ -619,10 +623,19 @@ Each part prints only when its count is not zero, the most frequent reason first
 link was left out carries `[link: <reason>]` on its own line. The apply resolves every link
 again under the lock, against the store as it then stands, and its last lines say what changed
 since the plan: `links   : 4 carried, 1 left out (...); since the plan: 1 changed, 1 gained`.
-`changed` and `dropped` count links the plan had, `gained` one it did not. The journal records
-the final link per row, and recovery never resolves again. It writes the journaled bytes, skips
-a row (`parent_not_written`) whose planned parent it did not write, and skips one
-(`parent_changed`) whose parent's row is gone or now opens another conversation.
+`changed` and `dropped` count links the plan had, `gained` one it did not. With `--verbose` the
+apply also lists them, one line per written row whose link or chain was left out or changed
+since the plan, with its account:
+
+```
+   local_c3 -> bob@example.com (cccc1111/dddd2222)   [link: the parent's own row is held in this plan; dropped since the plan]
+```
+
+The journal records the final link per row, and recovery never resolves again. It writes the
+journaled bytes, skips a row (`parent_not_written`) whose planned parent it did not write, and
+skips one (`parent_changed`) whose parent's row is gone or now opens another conversation.
+`recover --forward` names each row it skipped that way, with its reason, in the `skipped :` line
+`converge` prints for a skipped row.
 
 `undo` can leave a link dangling. When a row it created has become the last pointer to its
 conversation, `undo` keeps it, while it still removes the parent row the same operation created.
@@ -639,7 +652,9 @@ app shows that was not measured. `link redirected: ... (its parent's row now ope
 conversation)` names a link whose target row survives and now opens a different conversation,
 and `links not checked: N could not be read` counts what the report could not read. The report
 covers rows that link to a row the command removed, and for `recover --forward` the operation's
-own targets. It is not a check of every link in the store.
+own targets. It is not a check of every link in the store. A reversal cut short and run again
+counts a row the first run removed as removed, so a link to it is still named. The window's Undo
+shows the same lines, for a copy and a converge alike.
 
 **`realign`** - point every account's row of a split conversation at the folder holding its
 live transcript copy:
