@@ -15572,7 +15572,14 @@ def _lineage_pick(rows, prefer_name=""):
 
 
 def _lineage_short(x):
-    return str(x)[:8]
+    """An id shortened for a note or a refusal. A row id keeps its `local_`
+    prefix and the first 8 characters after it, so it does not shrink to the
+    prefix and 2 characters; any other value, a conversation id among them,
+    keeps its first 8. Never raises."""
+    s = str(x)
+    if s.startswith("local_"):
+        return s[:len("local_") + 8]
+    return s[:8]
 
 
 def _lineage_has(fn, sid):

@@ -399,6 +399,23 @@ def test_note_details_name_ids_by_8_chars_and_no_titles():
         assert "ACME-REVIEW" not in n["detail"]
 
 
+def test_shortened_ids_keep_a_row_ids_prefix_and_8_more():
+    """R18: a row id keeps its `local_` prefix and the first 8 characters
+    after it, so a minted id no longer prints as the prefix and 2
+    characters; any other value, a conversation id among them, keeps its
+    first 8. Short values are kept whole, and nothing raises."""
+    minted = "local_3f2a9c1d-7e4b-4c2a-9d1e-0123456789ab"
+    assert ct._lineage_short(minted) == "local_3f2a9c1d"
+    assert ct._lineage_short("local_p") == "local_p"
+    assert ct._lineage_short("local_") == "local_"
+    assert ct._lineage_short("9aaa0000-1111-4000-8000-00000000000a") == \
+        "9aaa0000"
+    assert ct._lineage_short("cli_pa_0123456789") == "cli_pa_0"
+    assert ct._lineage_short("LOCAL_3f2a9c1d-7e4b") == "LOCAL_3f"
+    assert ct._lineage_short(None) == "None"
+    assert ct._lineage_short(12345678901) == "12345678"
+
+
 # ---------------------------------------------------------------- Task 2
 # Cycles, write order and the row rewrite.
 
