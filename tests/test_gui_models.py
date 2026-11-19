@@ -59,6 +59,17 @@ def manifest(holds=(), rows=(), complete=None, **kw):
     return m
 
 
+def lineage(parent_row="", codes=()):
+    """A row's lineage record (the converge plan's per-row field)."""
+    return {"parent_session": "aaaa1111" if parent_row else "",
+            "parent_row": parent_row, "parent_planned": False,
+            "root_session": "", "root_row": "", "root_planned": False,
+            "carried_keys": ["sessionId", "taskId"] if parent_row else [],
+            "dropped_keys": [],
+            "notes": [{"code": c, "detail": "no row for parent aaaa1111"}
+                      for c in codes]}
+
+
 def alignment(short=0, rows_per_account=(379, 379, 379)):
     labels = ["alice@example.com", "bob@example.com", "carol@example.com"]
     n = len(rows_per_account)
@@ -249,6 +260,30 @@ def test_scoreboard_lines_render_from_alignment_report():
     assert "0 dead, 0 blank, 0 unreadable" in text
     half = gui._scoreboard_half(rep)
     assert half == "Level: 379 / 371 / 380 - 4 short."
+
+
+def test_plan_summary_lines_include_the_links_line():
+    """The Level tab's lineage branch: the plan's `links :` line, with its
+    left-out reasons, right under the completeness line - the same line the
+    CLI's dry run prints."""
+    rows = [{"account": ACCT, "lineage": lineage("local_pb")},
+            {"account": ACCT, "lineage": lineage(
+                codes=["parent_not_in_account"])},
+            {"account": ACCT, "lineage": lineage(
+                codes=["lineage_variant", "lineage_chain_dropped"])},
+            {"account": ACCT, "lineage": lineage(
+                codes=["parent_not_in_account"])}]
+    lines = gui._plan_summary_lines(manifest(rows=rows))
+    assert lines[1] == ("links   : 1 to carry, 3 left out (no row for the "
+                        "parent in that account 2, not a cleared link "
+                        "variant 1)")
+    assert "-> alice@example.com: 4 rows to create" in lines
+    # A plan with no links renders exactly today's lines.
+    plain = gui._plan_summary_lines(manifest(rows=[{"account": ACCT},
+                                                   {"account": ACCT,
+                                                    "lineage": lineage()}]))
+    assert not any(ln.startswith("links") for ln in plain)
+    assert plain == [plain[0], "-> alice@example.com: 2 rows to create"]
 
 
 # ---------------------------------------------------------------- predicate

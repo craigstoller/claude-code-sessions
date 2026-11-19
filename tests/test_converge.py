@@ -722,7 +722,9 @@ def test_crash_then_forward_re_evaluates_a_gained_row_as_skip(
     m, op = _crash_after_first_row(env, write_transcript, write_row)
     pending = [r for r in op.manifest["rows"] if not r["written"]]
     # In the window, one pending pair's destination gains a row for the same
-    # conversation.
+    # conversation. Which pending row is incidental: any of them would do, so
+    # the journal's write order (parents first, else the plan's) is not
+    # what this pins.
     gained = pending[0]
     acct_org = {A1: O1, A2: O2, A3: O3}[gained["account"]]
     write_row(env, 0, gained["account"], acct_org, "local_gained",
@@ -2734,3 +2736,495 @@ def test_title_validation_is_retitles_own(mkenv, tmp_path, write_transcript,
         assert mm["degrade_reason"] == "title rejected by retitle's validation"
         assert mm["suggested_title"] is None
         assert mm["command_runnable"] is False
+
+
+# ------------------------------------- carry the link (planning, lineage pass)
+# docs/specs/2026-11-17-carry-lineage-design.md, "converge": the plan carries
+# a side session's link to its parent's row in each destination. The child
+# sorts BEFORE its parent, so a plan that kept today's sid order would write
+# the child first.
+
+LP = "9aaa0000-1111-4000-8000-00000000000a"   # the parent
+LC = "0ccc0000-2222-4000-8000-00000000000c"   # its side session
+LD = "0ddd0000-3333-4000-8000-00000000000d"   # a second child, uncleared link
+LX = "0eee0000-4444-4000-8000-00000000000e"   # dead; its rows link in a loop
+LY = "0fff0000-5555-4000-8000-00000000000f"   # dead; LX's partner
+TASK = "task_7f"
+ORG = {A1: O1, A2: O2, A3: O3}
+NUM = {A1: "1", A2: "2", A3: "3"}
+LINEAGE_KEYS = {"parent_session", "parent_row", "parent_planned",
+                "root_session", "root_row", "root_planned", "carried_keys",
+                "dropped_keys", "notes"}
+
+
+def side_link(row_id, **extra):
+    d = {"sessionId": row_id, "taskId": TASK, "title": "Northwind",
+         "sideSession": True}
+    d.update(extra)
+    return d
+
+
+def lrow(sid, stem, title, **extra):
+    """row_data with sessionId set to the row's stem (row_data defaults it to
+    "local-x", which the lineage pass rightly refuses to resolve)."""
+    return row_data(sid, title, sessionId=stem, **extra)
+
+
+def post_of(r):
+    return json.loads(ct.unb64(r["post_b64"]).decode("utf-8"))
+
+
+def linked_holdings(env, write_transcript, write_row, parent_in=(A2, A3),
+                    parent_title="Northwind kickoff", chain=None):
+    """P (LP) and C (LC) are held by A1, and C's A1 row is a side session of
+    P's A1 row; P is also held by each account in PARENT_IN, and C by none of
+    them. An account without P gets a dead padding row, so it stays a
+    destination. Every row's sessionId is its stem."""
+    for sid in (LP, LC):
+        write_transcript(env, "C--p", sid, t_entries())
+    write_row(env, 0, A1, O1, "local_p1", lrow(LP, "local_p1", parent_title))
+    extra = {"spawnedFrom": side_link("local_p1")}
+    if chain is not None:
+        extra["startChain"] = chain
+    write_row(env, 0, A1, O1, "local_c1",
+              lrow(LC, "local_c1", "ACME-REVIEW side task", **extra))
+    for acct in (A2, A3):
+        if acct in parent_in:
+            stem = "local_p" + NUM[acct]
+            write_row(env, 0, acct, ORG[acct], stem,
+                      lrow(LP, stem, parent_title))
+        else:
+            write_row(env, 0, acct, ORG[acct], "local_pad",
+                      lrow(PAD, "local_pad", "Padding"))
+
+
+def rows_by(m, sid):
+    return {r["account"]: r for r in m["rows"] if r["session"] == sid}
+
+
+def test_plan_carries_a_translated_link_into_each_destination(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert m["lineage_format"] == 1
+    assert m["lineage_cycles"] == 0
+    mine = rows_by(m, LC)
+    assert sorted(mine) == [A2, A3]
+    assert not rows_by(m, LP)                       # P is complete already
+    for acct in (A2, A3):
+        r = mine[acct]
+        target = "local_p" + NUM[acct]
+        post = post_of(r)
+        assert post["spawnedFrom"] == {"sessionId": target, "taskId": TASK}
+        assert "startChain" not in post
+        # The link is appended to the synthesized row; nothing else changes.
+        assert list(post)[-1] == "spawnedFrom"
+        assert post["sessionId"] == r["name"][:-len(".json")]
+        assert post["cliSessionId"] == LC
+        assert r["lineage"] == {
+            "parent_session": LP, "parent_row": target,
+            "parent_planned": False, "root_session": "", "root_row": "",
+            "root_planned": False, "carried_keys": ["sessionId", "taskId"],
+            "dropped_keys": ["sideSession", "title"], "notes": []}
+    # Lineage notes live in the rows only, never among the title notes.
+    assert m["notes"] == []
+
+
+def test_plan_carries_the_link_to_a_parent_row_created_in_the_same_plan(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    parent = rows_by(m, LP)[A3]
+    child = rows_by(m, LC)[A3]
+    stem = parent["name"][:-len(".json")]
+    assert post_of(child)["spawnedFrom"] == {"sessionId": stem,
+                                             "taskId": TASK}
+    lin = child["lineage"]
+    assert lin["parent_row"] == stem and lin["parent_planned"] is True
+    assert lin["parent_session"] == LP
+    # The parent's own new row carries no link, and an empty record.
+    assert "spawnedFrom" not in post_of(parent)
+    assert parent["lineage"]["parent_row"] == ""
+    assert parent["lineage"]["notes"] == []
+    # And A2's child row still links to the parent row A2 already had.
+    assert post_of(rows_by(m, LC)[A2])["spawnedFrom"]["sessionId"] == \
+        "local_p2"
+
+
+def test_plan_rows_are_in_write_order_parents_first(
+        mkenv, tmp_path, write_transcript, write_row):
+    """Today's order is sid order, account order: (LC, A2), (LC, A3),
+    (LP, A3). The child in A3 names a planned parent, so it moves behind it;
+    the row with no planned dependency keeps its place."""
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert [(r["session"], r["account"]) for r in m["rows"]] == \
+        [(LC, A2), (LP, A3), (LC, A3)]
+
+
+def test_plan_leaves_the_link_out_when_the_parents_pair_is_held(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """P's pair into A2 is held (its title already names another
+    conversation there), so C's new A2 row cannot link to it: the note is
+    parent_pair_held, with the hold's reason, not parent_not_in_account."""
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row, parent_in=())
+    write_row(env, 0, A2, O2, "local_x2",
+              lrow(LX, "local_x2", "Northwind kickoff"))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert [(h["session"], h["account"], h["reason"]) for h in m["holds"]] \
+        == [(LP, A2, "held_title_collision")]
+    child = rows_by(m, LC)[A2]
+    assert "spawnedFrom" not in post_of(child)
+    lin = child["lineage"]
+    assert lin["parent_row"] == "" and lin["parent_session"] == ""
+    assert [n["code"] for n in lin["notes"]] == ["parent_pair_held"]
+    assert "held_title_collision" in lin["notes"][0]["detail"]
+    # The A3 copy links to the parent row this plan creates there.
+    assert rows_by(m, LC)[A3]["lineage"]["parent_planned"] is True
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    tagged = [ln for ln in out.splitlines()
+              if "[link: the parent's own row is held in this plan]" in ln]
+    assert len(tagged) == 1 and LC[:8] in tagged[0]
+    assert ("links   : 1 to carry, 1 left out (the parent's own row is held "
+            "in this plan 1)") in out
+
+
+def test_only_on_a_child_whose_parent_is_out_of_scope(
+        mkenv, tmp_path, write_transcript, write_row):
+    """--only C leaves P's own missing pair (A3) out of the plan. C's link
+    still resolves against the store: A2's existing parent row is carried,
+    and A3, where no parent row exists or is planned, gets no link."""
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row, parent_in=(A2,))
+    m = ct.plan_converge(env, ct.ConvergeFlags(only=LC[:8]))
+    assert {r["session"] for r in m["rows"]} == {LC}
+    mine = rows_by(m, LC)
+    assert post_of(mine[A2])["spawnedFrom"] == {"sessionId": "local_p2",
+                                                "taskId": TASK}
+    assert "spawnedFrom" not in post_of(mine[A3])
+    assert [n["code"] for n in mine[A3]["lineage"]["notes"]] == \
+        ["parent_not_in_account"]
+
+
+def test_dry_run_prints_the_links_and_chains_lines_and_row_reasons(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """C carries a cleared link and a chain into A2 and A3. D's link is an
+    uncleared variant (pendingPop), so D's rows carry neither its link nor
+    its chain, and each says why on its own line."""
+    env = mkenv(tmp_path)
+    chain = {"firstSessionId": "local_p1", "depth": 1}
+    linked_holdings(env, write_transcript, write_row, chain=chain)
+    write_transcript(env, "C--p", LD, t_entries())
+    write_row(env, 0, A1, O1, "local_d1",
+              lrow(LD, "local_d1", "Northwind follow-up",
+                   spawnedFrom={"sessionId": "local_p1", "taskId": TASK,
+                                "pendingPop": True},
+                   startChain=chain))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    for acct in (A2, A3):
+        assert post_of(rows_by(m, LC)[acct])["startChain"] == {
+            "firstSessionId": "local_p" + NUM[acct], "depth": 1}
+        assert "startChain" not in post_of(rows_by(m, LD)[acct])
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    lines = out.splitlines()
+    links = ("links   : 2 to carry, 2 left out (not a cleared link "
+             "variant 2)")
+    chains = "chains  : 2 to carry, 2 left out"
+    assert links in lines and chains in lines
+    complete = [i for i, ln in enumerate(lines)
+                if ln.startswith("complete : ")]
+    assert complete and complete[0] < lines.index(links) < lines.index(chains)
+    assert not any(ln.startswith("cycles") for ln in lines)
+    tagged = [ln for ln in lines if ln.endswith(
+        "   [link: not a cleared link variant]")]
+    assert len(tagged) == 2 and all(LD[:8] in ln for ln in tagged)
+    assert not any("[link:" in ln for ln in lines if LC[:8] in ln)
+    # The reasons: most frequent first, ties in the table's order.
+    summary = {"links": {"carried": 0, "left_out": {
+        "parent_not_in_account": 1, "lineage_self": 1,
+        "lineage_variant": 3}}}
+    assert ct._lineage_links_line(summary) == (
+        "links   : 5 left out (not a cleared link variant 3, the link names "
+        "the conversation itself 1, no row for the parent in that "
+        "account 1)")
+
+
+def test_dry_run_and_json_report_an_existing_cycle(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """A2 and A3 each already hold two rows that link to each other. The plan
+    leaves them alone and reports them once per account."""
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row)
+    for acct in (A2, A3):
+        x, y = "local_x" + NUM[acct], "local_y" + NUM[acct]
+        write_row(env, 0, acct, ORG[acct], x,
+                  lrow(LX, x, "Northwind loop one", spawnedFrom=side_link(y)))
+        write_row(env, 0, acct, ORG[acct], y,
+                  lrow(LY, y, "Northwind loop two", spawnedFrom=side_link(x)))
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    assert m["lineage_cycles"] == 2
+    rc = ct.cmd_converge(env, cv_ns())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "cycles  : 2 already present, left as they are" in out.splitlines()
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["lineage_cycles"] == 2
+    # existing_cycle is a report only, never a row note.
+    for r in payload["rows"]:
+        assert all(n["code"] != "existing_cycle"
+                   for n in r["lineage"]["notes"])
+
+
+def test_json_keeps_lineage_and_strips_row_images(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row)
+    rc = ct.cmd_converge(env, cv_ns(json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["lineage_format"] == 1
+    assert payload["lineage_cycles"] == 0
+    assert len(payload["rows"]) == 2
+    for r in payload["rows"]:
+        assert "post_b64" not in r and "pre_b64" not in r
+        assert set(r["lineage"]) == LINEAGE_KEYS
+        assert r["lineage"]["parent_row"] in ("local_p2", "local_p3")
+    # No source link or chain is ever emitted.
+    text = json.dumps(payload)
+    assert "spawnedFrom" not in text and "startChain" not in text
+
+
+def test_anonymized_plan_leaks_no_title_label_or_path(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """The parent is titled literally 'lineage': the structural key must
+    survive the scrub while the title is replaced. Labels carry addresses."""
+    env = mkenv(tmp_path)
+    linked_holdings(env, write_transcript, write_row, parent_title="lineage",
+                    chain={"firstSessionId": "local_p1", "depth": 1})
+    identity_files(env, A1, A1, email="alice@example.com")
+    agent_mode_email(env, A2, "bob@example.com")
+    ct._ANONYMIZE = True
+    ct._ANON_CACHE.clear()
+    try:
+        rc = ct.cmd_converge(env, cv_ns(anonymize=True))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "ACME-REVIEW" not in out and "@example.com" not in out
+        assert "links   : 2 to carry" in out
+        assert "chains  : 2 to carry" in out
+
+        rc = ct.cmd_converge(env, cv_ns(anonymize=True, json=True))
+        text = capsys.readouterr().out
+        assert rc == 0
+        assert "ACME-REVIEW" not in text and "@example.com" not in text
+        assert env.home not in text
+        payload = json.loads(text)
+        assert payload["lineage_format"] == 1
+        assert len(payload["rows"]) == 2
+        for r in payload["rows"]:
+            assert r["title"].startswith("<session-")
+            lin = r["lineage"]
+            assert set(lin) == LINEAGE_KEYS
+            assert lin["parent_row"] in ("local_p2", "local_p3")
+            assert lin["root_row"] == lin["parent_row"]
+            flat = json.dumps(lin)
+            assert "\\" not in flat and "/" not in flat and "@" not in flat
+
+        # Every note's detail, in lineage and lineage_planned, goes through
+        # the title scrub (details are title-free by construction; scrubbed
+        # anyway, as hold details are).
+        m = ct.plan_converge(env, ct.ConvergeFlags())
+        r = m["rows"][0]
+        r["lineage"]["notes"] = [{"code": "parent_not_in_account",
+                                  "detail": "ACME-REVIEW side task"}]
+        r["lineage_planned"] = {
+            **r["lineage"], "notes": [{"code": "lineage_variant",
+                                       "detail": "ACME-REVIEW side task"}]}
+        pub = ct._public_converge_manifest(env, m)
+        for key in ("lineage", "lineage_planned"):
+            detail = pub["rows"][0][key]["notes"][0]["detail"]
+            assert "ACME-REVIEW" not in detail and "<session-" in detail
+    finally:
+        ct._ANONYMIZE = False
+        ct._ANON_CACHE.clear()
+
+
+def test_a_store_without_links_plans_the_same_post_b64_as_before(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    """With no link anywhere, the lineage pass changes no byte and no row's
+    place: the plan equals one made with the pass and the write order turned
+    off, row for row, with the same minted ids."""
+    env = mkenv(tmp_path)
+    mixed_holdings(env, write_transcript, write_row)
+    counter = {"n": 0}
+
+    def fake_uuid4():
+        counter["n"] += 1
+        return "00000000-0000-4000-8000-{0:012d}".format(counter["n"])
+    monkeypatch.setattr(ct.uuid, "uuid4", fake_uuid4)
+    m = ct.plan_converge(env, ct.ConvergeFlags())
+    counter["n"] = 0
+    monkeypatch.setattr(ct, "_converge_lineage", lambda *a, **k: 0)
+    monkeypatch.setattr(ct, "_lineage_write_order",
+                        lambda rows, key: list(rows))
+    before = ct.plan_converge(env, ct.ConvergeFlags())
+
+    def shape(rows):
+        return [(r["name"], r["session"], r["account"], r["post_b64"])
+                for r in rows]
+    assert len(m["rows"]) == 3
+    assert shape(m["rows"]) == shape(before["rows"])
+    for r in m["rows"]:
+        assert r["lineage"] == {
+            "parent_session": "", "parent_row": "", "parent_planned": False,
+            "root_session": "", "root_row": "", "root_planned": False,
+            "carried_keys": [], "dropped_keys": [], "notes": []}
+
+
+def deep_store():
+    """The Review Focus fixture, in memory: a 2,000-row store in two accounts.
+
+    A1 holds a 200-deep chain of side sessions (each the child of the one
+    before it, each also carrying the chain's root at its depth) and one root
+    with 500 children; A2 holds none of them. A2 holds two conversations of
+    its own whose rows link to each other - an existing cycle - and A1 lacks
+    both, so in A1 the pass proposes that same cycle and must drop one edge.
+    The rest is filler held by both. Every child's sid sorts BEFORE its
+    parent's, so today's sid order would write each child first."""
+    store = {A1: os.path.join("u", A1, O1), A2: os.path.join("u", A2, O2)}
+    records, rows = [], []
+
+    def sid_of(n):
+        return "{0:08x}-0000-4000-8000-000000000000".format(n)
+
+    def existing(acct, sid, **extra):
+        stem = "local_a{0}_{1}".format(NUM[acct], sid[:8])
+        data = {"sessionId": stem, "cliSessionId": sid, "title": "Northwind",
+                "lastActivityAt": 9}
+        data.update(extra)
+        records.append(ct._RetitleRow(
+            acct, ORG[acct], store[acct], acct[:8], stem + ".json",
+            os.path.join(store[acct], stem + ".json"), b"", data))
+        return stem
+
+    def planned(acct, sid):
+        stem = "local_n{0}_{1}".format(NUM[acct], sid[:8])
+        data = {"sessionId": stem, "cliSessionId": sid, "title": "Northwind",
+                "lastActivityAt": 9}
+        rows.append({"name": stem + ".json", "store_path": store[acct],
+                     "dest_path": os.path.join(store[acct], stem + ".json"),
+                     "account": acct, "session": sid,
+                     "post_b64": ct.b64(json.dumps(
+                         data, separators=(",", ":")).encode())})
+        return stem
+
+    deep = [sid_of(0xd0000000 + 199 - i) for i in range(200)]
+    root = sid_of(0xf0000000)
+    kids = [sid_of(0xe0000000 + j) for j in range(500)]
+    lx, ly = sid_of(0xc0000001), sid_of(0xc0000002)
+    filler = [sid_of(0x10000000 + k) for k in range(648)]
+
+    first = existing(A1, deep[0])
+    prev = first
+    for i in range(1, 200):
+        prev = existing(A1, deep[i],
+                        spawnedFrom=side_link(prev, taskId="task_d%d" % i),
+                        startChain={"firstSessionId": first, "depth": i})
+    rstem = existing(A1, root)
+    for k in kids:
+        existing(A1, k, spawnedFrom=side_link(rstem, taskId="task_k"),
+                 startChain={"firstSessionId": rstem, "depth": 1})
+    xstem = "local_a2_" + lx[:8]
+    ystem = "local_a2_" + ly[:8]
+    existing(A2, lx, spawnedFrom=side_link(ystem, taskId="task_x"))
+    existing(A2, ly, spawnedFrom=side_link(xstem, taskId="task_y"))
+    for f in filler:
+        existing(A1, f)
+        existing(A2, f)
+    dup = "local_dup_" + filler[0][:8]
+    records.append(ct._RetitleRow(
+        A1, O1, store[A1], A1[:8], dup + ".json",
+        os.path.join(store[A1], dup + ".json"), b"",
+        {"sessionId": dup, "cliSessionId": filler[0], "title": "Northwind"}))
+    # The plan's rows, in today's order: by sid, each into its one missing
+    # account.
+    for sid in sorted(deep + kids + [root, lx, ly]):
+        planned(A1 if sid in (lx, ly) else A2, sid)
+    conversations = {}
+    for rec in records:
+        conversations.setdefault(rec.data["cliSessionId"], []).append(rec)
+    tids = set(conversations)
+    return records, conversations, rows, tids, deep, root, kids, lx, ly
+
+
+def test_large_deep_store_plans_correctly_without_recursion():
+    import inspect
+    import sys
+    import time
+    records, conversations, rows, tids, deep, root, kids, lx, ly = \
+        deep_store()
+    assert len(records) == 2000 and len(rows) == 703
+    limit = sys.getrecursionlimit()
+    # Room for the pass's own call depth, far short of the 200-deep chain: a
+    # walk that recursed per link would raise RecursionError here.
+    sys.setrecursionlimit(len(inspect.stack(0)) + 100)
+    try:
+        t0 = time.perf_counter()
+        cycles = ct._converge_lineage(records, conversations, rows, {}, tids)
+        t1 = time.perf_counter()
+        ordered = ct._lineage_write_order(
+            rows, key=lambda r: (r["store_path"], r["name"]))
+        t2 = time.perf_counter()
+    finally:
+        sys.setrecursionlimit(limit)
+    print("lineage pass {0:.3f}s, write order {1:.3f}s".format(t1 - t0,
+                                                              t2 - t1))
+    assert cycles == 1                     # A2's own loop, counted once
+    by = {r["session"]: r for r in rows}
+
+    def stem(sid, n="2"):
+        return "local_n{0}_{1}".format(n, sid[:8])
+    assert "spawnedFrom" not in post_of(by[deep[0]])
+    assert by[deep[0]]["lineage"]["notes"] == []
+    for i in range(1, 200):
+        post = post_of(by[deep[i]])
+        assert post["spawnedFrom"] == {"sessionId": stem(deep[i - 1]),
+                                       "taskId": "task_d%d" % i}
+        assert post["startChain"] == {"firstSessionId": stem(deep[0]),
+                                      "depth": i}
+        lin = by[deep[i]]["lineage"]
+        assert lin["parent_planned"] is True and lin["root_planned"] is True
+    for k in kids:
+        post = post_of(by[k])
+        assert post["spawnedFrom"] == {"sessionId": stem(root),
+                                       "taskId": "task_k"}
+        assert post["startChain"] == {"firstSessionId": stem(root),
+                                      "depth": 1}
+    # In A1 the pass proposes A2's loop again: the first edge by the child's
+    # id stands, the second would close the cycle and is dropped.
+    assert post_of(by[lx])["spawnedFrom"] == {"sessionId": stem(ly, "1"),
+                                              "taskId": "task_x"}
+    assert "spawnedFrom" not in post_of(by[ly])
+    assert [n["code"] for n in by[ly]["lineage"]["notes"]] == \
+        ["lineage_cycle"]
+    # Parents and roots are written before the rows that name them.
+    assert len(ordered) == len(rows)
+    pos = {(r["store_path"], r["name"]): i for i, r in enumerate(ordered)}
+    for i, r in enumerate(ordered):
+        lin = r["lineage"]
+        for ref, flag in (("parent_row", "parent_planned"),
+                          ("root_row", "root_planned")):
+            if lin[flag]:
+                assert pos[(r["store_path"], lin[ref] + ".json")] < i
+    assert [r["session"] for r in ordered
+            if r["session"] in deep] == deep

@@ -1561,6 +1561,42 @@ check("and the Undo press too - no confirmation was even asked",
       len(modals.calls) == before)
 tkroot.destroy()
 
+
+# ------------------ the lineage branch: a linked plan's links line renders
+def build_linked_env():
+    """A1 holds a parent (S1) and its side session (S2), whose row links to
+    the parent's row; A2 holds only the parent, so the plan's one row (S2
+    into A2) carries the link. Every row's sessionId is its stem."""
+    env, root = build_env(collide=False)
+    store = env.store_candidates[0]
+    for acct, org in ((A1, O1), (A2, O2)):
+        for name in os.listdir(os.path.join(store, acct, org)):
+            os.remove(os.path.join(store, acct, org, name))
+    parent = {"sessionId": "local_s1", "cliSessionId": S1,
+              "title": "Northwind kickoff", "createdAt": ms_local(2026, 8, 24),
+              "lastActivityAt": ms_local(2026, 8, 28)}
+    write_json(os.path.join(store, A1, O1, "local_s1.json"), parent)
+    write_json(os.path.join(store, A2, O2, "local_s1.json"), parent)
+    write_json(os.path.join(store, A1, O1, "local_s2.json"),
+               {"sessionId": "local_s2", "cliSessionId": S2,
+                "title": "ACME-REVIEW side task",
+                "createdAt": ms_local(2026, 8, 24),
+                "lastActivityAt": ms_local(2026, 8, 29),
+                "spawnedFrom": {"sessionId": "local_s1", "taskId": "task_7f",
+                                "title": "Northwind kickoff",
+                                "sideSession": True}})
+    return env, root
+
+
+env, root = build_linked_env()
+roots.append(root)
+app, tkroot, modals, settle = open_app(env)
+settle()
+level_lines = app.level_text.get("1.0", "end-1c").split("\n")
+check("a linked plan's summary shows the links line in the Level tab",
+      "links   : 1 to carry" in level_lines, repr(level_lines))
+tkroot.destroy()
+
 for r in roots:
     shutil.rmtree(r, ignore_errors=True)
 shutil.rmtree(GUIDIR, ignore_errors=True)

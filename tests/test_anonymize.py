@@ -832,6 +832,30 @@ def test_every_emitted_report_key_is_in_the_structural_set(
                "title": "Parked", "lastActivityAt": 9})
     ms = ct.plan_sync(env4, ct.SyncFlags())
     bad = walk_fixed_keys(ct._public_manifest(env4, ms), bad=bad)
+    # A converge that carries links (lineage records, a carried chain, a
+    # left-out link with its note) and an account already holding a cycle.
+    from test_converge import (linked_holdings, lrow, side_link, LD, LX, LY,
+                               A3, O3)
+    env5 = mkenv(tmp_path / "lineage")
+    chain = {"firstSessionId": "local_p1", "depth": 1}
+    linked_holdings(env5, write_transcript, write_row, parent_in=(A2,),
+                    chain=chain)
+    write_transcript(env5, "C--p", LD, t_entries())
+    write_row(env5, 0, A1, O1, "local_d1",
+              lrow(LD, "local_d1", "Northwind follow-up",
+                   spawnedFrom={"sessionId": "local_p1", "taskId": "task_7f",
+                                "pendingPop": True}, startChain=chain))
+    write_row(env5, 0, A3, O3, "local_x3",
+              lrow(LX, "local_x3", "Loop one", spawnedFrom=side_link("local_y3")))
+    write_row(env5, 0, A3, O3, "local_y3",
+              lrow(LY, "local_y3", "Loop two", spawnedFrom=side_link("local_x3")))
+    ml = ct._public_converge_manifest(
+        env5, ct.plan_converge(env5, ct.ConvergeFlags()))
+    # Sanity, so the walk cannot pass vacuously: the lineage shapes are here.
+    assert ml["lineage_format"] == 1 and ml["lineage_cycles"] == 1
+    assert any(r["lineage"]["notes"] for r in ml["rows"])
+    assert any(r["lineage"]["root_row"] for r in ml["rows"])
+    bad = walk_fixed_keys(ml, bad=bad)
     assert bad == []
 
 

@@ -694,3 +694,33 @@ def test_rewrite_post_is_idempotent_and_keeps_non_ascii_as_today():
     assert ct._lineage_rewrite_post(once, link, None) == once
     assert json.loads(base64.b64decode(once))["title"] == "café"
     assert "\\u00e9" in raw(once)
+
+
+def test_note_codes_phrases_and_left_out_set_match_the_table_exactly():
+    """The plan's note-code table, verbatim: every code to the phrase the
+    reports print, in the table's order (the `links :` line breaks ties by
+    it), and the codes that count as "link left out"."""
+    assert list(ct.LINEAGE_PHRASES.items()) == [
+        ("lineage_parent_disagree", "holders disagree on the parent"),
+        ("lineage_self", "the link names the conversation itself"),
+        ("lineage_parent_dead", "the parent's transcript is gone"),
+        ("parent_not_in_account", "no row for the parent in that account"),
+        ("parent_pair_held", "the parent's own row is held in this plan"),
+        ("parent_row_drifted",
+         "that account's row for the parent opens another conversation"),
+        ("lineage_variant", "not a cleared link variant"),
+        ("lineage_no_task", "no usable taskId"),
+        ("lineage_task_disagree", "holders disagree on taskId"),
+        ("lineage_cycle", "it would close a cycle"),
+        ("lineage_source_changed", "the source row changed since the plan"),
+        ("lineage_chain_dropped", "the chain was left out"),
+        ("existing_cycle", "the account already holds a cycle of links"),
+        ("lineage_retargeted", "changed since the plan"),
+        ("lineage_dropped", "dropped since the plan"),
+        ("lineage_gained", "gained since the plan"),
+    ]
+    assert ct.LINEAGE_LEFT_OUT == frozenset((
+        "lineage_parent_disagree", "lineage_self", "lineage_parent_dead",
+        "parent_not_in_account", "parent_pair_held", "parent_row_drifted",
+        "lineage_variant", "lineage_no_task", "lineage_task_disagree",
+        "lineage_cycle", "lineage_source_changed"))
