@@ -303,7 +303,8 @@ can tell `parent_pair_held` from `parent_not_in_account`:
        manifest. An op without that key was journaled before this change. Its rows need no
        `lineage`, and they are read as they always were, verbatim `sync` links included.
      - In an op with `lineage_format: 1`, a row with no `lineage` is valid only when its
-       `post_b64` carries neither `spawnedFrom` nor `startChain`, or the op is `--verbatim`. A
+       `post_b64` carries neither a `spawnedFrom` nor a `startChain` object, or the op is
+       `--verbatim`. A key that is not an object, a null say, names no row (R28). A
        non-verbatim row whose image carries a link but has no usable `lineage` is a shape error.
        So a damaged journal cannot slip a link past recovery's checks (round 3, Kimi).
      - A `lineage`, or `lineage_planned`, that is present but not a dict, or a dict whose listed
@@ -655,9 +656,11 @@ and `folderPlace.realPath`, never the link), `repoint`, `retitle` and `move`.
 - existing: `tools/check_new_row.py` (`new-row` rows still carry no `spawnedFrom`) and every
   `tools/check_*.py`.
 
-## Acceptance check (after release)
+## Acceptance check (before release)
 
-With the app closed, `converge --apply`. In an account that lacked a side session, open the app:
+It runs from the checkout before the release (the maintainer's ruling, 2026-11-19), so a display
+problem is found before anyone installs it; the code is the same. With the app closed,
+`converge --apply`. In an account that lacked a side session, open the app:
 the side session appears under its parent, and nothing Phase 0 ruled a side effect appears. Close
 and reopen the app and read the row: the link is still `{sessionId, taskId}` with the translated
 parent (normalized optional keys are fine). Record it as a dated measurement. It is the second
@@ -805,6 +808,9 @@ command wrote them, but `sync`'s route then gets an app-level look of its own.
   - Round 2: Codex, DeepSeek and Kimi reported. agy failed twice: first its headless `command`
     permission was denied, then it hit its 15-minute print timeout.
   - Round 3: all four reported, Kimi at its byte cap with nothing discarded.
+- **After the build (2026-11-19).** The acceptance check runs before the release, by the
+  maintainer's ruling. A link key that is not an object names no row in the shape checks, as in
+  the resolver (R28).
 
 ## Left to the builder
 
