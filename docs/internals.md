@@ -927,6 +927,19 @@ Each of these was a real defect. They are stated as rules because each one gener
   between `atomic_write` returning and the manifest save leaves a row holding this op's bytes
   while the manifest denies it. `_sync_delete_targets` consults the disk too: state `match`
   means the file holds exactly this op's post-image.
+- **A landed row is recorded before anything re-judges it.** `converge`'s forward recovery
+  re-runs `_converge_recheck`, which skips a pair as `already_present` when the account already
+  holds its conversation. Up to 0.17.0 it ran that against rows still flagged unwritten, so a
+  row that landed in the window above was judged against its own file. It became an
+  `already_present` skip with `written: false`, and `undo`, which removes only written rows, never
+  reached it. `_converge_mark_landed` now runs first in both directions of `recover`. It records
+  as written every pending row whose file holds its post-image, or holds the minted filename stem
+  as `sessionId` (`_row_is_ours`), since the app may rewrite a landed row before recovery and no
+  other writer mints that uuid4. Forward then finishes journal-only when nothing is left to write.
+  Back removes the row, or records it as residue if the app rewrote it. A file at the minted path
+  without that stem is never marked.
+  - An op journaled by an earlier version that already recorded such a row as `already_present`
+    is not repaired: the skip is kept as recorded.
 - **Matching bytes are not proof of authorship.** `transform_row` is deterministic, so a later
   op planned over unchanged source mints an identical post-image. Ownership needs an **order**:
   `_sync_paths_claimed_elsewhere` counts only ops *later* than this one (by `_op_sort_key`), so
