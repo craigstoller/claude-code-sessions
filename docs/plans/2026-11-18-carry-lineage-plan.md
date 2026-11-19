@@ -1125,8 +1125,20 @@ acceptance check runs on the maintainer's machine, with the app closed:
     the Global Constraints' "first 8 characters" now holds for conversation ids and other values,
     and a row id no longer prints as the prefix and 2 characters.
   - After the landing, R28 with m26 and m36: a `spawnedFrom` or `startChain` that is not an
-    object, a null say, names no row in three more places, as it already did to the resolver
-    and the writer. Those places are Departure 6's identity test, the refresh's `link :` and
-    `chain :` change lines, and the shape check's "agree with the bytes". So a byte-identical
-    row with null link keys is unchanged, and removing one reports no loss. An object without its
-    row id is still a link the lineage cannot read.
+    object, a null say, names no row in four more places, as it already did to the resolver
+    and the writer. Those places are:
+    - Departure 6's identity test;
+    - both sides of the refresh's `link :` and `chain :` change lines;
+    - the shape check's "agree with the bytes";
+    - its rule that a row with no `lineage` carries no link.
+
+    So a byte-identical row with null link keys is unchanged, and removing such a key reports no
+    loss. A `--verbatim` null over a real destination link reports the link lost. An object
+    without its row id is still a link the lineage cannot read. Two cases that are not
+    byte-identical keep the exact-bytes rule, and are recorded rather than widened (the fix's
+    review):
+    - a source null over a destination with no key is `held_same` under `--newer-only`;
+    - a destination null under a source with no key is refreshed only to remove the null, with
+      no change line.
+
+    Whether the app ever writes a null link is untested.

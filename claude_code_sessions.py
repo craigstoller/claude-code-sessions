@@ -9317,21 +9317,21 @@ def _sync_mark_existing(rows, names):
 
 def _sync_ref_change(pre, post, key, fields):
     """How a refresh changes the destination's own link (or chain): KEY of
-    the decoded rows PRE and POST. "dropped" when POST lacks it,
-    "retargeted" when it names another row (FIELDS, compared in value and
-    type alike, so a depth of True is not 1), else None. A destination value
-    that is not an object (a null, say) names no row, so removing it changes
-    no link and is None. Never raises."""
+    the decoded rows PRE and POST. Only an object names a row, on either
+    side: a null, say, names none. None when PRE has no such object, since
+    there is no link to change; "dropped" when POST carries none (the key
+    removed, or a --verbatim copy of a null); "retargeted" when it names
+    another row (FIELDS, compared in value and type alike, so a depth of
+    True is not 1); else None. Never raises."""
     if not isinstance(pre, dict) or not isinstance(pre.get(key), dict) \
             or not isinstance(post, dict):
         return None
-    if key not in post:
+    if not isinstance(post.get(key), dict):
         return "dropped"
     old, new = pre[key], post[key]
 
     def names(v):
-        return [(type(v.get(f)), v.get(f)) for f in fields] \
-            if isinstance(v, dict) else None
+        return [(type(v.get(f)), v.get(f)) for f in fields]
     return "retargeted" if names(old) != names(new) else None
 
 
@@ -9539,10 +9539,11 @@ def plan_sync(env, flags):
     The rows are planned in the spec's order (docs/specs/2026-11-17-carry-
     lineage-design.md, "sync", "Restructured planning"):
     1. each candidate's transformed bytes. A refresh whose bytes already
-       equal the destination's, and whose source carries neither spawnedFrom
-       nor startChain, is unchanged here, before the age holds, so such a
-       row is never reported as held (the plan's Departure 6, narrowed). A
-       linked one goes on to step 3, so its link is translated;
+       equal the destination's, and whose source carries neither a
+       spawnedFrom nor a startChain object, is unchanged here, before the
+       age holds, so such a row is never reported as held (the plan's
+       Departure 6, narrowed). A linked one goes on to step 3, so its link
+       is translated;
     2. --newer-only's age holds. Each held refresh is recorded in
        tally["held_sessions"] by the conversation its source opens;
     3. a refresh equal to the destination's row apart from spawnedFrom and

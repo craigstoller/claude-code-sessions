@@ -1132,11 +1132,13 @@ no dependency checks, so a pending op from 0.17.0 recovers as it did, and a `--v
 needs no `lineage`. Its `undo` or `recover --back` still gets the dangling part of the report; the
 redirected part and forward recovery's check of the op's own targets need a `lineage`, so they do
 not fire. In an op with the key, `lineage` must agree with the bytes: `parent_row` is non-empty
-exactly when the decoded `post_b64` has `spawnedFrom`, and equals its `sessionId`, and `root_row`
-is bound to `startChain` the same way. The `*_planned` flags mean another row of the op has that
-name in the same store. `lineage_planned` is checked for shape alone, since after a retarget, gain
-or drop it disagrees with the final bytes by design. A row without `lineage` is valid only when
-its image has neither key, or the op is `--verbatim`. An unreadable or missing `post_b64` is never
+exactly when the decoded `post_b64` has a `spawnedFrom` object, and equals its `sessionId`, and
+`root_row` is bound to a `startChain` object the same way. A key that is not an object, a null
+say, names no row, here as everywhere else in lineage (R28). The `*_planned` flags mean another
+row of the op has that name in the same store. `lineage_planned` is checked for shape alone,
+since after a retarget, gain or drop it disagrees with the final bytes by design. A row without
+`lineage` is valid only when its image carries neither a `spawnedFrom` nor a `startChain` object,
+or the op is `--verbatim`. An unreadable or missing `post_b64` is never
 a shape error, in an old journal or a new one: the readers fail such a row closed, so a stuck op
 keeps `back`, and the bytes check runs only on rows whose bytes decode.
 
@@ -1157,10 +1159,10 @@ the link report are how such a change is caught.
    renders no per-row notes of any kind. Its sync pane shows the same `link :` and `chain :`
    change lines as the CLI.
 5. `sync` keeps today's identity test ahead of the age holds, for a row whose source carries
-   neither a `spawnedFrom` nor a `startChain` object. A key that is not an object, a null say,
-   names no row, to this test as to the resolver, the writer, the refresh's change lines and the
-   shape checks (R28). Taken literally, the spec's order would report such a
-   byte-identical row under `--newer-only` as held, not unchanged. It writes nothing either way.
+   neither a `spawnedFrom` nor a `startChain` object. Taken literally, the spec's order would
+   report such a byte-identical row under `--newer-only` as held, not unchanged. It writes nothing
+   either way. A key that is not an object, a null say, names no row, to this test as to the
+   resolver, the writer, both sides of the refresh's change lines and the shape checks (R28).
    A row whose source carries either takes the spec's path (narrowed in the final review, R21):
    identical bytes that carry the source account's link may name a row the destination lacks,
    so the row is provisionally unchanged at step 3 and decided at step 6 on its translated

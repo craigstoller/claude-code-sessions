@@ -4399,6 +4399,51 @@ def test_sync_refresh_over_link_keys_that_name_no_row_reports_no_loss(
     assert not any("loses its" in ln or "another row" in ln for ln in lines)
 
 
+def test_sync_ref_change_reads_a_non_object_on_either_side_as_no_row():
+    """R28, from its review: both sides of _sync_ref_change take objects
+    only. A link replaced by a null, a string or a list is dropped, as a
+    removed key is; a destination value that is not an object changes no
+    link; another row is a retarget, and other keys are not."""
+    link = {"sessionId": "local_p", "taskId": LTASK}
+    other = {"sessionId": "local_q", "taskId": LTASK}
+    f = ("sessionId",)
+    for post in ({}, {"spawnedFrom": None}, {"spawnedFrom": "local_p"},
+                 {"spawnedFrom": [link]}):
+        assert ct._sync_ref_change({"spawnedFrom": link}, post,
+                                   "spawnedFrom", f) == "dropped", post
+    assert ct._sync_ref_change({"spawnedFrom": link}, {"spawnedFrom": other},
+                               "spawnedFrom", f) == "retargeted"
+    assert ct._sync_ref_change({"spawnedFrom": link},
+                               {"spawnedFrom": dict(link, title="x")},
+                               "spawnedFrom", f) is None
+    for pre in ({}, {"spawnedFrom": None}, {"spawnedFrom": "local_p"}):
+        assert ct._sync_ref_change(pre, {"spawnedFrom": other},
+                                   "spawnedFrom", f) is None, pre
+
+
+def test_sync_verbatim_null_link_over_a_real_destination_link_is_a_loss(
+        two_account_env, tmp_path, monkeypatch, capsys):
+    """R28, from its review: --verbatim copies a source's null link as it
+    is. Over the destination's real link that null names no row, so the
+    refresh reports the destination's link lost, not retargeted."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    for store in (src, dst):
+        _lrow(store, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=2,
+          spawnedFrom=None)
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, verbatim=True))
+    c = _by_name(m)["local_c.json"]
+    assert _post(c)["spawnedFrom"] is None
+    assert c["link_change"] == "dropped" and c["chain_change"] is None
+    rc, lines = _sync_main(env, monkeypatch, capsys, "--update", "--verbatim")
+    assert rc == 0
+    assert "link    : local_c loses its link" in lines
+    assert not any("another row" in ln for ln in lines)
+
+
 def test_sync_row_dropped_as_unchanged_is_not_counted_as_activity_unknown(
         two_account_env, tmp_path):
     """Neither side of the parent's refresh has a readable lastActivityAt.

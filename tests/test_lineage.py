@@ -909,7 +909,7 @@ DISAGREE = {
         lambda c: c["lineage"].__setitem__("root_row", "local_z"),
     "root_row but no chain in the bytes":
         lambda c: c.__setitem__("post_b64", b64post(spawnedFrom=LINK)),
-    "a link the lineage cannot read":
+    "a link that is not an object, with a parent_row":
         lambda c: c.__setitem__("post_b64", b64post(
             spawnedFrom="local_p", startChain=CHAIN)),
     "a chain the lineage cannot read":
@@ -957,6 +957,17 @@ def test_a_link_key_that_is_not_an_object_names_no_row_to_the_shape_check(why):
     c["post_b64"] = post
     err = ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
     assert isinstance(err, str) and "its bytes do not carry" in err
+
+
+@pytest.mark.parametrize("chain", [None, [1], "local_r"])
+def test_a_chain_that_is_not_an_object_is_no_chain_against_a_root_row(chain):
+    """R28, from its review: the chain side on its own. Beside a real link, a
+    startChain that is not an object carries no chain, so a lineage naming
+    a root row is refused for that, not for the link."""
+    c = good_child()
+    c["post_b64"] = b64post(spawnedFrom=LINK, startChain=chain)
+    err = ct._lineage_shape_error(jman([parent_row(), root_row(), c]))
+    assert err == "row 2's lineage names a root_row its bytes do not carry"
 
 
 def test_a_link_object_without_its_row_id_is_still_a_shape_error():
