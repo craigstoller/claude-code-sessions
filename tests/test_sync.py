@@ -4660,3 +4660,598 @@ def test_sync_journal_holds_the_final_bytes_and_order(two_account_env,
         with open(r["dest_path"], "rb") as fh:
             assert fh.read() == ct.unb64(r["post_b64"])
     assert ct._sync_shape_error(on_record) is None
+
+
+# ----------------------------------- Task 9: sync recovery and reversal
+#
+# docs/specs/2026-11-17-carry-lineage-design.md, "sync", "Recovery has no
+# per-row skip, and needs none", and "undo": classify_sync_op treats a
+# pending row whose journaled link or chain names a row that is gone or
+# opens another conversation as drift, so only 'back' is offered; undo and
+# recover --back reverse every row in reverse write order, children before
+# parents, adds and refreshes in one sequence; and forward recovery, undo
+# and back each end with the link report, saved to the journal.
+
+EMPTY_LINKS = {"dangling": [], "redirected": [], "unchecked": 0}
+LINK_LINES = ("link left", "link redirected", "links not checked")
+
+
+def _sync_crash(env, m, point="sync-mid-write", nth=1):
+    """Apply M and crash the NTH time POINT fires. Returns the stuck op."""
+    seen = {"n": 0}
+
+    def hook(p):
+        if p == point:
+            seen["n"] += 1
+            if seen["n"] == nth:
+                raise SimulatedCrash()
+    ct._crash_hook = hook
+    try:
+        with pytest.raises(SimulatedCrash):
+            ct.run_sync(env, m)
+    finally:
+        ct._crash_hook = None
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    return op
+
+
+def _sync_crash_before_any_row(env, m, monkeypatch):
+    """Apply M and crash at its first row write, before anything lands."""
+    real = ct.atomic_write
+
+    def boom(path, data):
+        if os.path.basename(path).startswith("local_"):
+            raise SimulatedCrash()
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", boom)
+    with pytest.raises(SimulatedCrash):
+        ct.run_sync(env, m)
+    monkeypatch.setattr(ct, "atomic_write", real)
+    op = ct.nonterminal_ops(env)[0]
+    assert op.manifest["status"] == "writing"
+    assert not any(r.get("written") for r in op.manifest["rows"])
+    return op
+
+
+def _journal_of(env, op):
+    """The op's manifest as it is on disk."""
+    with open(os.path.join(env.ops_dir, op.manifest["op_id"],
+                           "manifest.json"), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _recover_ns(op, direction):
+    import types
+    return types.SimpleNamespace(op_id=op.manifest["op_id"],
+                                 forward=direction == "forward",
+                                 back=direction == "back", apply=True,
+                                 verbose=True)
+
+
+def _undo_ns(op):
+    import types
+    return types.SimpleNamespace(show=False, op_id=op.manifest["op_id"],
+                                 apply=True, verbose=True)
+
+
+def _made_0_17(op):
+    """Rewrite a journaled sync op as 0.17.0 wrote it: no lineage fields."""
+    m = op.manifest
+    for k in ("lineage_format", "lineage_cycles"):
+        m.pop(k, None)
+    for r in m["rows"]:
+        r.pop("lineage", None)
+        r.pop("lineage_planned", None)
+    ct.save_manifest(op)
+    assert ct._sync_shape_error(m) is None
+
+
+def _touch(path, **changes):
+    """Rewrite a row in place, keys kept in order: the app on focus, or a
+    repoint when CHANGES names cliSessionId."""
+    with open(path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    d.update(changes)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(d, separators=(",", ":")))
+
+
+def _bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _added_parent_and_child(env, src):
+    """P (local_p) and its side session C (local_c), both added by one sync
+    into an empty destination: the parent first, in write order, and the
+    child's link names the parent's planned row."""
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json"]
+    assert m["rows"][1]["lineage"]["parent_planned"] is True
+    return m
+
+
+@pytest.mark.parametrize("fmt", ["lineage", "0.17"])
+@pytest.mark.parametrize("how", ["deleted", "repointed"])
+def test_sync_forward_reports_a_landed_childs_parent_deleted_or_repointed(
+        two_account_env, tmp_path, capsys, how, fmt):
+    """The child landed before the crash, linked to the parent's existing
+    row; that row is then deleted or repointed. classify checks pending rows
+    only, so forward is still offered, and it finishes the other row and
+    ends with the link report naming the landed child. A journal from 0.17.0
+    recovers exactly as before, with no report at all."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC, LR)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=9,
+          spawnedFrom=_side("local_p"))
+    _lrow(src, "local_n.json", LR, "ACME-REVIEW notes", lastActivityAt=1)
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    assert [r["name"] for r in m["rows"]] == ["local_c.json", "local_n.json"]
+    op = _sync_crash(env, m)
+    child, other = op.manifest["rows"]
+    assert child["written"] and not other["written"]
+    assert _post(child)["spawnedFrom"]["sessionId"] == "local_q"
+    if fmt == "0.17":
+        _made_0_17(op)
+    parent = os.path.join(dst, "local_q.json")
+    if how == "deleted":
+        os.remove(parent)
+    else:
+        _touch(parent, cliSessionId=LQ)
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    assert ct.cmd_recover(env, _recover_ns(op, "forward")) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "result: completed" in out
+    assert _bytes(other["dest_path"]) == ct.unb64(other["post_b64"])
+    saved = _journal_of(env, op)
+    assert saved["status"] == "completed"
+    if fmt == "0.17":
+        assert "link_report" not in saved
+        assert not any(x.startswith(LINK_LINES) for x in out)
+        return
+    entry = [{"row": "local_c", "target": "local_q", "kind": "parent"}]
+    if how == "deleted":
+        want = dict(EMPTY_LINKS, dangling=entry)
+        line = "link left dangling: local_c (its parent's row was removed)"
+    else:
+        want = dict(EMPTY_LINKS, redirected=entry)
+        line = ("link redirected: local_c (its parent's row now opens another "
+                "conversation)")
+    assert saved["link_report"] == want
+    assert line in out
+    assert out.index("result: completed") < out.index(line)
+
+
+def test_sync_forward_all_landed_still_reports_links(two_account_env,
+                                                     tmp_path, monkeypatch):
+    """Every row landed and only the last one's flag and the completion
+    marker are missing. Forward finishes the bookkeeping and still ends
+    with the link report: one landed child's parent row deleted (dangling),
+    the other's repointed (redirected). The report is on disk before the
+    journal is rotated."""
+    env, src, dst = two_account_env(tmp_path)
+    p2, c2 = "sid-parent-2", "sid-child-2"
+    _transcripts(env, LP, LC, p2, c2, LR)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_p2.json", p2, "Northwind board")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW one", lastActivityAt=9,
+          spawnedFrom=_side("local_p"))
+    _lrow(src, "local_d.json", c2, "ACME-REVIEW two", lastActivityAt=8,
+          spawnedFrom=_side("local_p2"))
+    _lrow(src, "local_n.json", LR, "ACME-REVIEW notes", lastActivityAt=1)
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    _lrow(dst, "local_q2.json", p2, "Northwind board")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    assert [r["name"] for r in m["rows"]] == ["local_c.json", "local_d.json",
+                                              "local_n.json"]
+    op = _sync_crash(env, m, point="sync-write-before-save", nth=3)
+    rows = op.manifest["rows"]
+    assert [r["written"] for r in rows] == [True, True, False]
+    for r in rows:
+        assert _bytes(r["dest_path"]) == ct.unb64(r["post_b64"])
+    os.remove(os.path.join(dst, "local_q.json"))
+    _touch(os.path.join(dst, "local_q2.json"), cliSessionId=LQ)
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    at_rotate = {}
+    real = ct.rotate_ops
+
+    def spy(env_):
+        at_rotate.update(_journal_of(env, op))
+        return real(env_)
+    monkeypatch.setattr(ct, "rotate_ops", spy)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    want = {"dangling": [{"row": "local_c", "target": "local_q",
+                          "kind": "parent"}],
+            "redirected": [{"row": "local_d", "target": "local_q2",
+                            "kind": "parent"}],
+            "unchecked": 0}
+    assert op.manifest["link_report"] == want
+    assert at_rotate["status"] == "completed"
+    assert at_rotate["link_report"] == want
+
+
+def test_sync_crash_before_the_parent_add_landed_forward_is_offered(
+        two_account_env, tmp_path, monkeypatch):
+    """Nothing landed. The child's target is the parent's planned row,
+    still pending, so it is not checked - it is written first: forward and
+    back are both offered, and forward writes the parent, then the child
+    with its journaled link, and reports nothing."""
+    env, src, dst = two_account_env(tmp_path)
+    m = _added_parent_and_child(env, src)
+    op = _sync_crash_before_any_row(env, m, monkeypatch)
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    written = []
+    real = ct.atomic_write
+
+    def spy(path, data):
+        if os.path.basename(path).startswith("local_"):
+            written.append(os.path.basename(path))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", spy)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert written == ["local_p.json", "local_c.json"]
+    with open(os.path.join(dst, "local_c.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["spawnedFrom"] == {"sessionId": "local_p",
+                                                "taskId": LTASK}
+    assert op.manifest["link_report"] == EMPTY_LINKS
+
+
+def test_sync_crash_between_parent_and_child_forward_finishes(
+        two_account_env, tmp_path, monkeypatch):
+    """The parent's add landed and was recorded; the child did not. The
+    parent's row, written by this op, is checked and still opens the
+    parent, so forward is offered. It writes the child with its journaled
+    bytes, never resolving again, and reports nothing."""
+    env, src, dst = two_account_env(tmp_path)
+    m = _added_parent_and_child(env, src)
+    op = _sync_crash(env, m)
+    parent, child = op.manifest["rows"]
+    assert parent["written"] and not child["written"]
+    journaled = child["post_b64"]
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    calls = []
+    real = ct._sync_lineage
+
+    def spy(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+    monkeypatch.setattr(ct, "_sync_lineage", spy)
+    assert ct.recover_op(env, op, "forward") == "completed"
+    assert calls == []
+    assert child["post_b64"] == journaled
+    assert _bytes(child["dest_path"]) == ct.unb64(journaled)
+    assert op.manifest["link_report"] == EMPTY_LINKS
+
+
+@pytest.mark.parametrize("target", ["parent", "root"])
+def test_sync_parent_written_then_repointed_withdraws_forward(
+        two_account_env, tmp_path, target):
+    """The parent's (or the chain root's) add landed before the crash and
+    was repointed at another conversation since. The pending child names
+    it, so forward is withdrawn and 'back' alone is offered, with a note
+    naming the child's row; forward refuses, and the child is never
+    written with the stale link."""
+    env, src, dst = two_account_env(tmp_path)
+    if target == "parent":
+        m = _added_parent_and_child(env, src)
+        named = "local_p.json"
+    else:
+        _transcripts(env, LR, LG, LC)
+        for store in (src, dst):
+            _lrow(store, "local_x.json", LG, "Northwind other parent")
+        _lrow(src, "local_r.json", LR, "Northwind root", lastActivityAt=1)
+        _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+              lastActivityAt=5, spawnedFrom=_side("local_x"),
+              startChain={"firstSessionId": "local_r", "depth": 2})
+        m = ct.plan_sync(env, ct.SyncFlags())
+        assert [r["name"] for r in m["rows"]] == ["local_r.json",
+                                                  "local_c.json"]
+        lin = m["rows"][1]["lineage"]
+        assert lin["root_row"] == "local_r" and lin["root_planned"] is True
+        assert lin["parent_row"] == "local_x" and not lin["parent_planned"]
+        named = "local_r.json"
+    op = _sync_crash(env, m)
+    first, child = op.manifest["rows"]
+    assert first["name"] == named and first["written"]
+    assert not child["written"]
+    _touch(first["dest_path"], cliSessionId=LQ)
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == ["back"]
+    # The link's clause names the pending row by its id and conversations
+    # by their first 8 characters, never a title. (The written row that
+    # drifted is named by title, as the drift clause always has.)
+    what, sid = ("chain root", LR) if target == "root" else ("parent", LP)
+    assert ("the journaled link of pending row(s) no longer matches its "
+            "target (local_c: its {0}'s row now opens {1}, not {2})".format(
+                what, LQ[:8], sid[:8])) in c["note"]
+    with pytest.raises(ct.Refusal):
+        ct.recover_op(env, op, "forward")
+    assert not os.path.exists(child["dest_path"])
+    assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert not os.path.exists(child["dest_path"])
+
+
+@pytest.mark.parametrize("fmt", ["lineage", "0.17"])
+@pytest.mark.parametrize("how", ["deleted", "repointed"])
+def test_sync_existing_parent_outside_the_op_deleted_withdraws_forward(
+        two_account_env, tmp_path, monkeypatch, how, fmt):
+    """The child links to a row the destination already held, outside the
+    op. That row is deleted, or repointed, after the crash: forward is
+    withdrawn and the child never written. A journal from 0.17.0 has no
+    dependency checks: forward is offered and writes the child as before."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_q.json", LP, "Northwind kickoff")
+    m = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    child, = m["rows"]
+    assert child["lineage"]["parent_row"] == "local_q"
+    assert child["lineage"]["parent_planned"] is False
+    op = _sync_crash_before_any_row(env, m, monkeypatch)
+    child, = op.manifest["rows"]
+    if fmt == "0.17":
+        _made_0_17(op)
+    parent = os.path.join(dst, "local_q.json")
+    if how == "deleted":
+        os.remove(parent)
+    else:
+        _touch(parent, cliSessionId=LQ)
+    c = ct.classify_op(env, op)
+    if fmt == "0.17":
+        assert c["resolutions"] == ["forward", "back"]
+        assert ct.recover_op(env, op, "forward") == "completed"
+        assert _bytes(child["dest_path"]) == ct.unb64(child["post_b64"])
+        assert "link_report" not in op.manifest
+        return
+    assert c["resolutions"] == ["back"]
+    assert "local_c" in c["note"]
+    with pytest.raises(ct.Refusal):
+        ct.recover_op(env, op, "forward")
+    assert not os.path.exists(child["dest_path"])
+
+
+@pytest.mark.parametrize("how", ["deleted", "repointed"])
+@pytest.mark.parametrize("kind", ["age-held", "unchanged"])
+def test_sync_age_held_or_unchanged_parent_changed_withdraws_forward(
+        two_account_env, tmp_path, monkeypatch, kind, how):
+    """The child links to the parent's own row, which this sync does not
+    write: --newer-only holds its refresh (the destination's copy is newer),
+    or it is dropped as unchanged. That row is deleted or repointed after
+    the crash: forward is withdrawn and the child never written."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    if kind == "age-held":
+        _lrow(src, "local_p.json", LP, "Northwind kickoff v2",
+              lastActivityAt=1)
+        _lrow(dst, "local_p.json", LP, "Northwind kickoff", lastActivityAt=9)
+        flags = ct.SyncFlags(update=True, newer_only=True)
+    else:
+        for store in (src, dst):
+            _lrow(store, "local_p.json", LP, "Northwind kickoff")
+        flags = ct.SyncFlags(update=True)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    m = ct.plan_sync(env, flags)
+    held = "held_older" if kind == "age-held" else "unchanged"
+    assert len(m["tally"][held]) == 1
+    child, = m["rows"]
+    assert child["lineage"]["parent_row"] == "local_p"
+    assert child["lineage"]["parent_planned"] is False
+    op = _sync_crash_before_any_row(env, m, monkeypatch)
+    parent = os.path.join(dst, "local_p.json")
+    if how == "deleted":
+        os.remove(parent)
+    else:
+        _touch(parent, cliSessionId=LQ)
+    c = ct.classify_op(env, op)
+    assert c["resolutions"] == ["back"]
+    assert "local_c" in c["note"]
+    with pytest.raises(ct.Refusal):
+        ct.recover_op(env, op, "forward")
+    assert not os.path.exists(os.path.join(dst, "local_c.json"))
+
+
+@pytest.mark.parametrize("leg", ["undo", "back"])
+def test_sync_reversal_restores_a_refreshed_child_before_removing_an_added_parent(
+        two_account_env, tmp_path, monkeypatch, leg):
+    """One op added the parent's row and refreshed the child's row to link
+    to it, in that order. The reversal goes in reverse write order, one
+    sequence for both kinds: the child is restored first, then the parent
+    removed. Cut short between the two, it leaves the parent without the
+    child's link - never a child naming a row already removed - and a
+    second run finishes it."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff", lastActivityAt=1)
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task v2",
+          lastActivityAt=5, spawnedFrom=_side("local_p"))
+    _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task", lastActivityAt=5)
+    pre = _bytes(os.path.join(dst, "local_c.json"))
+    m = ct.plan_sync(env, ct.SyncFlags(update=True))
+    by = _by_name(m)
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json"]
+    assert by["local_c.json"]["is_update"] and not by["local_p.json"].get(
+        "is_update")
+    assert by["local_c.json"]["lineage"]["parent_planned"] is True
+    if leg == "undo":
+        assert ct.run_sync(env, m) == "completed"
+        op = ct.list_ops(env)[-1]
+    else:
+        op = _sync_crash(env, m, point="sync-write-before-save", nth=2)
+    steps = []
+    real_unlink, real_write = os.unlink, ct.atomic_write
+
+    def unlink(path, *a, **k):
+        name = os.path.basename(str(path))
+        if name.startswith("local_"):
+            steps.append(("remove", name))
+            raise SimulatedCrash()          # the reversal is cut short here
+        return real_unlink(path, *a, **k)
+
+    def write(path, data):
+        name = os.path.basename(path)
+        if name.startswith("local_"):
+            steps.append(("restore", name))
+        return real_write(path, data)
+    monkeypatch.setattr(ct.os, "unlink", unlink)
+    monkeypatch.setattr(ct, "atomic_write", write)
+    with pytest.raises(SimulatedCrash):
+        if leg == "undo":
+            ct.undo_sync(env, op)
+        else:
+            ct.recover_op(env, op, "back")
+    monkeypatch.undo()
+    assert steps == [("restore", "local_c.json"), ("remove", "local_p.json")]
+    assert _bytes(os.path.join(dst, "local_c.json")) == pre
+    assert os.path.exists(os.path.join(dst, "local_p.json"))
+    if leg == "undo":
+        assert ct.undo_sync(env, op) == "undone"
+    else:
+        assert ct.recover_op(env, op, "back") == "rolled_back"
+    assert not os.path.exists(os.path.join(dst, "local_p.json"))
+    assert _bytes(os.path.join(dst, "local_c.json")) == pre
+    assert op.manifest["link_report"] == EMPTY_LINKS
+
+
+def _swapped_parent(env, src, dst, child_title="ACME-REVIEW side task",
+                    child_in_dst=False):
+    """The destination's row local_p opens another conversation (LQ), which
+    its row local_y still opens, so a refresh may move local_p onto the
+    parent (LP) without orphaning anything. The source's child links to
+    local_p. With CHILD_IN_DST the destination already holds the child's
+    row, linking to its own local_p, under an older title."""
+    _transcripts(env, LP, LC, LQ, LR)
+    _lrow(dst, "local_p.json", LQ, "ACME-REVIEW kickoff")
+    _lrow(dst, "local_y.json", LQ, "Northwind other thread")
+    _lrow(src, "local_p.json", LP, "ACME-REVIEW kickoff", lastActivityAt=3)
+    _lrow(src, "local_c.json", LC, child_title, lastActivityAt=5,
+          spawnedFrom=_side("local_p"))
+    if child_in_dst:
+        _lrow(dst, "local_c.json", LC, "ACME-REVIEW side task",
+              lastActivityAt=5, spawnedFrom=_side("local_p"))
+
+
+def test_sync_back_with_a_drifted_child_still_carrying_our_link_reports_redirected(
+        two_account_env, tmp_path, capsys):
+    """One op moved the destination's row local_p onto the parent and added
+    the child linking to it; the app then touched the child, which still
+    carries that link. recover --back leaves the drifted child in place and
+    restores local_p to the conversation it opened before: the report names
+    the child's link as redirected, after the line saying what back left."""
+    env, src, dst = two_account_env(tmp_path)
+    _swapped_parent(env, src, dst)
+    _lrow(src, "local_n.json", LR, "ACME-REVIEW notes", lastActivityAt=1)
+    pre = _bytes(os.path.join(dst, "local_p.json"))
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, only="ACME"))
+    by = _by_name(m)
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json",
+                                              "local_n.json"]
+    assert by["local_p.json"]["swaps_conversation"] is True
+    assert by["local_c.json"]["lineage"]["parent_planned"] is True
+    op = _sync_crash(env, m, nth=2)
+    parent, child, other = op.manifest["rows"]
+    assert parent["written"] and child["written"] and not other["written"]
+    _touch(child["dest_path"], lastFocusedAt=1_900_000_000_000)
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    assert ct.cmd_recover(env, _recover_ns(op, "back")) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "result: rolled_back" in out
+    assert _bytes(parent["dest_path"]) == pre
+    with open(child["dest_path"], encoding="utf-8") as fh:
+        assert json.load(fh)["spawnedFrom"]["sessionId"] == "local_p"
+    saved = _journal_of(env, op)
+    assert saved["link_report"] == dict(EMPTY_LINKS, redirected=[
+        {"row": "local_c", "target": "local_p", "kind": "parent"}])
+    line = ("link redirected: local_c (its parent's row now opens another "
+            "conversation)")
+    assert line in out
+    left = [i for i, x in enumerate(out) if "left 1 untouched" in x]
+    assert left and left[0] < out.index(line)
+
+
+def test_sync_undo_restoring_a_different_original_parent_reports_no_redirection(
+        two_account_env, tmp_path, capsys):
+    """One op refreshed both the parent's row (moving local_p onto the
+    parent) and the child's, whose own pre-image already named local_p.
+    Undo restores both. local_p opens its earlier conversation again and
+    the child's restored link names it - as it did before the op - so the
+    report says nothing: a restored row carries no expectation from this
+    op, even when its pre-image names the same row id."""
+    env, src, dst = two_account_env(tmp_path)
+    _swapped_parent(env, src, dst, child_title="ACME-REVIEW side task v2",
+                    child_in_dst=True)
+    pre = {n: _bytes(os.path.join(dst, n))
+           for n in ("local_p.json", "local_c.json")}
+    m = ct.plan_sync(env, ct.SyncFlags(update=True, only="ACME"))
+    by = _by_name(m)
+    assert [r["name"] for r in m["rows"]] == ["local_p.json", "local_c.json"]
+    assert all(r["is_update"] for r in m["rows"])
+    assert by["local_c.json"]["lineage"]["parent_row"] == "local_p"
+    assert by["local_c.json"]["lineage"]["parent_session"] == LP
+    assert ct.run_sync(env, m) == "completed"
+    op = ct.list_ops(env)[-1]
+    assert ct.cmd_undo(env, _undo_ns(op)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "result: undone" in out
+    for n, b in pre.items():
+        assert _bytes(os.path.join(dst, n)) == b
+    assert _journal_of(env, op)["link_report"] == EMPTY_LINKS
+    assert not any(x.startswith(LINK_LINES) for x in out)
+    # Without the restored exclusion the child's link would read as
+    # redirected: it names local_p, which now opens LQ, not LP.
+    assert ct._link_report(op.manifest["rows"], [dst])["redirected"] == [
+        {"row": "local_c", "target": "local_p", "kind": "parent"}]
+
+
+@pytest.mark.parametrize("fmt", ["lineage", "0.17"])
+@pytest.mark.parametrize("leg", ["undo", "back"])
+def test_sync_undo_reports_dangling_links_to_removed_rows(
+        two_account_env, tmp_path, capsys, leg, fmt):
+    """A first sync added the parent's row; a second added the child,
+    linking to it. Reversing the first removes the parent's row, and its
+    report names the second op's surviving child, whichever op wrote it.
+    The dangling part reads the store and the rows removed, never the
+    journal's lineage, so a journal from 0.17.0 gets it too."""
+    env, src, dst = two_account_env(tmp_path)
+    _transcripts(env, LP, LC)
+    _lrow(src, "local_p.json", LP, "Northwind kickoff")
+    _lrow(src, "local_c.json", LC, "ACME-REVIEW side task",
+          spawnedFrom=_side("local_p"))
+    m1 = ct.plan_sync(env, ct.SyncFlags(only="Northwind"))
+    assert [r["name"] for r in m1["rows"]] == ["local_p.json"]
+    if leg == "undo":
+        assert ct.run_sync(env, m1) == "completed"
+        op1 = ct.list_ops(env)[-1]
+    else:
+        op1 = _sync_crash(env, m1, point="sync-write-before-save")
+    if fmt == "0.17":
+        _made_0_17(op1)
+    m2 = ct.plan_sync(env, ct.SyncFlags(only="ACME"))
+    assert _post(m2["rows"][0])["spawnedFrom"]["sessionId"] == "local_p"
+    assert ct.run_sync(env, m2) == "completed"
+    if leg == "undo":
+        assert ct.cmd_undo(env, _undo_ns(op1)) == 0
+    else:
+        assert ct.cmd_recover(env, _recover_ns(op1, "back")) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert not os.path.exists(os.path.join(dst, "local_p.json"))
+    assert os.path.exists(os.path.join(dst, "local_c.json"))
+    assert _journal_of(env, op1)["link_report"] == dict(EMPTY_LINKS, dangling=[
+        {"row": "local_c", "target": "local_p", "kind": "parent"}])
+    line = "link left dangling: local_c (its parent's row was removed)"
+    assert line in out
+    result = "result: " + ("undone" if leg == "undo" else "rolled_back")
+    assert out.index(result) < out.index(line)
+    if leg == "undo":
+        assert out.index("removed 1 row(s), restored 0; 0 already gone; 0 "
+                         "refreshed row(s) not restored - that account "
+                         "deleted them since") < out.index(line)
