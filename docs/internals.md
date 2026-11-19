@@ -940,9 +940,10 @@ Each of these was a real defect. They are stated as rules because each one gener
   the app rewrote it. A file at the minted path without that stem is never marked.
   - In recovery, `_converge_recheck` also ignores every pending row's own minted path when it
     looks for rows that appeared (`ignore_own_paths`, passed by `recover_op`'s forward arm only).
-    So a landed row the marking pass could not read is still not judged against itself, and the
-    write loop records it. A foreign file at a minted path reaches the write loop's "a different
-    row already exists" refusal. A first apply keeps the plain rule, since nothing of the op can
+    So a landed row the marking pass could not read is still not judged against itself. The write
+    loop records it when its bytes still match; if the app had rewritten it, the write loop
+    refuses, the op stays recoverable, and the next `recover` marks it. A foreign file at a minted
+    path reaches the write loop's "a different row already exists" refusal. A first apply keeps the plain rule, since nothing of the op can
     be on disk before `new_op`.
   - An op journaled by an earlier version that already recorded such a row as `already_present`
     is not repaired: the skip is kept as recorded.
