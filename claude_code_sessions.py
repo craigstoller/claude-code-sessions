@@ -603,6 +603,107 @@ def find_transcripts(projects_root, session_id):
     return hits
 
 
+# The ids a _TranscriptIndex answers from its listing: ASCII letters, digits,
+# '-' and '_', as every cliSessionId the app writes is (a UUID). Any other id
+# - one that names a path below a folder or an absolute path, or holds a
+# character a file system may fold or normalise in ways a listing cannot
+# show - goes to find_transcripts itself.
+_INDEXED_SESSION_ID = re.compile(r"[0-9A-Za-z_-]+")
+
+
+class _TranscriptIndex:
+    """find_transcripts for one sync plan, from one listing of the projects
+    folder rather than a scan of it per lookup (docs/internals.md, "One
+    index of the projects folder per plan").
+
+    find_transcripts lists the projects root and asks os.path.isfile of
+    <folder>/<id>.jsonl in every folder, each time it is called; planning
+    called it for every candidate row, which with some 830 project folders
+    was three quarters of sync's time. This lists the root once, and each
+    folder in it once, at its first lookup. From then on a lookup asks
+    os.path.isfile only in the folders whose listing could hold the id.
+
+    The answer is find_transcripts' own: the same paths, built the same way
+    from the id as asked, in the root's sorted order, each confirmed by
+    os.path.isfile on the same string. The listing only rules folders out,
+    and only where os.path.isfile could not be true:
+    - a folder is ruled out for an id when none of its names equals
+      <id>.jsonl, ignoring ASCII case. The id is ASCII
+      (_INDEXED_SESSION_ID), and so is every name this compares, so this
+      keeps both an exact match and what a case-insensitive file system
+      folds onto one;
+    - a folder whose listing fails, whose own name is not ASCII or ends in
+      '.' or ' ', or which holds a name that is not ASCII (which a file
+      system may fold or normalise onto an ASCII one) is never ruled out:
+      every lookup asks os.path.isfile there, as find_transcripts does;
+    - an id that is not a str, or not plain, goes to find_transcripts
+      itself, so it answers, or fails, exactly as it always has.
+    A root that does not exist indexes as empty, as find_transcripts reads
+    it. A root that cannot be listed for any other reason is not indexed:
+    each lookup goes to find_transcripts, which raises, and the next one
+    tries the listing again.
+
+    The listing is the plan's snapshot. A transcript removed since is no
+    hit, since its os.path.isfile is asked at the lookup; one written since
+    is not seen by this plan. Apply time never uses an index: _sync_relink
+    and the write loop look transcripts up afresh, under the lock."""
+
+    def __init__(self, projects_root):
+        self.root = projects_root
+        self._entries = None    # the root's sorted listing, once built
+        self._holding = None    # "<ID>.JSONL" upper-cased -> [entry index]
+        self._always = None     # the entries every lookup asks
+
+    def _build(self):
+        try:
+            entries = sorted(os.listdir(self.root))
+        except FileNotFoundError:
+            entries = []
+        holding, always = {}, []
+        for i, entry in enumerate(entries):
+            if not entry.isascii() or entry[-1:] in (".", " "):
+                always.append(i)
+                continue
+            try:
+                names = os.listdir(os.path.join(self.root, entry))
+            except OSError:
+                always.append(i)
+                continue
+            for name in names:
+                if not name.isascii():
+                    always.append(i)
+                    break
+                key = name.upper()
+                if key.endswith(".JSONL"):
+                    at = holding.setdefault(key, [])
+                    if not at or at[-1] != i:
+                        at.append(i)
+        self._entries, self._holding, self._always = entries, holding, always
+
+    def find(self, session_id):
+        if type(session_id) is not str \
+                or not _INDEXED_SESSION_ID.fullmatch(session_id):
+            return find_transcripts(self.root, session_id)
+        if self._entries is None:
+            try:
+                self._build()
+            except Exception:
+                # A root that cannot be listed, or a listing this cannot
+                # read: find_transcripts answers, or raises, as it always
+                # has, and nothing is kept from the attempt.
+                return find_transcripts(self.root, session_id)
+        at = self._holding.get((session_id + ".jsonl").upper(), ())
+        if self._always:
+            at = sorted(set(at).union(self._always))
+        hits = []
+        for i in at:
+            cand = os.path.join(self.root, self._entries[i],
+                                session_id + ".jsonl")
+            if os.path.isfile(cand):
+                hits.append(cand)
+        return hits
+
+
 # How much of each copy the duplicated-transcript diagnosis reads at a time.
 # Streaming, so no copy is ever held whole and the longest is read once, only
 # as far as the longest of the others: transcripts run to 96 MB, and this is
@@ -7468,7 +7569,8 @@ def _row_is_refresh(r):
     return bool(r.get("is_update")) or r.get("pre_b64") is not None
 
 
-def select_sync_rows(env, source, dest, flags, found=None, decoded=None):
+def select_sync_rows(env, source, dest, flags, found=None, decoded=None,
+                     transcripts=None):
     """Which source rows are eligible to copy, and why the rest were skipped.
 
     Two optional dicts carry what this read learns on to the lineage pass,
@@ -7477,7 +7579,9 @@ def select_sync_rows(env, source, dest, flags, found=None, decoded=None):
     each one looked up here, and an answer already in it is used rather than
     looked up again. DECODED gets every local_*.json of the source as
     _lineage_store_rows takes it: the row as _lineage_light makes it, or
-    None when it could not be read or is not an object.
+    None when it could not be read or is not an object. Transcripts are
+    looked up in TRANSCRIPTS, the plan's _TranscriptIndex, or in one of
+    this selection's own when none is given.
 
     A row qualifies only if: it is a local_*.json row (not a tombstone or
     other sidecar), it is absent from the destination by filename, its
@@ -7568,16 +7672,18 @@ def select_sync_rows(env, source, dest, flags, found=None, decoded=None):
                         # input is a warning nobody can act on.
                         "last_activity": _activity_of(d)})
     overridden = _resolve_tombstone_overrides(entries, tombs, flags.include_deleted)
+    if transcripts is None:
+        transcripts = _TranscriptIndex(env.projects_root)
 
     def has_transcript(sid):
         # The lineage pass asks this of a parent or a root, which is often a
         # row selected here, so an answer is kept for it in FOUND. Only a
         # string id is kept: any other value fails in find_transcripts, as
-        # it always has.
+        # it always has (the index hands it there).
         if found is None or not isinstance(sid, str):
-            return bool(find_transcripts(env.projects_root, sid))
+            return bool(transcripts.find(sid))
         if sid not in found:
-            found[sid] = bool(find_transcripts(env.projects_root, sid))
+            found[sid] = bool(transcripts.find(sid))
         return found[sid]
 
     picked = []
@@ -9000,7 +9106,15 @@ def cmd_new_row(env, ns):
     return 1
 
 
-def _displaced_overlap(env, old_sid, new_sid):
+def _transcript_finder(env, transcripts):
+    """find_transcripts over env's projects folder, or TRANSCRIPTS' answer
+    to the same question when a plan passes its _TranscriptIndex."""
+    if transcripts is not None:
+        return transcripts.find
+    return lambda sid: find_transcripts(env.projects_root, sid)
+
+
+def _displaced_overlap(env, old_sid, new_sid, transcripts=None):
     """How much of the conversation a refresh DISPLACES also lives in the one it
     brings in - a float 0.0-1.0, or None when it cannot be measured.
 
@@ -9018,11 +9132,14 @@ def _displaced_overlap(env, old_sid, new_sid):
     displaced conversation is wholly contained in its replacement and nothing is
     reachable-only-there; a low number means it is substantially its own
     conversation.
+
+    TRANSCRIPTS is the plan's _TranscriptIndex, when there is one.
     """
     if not old_sid or not new_sid or old_sid == new_sid:
         return None
-    old = find_transcripts(env.projects_root, old_sid)
-    new = find_transcripts(env.projects_root, new_sid)
+    find = _transcript_finder(env, transcripts)
+    old = find(old_sid)
+    new = find(new_sid)
     if not old or not new:
         return None                      # nothing on disk to compare
     if len(old) > 1 or len(new) > 1:
@@ -9044,9 +9161,10 @@ def _displaced_overlap(env, old_sid, new_sid):
     return sum(1 for h in a if h in seen) / float(len(a))
 
 
-def _displaced_sizes(env, old_sid, new_sid):
+def _displaced_sizes(env, old_sid, new_sid, transcripts=None):
     """(displaced_turns, incoming_turns) - prose-turn counts for the two sides
     of a pointer swap, or (None, None) when either cannot be counted.
+    TRANSCRIPTS is the plan's _TranscriptIndex, when there is one.
 
     A LENGTH, alongside the overlap percentage, because they answer different
     questions and only one of them was being asked. Overlap says how much of
@@ -9077,8 +9195,9 @@ def _displaced_sizes(env, old_sid, new_sid):
     """
     if not old_sid or not new_sid or old_sid == new_sid:
         return (None, None)
-    old = find_transcripts(env.projects_root, old_sid)
-    new = find_transcripts(env.projects_root, new_sid)
+    find = _transcript_finder(env, transcripts)
+    old = find(old_sid)
+    new = find(new_sid)
     if not old or not new or len(old) > 1 or len(new) > 1:
         return (None, None)
     a = _message_fingerprints(old[0])
@@ -9607,15 +9726,20 @@ def plan_sync(env, flags):
     once"). Selection's read of the source is the pass's source index, its
     transcript answers the pass's own, and the pass's one read of the
     destination, as light rows, is also the census of the adds' duplicates
-    whenever it read every row that census would."""
+    whenever it read every row that census would. Every transcript lookup
+    is answered from one index of the projects folder (_TranscriptIndex;
+    docs/internals.md, "One index of the projects folder per plan")."""
     source, dest = resolve_sync_endpoints(env, flags.to or None,
                                           flags.live or None)
     verbatim = bool(flags.verbatim)
     found = {}            # conversation -> its transcript exists
+    # every lookup this plan makes, from one listing of the projects folder
+    transcripts = _TranscriptIndex(env.projects_root)
     # source filename -> its light row, or None; --verbatim runs no pass
     decoded = None if verbatim else {}
     picked, tally = select_sync_rows(env, source, dest, flags,
-                                     found=found, decoded=decoded)
+                                     found=found, decoded=decoded,
+                                     transcripts=transcripts)
     held = tally["held_sessions"]
     rows = []
     sources = {}          # row name -> its source row, for the lineage pass
@@ -9791,13 +9915,15 @@ def plan_sync(env, flags):
             except (KeyError, ValueError):
                 incoming = None
             r["displaced_overlap"] = _displaced_overlap(
-                env, r["displaced_session"], incoming)
+                env, r["displaced_session"], incoming,
+                transcripts=transcripts)
             # Lengths are cheap here - both files are already in the page cache
             # from the overlap read - and they are reported even when the
             # overlap could not be measured, because "436 -> 336 turns" is
             # useful on its own and does not depend on the comparison.
             r["displaced_turns"], r["incoming_turns"] = _displaced_sizes(
-                env, r["displaced_session"], incoming)
+                env, r["displaced_session"], incoming,
+                transcripts=transcripts)
             # Only a row that actually produced a number spends the budget. It
             # used to increment unconditionally, so a run of cheap failures - a
             # missing transcript, an unresolvable id - could exhaust the cap and
@@ -9865,7 +9991,7 @@ def plan_sync(env, flags):
             # The same test selection makes of a row's own transcript, and
             # its answer when it made it.
             if sid not in found:
-                found[sid] = bool(find_transcripts(env.projects_root, sid))
+                found[sid] = bool(transcripts.find(sid))
             return found[sid]
         # Selection's read of the source, through the same containment test
         # a read of the store here would make: not read again.
