@@ -10,8 +10,9 @@ the converge tests. Then the report: the per-account listing, the totals,
 and the public projection --json and --anonymize print; the journal's shape
 check and saver. Then the apply: the locked re-plan, the row writes verified
 by value, the CLI, and the one RULING 5 text the three apply rechecks share.
-Last, the claims: which rows a later live operation owns (D13), and the other
+Then the claims: which rows a later live operation owns (D13), and the other
 operations' ownership checks, which neither ignore a relink nor wait on one.
+Last, undo: key by key, leaving and naming what the app changed since.
 """
 import argparse
 import hashlib
@@ -26,9 +27,9 @@ import types
 import pytest
 
 import claude_code_sessions as ct
-from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O2, O3, O4, ORG, TASK,
-                           SimulatedCrash, _monotonic_now, identity_files, lrow, side_link,
-                           t_entries)
+from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O2, O3, O4, ORG, S1,
+                           TASK, SimulatedCrash, _monotonic_now, identity_files, lrow,
+                           side_link, t_entries, undo_ns)
 
 
 @pytest.fixture(autouse=True)
@@ -3156,3 +3157,672 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(
     (done,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "repoint"]
     assert done.manifest["status"] == "rolled_back"
     assert "rollback_declined" not in done.manifest
+
+
+# ---------------------------------------------------------------------- undo
+# Task 8: undo_relink puts back, row by row and key by key, each key the relink
+# wrote that still holds its new value (D8). A key the app changed since is left
+# and named, as is a row that is gone or opens another conversation now (D19). A
+# later live operation's claim refuses the whole undo before anything is written
+# (D13), and an unfinished one holds it (D18). cmd_undo previews and dispatches
+# it, and the window parks a relink as it parks a realign.
+
+UNDO_THEN = "The relink stays 'completed' - run 'undo --apply' again to resume it."
+APP_CHANGED = "the app changed it since"
+GONE = "gone from the store"
+REPOINTED = "now opens another conversation"
+EARLIER = {"op_id": "20000101T000000Z-eeeeee",               # an earlier relink's record
+           "history": [{"status": "journaled", "at": 1_000_000_000.0}]}
+
+
+def op_of(env, op_id):
+    """Operation OP_ID as list_ops reads it from disk now."""
+    (op,) = [o for o in ct.list_ops(env) if o.manifest["op_id"] == op_id]
+    return op
+
+
+def relink_now(env):
+    """A completed relink of what the store lacks now; returns its op as list_ops reads it."""
+    m = plan(env)
+    assert ct.run_relink(env, m) == "completed"
+    return op_of(env, m["op_id"])
+
+
+def applied(env, write_transcript, write_row, **store):
+    """relink_store(**STORE) on a clock that ticks per call, then a completed relink of
+    local_c2 and local_c3. Returns ({stem: path}, the relink op)."""
+    _monotonic_now(env)
+    paths = relink_store(env, write_transcript, write_row, **store)
+    op = relink_now(env)
+    assert names(op.manifest["rows"]) == ["local_c2.json", "local_c3.json"]
+    return paths, op
+
+
+def row_of(op, stem):
+    (r,) = [r for r in op.manifest["rows"] if r["name"] == stem + ".json"]
+    return r
+
+
+def undo(env, op):
+    """undo_relink on OP as the journal holds it now: (its result, the record after)."""
+    oid = op.manifest["op_id"]
+    final = ct.undo_relink(env, op_of(env, oid))
+    return final, op_of(env, oid).manifest
+
+
+def undo_refusal(env, op):
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, op_of(env, op.manifest["op_id"]))
+    return str(exc.value)
+
+
+def record_of(op):
+    """OP's record as its manifest file holds it, read without list_ops."""
+    return data_of(os.path.join(op.op_dir, "manifest.json"))
+
+
+def entry(row, what, why):
+    return {"name": row["name"], "label": row["label"], "what": what, "why": why}
+
+
+def crash_at(point):
+    def hook(p):
+        if p == point:
+            raise SimulatedCrash()
+    return hook
+
+
+def test_undo_takes_out_exactly_what_relink_added(mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row, local_c2=APP_KEYS)
+    before = {stem: data_of(p) for stem, p in paths.items()}
+    others = raws(paths, [s for s in paths if s not in ("local_c2", "local_c3")])
+    op = relink_now(env)
+    assert all("spawnedFrom" in data_of(paths[s]) for s in ("local_c2", "local_c3"))
+    final, om = undo(env, op)
+    assert final == "undone"
+    for stem in ("local_c2", "local_c3"):
+        after = data_of(paths[stem])
+        assert after == before[stem] and list(after) == list(before[stem])
+    assert raws(paths, others) == others
+    assert om["status"] == "undone" and om["history"][-1]["status"] == "undone"
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+    assert om["undo_left"] == [] and ct._relink_shape_error(om) is None
+    assert ct.read_lock(env) is None
+
+
+def test_undo_keeps_the_keys_the_app_added_since(mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    before = data_of(paths["local_c2"])
+    op = relink_now(env)
+    set_keys(paths["local_c2"], lastFocusedAt=1_800_000_000_000)        # the app, on focus
+    final, om = undo(env, op)
+    assert final == "undone" and om["undo_left"] == []
+    after = data_of(paths["local_c2"])
+    assert after == dict(before, lastFocusedAt=1_800_000_000_000)
+    assert list(after) == list(before) + ["lastFocusedAt"]
+
+
+def test_undo_leaves_and_names_a_key_the_app_changed(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2 = row_of(op, "local_c2")
+    assert c2["label"] == A2_LABEL
+    changed = dict(c2["new"]["spawnedFrom"], taskId="task_app")
+    set_keys(paths["local_c2"], spawnedFrom=changed)
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    line = "left    : local_c2 -> {0}: spawnedFrom (the app changed it since)".format(A2_LABEL)
+    assert capsys.readouterr().out.splitlines() == ["result: undone", line]
+    om = op_of(env, op.manifest["op_id"]).manifest
+    assert om["undo_left"] == [{"name": "local_c2.json", "label": A2_LABEL,
+                                "what": "spawnedFrom", "why": APP_CHANGED}]
+    assert ct._relink_left_line(om["undo_left"][0]) == line
+    assert data_of(paths["local_c2"])["spawnedFrom"] == changed
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+    # restored: no key the relink wrote is left at its new value on the row
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+
+
+@pytest.mark.parametrize("change", ["gone", "repointed"])
+def test_undo_skips_and_names_a_missing_or_repointed_row(
+        change, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2 = row_of(op, "local_c2")
+    asked = [like(c2)]                       # an earlier relink's row for the same file
+    assert claimed(ct._relink_claims(env, EARLIER, asked)) == [
+        (op.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+    if change == "gone":
+        os.unlink(paths["local_c2"])
+    else:
+        set_keys(paths["local_c2"], cliSessionId=LQ)
+    final, om = undo(env, op)
+    assert final == "undone"
+    assert om["undo_left"] == [entry(c2, "the row", GONE if change == "gone" else REPOINTED)]
+    r2, r3 = om["rows"]
+    assert r3["restored"] is True and "spawnedFrom" not in data_of(paths["local_c3"])
+    if change == "gone":
+        assert r2["restored"] is True and not os.path.exists(paths["local_c2"])
+    else:
+        # D19: the link stays on the row, so the record does not call it restored
+        assert "restored" not in r2
+        assert data_of(paths["local_c2"])["spawnedFrom"] == c2["new"]["spawnedFrom"]
+    # undone, the relink claims nothing (spec D13), whatever its rows' restored
+    assert ct._relink_claims(env, EARLIER, asked) == []
+
+
+def test_an_undone_relink_with_a_key_left_at_new_does_not_block_an_earlier_undo(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, r1 = applied(env, write_transcript, write_row, roots=True)
+    set_keys(paths["local_c1"], startChain=CHAIN)
+    r2 = relink_now(env)                     # the chains, on the links r1 wrote
+    assert names(r2.manifest["rows"]) == ["local_c2.json", "local_c3.json"]
+    for r in r2.manifest["rows"]:
+        assert set(r["new"]) == {"startChain"} and set(r["kept"]) == {"spawnedFrom"}
+    chain2 = row_of(r2, "local_c2")["new"]["startChain"]
+    set_keys(paths["local_c2"], cliSessionId=LQ)
+    final, m2 = undo(env, r2)
+    assert final == "undone"
+    assert m2["undo_left"] == [entry(row_of(r2, "local_c2"), "the row", REPOINTED)]
+    assert "restored" not in m2["rows"][0] and m2["rows"][1]["restored"] is True
+    assert data_of(paths["local_c2"])["startChain"] == chain2          # left at new
+    assert "startChain" not in data_of(paths["local_c3"])
+    # r2 is undone, so it claims nothing: r1's undo neither refuses naming it, which no
+    # command could undo again, nor leaves local_c3's link in
+    final, m1 = undo(env, r1)
+    assert final == "undone"
+    assert m1["undo_left"] == [entry(row_of(r1, "local_c2"), "the row", REPOINTED)]
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+    assert data_of(paths["local_c2"])["spawnedFrom"] == row_of(r1, "local_c2")["new"]["spawnedFrom"]
+
+
+def test_undo_restores_a_non_object_exactly(mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row,
+                         local_c2={"spawnedFrom": False, "model": "model-x"})
+    before = data_of(paths["local_c2"])
+    assert list(before)[-2:] == ["spawnedFrom", "model"]
+    op = relink_now(env)
+    assert row_of(op, "local_c2")["old"] == {"spawnedFrom": {"present": True, "value": False}}
+    assert list(data_of(paths["local_c2"])) == list(before)        # replaced where it stood
+    assert undo(env, op)[0] == "undone"
+    after = data_of(paths["local_c2"])
+    assert after == before and list(after) == list(before) and after["spawnedFrom"] is False
+
+
+@pytest.mark.parametrize("changed", [False, True], ids=["put back", "changed by the app"])
+def test_a_resumed_undo_after_a_crash_before_the_mark_names_nothing_false(
+        changed, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2 = row_of(op, "local_c2")
+    if changed:
+        set_keys(paths["local_c2"], spawnedFrom=dict(c2["new"]["spawnedFrom"], taskId="task_app"))
+    ct._crash_hook = crash_at("relink-undo-before-mark")
+    with pytest.raises(SimulatedCrash):
+        ct.undo_relink(env, op_of(env, op.manifest["op_id"]))
+    ct._crash_hook = None
+    ct.release_lock(env)
+    om = op_of(env, op.manifest["op_id"]).manifest            # the record on disk
+    want = [entry(c2, "spawnedFrom", APP_CHANGED)] if changed else []
+    assert om["status"] == "completed" and not any(r.get("restored") for r in om["rows"])
+    assert om["undo_left"] == want                 # saved on the way out, before the mark
+    assert ("spawnedFrom" in data_of(paths["local_c2"])) is changed    # put back, unless changed
+    assert "spawnedFrom" in data_of(paths["local_c3"])
+    # the resumed undo reads local_c2 again: a key already at old counts as restored and
+    # is not named, and an entry already recorded is not recorded twice
+    final, om = undo(env, op)
+    assert final == "undone" and om["undo_left"] == want
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+def test_an_unreadable_row_refuses_the_undo_before_any_write(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c3 = row_of(op, "local_c3")
+    landed = raw_of(paths["local_c3"])
+    with open(paths["local_c3"], "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    record = raw_of(os.path.join(op.op_dir, "manifest.json"))
+    before = raw_of(paths["local_c2"])
+    assert undo_refusal(env, op) == (
+        "could not read row local_c3.json ({0}), so nothing was changed; the relink stays "
+        "'completed' and 'undo --apply' resumes it once the row can be read.".format(c3["label"]))
+    assert raw_of(paths["local_c2"]) == before and "spawnedFrom" in data_of(paths["local_c2"])
+    assert raw_of(os.path.join(op.op_dir, "manifest.json")) == record
+    om = op_of(env, op.manifest["op_id"]).manifest
+    assert om["status"] == "completed" and not any("restored" in r for r in om["rows"])
+    assert ct.read_lock(env) is None
+    with open(paths["local_c3"], "wb") as fh:               # put right by hand
+        fh.write(landed)
+    assert undo(env, op)[0] == "undone"
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+def test_an_interrupted_undo_keeps_what_it_left_and_reports_it_once(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2, c3 = row_of(op, "local_c2"), row_of(op, "local_c3")
+    set_keys(paths["local_c2"], spawnedFrom=dict(c2["new"]["spawnedFrom"], taskId="task_app"))
+    real = ct.atomic_write
+
+    def full_for_c3(path, data):
+        # every other path, the manifest's among them, goes to the real writer
+        if same_file(path, paths["local_c3"]):
+            raise OSError(28, "No space left on device")
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", full_for_c3)
+    msg = undo_refusal(env, op)
+    assert msg == "could not write row local_c3.json ({0}): [Errno 28] No space left on " \
+                  "device. {1}".format(c3["label"], UNDO_THEN)
+    assert "run 'undo --apply' again" in msg
+    monkeypatch.setattr(ct, "atomic_write", real)
+    om = op_of(env, op.manifest["op_id"]).manifest
+    assert om["status"] == "completed"
+    assert [r.get("restored") for r in om["rows"]] == [True, None]
+    assert om["undo_left"] == [entry(c2, "spawnedFrom", APP_CHANGED)]
+    assert "spawnedFrom" in data_of(paths["local_c3"]) and ct.read_lock(env) is None
+    final, om = undo(env, op)
+    assert final == "undone"
+    assert om["undo_left"] == [entry(c2, "spawnedFrom", APP_CHANGED)]
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+@pytest.mark.parametrize("fail_in", [(), ("undo_relink",)], ids=["saved", "way-out-save-fails"])
+def test_a_failed_verify_leaves_the_row_unmarked_and_undo_again_reads_the_disk(
+        fail_in, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    real = ct.atomic_write
+
+    def wrong_for_c3(path, data):
+        if same_file(path, paths["local_c3"]):
+            return real(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", wrong_for_c3)
+    saves = record_saves(monkeypatch, fail_in=fail_in)
+    with pytest.raises(ct.LayoutError) as exc:         # never the OSError, never a traceback
+        ct.undo_relink(env, op_of(env, op.manifest["op_id"]))
+    assert str(exc.value) == (
+        "verify failed restoring row local_c3.json: the row on disk is not the row read "
+        "with relink's keys put back. 'undo --apply' again re-reads it and goes by what "
+        "each key holds.")
+    assert [who for who, _, _ in saves] == ["tick", "undo_relink"]
+    monkeypatch.undo()
+    om = op_of(env, op.manifest["op_id"]).manifest
+    assert om["status"] == "completed"
+    assert [r.get("restored") for r in om["rows"]] == [True, None]   # the row is judged afresh
+    assert ct.read_lock(env) is None
+    final, om = undo(env, op)
+    assert final == "undone" and om["undo_left"] == []
+
+
+def test_a_failed_save_of_undone_refuses_and_undo_again_finishes(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    target = op_of(env, op.manifest["op_id"])
+    real = ct.save_manifest
+
+    def full_at_undone(o):
+        # the real set_status sets the status in memory, then saves it
+        if o.manifest.get("status") == "undone":
+            raise OSError(28, "No space left on device")
+        return real(o)
+    monkeypatch.setattr(ct, "save_manifest", full_at_undone)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    assert str(exc.value) == (
+        "could not save the operation record in {0} ([Errno 28] No space left on device). "
+        "{1}".format(target.op_dir, UNDO_THEN))
+    monkeypatch.setattr(ct, "save_manifest", real)
+    om = op_of(env, op.manifest["op_id"]).manifest
+    assert om["status"] == "completed" and [r["restored"] for r in om["rows"]] == [True, True]
+    assert undo(env, op)[0] == "undone"
+
+
+def test_undo_waits_while_another_operation_is_unfinished(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    target = op_of(env, op.manifest["op_id"])
+    before = raws(paths)
+    waits = D18_OPEN.replace("relink waits", "relink's undo waits", 1).format(OPEN_ID)
+    put_op(env, OPEN_ID, open_op())
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    assert str(exc.value) == waits
+    bad = "20990101T000001Z-bbbbbb"
+    put_op(env, bad, "{not json")
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    assert str(exc.value).split("\n") == [
+        waits, "relink's undo waits: the record(s) in {0} could not be read, so whether they "
+               "are unfinished cannot be told. Nothing was changed.".format(bad)]
+    assert raws(paths) == before and record_of(target)["status"] == "completed"
+    assert ct.read_lock(env) is None
+
+
+def test_undo_refuses_while_the_app_runs(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    before = raws(paths)
+    env.process_lister = lambda: APP_RUNNING
+    msg = undo_refusal(env, op)
+    assert "refusing to take links out of rows in the session store while it is" in msg
+    assert ct.RELINK_GUARD_WHY in msg
+    assert raws(paths) == before and record_of(op)["status"] == "completed"
+    assert ct.read_lock(env) is None
+
+
+def test_undo_refuses_another_type_or_a_relink_not_completed(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    sync = whole_op(env, "sync", paths["local_p2"])
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, sync)
+    assert str(exc.value) == "not a relink op: " + sync.manifest["op_id"]
+    target = op_of(env, op.manifest["op_id"])
+    target.manifest["status"] = "writing"           # in memory only
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    assert str(exc.value) == "op {0} is 'writing', not 'completed'".format(op.manifest["op_id"])
+    assert ct.read_lock(env) is None
+
+
+@pytest.mark.parametrize("damage", ["old", "history missing", "history empty",
+                                    "history not a list", "no time", "time not a number"])
+def test_a_damaged_record_or_one_with_no_usable_history_refuses_the_undo(
+        damage, mkenv, tmp_path, write_transcript, write_row):
+    # a record with no usable history cannot say which operations came after it, so its
+    # undo refuses as damaged, named by its folder, rather than judge claims it cannot order
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    target = op_of(env, op.manifest["op_id"])
+    m = target.manifest
+    if damage == "old":
+        m["rows"][0]["old"] = {"spawnedFrom": 5}
+    elif damage == "history missing":
+        del m["history"]
+    else:
+        m["history"] = {"history empty": [], "history not a list": {"at": 1_900_000_000.0},
+                        "no time": [{"status": "journaled"}],
+                        "time not a number": [{"status": "journaled", "at": "later"}]}[damage]
+    ct.save_manifest(target)
+    record = raw_of(os.path.join(target.op_dir, "manifest.json"))
+    before = raws(paths)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    if damage == "old":
+        assert str(exc.value) == (
+            "the record for {0} is damaged (row 0 has no usable 'old'); refusing rather than "
+            "guess. Nothing was changed.".format(m["op_id"]))
+    else:
+        assert str(exc.value) == (
+            "the record in {0} is damaged (its 'history' gives no time it was made, so which "
+            "operations came after it cannot be told); refusing rather than guess. Nothing "
+            "was changed.".format(os.path.basename(target.op_dir)))
+    assert raws(paths) == before
+    assert raw_of(os.path.join(target.op_dir, "manifest.json")) == record
+    assert ct.read_lock(env) is None
+
+
+def test_a_later_live_op_refuses_the_undo_and_names_it(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2, c3 = row_of(op, "local_c2"), row_of(op, "local_c3")
+    pm = ct.plan_retitle(env, ct.RetitleFlags(only=LC, title="ACME-REVIEW side task, round two"))
+    assert ct.run_retitle(env, pm) == "completed"
+    (rt,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "retitle"]
+    before = raws(paths)
+    assert undo_refusal(env, op) == (
+        "cannot undo {0}: operation(s) {1} wrote row(s) local_c2.json ({2}), local_c3.json "
+        "({3}) after it - undo those first. Nothing was changed.".format(
+            op.manifest["op_id"], rt.manifest["op_id"], c2["label"], c3["label"]))
+    assert op_of(env, op.manifest["op_id"]).manifest["status"] == "completed"
+    assert raws(paths) == before
+    assert all("spawnedFrom" in data_of(paths[s]) for s in ("local_c2", "local_c3"))
+
+
+def test_a_later_relink_of_the_same_key_refuses_and_of_the_other_key_only_does_not(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2 = row_of(op, "local_c2")
+    same = journal_op(env, "relink", [like(c2)])
+    assert undo_refusal(env, op) == (
+        "cannot undo {0}: operation(s) {1} wrote row(s) local_c2.json ({2}) after it - undo "
+        "those first. Nothing was changed.".format(op.manifest["op_id"], same.manifest["op_id"],
+                                                    c2["label"]))
+    assert "spawnedFrom" in data_of(paths["local_c2"])
+    shutil.rmtree(same.op_dir)
+    # a chain written beside no kept link touches none of this relink's keys
+    journal_op(env, "relink", [like(c2, new={"startChain": {"firstSessionId": "local_r2",
+                                                            "depth": 1}}, kept={})])
+    assert undo(env, op)[0] == "undone"
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+
+
+def test_a_later_realign_does_not_refuse(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    realign_op(env, paths["local_c2"])               # it writes other keys (D13)
+    assert undo(env, op)[0] == "undone"
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+
+
+def test_a_damaged_later_record_refuses_the_undo_by_its_folder(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2, c3 = row_of(op, "local_c2"), row_of(op, "local_c3")
+    # readable, and finished, so D18 does not hold it; its rows cannot be read
+    put_op(env, OPEN_ID, '{"op_id": "x", "status": "completed", "rows": [5]}')
+    msg = undo_refusal(env, op)
+    assert msg == (
+        "cannot undo {0}: the record(s) in {1} cannot be read, so whether they wrote row(s) "
+        "local_c2.json ({2}), local_c3.json ({3}) after it cannot be told. No command "
+        "repairs a record: with the app closed, repair each one, or move its folder out of "
+        "the journal. Nothing was changed.".format(op.manifest["op_id"], OPEN_ID, c2["label"],
+                                                    c3["label"]))
+    assert "undo those first" not in msg
+    assert all("spawnedFrom" in data_of(paths[s]) for s in ("local_c2", "local_c3"))
+
+
+def test_a_journal_that_cannot_be_listed_for_the_claims_names_no_op_id(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    target = op_of(env, op.manifest["op_id"])
+    real, calls = ct._relink_load_ops, []
+
+    def load(env):
+        # D18 lists the journal first; by the claims' turn it cannot be listed
+        calls.append(1)
+        if len(calls) > 1:
+            raise PermissionError(13, "Access is denied")
+        return real(env)
+    monkeypatch.setattr(ct, "_relink_load_ops", load)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env, target)
+    assert str(exc.value) == (
+        "cannot undo {0}: the journal folder could not be listed ([Errno 13] Access is "
+        "denied), so whether a later operation wrote its rows cannot be told. Nothing was "
+        "changed.".format(op.manifest["op_id"]))
+    assert len(calls) == 2
+    assert all("spawnedFrom" in data_of(paths[s]) for s in ("local_c2", "local_c3"))
+
+
+def test_cmd_undo_previews_the_relink(capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    before = raws(paths)
+    preview = ("would undo {0} (relink: takes out the links and chains it added to {1} row(s), "
+               "key by key; a key changed since is left and named); pass --apply to execute\n")
+    assert ct.cmd_undo(env, undo_ns()) == 0
+    assert capsys.readouterr().out == preview.format(op.manifest["op_id"], 2)
+    target = op_of(env, op.manifest["op_id"])          # n is the rows written and not restored
+    target.manifest["rows"][0]["restored"] = True
+    ct.save_manifest(target)
+    assert ct.cmd_undo(env, undo_ns()) == 0
+    assert capsys.readouterr().out == preview.format(op.manifest["op_id"], 1)
+    assert raws(paths) == before
+    assert op_of(env, op.manifest["op_id"]).manifest["status"] == "completed"
+
+
+def test_the_window_offers_no_undo_while_a_relink_is_latest(
+        mkenv, tmp_path, write_transcript, write_row):
+    import claude_code_sessions_gui as gui
+    env = _monotonic_now(mkenv(tmp_path))
+    app = types.SimpleNamespace(env=env)
+    paths = relink_store(env, write_transcript, write_row)
+    sync = whole_op(env, "sync", paths["local_p2"])      # an earlier op the window reverses
+    t = gui.SyncApp._find_undoable_op(app)
+    assert (t["type"], t["op_id"]) == ("sync", sync.manifest["op_id"])
+    relink_now(env)
+    # CLI-only, so parked: reaching past it would undo something other than the last op
+    assert gui.SyncApp._find_undoable_op(app) is None
+
+
+def test_undo_takes_out_a_reordered_link_and_leaves_an_extended_one(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c3 = row_of(op, "local_c3")
+    set_keys(paths["local_c2"], spawnedFrom={"taskId": TASK, "sessionId": "local_p2"})
+    assert b'"spawnedFrom": {"taskId": ' in raw_of(paths["local_c2"])   # the app's order
+    extended = dict(c3["new"]["spawnedFrom"], title="Northwind")
+    set_keys(paths["local_c3"], spawnedFrom=extended)
+    final, om = undo(env, op)
+    assert final == "undone"
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+    assert data_of(paths["local_c3"])["spawnedFrom"] == extended
+    assert om["undo_left"] == [entry(c3, "spawnedFrom", APP_CHANGED)]
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+
+
+def test_an_earlier_relink_and_a_later_retitle_leaving_the_same_bytes_are_each_undoable(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row, local_c2={"titleSource": "user"})
+    before = data_of(paths["local_c2"])
+    op = relink_now(env)
+    landed = raw_of(paths["local_c2"])
+    pm = ct.plan_retitle(env, ct.RetitleFlags(only=LC, title="ACME-REVIEW side task",
+                                              store=A2[:8]))
+    assert names(pm["rows"]) == ["local_c2.json"]
+    assert ct.unb64(pm["rows"][0]["post_b64"]) == landed            # the same bytes
+    assert ct.run_retitle(env, pm) == "completed"
+    assert raw_of(paths["local_c2"]) == landed
+    (rt,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "retitle"]
+    assert ct.undo_retitle(env, rt) == "undone"
+    assert undo(env, op)[0] == "undone"
+    assert data_of(paths["local_c2"]) == before
+
+
+def test_a_later_relink_blocks_a_repoint_undo_and_a_restored_one_does_not(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row, local_c2={"cliSessionId": LQ})
+    write_transcript(env, "C--p", LQ, t_entries())
+    pre = raw_of(paths["local_c2"])
+    rpm = ct.plan_repoint(env, ct.RepointFlags(only="ACME-REVIEW", to_session=LC,
+                                               store=A2[:8]))
+    assert same_file(rpm["rows"][0]["dest_path"], paths["local_c2"])
+    assert ct.run_repoint(env, rpm) == "completed"
+    repointed = raw_of(paths["local_c2"])
+    (rp,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "repoint"]
+    op = relink_now(env)
+    assert names(op.manifest["rows"]) == ["local_c2.json", "local_c3.json"]
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_repoint(env, op_of(env, rp.manifest["op_id"]))
+    assert "no longer holds" in str(exc.value)
+    assert undo(env, op)[0] == "undone"
+    assert raw_of(paths["local_c2"]) == repointed
+    assert ct.undo_repoint(env, op_of(env, rp.manifest["op_id"])) == "undone"
+    assert raw_of(paths["local_c2"]) == pre
+
+
+def test_a_realign_undo_after_a_relink_of_the_same_row_succeeds(
+        mkenv, tmp_path, write_transcript, write_row):
+    from test_realign import World, behind_store, plan as realign_plan
+    w = World(_monotonic_now(mkenv(tmp_path)), tmp_path, write_transcript, write_row)
+    env = w.env
+    s = behind_store(w)                  # S1: A1's row opens the live copy, A2's a copy behind
+    kickoff, _ = w.place("Northwind-kickoff")
+    w.copy(kickoff, LP, t_entries(cwd=kickoff))
+    for acct, org in ((A1, O1), (A2, O2)):
+        w.row(acct, org, "local_p", LP, kickoff, title="Northwind kickoff")
+    w.row(A1, O1, "local_1", S1, s.live_cwd, activity=20, spawnedFrom=side_link("local_p"))
+    rm = realign_plan(w)
+    assert [r["dest_path"] for r in rm["rows"]] == [s.r2]
+    ct.run_realign(env, rm)
+    (ra,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "realign"]
+    assert ra.manifest["status"] == "completed"
+    op = relink_now(env)
+    (r,) = op.manifest["rows"]
+    assert same_file(r["dest_path"], s.r2)
+    link = r["new"]["spawnedFrom"]
+    assert w.read(s.r2)["cwd"] == s.live_cwd and w.read(s.r2)["spawnedFrom"] == link
+    assert ct.undo_realign(env, op_of(env, ra.manifest["op_id"])) == "undone"
+    after = w.read(s.r2)
+    assert after["cwd"] == s.old_cwd and after["folderPlace"]["cwd"] == s.old_cwd
+    assert after["spawnedFrom"] == link
+
+
+def converged(env):
+    """A completed converge of the store as it is; returns its op and its one written row."""
+    assert ct.run_converge(env, ct.plan_converge(env, ct.ConvergeFlags())) == "completed"
+    (cv,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "converge"]
+    (made,) = [r for r in cv.manifest["rows"] if r.get("written")]
+    return cv, made
+
+
+def test_a_converge_undo_deletes_a_relinked_row_and_relink_undo_names_it_gone(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_c3"])                    # A3 lacks C: converge creates its row
+    cv, made = converged(env)
+    assert (made["account"], made["session"]) == (A3, LC)
+    d = data_of(made["dest_path"])                  # the app drops the link converge carried
+    d.pop("spawnedFrom", None)
+    with open(made["dest_path"], "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+    op = relink_now(env)
+    assert names(op.manifest["rows"]) == ["local_c2.json", made["name"]]
+    mine = row_of(op, made["name"][:-len(".json")])
+    assert ct.cmd_undo(env, undo_ns(apply=True, op_id=cv.manifest["op_id"])) == 0
+    assert not os.path.exists(made["dest_path"])
+    final, om = undo(env, op)
+    assert final == "undone"
+    assert om["undo_left"] == [entry(mine, "the row", GONE)]
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+
+
+def test_undoing_a_converge_whose_created_parent_a_relink_linked_to_reports_it_dangling(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])                    # A3 lacks P: converge creates its row
+    cv, made = converged(env)
+    assert (made["account"], made["session"]) == (A3, LP)
+    made_id = made["name"][:-len(".json")]
+    op = relink_now(env)
+    assert row_of(op, "local_c3")["new"]["spawnedFrom"]["sessionId"] == made_id
+    capsys.readouterr()
+    assert ct.cmd_undo(env, undo_ns(apply=True, op_id=cv.manifest["op_id"])) == 0
+    assert not os.path.exists(made["dest_path"])
+    rep = op_of(env, cv.manifest["op_id"]).manifest["link_report"]
+    assert rep["dangling"] == [{"row": "local_c3", "target": made_id, "kind": "parent"}]
+    assert "link left dangling: local_c3 (its parent's row was removed)" in \
+        capsys.readouterr().out.splitlines()

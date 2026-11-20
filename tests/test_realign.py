@@ -850,8 +850,9 @@ _OP_TYPE_BRANCHES = {
                       "reads a relink op as any other, by status and "
                       "rollback_residue; a relink creates no row to vanish "
                       "and sets no copy aside"),
-    "cmd_undo": ("names it", "pending: Task 8 adds the relink arm"),
+    "cmd_undo": ("names it", "names it"),
     "undo_realign": ("names it", "its own type"),
+    "undo_relink": ("its own type", "names it"),
     "_collides": ("names it",
                   "relink is one of rotate_ops' claimants, which _collides reads; "
                   "a relink sets no copy aside"),
@@ -932,7 +933,7 @@ def test_every_op_type_branch_names_realign_and_relink_or_says_why_not():
         want = tuple(col == "names it" for col in _OP_TYPE_BRANCHES[name])
         assert names_it == want, name
     gui = _op_type_branches(os.path.join(root, "claude_code_sessions_gui.py"))
-    assert gui == {"_find_undoable_op": (True, False)}
+    assert gui == {"_find_undoable_op": (True, True)}
 
 
 # ------------------------------------------- the code review's findings
