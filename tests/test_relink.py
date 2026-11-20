@@ -2765,10 +2765,9 @@ def test_a_later_live_operation_that_wrote_the_row_claims_every_key(
     assert set(c2["new"]) == {"spawnedFrom"}
 
 
-def test_a_later_move_and_its_undo_claim_the_row_without_a_written_flag(
-        mkenv, tmp_path, write_transcript, write_row):
-    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
-    c2 = rows["local_c2"]
+def moved_c(env, tmp_path, write_row, paths):
+    """A real move of LC's transcript to another project folder, which rewrites
+    local_c1..3; returns the completed move op."""
     # the scheme evidence plan_move reads, as tests/test_journal_reroot.py's `moved` gives it
     ev = "C:\\proj\\_ev"
     os.makedirs(os.path.join(env.projects_root, ct.encode(ev, ct.SCHEME_CURRENT)))
@@ -2782,13 +2781,44 @@ def test_a_later_move_and_its_undo_claim_the_row_without_a_written_flag(
         "local_c1.json", "local_c2.json", "local_c3.json"]
     assert not any("written" in r for r in mv.manifest["rows"])
     assert data_of(paths["local_c2"])["cwd"] == os.path.normpath(target)
+    return mv
+
+
+def test_a_later_move_claims_the_row_without_a_written_flag_and_its_finished_undo_does_not(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    mv = moved_c(env, tmp_path, write_row, paths)
     assert claimed(ct._relink_claims(env, m, [c2])) == [
         (mv.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
     assert ct.run_undo(env, mv) == "completed"
     by_type = {o.manifest["op_type"]: o.manifest for o in ct.list_ops(env)}
     assert by_type["move"]["status"] == "undone"
     assert not any("written" in r for r in by_type["undo"]["rows"])
+    # no command undoes an undo, so a finished one's claim could never clear; the row it
+    # left is the move's pre-image, which holds this relink's keys at new
+    assert by_type["undo"]["status"] == "completed"
+    assert ct._relink_claims(env, m, [c2]) == []
+
+
+def test_an_unfinished_undo_of_a_later_move_still_claims_the_row(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    mv = moved_c(env, tmp_path, write_row, paths)
+
+    def hook(point):
+        if point == "after-rewriting":
+            raise SimulatedCrash()
+    ct._crash_hook = hook
+    with pytest.raises(SimulatedCrash):
+        ct.run_undo(env, mv)
+    ct._crash_hook = None
+    by_type = {o.manifest["op_type"]: o.manifest for o in ct.list_ops(env)}
+    assert by_type["undo"]["status"] in ct.NONTERMINAL
+    assert by_type["move"]["status"] == "completed"
     assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (mv.manifest["op_id"], "local_c2.json", {"spawnedFrom"}),
         (by_type["undo"]["op_id"], "local_c2.json", {"spawnedFrom"})]
 
 
@@ -2869,12 +2899,49 @@ def test_an_unreadable_or_damaged_manifest_claims_every_row_without_crashing(
     c2, c3 = rows["local_c2"], rows["local_c3"]
     sync = whole_op(env, "sync", paths["local_c3"])     # sorts before OPEN_ID's folder
     put_op(env, OPEN_ID, bad)
-    oid = OPEN_ID if bad == "{not json" else "x"
     sid = sync.manifest["op_id"]
+    # named by its folder, whatever op_id its record holds; a record with no history
+    # counts as later, so a damaged one is never passed over as the earliest of all
     assert ct._relink_claims(env, m, [c2, c3]) == [
         {"row": c3, "op_id": sid, "keys": {"spawnedFrom"}, "why": wrote_it(sid)},
-        {"row": c2, "op_id": oid, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM},
-        {"row": c3, "op_id": oid, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}]
+        {"row": c2, "op_id": OPEN_ID, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM},
+        {"row": c3, "op_id": OPEN_ID, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}]
+
+
+@pytest.mark.parametrize("history", ["missing", [], {"at": 1_900_000_000.0},
+                                     [{"status": "completed"}], [{"at": "later"}]],
+                         ids=["missing", "empty", "not a list", "no time", "not a number"])
+def test_a_damaged_record_with_no_usable_history_still_claims_under_its_folder(
+        history, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    body = {"op_id": "x", "op_type": "sync", "status": "completed", "rows": "nope"}
+    if history != "missing":
+        body["history"] = history
+    put_op(env, OPEN_ID, body)
+    assert ct._relink_claims(env, m, [c2]) == [
+        {"row": c2, "op_id": OPEN_ID, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}]
+
+
+@pytest.mark.parametrize("op_type, status, when, claims", [
+    ("sync", "undone", "later", False),
+    ("relink", "rolled_back", "later", False),
+    ("relink", "undone", "later", False),
+    ("undo", "completed", "later", False),         # no command undoes an undo
+    ("sync", "completed", "earlier", False),
+    ("sync", "completed", "later", True),          # live: the damage is a claim
+    ("undo", "rewriting", "later", True)])
+def test_an_earlier_or_withdrawn_damaged_record_claims_nothing(
+        op_type, status, when, claims, mkenv, tmp_path, write_transcript, write_row):
+    # liveness before damage: verdicts that read no row pass a damaged record over as
+    # they pass a sound one, so nothing waits on a record no command can undo
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    at = m["history"][0]["at"] + (100 if when == "later" else -100)
+    put_op(env, OPEN_ID, {"op_id": OPEN_ID, "op_type": op_type, "status": status,
+                          "history": [{"status": status, "at": at}], "rows": "nope"})
+    assert claimed(ct._relink_claims(env, m, [c2])) == (
+        [(OPEN_ID, "local_c2.json", {"spawnedFrom"})] if claims else [])
 
 
 def test_a_sort_key_that_cannot_be_computed_counts_as_later(
@@ -3002,6 +3069,38 @@ def test_a_malformed_later_relink_is_a_claim_in_the_retitle_and_repoint_checks(
     oid = bad.manifest["op_id"]
     assert ct._retitle_claimed_elsewhere(env, rt.manifest, rt.manifest["rows"][0]) == oid
     assert ct._repoint_claimed_later(env, rp.manifest, rp.manifest["rows"][0]) == oid
+
+
+@pytest.mark.parametrize("which, claims", [
+    ("an earlier relink, its rows damaged", False),
+    ("an undone relink, its rows damaged", False),
+    ("a rolled-back relink, its rows damaged", False),
+    ("a later relink with no history", True)])      # its sort key cannot be computed
+def test_an_earlier_or_withdrawn_damaged_relink_is_passed_by_the_retitle_and_repoint_checks(
+        which, claims, mkenv, tmp_path, write_transcript, write_row):
+    # liveness before damage: an earlier or withdrawn relink is passed over before its
+    # rows are read, so neither check waits on a relink no command can undo
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    (real,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "relink"]
+    rt = whole_op(env, "retitle", paths["local_c2"], written=False,
+                  post=raw_of(paths["local_c2"]))
+    rp = whole_op(env, "repoint", paths["local_c2"], written=False)
+    if which.startswith("an earlier"):
+        op = real
+    else:
+        op = journal_op(env, "relink", [like(rows["local_c3"])])   # names local_c3 only
+        if which.startswith("an undone"):
+            ct.set_status(op, "undone")
+        elif which.startswith("a rolled-back"):
+            ct.set_status(op, "rolled_back")
+    if which.endswith("no history"):
+        del op.manifest["history"]
+    else:
+        op.manifest["rows"] = "nope"
+    ct.save_manifest(op)
+    want = op.manifest["op_id"] if claims else None
+    assert ct._retitle_claimed_elsewhere(env, rt.manifest, rt.manifest["rows"][0]) == want
+    assert ct._repoint_claimed_later(env, rp.manifest, rp.manifest["rows"][0]) == want
 
 
 @pytest.mark.parametrize("damage", ['"rows": "nope"', "a row whose session_id is a list"])
