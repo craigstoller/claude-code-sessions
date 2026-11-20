@@ -1973,6 +1973,13 @@ window keeps parking a completed relink; no GUI change.)*
 - [ ] **Step 7: Commit** - `feat(relink): partial undo - keys nobody claims are taken out, the
   rest wait, named, and the relink stays resumable (I-1)`, then the docs commit.
 
+*(As built 2026-11-20, accepted at the task review: the damaged line reads "cannot be read or are
+damaged", to agree with "record(s)"; a link waiting beside a waiting chain is a third wait reason,
+"the chain beside it waits", with empty `op_ids`, its chain's own entry naming the claimant;
+waiting lines are uncapped under `--verbose`, as the dry run's listing is. A pass counts a key on a
+row that now opens another conversation as progress only when the row is marked. The code's
+wording governs.)*
+
 ## Departures from the spec
 
 Recorded so the spec's authority can be checked against them. Departures 1, 2, 3, 5, 6, 7 and 8
@@ -2215,6 +2222,10 @@ Choices the spec leaves to the builder, made here:
     `_repoint_claimed_later` now judge a relink by its rows' `restored`, whatever its status.
     Tests for both. (Superseded by the pre-flight scan, item 1: an undone or rolled-back relink
     claims nothing, as spec D13 says; `restored` keeps this meaning within a live relink.)
+    *(Superseded for `undo` 2026-11-20, by Task 11 and the spec's "`undo`, as amended (I-1)":
+    undo marks a row `restored` when every key of its `new` is finished, which includes a link
+    left beside a chain the app changed, still at `new`. `back` keeps the meaning above. The
+    task review found no reader this breaks.)*
   - `classify_relink_op`'s `rolling_back` note and forward's refusal share the wording the test
     asserts, "began and stopped part-way", since `recover_op` refuses from the note before it
     dispatches (agy).
