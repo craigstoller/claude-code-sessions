@@ -5848,6 +5848,33 @@ def build_parser():
     ra.add_argument("--json", action="store_true", help="print the plan as JSON")
     common(ra)
 
+    rl = sub.add_parser(
+        "relink",
+        help="give existing rows of a side session the parent link another account's row carries",
+        description="Give existing rows of a side session the parent link (spawnedFrom), and its "
+                    "chain (startChain), that another account's row carries, translated to that "
+                    "account's own rows as converge writes them on a new row. Only those two keys "
+                    "change, and only where a row has no link object; rows whose accounts disagree "
+                    "are left out with the reason. Undoable per key.")
+    rl.add_argument("--only", default="", metavar="TITLE_OR_ID",
+                    help="narrow to one conversation (a title substring, or a cliSessionId prefix) "
+                         "or to one row (local_ and a prefix of its id) - must resolve to exactly "
+                         "one; a conversation that leaves more than one row to change refuses and "
+                         "lists their ids")
+    rl.add_argument("--account", default="", metavar="SUBSTRING",
+                    help="narrow to one account's store: an account id, org id, store path or email "
+                         "substring that resolves to exactly one account, the signed-in account's "
+                         "included")
+    rl.add_argument("--live", default="", metavar="SUBSTRING",
+                    help="assert which account the desktop app is signed into (RULING 5), when the "
+                         "identity files disagree")
+    rl.add_argument("--apply", action="store_true",
+                    help="actually add the links. Needs the desktop app fully closed and no "
+                         "unfinished operation. Exits 0 when rows were left out - each is counted "
+                         "by its reason")
+    rl.add_argument("--json", action="store_true", help="print the plan as JSON")
+    common(rl)
+
     sp = sub.add_parser("sync", help="copy session listing rows to your other account")
     sp.add_argument("--to", default="", metavar="SUBSTRING",
                     help="destination account id, org id, store path, or email "
@@ -6270,7 +6297,7 @@ def main(argv=None):
                 "undo": cmd_undo, "recover": cmd_recover, "sync": cmd_sync,
                 "repoint": cmd_repoint, "new-row": cmd_new_row,
                 "retitle": cmd_retitle, "converge": cmd_converge,
-                "realign": cmd_realign,
+                "realign": cmd_realign, "relink": cmd_relink,
                 "trust-signed-helper": cmd_trust_signed_helper}
     try:
         return handlers[ns.cmd](env, ns)
@@ -6385,6 +6412,28 @@ def _identity_disagreement(env):
         if isinstance(last, str) and last and last != oauth:
             return (oauth, last)
     return None
+
+
+def _ruling5_recheck(env, m, command, tail=""):
+    """The one RULING 5 check of the apply-time rechecks (realign, converge,
+    relink): while the identity files disagree, refuse unless the plan M
+    recorded a --live assertion naming one side. COMMAND is the subcommand
+    the remedy line reruns; TAIL is the caller's own sentences, after the
+    shared remedies and before the closing one. The remedies are ordered by
+    what can actually work: --live in every disagreement, re-authenticating
+    only when the CLI's record is the stale one."""
+    dis = _identity_disagreement(env)
+    if dis and (m.get("live_asserted") or "") not in dis:
+        raise Refusal(
+            "~/.claude.json ({0}) and config.json ({1}) disagree about the "
+            "signed-in account (RULING 5). The designed remedy is to assert "
+            "which account the desktop app is on and re-plan:\n"
+            "   claude-code-sessions {2} --live <email, or acct/org as "
+            "reports print it> --apply\n"
+            "If it is the CLI's record that is stale, re-authenticating the CLI "
+            "as the desktop's account (run 'claude', then /login) also clears "
+            "this.{3} Nothing was written.".format(
+                dis[0][:8], dis[1][:8], command, " " + tail if tail else ""))
 
 
 def live_account(env):
@@ -13460,17 +13509,7 @@ def _realign_recheck(env, m):
     path changed since the plan - or that is held now, or gone - moves to
     `held` and nothing is written for it. Mutates M; raises Refusal for the
     whole run."""
-    dis = _identity_disagreement(env)
-    if dis and (m.get("live_asserted") or "") not in dis:
-        raise Refusal(
-            "~/.claude.json ({0}) and config.json ({1}) disagree about the "
-            "signed-in account (RULING 5). The designed remedy is to assert "
-            "which account the desktop app is on and re-plan:\n"
-            "   claude-code-sessions realign --live <email, or acct/org as "
-            "reports print it> --apply\n"
-            "If it is the CLI's record that is stale, re-authenticating the CLI "
-            "as the desktop's account (run 'claude', then /login) also clears "
-            "this. Nothing was written.".format(dis[0][:8], dis[1][:8]))
+    _ruling5_recheck(env, m, "realign")
     # The same scope, the --live assertion included. A refusal of the fresh
     # plan refuses the run with its own reason (an --only that now matches
     # two conversations, a row that became unreadable): nothing is
@@ -18128,22 +18167,11 @@ def _converge_recheck(env, m, ignore_own_paths=False, relink=False):
     # false agreement a liveness guard must not invite, which is why the
     # old "so the two agree" promise is gone. The desktop switch says "may
     # not", not "cannot": config.json has been measured both ways.
-    dis = _identity_disagreement(env)
-    if dis and (m.get("live_asserted") or "") not in dis:
-        raise Refusal(
-            "~/.claude.json ({0}) and config.json ({1}) disagree about the "
-            "signed-in account (RULING 5). The designed remedy is to "
-            "assert which account the desktop app is on and re-plan:\n"
-            "   claude-code-sessions converge --live <email, or acct/org "
-            "as reports print it> --apply\n"
-            "If it is the CLI's record that is stale, re-authenticating "
-            "the CLI as the desktop's account (run 'claude', then /login) "
-            "also clears this. Switching the desktop app may not - "
-            "config.json has been measured both tracking a switch "
-            "(2026-08-02) and keeping the previous account across one "
-            "(2026-08-29) - and re-authenticating never writes it. --live "
-            "exists for exactly that case. Nothing was written."
-            .format(dis[0][:8], dis[1][:8]))
+    _ruling5_recheck(env, m, "converge", tail=(
+        "Switching the desktop app may not - config.json has been measured "
+        "both tracking a switch (2026-08-02) and keeping the previous account "
+        "across one (2026-08-29) - and re-authenticating never writes it. "
+        "--live exists for exactly that case."))
     # The plan's stores are re-discovered and must still resolve to the same
     # populated-one answer - a store that moved since planning is a replan,
     # never a guess.
@@ -20296,6 +20324,283 @@ class _RelinkSaver:
             raise Refusal("could not save the operation record in {0} ({1}). "
                           .format(self.op.op_dir, str(exc) or repr(exc))
                           + self.then)
+
+
+# Applying (spec "Applying"; D15, D19): under the guard and the lock the plan
+# is made again, journaled, and each row is written with only its two keys
+# changed, then read back and verified by value. The row reader and writer
+# here are the ones undo and recovery use too, with roots from discovery.
+
+RELINK_GUARD_WHY = ("The app holds these rows in memory and rewrites them on "
+                    "focus, so a key written underneath it is whatever the app "
+                    "decides later, not what you wrote")
+
+
+def _relink_read(r, roots):
+    """("present", data, raw), ("absent", None, None), or ("unreadable",
+    None, raw or None) for an OSError, a strict-parse failure or a row that
+    is not an object: one read of row R's dest_path, after _retitle_contained
+    (its LayoutError propagates). The one relink function that opens a row."""
+    _retitle_contained(r, roots)
+    try:
+        with open(r["dest_path"], "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return "absent", None, None
+    except OSError:
+        return "unreadable", None, None
+    try:
+        data = _strict_row_dict(raw)
+    except (ValueError, RecursionError):
+        return "unreadable", None, raw
+    if not isinstance(data, dict):
+        return "unreadable", None, raw
+    return "present", data, raw
+
+
+def _relink_put(r, value, roots, then):
+    """Write VALUE to row R and read it back: True when the row now holds
+    VALUE, by value (_relink_same), else False, which each caller acts on in
+    its own way. Containment is checked here, whatever the caller read
+    before, since a journal can be edited. An OSError from the write is a
+    Refusal ending in THEN, the caller's own next step."""
+    _retitle_contained(r, roots)
+    try:
+        atomic_write(r["dest_path"], _relink_row_bytes(value))
+    except OSError as exc:
+        raise Refusal("could not write row {0} ({1}): {2}. ".format(
+            r["name"], r.get("label", ""), exc) + then)
+    state, data, _raw = _relink_read(r, roots)
+    return state == "present" and _relink_same(data, value)
+
+
+def _relink_row_agrees(r, data):
+    """Whether the journal row R agrees with DATA, the row it names (D15
+    leaves no image to fall back on): each key R writes is absent or present
+    as `old` says, present only as the same non-object value, and DATA with
+    R's keys set serializes to R's post_sha256. Never raises."""
+    try:
+        old = r["old"]
+        for key in r["new"]:
+            was = old[key]
+            if was["present"] is not (key in data):
+                return False
+            if was["present"] and (isinstance(data[key], dict)
+                                   or not _relink_same(data[key], was["value"])):
+                return False
+        post = _relink_apply_new(data, r["new"])
+        return _relink_sha(_relink_row_bytes(post)) == r["post_sha256"]
+    except Exception:
+        return False
+
+
+def _relink_apply_then(m):
+    """The apply's and forward's next step after a refusal, every hint
+    runnable: the op's status as it is when the text is built."""
+    return ("The op is left at '{0}' - 'recover --resolve {1} --back --apply' "
+            "takes out what landed.".format(m.get("status", ""),
+                                            m.get("op_id", "")))
+
+
+def _relink_recheck(env, m):
+    """Under the lock, before new_op: RULING 5, then the plan made again
+    with the plan's own scope (its refusals refuse the run, nothing
+    journaled). M takes the fresh plan's rows, left-out rows and cycle
+    count, and `since_plan` counts, by (account, name), the rows in both
+    whose writes differ, those in the plan only, and those in the fresh plan
+    only. Mutates M; raises Refusal."""
+    _ruling5_recheck(env, m, "relink")
+    # The scope is passed back as typed, the --live assertion by its uuid;
+    # a value that is not a string cannot be, so the run is refused rather
+    # than replanned with another scope or a traceback.
+    for k in ("only", "account_filter", "live_asserted"):
+        if not isinstance(m.get(k), str):
+            raise Refusal("this plan's {0!r} is not a string, so the apply cannot "
+                          "repeat its scope under the lock. Nothing was written "
+                          "- re-run to replan.".format(k))
+    fresh = plan_relink(env, RelinkFlags(only=m["only"],
+                                         account=m["account_filter"],
+                                         live=m["live_asserted"]))
+
+    def by_row(rows):
+        return {(r["account"], r["name"]): r for r in rows}
+    was, now = by_row(m["rows"]), by_row(fresh["rows"])
+    m["since_plan"] = {
+        "changed": sum(1 for k in was.keys() & now.keys()
+                       if not _relink_same(was[k]["new"], now[k]["new"])),
+        "dropped": len(was.keys() - now.keys()),
+        "gained": len(now.keys() - was.keys())}
+    m["rows"] = fresh["rows"]
+    m["left_out"] = fresh["left_out"]
+    m["lineage_cycles"] = fresh["lineage_cycles"]
+
+
+def _relink_write_rows(op, m, roots, saver):
+    """Per row not written, in journal order: read it once; refuse when it
+    is gone, unreadable or opens another conversation now (D19); mark a row
+    that holds its post_sha256 as written (a landed write); refuse one whose
+    bytes are not its pre_sha256; refuse a record that does not agree with
+    its row; else write the found value with exactly relink's keys set and
+    verify it by value. Every refusal leaves the op at 'writing'."""
+    then = _relink_apply_then(m)
+    op_id = m.get("op_id", "")
+    for i, r in enumerate(m["rows"]):
+        if r.get("written"):
+            continue
+        if i:
+            _maybe_crash("relink-mid-rows")
+        where = "row {0} ({1})".format(r["name"], r.get("label", ""))
+        state, data, raw = _relink_read(r, roots)
+        if state == "absent":
+            raise Refusal("{0} is gone from the store since this relink was "
+                          "planned. {1}".format(where, then))
+        if state == "unreadable":
+            raise Refusal("{0} could not be read as a row. {1}".format(where, then))
+        if data.get("cliSessionId") != r["session_id"]:
+            raise Refusal("{0} now opens another conversation, not the one this "
+                          "relink planned its link for. {1}".format(where, then))
+        sha = _relink_sha(raw)
+        if sha == r["post_sha256"]:
+            r["written"] = True
+            saver.tick()
+            continue
+        if sha != r["pre_sha256"]:
+            raise Refusal(
+                "{0} changed since this relink was planned - writing would "
+                "discard whatever changed it, most likely the app. The op is "
+                "left at '{1}' - 'recover --resolve {2} --back --apply' takes "
+                "out what landed, then re-run to replan.".format(
+                    where, m.get("status", ""), op_id))
+        if not _relink_row_agrees(r, data):
+            raise LayoutError("the record for {0} does not match row {1}; "
+                              "refusing rather than write from it".format(
+                                  op_id, r["name"]))
+        ok = _relink_put(r, _relink_apply_new(data, r["new"]), roots, then)
+        _maybe_crash("relink-before-mark")
+        r["written"] = True
+        if not ok:
+            # Marked and saved before the raise, as realign and retitle do:
+            # recovery reads the row, and goes by what each key holds.
+            save_manifest(op)
+            raise LayoutError(
+                "verify failed on {0}: the row on disk is not the found value "
+                "with exactly relink's keys set. 'recover --resolve {1} --back "
+                "--apply' takes out what it can check and names the rest."
+                .format(r["name"], op_id))
+        saver.tick()
+
+
+def execute_relink_op(env, op):
+    """journaled -> writing -> completed. Containment roots come from
+    discovery, fresh, never from the journal. Callers own the guard and the
+    recheck."""
+    m = op.manifest
+    if m.get("status") != "journaled":
+        raise LayoutError("execute_relink_op runs ops from 'journaled'; use "
+                          "recover for interrupted ops")
+    roots = _retitle_roots(env)
+    try:
+        set_status(op, "writing")
+    except OSError as exc:
+        raise Refusal(
+            "could not save the operation record in {0} ({1}). Nothing landed; "
+            "the op is left at 'journaled' - 'recover --resolve {2} --back "
+            "--apply' closes it.".format(op.op_dir, exc, m.get("op_id", "")))
+    try:
+        _relink_write_rows(op, m, roots,
+                           _RelinkSaver(op, then=_relink_apply_then(m)))
+        _maybe_crash("relink-after-rows")
+    except BaseException:
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    set_status(op, "completed")
+    return "completed"
+
+
+def run_relink(env, manifest):
+    """Guard, D18, lock, re-plan, journal, execute, rotate. Returns the
+    result, "unchanged" without an op when the locked re-plan leaves no row
+    to write: a record of no rows is never journaled."""
+    _guard_mutation(env, "add links to rows in", NEW_ROW_STORE,
+                    because=RELINK_GUARD_WHY)
+    _relink_refuse_open(env, "relink")
+    acquire_lock(env, "relink")
+    try:
+        _relink_recheck(env, manifest)
+        if not manifest["rows"]:
+            return "unchanged"
+        # The check undo and recovery run on this record, run before it is
+        # journaled. new_op adds only op_id, status and history, which the
+        # check does not read, so the answer is the same; and recovery
+        # refuses a record that fails it, so a journaled one could never be
+        # closed, and D18 would hold every relink behind it.
+        bad = _relink_shape_error(manifest)
+        if bad:
+            raise Refusal("this relink's own record is damaged ({0}); refusing "
+                          "rather than journal it or write from it. Nothing was "
+                          "written.".format(bad))
+        try:
+            op = new_op(env, manifest)
+        except OSError as exc:
+            raise Refusal(
+                "could not write the operation record ({0}). The journal is "
+                "written before any row is touched, so nothing landed - fix the "
+                "space or permissions under {1} and re-run.".format(exc, env.ops_dir))
+        manifest["op_id"] = op.manifest["op_id"]
+        final = execute_relink_op(env, op)
+        rotate_ops(env)
+        return final
+    finally:
+        release_lock(env)
+
+
+def cmd_relink(env, ns):
+    def say(line):
+        text = line if ns.verbose else redact(env, line)
+        try:
+            print(text)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(text.encode(enc, "replace").decode(enc, "replace"))
+
+    m = plan_relink(env, RelinkFlags(only=ns.only, account=ns.account,
+                                     live=ns.live))
+    if not ns.json:
+        for line in _identity_warning_lines(env, m, command="relink"):
+            say(line)
+        _print_relink_report(say, m, _public_relink_manifest(env, m), ns.verbose)
+    planned = bool(m["rows"])
+    final = None
+    if ns.apply:
+        # A plan with no row journals nothing: there is no run to make.
+        final = run_relink(env, m) if planned else "unchanged"
+    code = 0 if final in (None, "completed", "unchanged") else 1
+    if ns.json:
+        pub = _public_relink_manifest(env, m)
+        if final is not None:
+            pub["result"] = final
+        print(json.dumps(pub, indent=1))
+        return code
+    if final is None:
+        if planned:
+            say("")
+            say("dry run - pass --apply to add them")
+        return code
+    say("")
+    say("result  : {0}".format(final))
+    if planned and final in ("completed", "unchanged"):
+        # Exact here only: every row the locked re-plan left has landed.
+        for line in _relink_apply_lines(m):
+            say(line)
+        if final == "completed":
+            say("Reopen the app and check that the relinked rows show under "
+                "their parents. 'undo' takes the links out again, key by key.")
+        else:
+            say("nothing to add")
+    return code
 
 
 if __name__ == "__main__":
