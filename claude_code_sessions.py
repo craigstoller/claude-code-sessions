@@ -4256,7 +4256,7 @@ def _listing_label(s):
 
 
 _ANON_FIELDS = ("title", "cwd", "project", "folder", "new_title", "old_title",
-                "suggested_title")
+                "suggested_title", "parent_title")
 _ANON_EMAIL_FIELDS = ("label", "email", "account_email", "source_email",
                       "dest_email")
 
@@ -4278,7 +4278,7 @@ def _short_ids(text):
 
 # The fixed field vocabulary of every report anonymize_report traverses
 # (list items, doctor, alignment, and the retitle, converge, new-row,
-# repoint and sync public manifests).
+# repoint, sync and relink public manifests).
 # Keys in this set are SCHEMA, never data, and must never be renamed: a
 # title in the substitution table that happens to equal one - 'rows' as a
 # terse customTitle is enough - used to rename the key, crashing
@@ -4317,6 +4317,11 @@ _ANON_STRUCTURAL_KEYS = frozenset((
     "root_row", "root_planned", "carried_keys", "dropped_keys", "code",
     "link_report", "dangling", "redirected", "unchecked", "target", "kind",
     "error", "link_change", "chain_change", "verbatim_links",
+    # relink (docs/specs/2026-11-19-relink-design.md): the public manifest's
+    # left-out list and --account echo, the counts an apply and an undo
+    # record, and each row's written and kept keys and its undo mark.
+    "left_out", "account_filter", "since_plan", "changed", "dropped",
+    "gained", "undo_left", "what", "why", "adds", "keeps", "restored",
     "filtered", "from_session", "held", "held_older", "held_orphan",
     "held_orphan_detail", "held_same", "held_unknown", "holder_titles",
     "holders", "holds", "identity_disagreement", "in_all_accounts",
@@ -18911,10 +18916,11 @@ def _print_converge_report(say, m):
         say(line)
 
 
-def _identity_warning_lines(env, m):
+def _identity_warning_lines(env, m, command="converge"):
     """Change 1 of 0.13.0: the warning block for a converge manifest that
     carries an identity_disagreement no valid --live arbitrated. [] when
-    there is nothing to warn about.
+    there is nothing to warn about. COMMAND is the subcommand the remedy
+    lines rerun (relink passes its own; converge keeps the default).
 
     RULING 5 is evaluated only inside _converge_recheck, so a 0.12.0 plan
     could read `0 held` while --apply was always going to refuse for a
@@ -18958,7 +18964,7 @@ def _identity_warning_lines(env, m):
             oauth_name = _anon_label("account", oauth_name)
         if "@" in config_name:
             config_name = _anon_label("account", config_name)
-    remedies = ["claude-code-sessions converge --live {0} --apply".format(n)
+    remedies = ["claude-code-sessions {0} --live {1} --apply".format(command, n)
                 for n in (oauth_name, config_name)]
     width = max(len(r) for r in remedies)
     return [
@@ -19756,6 +19762,275 @@ def plan_relink(env, flags):
     if dis:
         m["identity_disagreement"] = {"oauth": dis[0], "config": dis[1]}
     return m
+
+
+# The report (spec "What it prints"): the totals, counted from the plan's
+# written keys and its left-out list, the per-account listing, and the public
+# projection --json and --anonymize print. Every structural fact is read from
+# the plan; the projection gives only the strings shown.
+
+def _relink_codes(entry):
+    """The note codes of a plan row (its `lineage` record's notes) or of a
+    left-out entry (its own `notes`), in order, each once. Never raises."""
+    if not isinstance(entry, dict):
+        return []
+    return _lineage_codes(entry.get("lineage") if "lineage" in entry else entry)
+
+
+def _relink_tag(codes):
+    """`[link: <phrase>]` for the first code of CODES in LINEAGE_LEFT_OUT,
+    else `[chain: <phrase>]` for the first in RELINK_CHAIN_CODES, else ""."""
+    codes = [c for c in codes if isinstance(c, str)] \
+        if isinstance(codes, (list, tuple)) else []
+    for kind, table in (("link", LINEAGE_LEFT_OUT), ("chain", RELINK_CHAIN_CODES)):
+        for c in codes:
+            if c in table:
+                return "[{0}: {1}]".format(kind, LINEAGE_PHRASES.get(c, c))
+    return ""
+
+
+def _relink_summary(m):
+    """The totals of the plan M in _lineage_summary's shape, counted from
+    the plan and never from the rows' records, which also name a kept key: a
+    link is carried by each row whose `new` holds spawnedFrom, a chain by
+    each whose `new` holds startChain; a link is left out by each left-out
+    entry, under its first LINEAGE_LEFT_OUT code; a chain by each row or
+    entry with a code in RELINK_CHAIN_CODES. `changes` are the apply's
+    `since_plan`, zero without it. Never raises."""
+    links = {"carried": 0, "left_out": {}}
+    chains = {"carried": 0, "left_out": 0}
+    changes = {"changed": 0, "dropped": 0, "gained": 0}
+    m = m if isinstance(m, dict) else {}
+    rows, left = m.get("rows"), m.get("left_out")
+    for r in rows if isinstance(rows, list) else ():
+        if not isinstance(r, dict):
+            continue
+        new = r.get("new") if isinstance(r.get("new"), dict) else {}
+        if "spawnedFrom" in new:
+            links["carried"] += 1
+        if "startChain" in new:
+            chains["carried"] += 1
+        if any(c in RELINK_CHAIN_CODES for c in _relink_codes(r)):
+            chains["left_out"] += 1
+    for e in left if isinstance(left, list) else ():
+        codes = _relink_codes(e)
+        first = next((c for c in codes if c in LINEAGE_LEFT_OUT), "")
+        if first:
+            links["left_out"][first] = links["left_out"].get(first, 0) + 1
+        if any(c in RELINK_CHAIN_CODES for c in codes):
+            chains["left_out"] += 1
+    since = m.get("since_plan")
+    for k in changes:
+        v = since.get(k) if isinstance(since, dict) else None
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            changes[k] = v
+    return {"links": links, "chains": chains, "changes": changes}
+
+
+def _relink_plan_lines(m):
+    """The dry run's totals: `links   : N to add, M left out (<reasons>)`,
+    `chains  : N to add, M left out`, and `cycles  : N already present, left
+    as they are`; each part only when its count is not zero, and a line with
+    nothing to say is not given."""
+    s = _relink_summary(m)
+    lines = [ln for ln in (_lineage_links_line(s, carried="to add"),
+                           _lineage_chains_line(s, carried="to add")) if ln]
+    cycles = m.get("lineage_cycles") if isinstance(m, dict) else None
+    if isinstance(cycles, int) and not isinstance(cycles, bool) and cycles > 0:
+        lines.append("cycles  : {0} already present, left as they are"
+                     .format(cycles))
+    return lines
+
+
+def _relink_apply_lines(m):
+    """The totals after an apply, in converge's order: `links   : N added, M
+    left out (<reasons>); since the plan: R changed, D dropped, G gained`
+    (with no other part, `links   : since the plan: ...`), then `chains  : N
+    added, M left out`. Each part only when its count is not zero."""
+    s = _relink_summary(m)
+    links = _lineage_links_line(s, carried="added")
+    since = ", ".join("{0} {1}".format(s["changes"][k], k)
+                      for k in ("changed", "dropped", "gained")
+                      if s["changes"][k])
+    if since:
+        since = "since the plan: " + since
+        links = links + "; " + since if links else "links   : " + since
+    return [ln for ln in (links, _lineage_chains_line(s, carried="added"))
+            if ln]
+
+
+def _relink_dicts(v):
+    """The dict entries of the list V, in order ([] for anything else): the
+    one list the report and the projection both index."""
+    return [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
+
+
+def _relink_shown(entries, i, key):
+    """The string KEY of the public entry at index I of ENTRIES, "" when it
+    has none: what the report shows, never what it decides on."""
+    e = entries[i] if isinstance(entries, list) and 0 <= i < len(entries) \
+        else None
+    v = e.get(key) if isinstance(e, dict) else None
+    return v if isinstance(v, str) else ""
+
+
+def _relink_line(entry, title, width, what):
+    """`   <row>  <title>   <what>`, the title padded to WIDTH."""
+    line = "   {0}  {1:<{w}}".format(
+        _lineage_short(_lineage_stem(entry.get("name"))), title, w=width)
+    return line + "   " + what if what else line.rstrip()
+
+
+def _print_relink_report(say, m, pub, verbose=False):
+    """The dry run: per account, `-> <label>`, its rows to change (the first
+    RELINK_LIST_CAP, then `   ... and <n> more`, unless VERBOSE), under
+    VERBOSE its left-out rows each with its tag, and a blank line; then the
+    totals (_relink_plan_lines), and `nothing to add` when the plan writes
+    no row. M is the plan, and every structural fact - the written keys, the
+    codes and their phrases, the counts, the row ids, the order - is read
+    from it. PUB is its public projection (_public_relink_manifest), which
+    gives only the strings shown (label, title, parent_title), from its
+    entry at the same index."""
+    rows = _relink_dicts(m.get("rows"))
+    prows = pub.get("rows") if isinstance(pub, dict) else None
+    pleft = pub.get("left_out") if isinstance(pub, dict) else None
+    listed = list(enumerate(rows))
+    lost = list(enumerate(_relink_dicts(m.get("left_out")))) if verbose else []
+    for acct in sorted({str(e.get("account")) for _, e in listed + lost}):
+        mine = [(i, r) for i, r in listed if str(r.get("account")) == acct]
+        shown = mine if verbose else mine[:RELINK_LIST_CAP]
+        gone = [(i, e) for i, e in lost if str(e.get("account")) == acct]
+        titles = ([repr(_relink_shown(prows, i, "title")) for i, _ in shown]
+                  + [repr(_relink_shown(pleft, i, "title")) for i, _ in gone])
+        width = max(len(t) for t in titles)
+        head = (prows, shown[0][0]) if shown else (pleft, gone[0][0])
+        say("-> {0}".format(_relink_shown(head[0], head[1], "label")))
+        for (i, r), title in zip(shown, titles):
+            new = r.get("new") if isinstance(r.get("new"), dict) else {}
+            if "spawnedFrom" in new and "startChain" in new:
+                what = "link and chain"
+            elif "spawnedFrom" in new:
+                # The link is written; a chain left out beside it is tagged.
+                tag = _relink_tag([c for c in _relink_codes(r)
+                                   if c in RELINK_CHAIN_CODES])
+                what = "link under {0!r}{1}".format(
+                    _relink_shown(prows, i, "parent_title"),
+                    "   " + tag if tag else "")
+            elif "startChain" in new:
+                what = "chain"
+            else:
+                what = ""
+            say(_relink_line(r, title, width, what))
+        if len(mine) > len(shown):
+            say("   ... and {0} more".format(len(mine) - len(shown)))
+        for (i, e), title in zip(gone, titles[len(shown):]):
+            say(_relink_line(e, title, width, _relink_tag(_relink_codes(e))))
+        say("")
+    for line in _relink_plan_lines(m):
+        say(line)
+    if not rows:
+        say("nothing to add")
+
+
+def _relink_json_copy(x):
+    return json.loads(json.dumps(x))
+
+
+def _relink_public_row(r):
+    """A plan row without `old`, `new`, `kept` or a hash: the written and
+    kept keys by name only, in RELINK_KEYS order, since a link object can
+    carry a title."""
+    new = r.get("new") if isinstance(r.get("new"), dict) else {}
+    kept = r.get("kept") if isinstance(r.get("kept"), dict) else {}
+    out = {k: r.get(k, "") for k in ("account", "label", "name", "session_id",
+                                     "title", "parent_title", "store_path",
+                                     "dest_path")}
+    out["adds"] = [k for k in RELINK_KEYS if k in new]
+    out["keeps"] = [k for k in RELINK_KEYS if k in kept]
+    out["lineage"] = _relink_json_copy(r.get("lineage"))
+    out["written"] = bool(r.get("written"))
+    for k in ("skipped", "skip_detail", "restored"):
+        if k in r:
+            out[k] = r[k]
+    return out
+
+
+def _relink_public_left(e):
+    out = {k: e.get(k, "") for k in ("account", "label", "name", "session_id",
+                                     "title")}
+    out["notes"] = _relink_json_copy(e.get("notes") or [])
+    return out
+
+
+def _relink_put_codes(dst, src):
+    """Each note code of DST set again from SRC's note at the same index."""
+    dn = dst.get("notes") if isinstance(dst, dict) else None
+    sn = src.get("notes") if isinstance(src, dict) else None
+    for a, b in zip(dn if isinstance(dn, list) else (),
+                    sn if isinstance(sn, list) else ()):
+        if isinstance(a, dict) and isinstance(b, dict) and "code" in b:
+            a["code"] = b["code"]
+
+
+def _public_relink_manifest(env, m):
+    """The plan or op for --json and the printed report, with no `old`,
+    `new`, `kept` or hash; --anonymize honoured here, as realign's and
+    converge's public manifests honour it: no paths, `account` shortened,
+    `label` scrubbed, the --only and --account values hidden, and every
+    title scrubbed, the parent's included."""
+    rows, left = _relink_dicts(m.get("rows")), _relink_dicts(m.get("left_out"))
+    out = {"op_type": m.get("op_type", "relink"),
+           "only": _only_display(m.get("only", "")),
+           "account_filter": _relink_account_filter_display(
+               m.get("account_filter", "")),
+           "live_asserted": m.get("live_asserted", ""),
+           "lineage_format": m.get("lineage_format", LINEAGE_FORMAT),
+           "lineage_cycles": m.get("lineage_cycles", 0)}
+    for k in ("op_id", "identity_disagreement", "since_plan", "undo_left"):
+        if k in m:
+            out[k] = _relink_json_copy(m[k])
+    out["rows"] = [_relink_public_row(r) for r in rows]
+    out["left_out"] = [_relink_public_left(e) for e in left]
+    if not _ANONYMIZE:
+        return out
+    plain = out
+    for r in plain["rows"]:
+        _anon_register_title(env, r.get("title"))
+        _anon_register_title(env, r.get("parent_title"))
+    for e in plain["left_out"]:
+        _anon_register_title(env, e.get("title"))
+    # anonymize_report substitutes titles only in the values of _ANON_FIELDS
+    # and _ANON_EMAIL_FIELDS and in keys outside _ANON_STRUCTURAL_KEYS; any
+    # other string is only home-folded and uuid-shortened. So the note
+    # details and skip_detail are title-scrubbed below, and nothing else
+    # would scrub them.
+    out = anonymize_report(env, plain)
+    for r in out["rows"]:
+        r.pop("store_path", None)
+        r.pop("dest_path", None)
+    _anon_lineage_notes(env, out["rows"])
+
+    def _scrub(s):
+        return anonymize(env, s) if isinstance(s, str) else s
+
+    for e in out["left_out"]:
+        for n in e["notes"] if isinstance(e.get("notes"), list) else ():
+            if isinstance(n, dict) and "detail" in n:
+                n["detail"] = _scrub(n["detail"])
+    for r in out["rows"]:
+        if "skip_detail" in r:
+            r["skip_detail"] = _scrub(r["skip_detail"])
+    # The schema values set again from the plan: a no-op while
+    # anonymize_report leaves plain values alone, and what keeps them exact
+    # should it ever scrub them.
+    for r, p in zip(out["rows"], plain["rows"]):
+        for k in ("adds", "keeps", "skipped"):
+            if k in p:
+                r[k] = _relink_json_copy(p[k])
+        _relink_put_codes(r.get("lineage"), p.get("lineage"))
+    for e, p in zip(out["left_out"], plain["left_out"]):
+        _relink_put_codes(e, p)
+    return out
 
 
 if __name__ == "__main__":
