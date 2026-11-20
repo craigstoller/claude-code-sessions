@@ -20480,8 +20480,13 @@ def _relink_write_rows(op, m, roots, saver):
         r["written"] = True
         if not ok:
             # Marked and saved before the raise, as realign and retitle do:
-            # recovery reads the row, and goes by what each key holds.
-            save_manifest(op)
+            # recovery reads the row, and goes by what each key holds. A
+            # failed save never replaces the verify's error and its hint
+            # (D15); the save on the way out tries again.
+            try:
+                save_manifest(op)
+            except Exception:
+                pass
             raise LayoutError(
                 "verify failed on {0}: the row on disk is not the found value "
                 "with exactly relink's keys set. 'recover --resolve {1} --back "
@@ -20506,17 +20511,24 @@ def execute_relink_op(env, op):
             "could not save the operation record in {0} ({1}). Nothing landed; "
             "the op is left at 'journaled' - 'recover --resolve {2} --back "
             "--apply' closes it.".format(op.op_dir, exc, m.get("op_id", "")))
+    # Built at 'writing', the status the disk keeps if a later save fails:
+    # set_status changes the record in memory before it saves it.
+    then = _relink_apply_then(m)
     try:
-        _relink_write_rows(op, m, roots,
-                           _RelinkSaver(op, then=_relink_apply_then(m)))
+        _relink_write_rows(op, m, roots, _RelinkSaver(op, then=then))
         _maybe_crash("relink-after-rows")
     except BaseException:
+        # A failed save never replaces the exception in flight (D15).
         try:
             save_manifest(op)
         except Exception:
             pass
         raise
-    set_status(op, "completed")
+    try:
+        set_status(op, "completed")
+    except OSError as exc:
+        raise Refusal("could not save the operation record in {0} ({1}). "
+                      .format(op.op_dir, exc) + then)
     return "completed"
 
 
