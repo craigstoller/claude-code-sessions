@@ -17,7 +17,7 @@ import types
 import pytest
 
 import claude_code_sessions as ct
-from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O3, O4, ORG, TASK,
+from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O2, O3, O4, ORG, TASK,
                            identity_files, lrow, side_link, t_entries)
 
 
@@ -853,8 +853,9 @@ def test_only_by_conversation_with_two_rows_to_change_refuses(
     env = mkenv(tmp_path)
     paths = relink_store(env, write_transcript, write_row)
     head, *lines = refusal(env, only="ACME-REVIEW").split("\n")
-    assert head == ("--only 'ACME-REVIEW' leaves 2 rows to change; name one by its row id, "
-                    "so a proof touches one row:")
+    assert head == ("--only 'ACME-REVIEW' leaves 2 rows to change; name one by its row id "
+                    "(with --account when two accounts hold that id), so a proof touches one "
+                    "row:")
     assert lines == ["   local_c2   cccccccc (cccccccc/dddddddd)",
                      "   local_c3   eeeeeeee (eeeeeeee/ffffffff)"]
     assert names(plan(env, only=LC[:8], account=A2[:8])["rows"]) == ["local_c2.json"]
@@ -877,9 +878,16 @@ def test_only_refuses_no_match_and_an_ambiguous_one(mkenv, tmp_path, write_trans
     assert refusal(env, only="local_c1", account=A2[:8]).startswith(
         "no row matches --only 'local_c1'")
     head, *lines = refusal(env, only="local_c").split("\n")
-    assert head == "--only 'local_c' matches 3 rows; give more of the id:"
+    assert head == ("--only 'local_c' matches 3 rows; give more of the id, or add --account "
+                    "to name its account:")                 # the rows span three accounts
     assert [ln.split()[0] for ln in lines] == ["local_c1", "local_c2", "local_c3"]
     assert lines[0] == "   local_c1   aaaaaaaa (aaaaaaaa/bbbbbbbb)   ACME-REVIEW side task"
+    # rows of one account are told apart by more of the id alone
+    extra = put_row(env, write_row, A2, "local_c2b", LC, "ACME-REVIEW side task")
+    head, *lines = refusal(env, only="local_c2", account=A2[:8]).split("\n")
+    assert head == "--only 'local_c2' matches 2 rows; give more of the id:"
+    assert [ln.split()[0] for ln in lines] == ["local_c2", "local_c2b"]
+    os.unlink(extra)
     # a second conversation whose title holds the first one's
     write_transcript(env, "C--p", LD, t_entries())
     put_row(env, write_row, A1, "local_d1", LD, "ACME-REVIEW side task, round two")
@@ -915,9 +923,52 @@ def test_account_narrows_to_one_store_the_signed_in_one_included(
         assert names(plan(env, account=value)["rows"]) == ["local_c2.json"], value
     assert names(plan(env, account=O3[:8])["rows"]) == ["local_c3.json"]
     # A1's store path, in either separator and any case: its row carries the link already
-    for value in (os.path.join(A1, O1), A1 + "/" + O1, (A1 + "\\" + O1).upper()):
+    for value in (os.path.join("claude-code-sessions", A1, O1),
+                  "claude-code-sessions/" + A1 + "/" + O1,
+                  ("claude-code-sessions\\" + A1 + "\\" + O1).upper()):
         m = plan(env, account=value)
         assert m["rows"] == [] and m["left_out"] == [], value
+
+
+def test_account_takes_the_printed_pair_and_a_trailing_separator(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    # the listing's own label pasted back: its 8 characters, shorter prefixes, the full ids
+    for value in (A2[:8] + "/" + O2[:8], A2[:4] + "/" + O2[:2], (A2 + "/" + O2).upper()):
+        assert names(plan(env, account=value)["rows"]) == ["local_c2.json"], value
+    # a pair is parsed, never searched: A1's folded store path holds this mid-uuid fragment
+    fragment = A1[-4:] + "/" + O1[:4]
+    assert fragment in (A1 + "/" + O1)
+    assert refusal(env, account=fragment).startswith("no account store matches")
+    # a Tab-completed store path keeps its trailing separator, in either spelling
+    store = store_dir(env, A2, O2)
+    other = "/" if os.sep == "\\" else "\\"
+    for value in (store + os.sep, store.replace(os.sep, other) + other):
+        assert names(plan(env, account=value)["rows"]) == ["local_c2.json"], value
+
+
+def test_a_row_id_two_accounts_hold_refuses_toward_account(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    # the same stem in A2 and A3, as two stores may legitimately hold it
+    put_row(env, write_row, A3, "local_c2", LC, "ACME-REVIEW side task")
+    head, *lines = refusal(env, only="local_c2").split("\n")
+    assert head == ("--only 'local_c2' matches 2 rows; give more of the id, or add --account "
+                    "to name its account:")
+    assert lines == ["   local_c2   cccccccc (cccccccc/dddddddd)   ACME-REVIEW side task",
+                     "   local_c2   eeeeeeee (eeeeeeee/ffffffff)   ACME-REVIEW side task"]
+    m = plan(env, only="local_c2", account=A3[:8])
+    assert [(r["account"], r["name"]) for r in m["rows"]] == [(A3, "local_c2.json")]
+    # the conversation's three rows to change name the way out too
+    head, *lines = refusal(env, only="ACME-REVIEW").split("\n")
+    assert head == ("--only 'ACME-REVIEW' leaves 3 rows to change; name one by its row id "
+                    "(with --account when two accounts hold that id), so a proof touches one "
+                    "row:")
+    assert lines == ["   local_c2   cccccccc (cccccccc/dddddddd)",
+                     "   local_c2   eeeeeeee (eeeeeeee/ffffffff)",
+                     "   local_c3   eeeeeeee (eeeeeeee/ffffffff)"]
 
 
 def test_account_matches_empty_org_folders_without_ambiguity(
