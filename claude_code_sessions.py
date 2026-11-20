@@ -3033,12 +3033,23 @@ def classify_op(env, op):
                         "succeeds, and nothing was changed".format(disc.detail)}
     stray = _unresolved_rows(disc, m)
     kind = m.get("op_type", "move")
+    if kind == "relink" and stray:
+        # A relink's verdicts that offer nothing come before the gate, so
+        # classify_op never advertises a 'back' that recover_op would
+        # refuse: D18 (another operation unfinished), and a record whose
+        # history gives no time it was made, which the shape check below
+        # cannot see. Without unresolved rows the dispatch below asks the
+        # same classifier.
+        early = classify_relink_op(env, op)
+        if not early["resolutions"]:
+            return early
     if stray and kind not in ("move", "undo"):
         shape = {"new-row": _new_row_shape_error, "repoint": _repoint_shape_error,
                  "retitle": _retitle_shape_error,
                  "converge": _converge_shape_error,
                  "sync": _sync_shape_error,
-                 "realign": _realign_shape_error}.get(kind)
+                 "realign": _realign_shape_error,
+                 "relink": _relink_shape_error}.get(kind)
         if not (shape and shape(m)):
             return {"status": status, "source": m.get("store_label", "n/a"),
                     "dest": m.get("store_label", "n/a"), "resolutions": ["back"],
@@ -3176,6 +3187,8 @@ def classify_op(env, op):
         return classify_converge_op(env, op)
     if m.get("op_type") == "realign":
         return classify_realign_op(env, op)
+    if m.get("op_type") == "relink":
+        return classify_relink_op(env, op)
 
     def _src_state():
         transcript_present = os.path.isfile(m["source_transcript"])
@@ -3388,7 +3401,8 @@ def recover_op(env, op, direction):
         # Refusal/LayoutError, so the user got a traceback from the one command
         # that exists to get them unstuck.
         if op.manifest.get("op_type") not in ("sync", "repoint", "new-row",
-                                              "retitle", "converge", "realign"):
+                                              "retitle", "converge", "realign",
+                                              "relink"):
             _validate_manifest_paths(env, op.manifest, leave_unresolved=bool(stray))
         elif op.manifest.get("op_type") == "new-row":
             # The allowlist above skips the move-shaped validator, so this op
@@ -3411,6 +3425,8 @@ def recover_op(env, op, direction):
         m = op.manifest
         if m.get("op_type") == "realign":
             return _recover_realign(env, op, direction, stray)
+        if m.get("op_type") == "relink":
+            return _recover_relink(env, op, direction, stray)
         if m.get("op_type") == "new-row":
             if direction == "forward":
                 # The preflight moved out of execute_new_row_op, so this arm
@@ -6269,6 +6285,14 @@ def cmd_recover(env, ns):
         for r in _journal_dict_rows(matches[0].manifest):
             if r.get("skipped") in LINEAGE_SKIP_REASONS:
                 line = _converge_skip_line(r)
+                print(line if ns.verbose else redact(env, line))
+    if direction == "forward" \
+            and matches[0].manifest.get("op_type") == "relink":
+        # Each row forward recovery skipped, with its reason: it stays
+        # without the link for the next relink, which plans it afresh.
+        for r in _journal_dict_rows(matches[0].manifest):
+            if r.get("skipped") in RELINK_SKIP_REASONS:
+                line = _relink_skip_line(r)
                 print(line if ns.verbose else redact(env, line))
     if final != "completed":
         _print_abort_reason(env, ns, matches[0])
@@ -20508,6 +20532,15 @@ def _relink_apply_then(m):
                                             m.get("op_id", "")))
 
 
+def _relink_verify_error(r, op_id):
+    """The apply's and forward's error for row R, whose read-back is not the
+    value written."""
+    return LayoutError(
+        "verify failed on {0}: the row on disk is not the found value with "
+        "exactly relink's keys set. 'recover --resolve {1} --back --apply' "
+        "takes out what it can check and names the rest.".format(r["name"], op_id))
+
+
 def _relink_recheck(env, m):
     """Under the lock, before new_op: RULING 5, then the plan made again
     with the plan's own scope (its refusals refuse the run, nothing
@@ -20593,11 +20626,7 @@ def _relink_write_rows(op, m, roots, saver):
                 save_manifest(op)
             except Exception:
                 pass
-            raise LayoutError(
-                "verify failed on {0}: the row on disk is not the found value "
-                "with exactly relink's keys set. 'recover --resolve {1} --back "
-                "--apply' takes out what it can check and names the rest."
-                .format(r["name"], op_id))
+            raise _relink_verify_error(r, op_id)
         saver.tick()
 
 
@@ -21088,6 +21117,454 @@ def undo_relink(env, op):
         return "undone"
     finally:
         release_lock(env)
+
+
+# Recovery (spec "Recovery"; D13, D15, D18, D19): recover's two ways out of
+# an interrupted relink. Forward finishes the rows still to write by what each
+# key holds now; back takes out every key that landed, key by key, and leaves
+# a key a later live operation claims or the app changed since, naming it.
+# Both read each row once through _relink_read, with roots from discovery,
+# and neither re-resolves a link. Which way a row goes, by its written flag
+# and what a read finds, is the recovery matrix of the build plan
+# (docs/plans/2026-11-19-relink-plan.md, Task 9).
+
+_RELINK_NO_HISTORY = ("its 'history' gives no time it was made, so which "
+                      "operations came after it cannot be told")
+
+
+def _relink_row_states(r, cur):
+    """{key: "new" | "old" | "other"} for each key journal row R writes, by
+    what CUR, the row as read now, holds (_relink_key_state)."""
+    return {k: _relink_key_state(cur, k, r["old"][k], r["new"][k])
+            for k in RELINK_KEYS if k in r["new"]}
+
+
+def _relink_landed(states):
+    """Whether a row's write landed: some key at its new value, whatever the
+    others hold. Recovery goes by key (Departure 9)."""
+    return "new" in states.values()
+
+
+def _relink_dependency_skip(m, r, by_name):
+    """("parent_changed", detail) when pending row R of relink M must not be
+    written because a row its write relies on is gone, unreadable or opens
+    another conversation now; None otherwise (_lineage_dependency_skip, on
+    a copy of R). The parent row is always checked: a row that writes the
+    link depends on its target, and a chain-only row on the kept link it
+    stands behind. The chain root only when R writes the chain: a chain R
+    keeps is not this relink's to re-check. BY_NAME is
+    _lineage_rows_by_name(m). NEVER RAISES."""
+    try:
+        lin = dict(r["lineage"])
+        if "startChain" not in r["new"]:
+            lin["root_row"] = ""
+        return _lineage_dependency_skip(m, dict(r, lineage=lin), by_name)
+    except Exception:
+        return "parent_changed", "its link's target could not be checked"
+
+
+def _relink_verdict(m, resolutions, note):
+    return {"status": m.get("status") if isinstance(m, dict) else None,
+            "source": "n/a", "dest": "n/a", "resolutions": resolutions,
+            "drifted_rows": [], "note": note}
+
+
+def _relink_d18_note(env, m):
+    """classify_op's verdict for relink M while its recovery waits (D18), or
+    None when no other operation is unfinished and every record could be
+    read. It offers nothing, and its note names the open operations, then
+    every record that could not be read (_relink_unreadable_line). M's own
+    op is passed as `mine`: a recovering relink is itself unfinished, and
+    would otherwise always wait on itself. NEVER RAISES."""
+    try:
+        ids, unreadable = _relink_open_others(env, mine=m.get("op_id", ""))
+        parts = []
+        if ids:
+            parts.append("recovery waits while another operation is unfinished "
+                         "({0}); recover that first".format(", ".join(ids)))
+        if unreadable:
+            parts.append(_relink_unreadable_line("recovery", unreadable))
+        if not parts:
+            return None
+        note = "relink: " + "; ".join(parts)
+    except Exception:
+        note = ("relink: recovery waits: whether another operation is "
+                "unfinished could not be told")
+    return _relink_verdict(m, [], note)
+
+
+def _relink_rolling_note(m):
+    return ("relink: a back recovery began and stopped part-way; only back is "
+            "offered - 'recover --resolve {0} --back --apply' goes on from what "
+            "each row holds now".format(m.get("op_id", "")))
+
+
+def classify_relink_op(env, op):
+    """Recovery shape for an interrupted relink, the first that applies: a
+    damaged record, or one whose history gives no time it was made, offers
+    nothing; a finished one points at undo; D18 holds it while another
+    operation is unfinished; once back has begun (`rolling_back`), only back
+    is offered; otherwise forward and back. recover_op refuses a direction
+    this does not offer, quoting the note, before it dispatches. NEVER
+    RAISES."""
+    m = op.manifest
+    try:
+        bad = _relink_shape_error(m)
+        if bad:
+            return _relink_verdict(m, [], (
+                "relink: this operation's record is damaged ({0}), so neither "
+                "direction can be run from it".format(bad)))
+        if _relink_sort_key(m) is None:
+            return _relink_verdict(m, [], (
+                "relink: the record in {0} is damaged ({1}), so neither "
+                "direction can be run from it".format(
+                    os.path.basename(op.op_dir), _RELINK_NO_HISTORY)))
+        rows = m["rows"]
+        written = sum(1 for r in rows if r["written"])
+        if m.get("status") not in NONTERMINAL:
+            return _relink_verdict(m, [], (
+                "relink: {0} row(s) written (use undo to take a completed "
+                "relink's links out)".format(written)))
+        waits = _relink_d18_note(env, m)
+        if waits is not None:
+            return waits
+        if m.get("rolling_back"):
+            return _relink_verdict(m, ["back"], _relink_rolling_note(m))
+        pending = sum(1 for r in rows if not r["written"] and not r.get("skipped"))
+        return _relink_verdict(m, ["forward", "back"], (
+            "relink: {0} row(s) written, {1} pending; forward finishes from the "
+            "journal by what each key holds now, skipping and naming any row it "
+            "cannot attribute; back takes out what landed, key by key".format(
+                written, pending)))
+    except Exception:
+        return _relink_verdict(m, [], (
+            "relink: this operation's record could not be read, so neither "
+            "direction can be run from it"))
+
+
+def _relink_skip_line(r):
+    """`skipped : <row> -> <label>: <reason> - <skip_detail>` for a row
+    forward recovery skipped. Never raises."""
+    r = r if isinstance(r, dict) else {}
+    return "skipped : {0} -> {1}: {2} - {3}".format(
+        _lineage_short(_lineage_stem(r.get("name"))), r.get("label", ""),
+        r.get("skipped"), r.get("skip_detail", ""))
+
+
+def _recover_relink(env, op, direction, stray):
+    """recover_op's relink arm. Refuses, with nothing changed: a damaged
+    record; one whose history gives no time it was made (back orders every
+    other operation against it, D13), named by its folder as undo names it;
+    and, D18, another operation unfinished or a record that cannot be read,
+    the relink's own op passed as `mine`. Then the containment roots come
+    from discovery, fresh, for every read and write in either direction,
+    never from the journal. Rows in STRAY, in a store this version does not
+    read, are never read."""
+    m = op.manifest
+    bad = _relink_shape_error(m)
+    if bad:
+        raise Refusal("the record for {0} is damaged ({1}), so neither direction "
+                      "can be run from it. Nothing was changed."
+                      .format(m.get("op_id"), bad))
+    if _relink_sort_key(m) is None:
+        raise Refusal("the record in {0} is damaged ({1}), so neither direction "
+                      "can be run from it. Nothing was changed.".format(
+                          os.path.basename(op.op_dir), _RELINK_NO_HISTORY))
+    _relink_refuse_open(env, "relink's recovery", mine=m.get("op_id", ""))
+    roots = _retitle_roots(env)
+    if direction == "forward":
+        return _relink_forward(env, op, roots, stray)
+    return _relink_back(env, op, roots, stray)
+
+
+def _relink_forward_decision(m, r, roots, by_name, graphs):
+    """(what, detail, data) for pending row R of relink M, from one read, by
+    the recovery matrix: `what` is "landed" (a key at new: mark it written),
+    "write" (still at its pre-image and every check passes; DATA is the row
+    as read), or a skip reason with its detail. D19 comes first: a row gone,
+    unreadable or opening another conversation is skipped, landed or not. A
+    row at its pre-image is re-checked against its targets
+    (_relink_dependency_skip) and, for the keys it writes only, against the
+    account's links on disk and those of the rows this pass decided to write
+    before it: an edge that reaches back to the row closes a cycle, and a
+    store with rows that could not be read cannot rule one out. GRAPHS holds
+    each store's graph, read once. Raises LayoutError for a record that does
+    not match its row, and for a row outside the discovered roots."""
+    state, data, raw = _relink_read(r, roots)
+    if state == "absent":
+        return "gone", "gone from the store", None
+    if state == "unreadable":
+        return "unreadable", "could not be read", None
+    if data.get("cliSessionId") != r["session_id"]:
+        return "repointed", "now opens another conversation", None
+    if _relink_landed(_relink_row_states(r, data)):
+        return "landed", "", None
+    if _relink_sha(raw) != r["pre_sha256"]:
+        return "changed_since_plan", "changed since the plan", None
+    if not _relink_row_agrees(r, data):
+        raise LayoutError("the record for {0} does not match row {1}; refusing "
+                          "rather than write from it. Nothing was changed."
+                          .format(m.get("op_id", ""), r["name"]))
+    skip = _relink_dependency_skip(m, r, by_name)
+    if skip:
+        return skip[0], skip[1], None
+    store = _relink_store_key(r["store_path"])
+    if store not in graphs:
+        found, unread = _lineage_store_rows(r["store_path"], light=True)
+        graphs[store] = (_lineage_existing_edges(_lineage_index(
+            [LineageRow(r["account"], rid + ".json", d) for rid, d in found])),
+            unread)
+    graph, unread = graphs[store]
+    lin, child = r["lineage"], r["session_id"]
+    targets = [lin[field] for key, field in (("spawnedFrom", "parent_session"),
+                                             ("startChain", "root_session"))
+               if key in r["new"]]
+    if any(_lineage_reaches(graph, t, child) for t in targets):
+        return "lineage_cycle", "it would close a cycle now", None
+    if unread:
+        return ("edges_unreadable", "the account's links could not all be "
+                "read, so a cycle cannot be ruled out", None)
+    for t in targets:
+        _lineage_edge_add(graph, child, t)
+    return "write", "", data
+
+
+def _relink_forward(env, op, roots, stray):
+    """recover --forward: every row not written and not skipped, in journal
+    order, is read once and decided (_relink_forward_decision) before
+    anything changes, so a record that does not match its row refuses with
+    nothing changed. Then, under the guard only when a row will be written,
+    the decisions are recorded and each row to write gets exactly relink's
+    keys set, verified by value; then the op completes and the link report
+    names a landed link whose target has gone since. A landed, marked row
+    is not looked at again: undo names it later if it changed."""
+    m = op.manifest
+    if m.get("rolling_back"):
+        # A key back took out and marked restored would be written again
+        # where undo and the claim checks no longer look.
+        raise Refusal(_relink_rolling_note(m) + ". Nothing was changed.")
+    if stray:
+        raise Refusal("cannot finish {0}: {1}; forward cannot run on them. Nothing "
+                      "was changed.".format(m.get("op_id"), _unresolved_clause(stray)))
+    then = _relink_apply_then(m)
+    by_name, graphs = _lineage_rows_by_name(m), {}
+    decided = [(r,) + _relink_forward_decision(m, r, roots, by_name, graphs)
+               for r in m["rows"] if not r["written"] and not r.get("skipped")]
+    writes = [(r, data) for r, what, _detail, data in decided if what == "write"]
+    if writes:
+        _guard_mutation(env, "add links to rows in", NEW_ROW_STORE,
+                        because=RELINK_GUARD_WHY)
+    saver = _RelinkSaver(op, then=then)
+    try:
+        for r, what, detail, _data in decided:
+            if what == "landed":
+                r["written"] = True
+            elif what != "write":
+                r["skipped"], r["skip_detail"] = what, detail
+        if decided:
+            saver.tick()
+        for r, data in writes:
+            ok = _relink_put(r, _relink_apply_new(data, r["new"]), roots, then)
+            r["written"] = True
+            if not ok:
+                try:
+                    save_manifest(op)
+                except Exception:
+                    pass
+                raise _relink_verify_error(r, m.get("op_id", ""))
+            saver.tick()
+    except BaseException:
+        # A failed save never replaces the exception in flight (D15).
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    try:
+        set_status(op, "completed")
+    except OSError as exc:
+        raise Refusal("could not save the operation record in {0} ({1}). "
+                      .format(op.op_dir, exc) + then)
+    _op_link_report(op, m, skip_ids=frozenset(id(r) for r, _p in stray),
+                    forward=True)
+    rotate_ops(env)
+    return "completed"
+
+
+def _relink_back_then(m):
+    """back's next step after a refusal or a failed save: back again, which
+    goes by what each row holds now."""
+    return ("The op is left at '{0}' - run 'recover --resolve {1} --back "
+            "--apply' again; it goes on from what each row holds now.".format(
+                m.get("status", ""), m.get("op_id", "")))
+
+
+def _relink_back_disposition(r, state, data, claimed):
+    """What back does with landed row R, from its one read (STATE, DATA), by
+    the recovery matrix: (keys to put back, entries to leave, whether a key
+    the relink wrote stays at its new value). A row gone is one entry and
+    restored; one that cannot be read is one entry, and stays; one that
+    opens another conversation now (D19) is one entry and left whole, and
+    stays while a key of it holds new. Otherwise each key by what it holds:
+    at new it goes back, unless a later live operation claims it (CLAIMED
+    maps such a key to why it is left), when it is left, named, and stays;
+    at old it counts as back; anything else is the app's, left and named."""
+    if state == "absent":
+        return [], [_relink_left_entry(r, "the row", "gone from the store")], False
+    if state == "unreadable":
+        return [], [_relink_left_entry(r, "the row", "could not be read")], True
+    held = _relink_row_states(r, data)
+    if data.get("cliSessionId") != r["session_id"]:
+        if _relink_landed(held):
+            return [], [_relink_left_entry(
+                r, "the row", "now opens another conversation; its link was "
+                              "left")], True
+        return [], [_relink_left_entry(r, "the row",
+                                       "now opens another conversation")], False
+    back, entries = [], []
+    for k, h in held.items():
+        if h == "new" and k in claimed:
+            entries.append(_relink_left_entry(r, k, claimed[k]))
+        elif h == "new":
+            back.append(k)
+        elif h == "other":
+            entries.append(_relink_left_entry(r, k, "the app changed it since"))
+    return back, entries, any(h == "new" and k in claimed for k, h in held.items())
+
+
+def _relink_back_reason(m):
+    """back's abort_reason, from the record, so it covers every pass:
+    `back restored <n> row(s)`, then `; left <k>: <row> <what> (<why>), ...`
+    when back_left holds anything."""
+    left = m.get("back_left") or []
+    head = "back restored {0} row(s)".format(m.get("back_restored", 0))
+    if not left:
+        return head
+    return "{0}; left {1}: {2}".format(head, len(left), ", ".join(
+        "{0} {1} ({2})".format(_lineage_short(_lineage_stem(e.get("name"))),
+                               e.get("what"), e.get("why"))
+        for e in left))
+
+
+def _relink_back(env, op, roots, stray):
+    """recover --back: take out every key that landed, rows in reverse
+    journal order, and always terminate. A row has landed when it is marked
+    written, or when a read finds a key of it at new; only landed rows are
+    acted on or reported. Every row is read once, and the claims (D13) are
+    judged, before anything is written; the guard runs only when a key will
+    go back. rolling_back is saved before the first write, so from then on
+    only back is offered. Per landed row: (1) one save marks it written and
+    adds the keys about to go back to back_keys, so a crash mid-row never
+    leaves it looking untouched; (2) those keys go back in one write; (3) a
+    failed verify leaves the row unmarked for a second back; (4) its left
+    entries and the back_restored count are saved before (5) its restored
+    mark, set only when no key the relink wrote stays at new. back_left and
+    back_restored are kept in the record, so a resumed back reports the
+    rows an earlier pass handled. Rows in STRAY are never read, and are
+    recorded as residue unless restored; no other row ever is."""
+    m = op.manifest
+    op_id = m.get("op_id", "")
+    stray_ids = {id(r) for r, _p in stray}
+    work = []
+    for r in reversed(m["rows"]):
+        if id(r) in stray_ids or r.get("restored"):
+            continue
+        try:
+            state, data, _raw = _relink_read(r, roots)
+        except LayoutError:
+            if r["written"]:
+                raise
+            continue                     # never landed, and not this op's to read
+        if r["written"] or (state == "present"
+                            and _relink_landed(_relink_row_states(r, data))):
+            work.append((r, state, data))
+    claimed = {}                         # id(row) -> {key: why it is left}
+    for c in _relink_claims(env, m, [r for r, _s, _d in work]):
+        why = c["why"]
+        if why == _RELINK_CLAIM_UNREADABLE:
+            why = "the record in {0} cannot be read".format(c["op_id"])
+        held = claimed.setdefault(id(c["row"]), {})
+        for k in RELINK_KEYS:
+            if k in c["keys"]:
+                held.setdefault(k, why)
+    plan = [(r, data) + _relink_back_disposition(r, state, data,
+                                                 claimed.get(id(r), {}))
+            for r, state, data in work]
+    if any(back for _r, _d, back, _e, _s in plan):
+        _guard_mutation(env, "take links out of rows in", NEW_ROW_STORE,
+                        because=RELINK_GUARD_WHY)
+    then = _relink_back_then(m)
+    if plan and m.get("rolling_back") is not True:
+        m["rolling_back"] = True
+        try:
+            save_manifest(op)
+        except OSError as exc:
+            m.pop("rolling_back", None)
+            raise Refusal("could not save the operation record in {0} ({1}). "
+                          "Nothing was changed. ".format(op.op_dir, exc) + then)
+    left = m.setdefault("back_left", [])
+    saver = _RelinkSaver(op, then=then)
+    first = True
+    try:
+        for r, data, back, entries, stays in plan:
+            changed = not r["written"]
+            r["written"] = True
+            if back:
+                keys = r.setdefault("back_keys", [])
+                for k in back:
+                    if k not in keys:
+                        keys.append(k)
+                        changed = True
+            if changed:
+                saver.tick()
+            if back:
+                if not first:
+                    _maybe_crash("relink-back-mid-rows")
+                first = False
+                # The lock is held and the app closed, so the row is as the
+                # read found it.
+                if not _relink_put(r, _relink_apply_old(data, r["old"], back),
+                                   roots, then):
+                    # Left unmarked, so a second back reads it afresh.
+                    try:
+                        save_manifest(op)
+                    except Exception:
+                        pass
+                    raise LayoutError(
+                        "verify failed restoring row {0}: the row on disk is not "
+                        "the row read with relink's keys put back - run 'recover "
+                        "--resolve {1} --back --apply' again; it re-reads the row "
+                        "and goes by what each key holds.".format(r["name"], op_id))
+            _maybe_crash("relink-back-before-mark")
+            for e in entries:
+                if e not in left:
+                    left.append(e)
+            m["back_restored"] = sum(1 for x in m["rows"] if x.get("back_keys"))
+            saver.tick()
+            if not stays:
+                r["restored"] = True
+    except BaseException:
+        # A failed save never replaces the exception in flight (D15).
+        try:
+            save_manifest(op)
+        except Exception:
+            pass
+        raise
+    m["back_restored"] = sum(1 for x in m["rows"] if x.get("back_keys"))
+    m["abort_reason"] = _relink_back_reason(m)
+    # Rows in a store this version does not read: left alone, and recorded
+    # where doctor looks, as realign's back records them. A row relink can
+    # read is never residue: doctor's advice for residue is wrong for a row
+    # relink only edited.
+    _add_residue(m, *_unresolved_residue(
+        [(r, p) for r, p in stray if not r.get("restored")]))
+    try:
+        set_status(op, "rolled_back")
+    except OSError as exc:
+        raise Refusal("could not save the operation record in {0} ({1}). "
+                      .format(op.op_dir, exc) + then)
+    rotate_ops(env)
+    return "rolled_back"
 
 
 if __name__ == "__main__":
