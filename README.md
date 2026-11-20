@@ -869,23 +869,37 @@ record either: with the app closed, repair the record or move its folder out of 
 `undo` takes the links out key by key. A key that still holds what relink wrote goes back:
 removed where the row had none, set back to its exact old value where it held a non-object. A
 key the app has changed since is left and named, as is a row that is gone or now opens another
-conversation, and every other key stays as the app now has it:
+conversation, and every other key stays as the app now has it. A link beside a chain the app
+changed stays too, named, since a chain without the link it follows is a shape relink never
+writes; a chain the app took out lets the link go:
 
 ```
 left    : local_q2 -> bob@example.com (cccc1111/dddd2222): startChain (the app changed it since)
 ```
 
-It refuses as a whole, writing nothing, while a row cannot be read, and while a later operation
-that wrote one of the rows still stands, naming it to be undone first. If that operation cannot
-itself be undone, neither can the relink. A `retitle` cannot be undone once the app has
-rewritten any row it wrote. A `realign`, which writes other keys, and a finished `undo`, which
-no command can undo, do not count. A journal record that cannot be read refuses the undo too,
-named by its folder (above). An undo cut short resumes with `undo --id <op_id> --apply`, since
-a bare `undo --apply` takes the latest completed operation, which may by then be another. Like
-every operation's undo, it works only while the relink is in the journal, which keeps the ten
-most recent finished operations. `relink` is CLI-only, and while a relink is the latest
-operation the window offers no undo, as for `realign`; an operation before it is undone from the
-CLI.
+A key that a later operation wrote since waits, whatever the row holds now, because that
+operation's own undo may put relink's value back. So does every key of a row that cannot be
+read. The undo takes out the rest, prints `result: partial`, names each key that waits and what
+it waits on, says what to do next, and exits 1:
+
+```
+result: partial
+waiting : local_c2 -> bob@example.com (cccc1111/dddd2222): spawnedFrom (operation(s) <later_id> wrote it since)
+Undo operation(s) <later_id> first; then run 'undo --id <op_id> --apply' again. If one of those operations cannot be undone, the keys it claims stay linked for good.
+```
+
+The relink stays `completed`, and `undo --id <op_id> --apply` goes on from what each row holds;
+a key it has finished is never written again. Name the op: a bare `undo --apply` takes the latest
+completed operation, which may by then be another. A `retitle` cannot be undone once the app has
+rewritten any row it wrote, so the keys it wrote stay linked. A `realign`, which writes other
+keys, and a finished `undo`, which no command can undo, do not count. When every key left
+waits, so nothing can go, the undo refuses instead and changes no row. A journal record that
+cannot be read or is damaged refuses the whole undo, named by its folder (above), since it could
+claim any key. Like every operation's undo, it works only while the relink is in the journal,
+which keeps the ten most recent finished operations; once an undo has begun, the journal keeps
+the relink, and every record naming a row it has not finished, until the undo ends. `relink` is
+CLI-only, and while a relink is the latest operation the window offers no undo, as for
+`realign`; an operation before it, and a partial undo's resume, run from the CLI.
 
 An interrupted apply recovers in both directions, by what each row holds now. `recover
 --forward` counts a row that still opens its conversation and has a key already at relink's

@@ -1435,12 +1435,15 @@ Undo and `back` write `old` from the shape-checked record without it.
 
 The status fields take their siblings' names, so the generic readers see them: a row's `written`
 (realign's rows'), `restored` (realign's copies') and `skipped` with `skip_detail` (converge's
-rows'), and `back_keys`, the keys `back` is putting back, saved before its write. `restored`
-means that no relink-written key remains at its `new` value on the row; undo and `back` set it
-only then. The manifest gains `since_plan` at the apply, `undo_left` from undo, and
-`rolling_back`, `back_left` and `back_restored` from `back`, beside `only`, `account_filter`,
-`live_asserted`, `lineage_cycles`, `left_out` and, when the files disagreed at plan time,
-`identity_disagreement`.
+rows'), `back_keys`, the keys `back` is putting back, saved before its write, and `undo_done`,
+the keys of its `new` an undo has finished. `restored` means the relink has nothing left to do
+on the row: `back` sets it only when no relink-written key remains at its `new` value, and undo
+when every key of its `new` is finished (Undo, below), which a link left beside a chain the app
+changed counts as. The manifest gains `since_plan` at the apply, `undo_started`, `undo_left` and
+`undo_waiting` from undo, and `rolling_back`, `back_left` and `back_restored` from `back`,
+beside `only`, `account_filter`, `live_asserted`, `lineage_cycles`, `left_out` and, when the
+files disagreed at plan time, `identity_disagreement`. The three undo fields are optional:
+absent means none, as in a record made before them.
 
 `_RelinkSaver` saves the manifest as rows land, under a 32 MB budget (`sync`'s). It estimates one
 save once, as the indented manifest's length plus 4096 bytes, and saves nothing once the budget
@@ -1486,8 +1489,12 @@ never aborts the check, and judges each by these rules in this order, liveness b
 3. Rows that are not a list of objects with string paths claim every row, all keys.
 4. A `realign` claims nothing: it writes other keys (D13's first per-key exception).
 5. A relink claims, on each row naming the same file that it has not `restored` and that is
-   `written` or belongs to an unfinished relink, the keys of its `new` and `kept` among this
-   row's `new`, since a chain it wrote relies on the link it kept (the second exception).
+   `written` or belongs to an unfinished relink, the keys of its `new` not in its `undo_done`,
+   and the keys of its `kept` while one of those remains, judged over its whole `new` and then
+   narrowed to this row's `new` (`_relink_row_claims`): a chain it wrote relies on the link it
+   kept until its own undo takes that chain out (the second exception). A row whose `new`,
+   `kept` or `undo_done` is malformed makes its whole record damaged; its `undo_started` and
+   `undo_waiting` are not read.
 6. A `move`, or an unfinished `undo`, claims every row it names, all keys: it rewrites each row
    it journals and records no flag (the moveish rule).
 7. Any other operation claims, all keys, each row naming the same file that it wrote, or that
@@ -1510,23 +1517,29 @@ restored, written or not. Under D18 that last case cannot reach undo or `back`, 
 first while another operation is unfinished; `_relink_claims` keeps it, and a test calls it
 directly.
 
-A claim makes undo refuse as a whole, before it writes, and the relink stays `completed`. A live
-claimant is named, to be undone first; the line adds that if one cannot be undone, the relink
-cannot be undone either (a `retitle` cannot once the app has rewritten a row it wrote). A damaged
-record is named by its folder, with the note that no command repairs a record, so it is
-repaired, or its folder moved out of the journal, with the app closed (`_RELINK_REPAIR_ROUTE`).
-Each line names at most `RELINK_LIST_CAP` rows, then `... and <n> more`: a damaged record
-claims every row asked about. `back` must close the record, so it leaves a live claimant's keys
-at `new` and names them. A claim by a record that cannot be read or is damaged, or by a journal
-that cannot be listed, covers every key, and a `back` that left them all and closed would strand
-them where no command reaches, so `back` refuses those as undo does.
+A live claim holds only the keys it claims: undo leaves them waiting, named with every claimant,
+and takes out the rest (Undo, below); `back` must close the record, so it leaves them at `new`
+and names them. A claim by a record that cannot be read or is damaged, or by a journal that
+cannot be listed, covers every key and cannot be judged, so it refuses the whole undo before
+anything is written, and the whole `back`: a `back` that left every key and closed would strand
+them where no command reaches (departure 16). The refusal (`_relink_claims_refusal`) names a
+damaged record by its folder, saying it "cannot be read or are damaged", with the note that no
+command repairs a record, so it is repaired, or its folder moved out of the journal, with the
+app closed (`_RELINK_REPAIR_ROUTE`). Each line names at most `RELINK_LIST_CAP` rows, then `...
+and <n> more`: a damaged record claims every row asked about. Its line for live claimants,
+which undo's own refusal shares, names every claimant to be undone first and adds that if one
+cannot be undone, the keys it claims stay linked for good (a `retitle` cannot, once the app has
+rewritten a row it wrote).
 
 **The three ownership checks.** Other operations' checks learn relink beside their own code:
 - `_retitle_claimed_elsewhere` compares a relink's rows by `post_sha256`, since a relink keeps
   no `post_b64`, in a branch of its own ahead of the status filter. An earlier or withdrawn
   relink is passed over: it wrote the bytes the retitle then read as its pre-image, and without
   that an earlier relink and a later retitle that left the same bytes would each wait on the
-  other. Rows marked `restored` are passed over too.
+  other. Rows marked `restored` are passed over too. A relink whose undo has begun
+  (`undo_started`) claims each written row it has not restored by its path, whatever its
+  `post_sha256`: that digest is of bytes it wrote before its undo began, a partly undone row can
+  match a retitle's image exactly, and a pass's first write can land before any row save does.
 - `_repoint_claimed_later` counts any other terminal operation that wrote the row, whatever its
   order, but a relink only when it is later than the repoint, not undone or rolled back, and its
   row is not `restored` and is `written` (or the relink is unfinished). An earlier relink wrote
@@ -1544,32 +1557,80 @@ claimant names one of its written rows. Its `_collides` also keeps a relink that
 rolled back, a row marked `written` and not `restored`. Relink writes no `rollback_residue` for a
 row it can read, so those are the only record of a key left at relink's value, and the undo's or
 `back`'s own rotation would otherwise prune them in the call that wrote them. A completed relink
-rotates as before, and a row never written holds nothing of relink's.
+whose undo has begun (`undo_started`, `_relink_undo_begun`) is kept until it ends `undone`, and
+while one is, so is every operation whose journal names a row it has written and not restored,
+whatever its order and whether or not a pass has named it, and every record whose rows cannot be
+read as paths (`_journal_row_paths`), which claims every row: those are the claims its undo
+waits on, or may come to, and they must not age out from under it. `rotate_ops` gathers those
+paths before it judges any operation; when the relink ends `undone`, they rotate as usual. The
+cost is journal space while a claimant that cannot be undone stands, or a row stays unreadable.
+A completed relink no undo has reached rotates as before, and a row never written holds nothing
+of relink's.
 
 **Undo.** `undo_relink`, under the lock, checks the type and the `completed` status, then the
 shape. A record whose `history` gives no creation time refuses, named by its folder: another
 operation's check would count it as a claimant while this undo counted every other operation as
-later, and the two would wait on each other with neither saying why. Then the guard, D18 with its
-own op id as `mine`, a refusal for rows in a store this version does not read
-(`_unresolved_rows`), and roots from discovery. Every row written and not restored is read once,
-and an unreadable one refuses with nothing changed. Each read is judged
-(`_relink_undo_disposition`) and the claims over those rows are judged before anything is
-written:
-- a row gone, or opening another conversation now (D19), is one `the row` entry, and nothing is
-  written to it; on the latter a key still at `new` stays, and while one does the row is not
-  marked;
-- otherwise each written key goes by what it holds (`_relink_key_state`, by value, members in
-  any order, `True` never `1`): at `new` it goes back (`_relink_apply_old` pops a key that was
-  absent and restores a non-object exactly), at `old` it counts as back, and anything else is
-  the app's, left and named "the app changed it since".
+later, and the two would wait on each other with neither saying why. An attempt past those
+checks saves `undo_started`, once, before anything after them can refuse, so rotation keeps a
+relink someone has begun to undo (Rotation, above); the journal is this tool's own, so it is
+written whether or not the app runs, and a failed save refuses with nothing changed. Then the
+guard, D18 with its own op id as `mine`, a refusal for rows in a store this version does not
+read (`_unresolved_rows`), and roots from discovery. The claims over every row written and not
+restored are judged once, from the journal, and one the undo cannot judge refuses it as a whole
+(Claims, above). Then each such row is read once and judged with its claims
+(`_relink_undo_disposition`), before anything is written. Each key of the row's `new` not in its
+`undo_done` takes the first of these that applies:
+- the row is gone: finished, one `the row` entry ("gone from the store"), whatever claims it,
+  since no claimant's undo puts a deleted row back;
+- a live operation claims it: it waits, whatever the row holds, named in `undo_waiting` with
+  every claimant ("operation(s) <ids> wrote it since"), since that operation's own undo may put
+  relink's value back;
+- the row cannot be read: it waits with its row, one `the row` entry ("could not be read"), or
+  with "; could not be read" after the claim when the key is claimed too;
+- the row opens another conversation now (D19): one `the row` entry, and nothing written to
+  it. A key not at `new` is finished as the row's, not in `undo_done`, so the entry is replaced
+  when the row is judged again, and a pass counts it as done only when it marks the row
+  restored; a key at `new` neither waits nor finishes, and keeps the row unmarked;
+- otherwise by what it holds (`_relink_key_state`, by value, members in any order, `True` never
+  `1`): at `new` it goes back (`_relink_apply_old` pops a key that was absent and restores a
+  non-object exactly), at `old` it counts as finished, and anything else is the app's, left and
+  named "the app changed it since".
 
-The keys of a row go back in one write, verified by value; a failed verify raises with the row
-unmarked, so a resumed undo reads it afresh. A row's entries are appended to `undo_left`,
-deduplicated, before its `restored` mark, and reach the disk with that mark at the saver's tick
-or on the way out of any exception. The op ends `undone`, and `cmd_undo` prints each entry as a
-`left    :` line. Taking out a link leaves no other link dangling, so there is no link report.
-The resume hint names the op, `undo --id <op_id> --apply`, because a bare `undo --apply` takes
-the latest completed operation, which may by then be another one.
+The link follows the chain (D6): on a row where the relink wrote both, a link that would go back
+stays while the chain does not end the pass at `old`. Beside a chain that waits it waits ("the
+chain beside it waits", with no claimant of its own); beside a chain left at another value, by
+this pass or an earlier one, it is left, named "the chain beside it was left", and finished.
+Taking it out alone would leave a chain without the link it follows. A chain the app took out
+reads as `old` and lets the link go. `back` follows the same rule.
+
+Before any write, the pass saves `undo_waiting`, replacing the last pass's. Then, row by row in
+journal order, the keys going back go in one write, verified by value; a failed verify raises
+with the row unmarked, so a resumed undo reads it afresh. Then one save, through the budget saver, of
+the row's `undo_done`, its new `undo_left` entries (deduplicated, a `the row` entry replaced) and
+its `restored` mark, set when every key of its `new` is finished; a row with nothing to write and
+keys to finish gets that save alone. A key's entry and its place in `undo_done` land in one
+save, and a finished key is never judged again, so an entry never goes stale, and a key one pass
+put back is never written by a later one, even when the app has set it to relink's value again.
+Every pass that reaches the judgment ends with a save the budget does not govern. Then:
+- nothing waits: the op ends `undone`, even when the pass wrote no row;
+- something waits, and the pass wrote a row or finished a key: `undo_relink` returns `partial`
+  and the relink stays `completed`. `cmd_undo` prints a `left    :` line per `undo_left` entry,
+  a `waiting :` line per wait (the first `RELINK_LIST_CAP` unless `--verbose`, then `waiting :
+  ... and <n> more`), and the way on (`_relink_way_on`): undo every claimant named, with the app
+  closed repair each row that could not be read, then run `undo --id <op_id> --apply` again; a
+  claimant that cannot itself be undone leaves the keys it claims linked for good. It exits 1,
+  as realign's partial undo does;
+- something waits, and the pass did neither: it refuses (`_relink_undo_waits_refusal`), naming
+  every claimant and each row that cannot be read, saying no row was changed in this pass and,
+  when an earlier pass finished rows, that those stay undone. The record keeps the refreshed
+  `undo_waiting`.
+
+A failed save is a `Refusal` naming `undo --id <op_id> --apply`, and what is done stays done;
+the save on the way out of an exception never replaces the error in flight. Taking out a link
+leaves no other link dangling, so there is no link report. The resume hint names the op because
+a bare `undo --apply` takes the latest completed operation, which may by then be another one.
+The desktop window still parks a completed relink, offering no undo while one is the latest
+operation, so a partial undo and its resume run from the CLI.
 
 **Recovery by key.** `classify_relink_op` gives the first that applies: a damaged record, or one
 whose `history` gives no creation time (named by its folder), offers nothing; a finished one
@@ -1606,7 +1667,7 @@ applies decides, and `-` is a cell that direction never reaches.
 | yes | unreadable | - | - | - | `the row` named ("could not be read"), not restored |
 | yes | readable | other | some or all | - | `the row` left and named ("now opens another conversation; its link was left"), not restored |
 | yes | readable | other | none | - | `the row` named ("now opens another conversation"), restored |
-| yes | readable | same | some or all | - | the unclaimed keys at `new` put back; each claimed key and each changed key named; restored unless a claimed key stays at `new` |
+| yes | readable | same | some or all | - | the unclaimed keys at `new` put back, but a link beside a chain left claimed or changed stays, named ("the chain beside it was left"); each claimed key and each changed key named; restored unless a key stays at `new` |
 | yes | readable | same | none | - | nothing written; each changed key named; restored |
 
 Forward refuses while `rolling_back` is set: a key `back` took out and marked `restored` would be
@@ -1627,7 +1688,10 @@ landed link whose target has gone or now opens another conversation. `cmd_recove
 
 `back` takes the rows in reverse journal order, reads every one once and judges the claims before
 any write, and refuses as a whole on a claim it cannot judge (Claims, above). Only landed rows
-are acted on or reported. The guard runs only when a key will go back. Before its first write,
+are acted on or reported. The link follows the chain, as in undo: on a row where the relink
+wrote both, a link beside a chain `back` leaves, claimed or changed by the app, is left too,
+named "the chain beside it was left" in `back_left`, and the row is not marked while it holds
+`new`. The guard runs only when a key will go back. Before its first write,
 `back` sets `rolling_back` and saves it, its durable intent, so from then on only `back` is
 offered. Each landed row then goes in five steps, the saves in steps 1 and 4 the budget
 saver's:
@@ -1747,6 +1811,11 @@ sheet's instruction is to keep the app closed throughout.
   (no key is at `new`, so it is not provably landed). Forward skips it as `changed_since_plan`,
   which names it once. Nothing is destroyed: the app's values stand, and relink has nothing of
   its own left on the row.
+- An app write, between a crash after an undo's verified write and the next pass, that sets a
+  key back to exactly relink's value is taken out by that pass (spec "undo, as amended (I-1)").
+  An intent record with a byte hash before each write would catch it, but after the likelier
+  crash, one before the write lands followed by the app touching the row, it would leave
+  relink's link in place for good. Relink's link is a shape the app does not write (D11).
 
 ##### When the app orphans a conversation, and nothing here can stop it (2026-08-21)
 
