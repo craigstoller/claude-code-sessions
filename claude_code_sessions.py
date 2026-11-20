@@ -19162,5 +19162,326 @@ def _relink_key_state(cur, key, old, new):
     return "other"
 
 
+# The resolution core (spec "What a run plans", steps 1 to 6): row by row,
+# what to write and what to leave out. Pure planning over the records it is
+# given and the transcript set; 0.18.0's lineage functions are used as they
+# are.
+
+_RELINK_LINK_LEFT = "the parent link was left out"
+
+
+def _relink_tids(env):
+    """The transcript stems under env.projects_root, read once per plan."""
+    return {os.path.splitext(os.path.basename(p))[0]
+            for _, p in iter_transcripts(env.projects_root)}
+
+
+def _relink_note(code, detail):
+    return {"code": code, "detail": detail}
+
+
+def _relink_links(lrows, index):
+    """(row, conversation) for each row whose spawnedFrom is a dict naming a
+    usable row of its own account (_lineage_named_conversation)."""
+    out = []
+    for r in lrows or ():
+        sf = r.data.get("spawnedFrom") if isinstance(r.data, dict) else None
+        if isinstance(sf, dict):
+            p, _ = _lineage_named_conversation(r, index, sf.get("sessionId"))
+            if p is not None:
+                out.append((r, p))
+    return out
+
+
+def _relink_judge(lrows, index):
+    """D12 over every row of one conversation, in every account, whatever
+    the narrowing: (parent, task, note). Two or more parents, or two or more
+    usable taskIds among the rows naming the parent, is a disagreement: no
+    parent and the note. One parent gives it with its one usable taskId (None
+    when no row has one); none gives (None, None, None). Never raises."""
+    yielded = _relink_links(lrows, index)
+    parents = {p for _, p in yielded}
+    if len(parents) > 1:
+        return None, None, _relink_note(
+            "lineage_parent_disagree",
+            "holders name {0} different parents".format(len(parents)))
+    if not parents:
+        return None, None, None
+    parent = next(iter(parents))
+    tasks = {r.data["spawnedFrom"]["taskId"] for r, _ in yielded
+             if _lineage_task_ok(r.data["spawnedFrom"])}
+    if len(tasks) > 1:
+        return None, None, _relink_note(
+            "lineage_task_disagree",
+            "holders give {0} different taskIds for parent {1}".format(
+                len(tasks), _lineage_short(parent)))
+    return parent, (next(iter(tasks)) if tasks else None), None
+
+
+def _relink_agreed_chain(holders, index):
+    """(root, depth) when every holder whose startChain is a dict names a
+    usable row of one root conversation, with one depth that is an int (not
+    a bool) of at least 1; else None, as when no holder carries a chain."""
+    roots = set()
+    depths = set()
+    for h in holders or ():
+        sc = h.data.get("startChain") if isinstance(h.data, dict) else None
+        if not isinstance(sc, dict):
+            continue
+        root, _ = _lineage_named_conversation(h, index,
+                                              sc.get("firstSessionId"))
+        depth = sc.get("depth")
+        if root is None or type(depth) is not int or depth < 1:
+            return None
+        roots.add(root)
+        depths.add(depth)
+    if len(roots) != 1 or len(depths) != 1:
+        return None
+    return next(iter(roots)), next(iter(depths))
+
+
+def _relink_chain_agrees(row, index, agreed):
+    """True when AGREED is not None and the row's startChain names a usable
+    row in its own account of conversation agreed[0], with a depth that is
+    an int (True never agrees with 1) equal to agreed[1]."""
+    if agreed is None:
+        return False
+    sc = row.data.get("startChain") if isinstance(row.data, dict) else None
+    if not isinstance(sc, dict):
+        return False
+    root, _ = _lineage_named_conversation(row, index, sc.get("firstSessionId"))
+    depth = sc.get("depth")
+    return (root is not None and root == agreed[0]
+            and type(depth) is int and depth == agreed[1])
+
+
+def _relink_backed(lrows, index, parent):
+    """D11: some row in LROWS whose spawnedFrom is app-written and names a
+    usable row of PARENT."""
+    return any(p == parent and _relink_app_written(r.data["spawnedFrom"])
+               for r, p in _relink_links(lrows, index))
+
+
+def _relink_row_decision(row, conv_rows, holders, index, judged, tids):
+    """The one place a row's codes are chosen (plan Task 2, step 4's table,
+    the first line that applies winning): (proposal, notes). PROPOSAL is a
+    _lineage_resolve result trimmed to the keys the row writes, its lineage
+    rebuilt for any kept key, or None; NOTES the row's left-out notes when
+    there is no proposal ([] for a row in neither list). CONV_ROWS are the
+    conversation's LineageRows in every account, HOLDERS those in the other
+    accounts, JUDGED _relink_judge's (parent, task, note). Never raises."""
+    parent, task, note = judged
+    data = row.data if isinstance(row.data, dict) else {}
+    sf = data.get("spawnedFrom")
+    sc = data.get("startChain")
+    holder_chain = any(isinstance(h.data, dict)
+                       and isinstance(h.data.get("startChain"), dict)
+                       for h in holders or ())
+    link_cand = not isinstance(sf, dict)
+    chain_cand = not isinstance(sc, dict) and holder_chain
+    plus_chain = ([_relink_note("lineage_chain_dropped", _RELINK_LINK_LEFT)]
+                  if chain_cand else [])
+
+    # D12: the conversation's links disagree.
+    if note is not None:
+        return None, [dict(note)] + plus_chain
+    # The row keeps a link naming no usable row, or without the agreed
+    # usable taskId. A wrong but usable taskId never gets here: it is the
+    # conversation's disagreement.
+    if not link_cand:
+        if _lineage_named_conversation(row, index,
+                                       sf.get("sessionId"))[0] is None:
+            return None, [_relink_note(
+                "own_link_differs",
+                "the row's own link names no row in its account")] + plus_chain
+        if not (_lineage_task_ok(sf) and sf["taskId"] == task):
+            return None, [_relink_note(
+                "own_link_differs",
+                "the row's own link carries no usable taskId")] + plus_chain
+    # The row keeps a chain that does not agree with the holders'.
+    if isinstance(sc, dict) and holder_chain:
+        agreed = _relink_agreed_chain(holders, index)
+        if not _relink_chain_agrees(row, index, agreed):
+            detail = ("its holders' chains do not agree on one root and depth"
+                      if agreed is None else
+                      "the row's own chain does not name root {0} at depth "
+                      "{1}".format(_lineage_short(agreed[0]), agreed[1]))
+            return None, [_relink_note("own_chain_differs", detail)]
+    if not (link_cand or chain_cand):
+        return None, []
+
+    exists = getattr(tids, "__contains__", None) or (lambda _sid: False)
+    dest = index.get(row.account) if isinstance(index, dict) else None
+    if dest is None:
+        dest = _lineage_index(())
+    res = _lineage_resolve(_lineage_cli(data), row.name, holders, index, dest,
+                           held={}, transcript_exists=exists)
+    lin = res["lineage"]
+
+    if link_cand:
+        if res["link"] is None:
+            # The resolver's notes, its chain note only for a chain
+            # candidate; with none left the row is in neither list.
+            return None, [dict(n) for n in lin["notes"]
+                          if chain_cand or n["code"] != "lineage_chain_dropped"]
+        # D11: an app-written link among the holders that yield the parent.
+        # The resolver's result is dropped whole, its link and chain with it.
+        if not _relink_backed(holders, index, parent):
+            return None, [_relink_note(
+                "lineage_no_app_link",
+                "no app-written link among the holders that name parent "
+                "{0}".format(_lineage_short(parent)))] + plus_chain
+        if isinstance(sc, dict):
+            # The row keeps its own chain object: no chain is proposed, and
+            # the record names the kept chain only when it was judged.
+            _lineage_clear_chain(res)
+            lin["notes"] = [n for n in lin["notes"]
+                            if n["code"] != "lineage_chain_dropped"]
+            if holder_chain:
+                lin["root_row"] = sc["firstSessionId"]
+                lin["root_session"] = _lineage_named_conversation(
+                    row, index, sc["firstSessionId"])[0]
+        return res, []
+
+    # A chain-only candidate: the row keeps its agreeing link. A holder
+    # carries a chain, so a chain the resolver left out has its note.
+    if res["chain"] is None:
+        return None, [dict(n) for n in lin["notes"]
+                      if n["code"] == "lineage_chain_dropped"]
+    # D11 for the chain counts every row of the conversation, its own too.
+    if not _relink_backed(conv_rows, index, parent):
+        return None, [_relink_note("lineage_chain_dropped",
+                                   "no app-written link backs the chain")]
+    # The kept link is an existing edge, never a proposed one, and the
+    # record names what it names, not the resolver's pick.
+    res["link"] = None
+    res["edges"]["parent"] = None
+    lin["parent_row"] = sf["sessionId"]
+    lin["parent_session"] = _lineage_named_conversation(
+        row, index, sf["sessionId"])[0]
+    lin["parent_planned"] = False
+    lin["carried_keys"] = [str(k) for k in sf]
+    lin["dropped_keys"] = [k for k in lin["dropped_keys"]
+                           if str(k).startswith("startChain.")]
+    return res, []
+
+
+def _relink_title(d):
+    t = d.get("title") if isinstance(d, dict) else None
+    return t if isinstance(t, str) else ""
+
+
+def _relink_link_first(notes):
+    """NOTES with every chain code moved behind the link codes, the order
+    otherwise kept: the counting and the report read the first code."""
+    return sorted(notes, key=lambda n: n.get("code") in RELINK_CHAIN_CODES)
+
+
+def _relink_row(rec, res, dest):
+    """The journal row of one surviving proposal (Global Constraints)."""
+    data = rec.data
+    new = {}
+    if res["link"] is not None:
+        new["spawnedFrom"] = res["link"]
+    if res["chain"] is not None:
+        new["startChain"] = res["chain"]
+    lin = res["lineage"]
+    prow = dest.by_id.get(lin["parent_row"])
+    post = _relink_apply_new(data, new)
+    return {
+        "account": rec.account, "label": rec.label, "name": rec.name,
+        "dest_path": rec.path, "store_path": rec.store,
+        "session_id": _lineage_cli(data),
+        "title": _relink_title(data),
+        "parent_title": _relink_title(prow.data if prow is not None else None),
+        "pre_sha256": _relink_sha(rec.raw),
+        "post_sha256": _relink_sha(_relink_row_bytes(post)),
+        "old": {k: {"present": k in data, "value": data.get(k)} for k in new},
+        "new": new,
+        "kept": {k: data[k] for k in RELINK_KEYS
+                 if isinstance(data.get(k), dict)},
+        "lineage": lin,
+        "written": False,
+    }
+
+
+def _relink_left(rec, notes):
+    """The journal entry of one row left out, its link code first."""
+    return {"account": rec.account, "label": rec.label, "name": rec.name,
+            "session_id": _lineage_cli(rec.data) or "",
+            "title": _relink_title(rec.data),
+            "notes": _relink_link_first(
+                [{"code": n["code"], "detail": n["detail"]} for n in notes])}
+
+
+def _relink_plan_rows(records, tids, in_scope):
+    """(rows, left_out, cycles) over the scanned RECORDS (_retitle_scan).
+    IN_SCOPE(rec) picks the rows that may be written or reported; the D12
+    judgement, the holders, the targets and the cycle graph always read
+    every record. TIDS is the transcript set (_relink_tids). A conversation
+    is planned when some row of it carries a cleared link; each of its rows
+    in scope gets _relink_row_decision's verdict, then each account's
+    proposals pass _lineage_drop_cycles over its links on disk. CYCLES is
+    the number of cycles the accounts already hold. Rows and left-out rows
+    are sorted by (account, session_id, name). Never raises on a malformed
+    row."""
+    as_lrow = {}
+    own = {}
+    for rec in records or ():
+        lr = LineageRow(rec.account, rec.name, rec.data)
+        as_lrow[id(rec)] = lr
+        own.setdefault(rec.account, []).append(lr)
+    index = {acct: _lineage_index(rs) for acct, rs in own.items()}
+    conversations = {}
+    for rec in records or ():
+        cid = _lineage_cli(rec.data)
+        if cid is not None:
+            conversations.setdefault(cid, []).append(rec)
+
+    proposals = {}      # account -> {(account, name): resolver result}
+    planned = []        # (record, result, whether it proposes a link)
+    left = []           # (record, notes)
+    for cid in sorted(conversations):
+        recs = sorted(conversations[cid], key=lambda r: (r.account, r.name))
+        lrows = [as_lrow[id(r)] for r in recs]
+        if not any(_lineage_variant_ok(lr.data.get("spawnedFrom"))
+                   for lr in lrows):
+            continue
+        judged = _relink_judge(lrows, index)
+        for rec, lr in zip(recs, lrows):
+            if not in_scope(rec):
+                continue
+            holders = [h for h in lrows if h.account != rec.account]
+            res, notes = _relink_row_decision(lr, lrows, holders, index,
+                                              judged, tids)
+            if res is not None:
+                proposals.setdefault(rec.account, {})[
+                    (rec.account, rec.name)] = res
+                planned.append((rec, res, res["link"] is not None))
+            elif notes:
+                left.append((rec, notes))
+
+    cycles = 0
+    for acct in sorted(index):
+        cycles += _lineage_drop_cycles(proposals.get(acct, {}),
+                                       _lineage_existing_edges(index[acct]))
+
+    rows = []
+    for rec, res, has_link in planned:
+        dropped = res["link"] is None if has_link else res["chain"] is None
+        if dropped:
+            left.append((rec, res["lineage"]["notes"]))
+        else:
+            rows.append(_relink_row(rec, res, index[rec.account]))
+
+    def order(e):
+        return (e["account"], e["session_id"], e["name"])
+
+    return (sorted(rows, key=order),
+            sorted((_relink_left(rec, notes) for rec, notes in left),
+                   key=order),
+            cycles)
+
+
 if __name__ == "__main__":
     sys.exit(main())
