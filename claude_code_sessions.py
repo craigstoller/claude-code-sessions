@@ -19483,5 +19483,268 @@ def _relink_plan_rows(records, tids, in_scope):
             cycles)
 
 
+# The plan (spec "What a run plans" and "Interface"; D16 to D18): the strict
+# scan, the refusals, the identity disclosure and the narrowing, around the
+# resolution core.
+
+@dataclasses.dataclass
+class RelinkFlags:
+    """Narrowing and identity assertion only."""
+    only: str = ""          # title substring, cliSessionId prefix, or row id
+    account: str = ""       # account id, org id, store path or email substring
+    live: str = ""          # RULING 5 assertion, converge's account scope
+
+
+# What the unreadable-row refusal says relink could not decide (D16).
+_RELINK_SCAN_WHY = ("which rows lack a parent link another account carries, "
+                    "or which row a link would name - a guess there could "
+                    "link the wrong row or miss a disagreement")
+
+
+def _relink_load_ops(env):
+    """[(folder name, manifest or None)], sorted by folder name, for each
+    folder of env.ops_dir holding a manifest.json, each record read on its
+    own: None when it cannot be read, is not an object, or has no non-empty
+    op_id string. A record read is rerooted as list_ops reroots it. Files,
+    the lock among them, and folders without a manifest.json are not
+    operations. A journal folder that does not exist is no operations, as
+    list_ops reads it: only acquire_lock creates it. One that exists and
+    cannot be listed raises OSError, for the caller to word."""
+    try:
+        names = os.listdir(env.ops_dir)
+    except FileNotFoundError:
+        if os.path.lexists(env.ops_dir):
+            raise
+        return []
+    pairs = _reroot_pairs(env)
+    out = []
+    for name in sorted(names):
+        folder = os.path.join(env.ops_dir, name)
+        mp = os.path.join(folder, "manifest.json")
+        if not os.path.isdir(folder) or not os.path.lexists(mp):
+            continue
+        try:
+            m = read_json(mp)
+        except Exception:
+            m = None
+        if not (isinstance(m, dict) and isinstance(m.get("op_id"), str)
+                and m["op_id"]):
+            m = None
+        if m is not None:
+            _reroot_manifest(Op(folder, m), pairs)
+        out.append((name, m))
+    return out
+
+
+def _relink_open_others(env, mine=""):
+    """(op ids, unreadable) for D18: the sorted op ids of the non-terminal
+    operations other than MINE, and the sorted folder names of every record
+    that could not be read. For a journal folder that exists and could not
+    be listed, UNREADABLE is instead the listing error, a string; a missing
+    one gives ([], []). Never raises."""
+    try:
+        loaded = _relink_load_ops(env)
+    except Exception as exc:
+        return [], str(exc) or repr(exc)
+    ids, unreadable = [], []
+    for name, m in loaded:
+        if m is None:
+            unreadable.append(name)
+        elif m.get("status") in NONTERMINAL and m["op_id"] != mine:
+            ids.append(m["op_id"])
+    return sorted(ids), sorted(unreadable)
+
+
+def _relink_unreadable_line(what, unreadable):
+    """D18's line for a journal that could not be fully read, never posing
+    as an op id. UNREADABLE is _relink_open_others' second value."""
+    if isinstance(unreadable, str):
+        return ("{0} waits: the journal folder could not be listed ({1}). "
+                "Nothing was changed.".format(what, unreadable))
+    return ("{0} waits: the record(s) in {1} could not be read, so whether "
+            "they are unfinished cannot be told. Nothing was changed.".format(
+                what, ", ".join(sorted(unreadable))))
+
+
+def _relink_refuse_open(env, what, mine=""):
+    """D18: refuse while another operation is unfinished, and, on its own,
+    while any record of the journal could not be read, so a damaged record
+    is never found only on the next run; both lines when both apply, the
+    open operations' first. WHAT is the route (relink, relink's undo or
+    relink's recovery); MINE its own op id, so it never waits on itself."""
+    ids, unreadable = _relink_open_others(env, mine)
+    lines = []
+    if ids:
+        lines.append(
+            "{0} waits while another operation is unfinished ({1}): an "
+            "unfinished operation of any kind may yet roll back or finish "
+            "over rows a relink reads or changes - a converge or sync rolled "
+            "back after a relink, for one, could delete a parent row a new "
+            "link names. One unfinished operation holds every relink, its dry "
+            "run included, until it is recovered. Run 'claude-code-sessions "
+            "recover' and finish it first. Nothing was changed.".format(
+                what, ", ".join(ids)))
+    if unreadable:
+        lines.append(_relink_unreadable_line(what, unreadable))
+    if lines:
+        raise Refusal("\n".join(lines))
+
+
+def _relink_account_filter_display(value):
+    """An --account value as refusal text shows it: a typed substring matches
+    no whole registered string, so under --anonymize it becomes a fixed
+    marker, as _only_display's does."""
+    return "<account-filter>" if _ANONYMIZE and value else value
+
+
+def _relink_store_key(path):
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _relink_account_scope(env, value, live):
+    """The store keys --account VALUE scopes the run to: a case-insensitive
+    substring of an account id, org id, store path (both sides folded by
+    _path_match_key) or email, over every account directory, empty org
+    folders and the signed-in account's included. The folders of one
+    account are the scope: its rows all sit in its one populated store
+    (D17), so its empty org folders matching beside it are no ambiguity.
+    No match, or matches in two or more accounts, refuses with every
+    account directory listed."""
+    dirs = _account_dirs(env)
+    emails = {}
+    for acct, _org, _path in dirs:
+        if acct not in emails:
+            e = _email_of(env, acct, live)
+            emails[acct] = e if isinstance(e, str) else ""
+    want = value.lower()
+    want_path = _path_match_key(value)
+    hits = [(a, o, p) for a, o, p in dirs
+            if want in a.lower() or want in o.lower()
+            or want in emails[a].lower() or want_path in _path_match_key(p)]
+    accounts = {a for a, _o, _p in hits}
+    if len(accounts) == 1:
+        return {_relink_store_key(p) for _a, _o, p in hits}
+    listing = "".join(
+        "\n   {0} ({1}/{2})   {3}".format(
+            _listing_label(emails[a]) if emails[a] else a[:8], a[:8], o[:8], p)
+        for a, o, p in dirs)
+    shown = _relink_account_filter_display(value)
+    if not accounts:
+        raise Refusal("no account store matches --account {0!r} (an account "
+                      "id, org id, store path or email).{1}".format(
+                          shown, listing))
+    raise Refusal("--account {0!r} matches {1} accounts; give more of it:{2}"
+                  .format(shown, len(accounts), listing))
+
+
+def _relink_row_listing(env, recs):
+    """One `   <stem>   <label>   <title>` line per scanned row."""
+    return "\n".join("   {0}   {1}   {2}".format(
+        rec.name[:-len(".json")], _listing_label(rec.label),
+        _listing_title(env, _relink_title(rec.data))) for rec in recs)
+
+
+def plan_relink(env, flags):
+    """Build a relink manifest. Pure planning - writes nothing.
+
+    The manifest is the journal's before new_op (Global Constraints), every
+    row unwritten. The scan reads every account whatever the narrowing,
+    since the judgement, the holders and the targets read every record; the
+    narrowing only picks the rows that may be written or reported. Refuses:
+    while another operation is unfinished or the journal cannot be fully
+    read (D18), on an unreadable row (D16), an account with rows in two org
+    folders (D17), an --account or --only that names nothing or more than
+    one thing, and a conversation --only that leaves more than one row to
+    change, so a proof touches one row."""
+    # Recorded whether or not --live arbitrates it, as converge records it.
+    dis = _identity_disagreement(env)
+    if flags.live:
+        live = _resolve_live_assertion(env, flags.live, _account_dirs(env),
+                                       account_scope=True)
+    else:
+        live = live_account(env)
+    _relink_refuse_open(env, "relink")
+    records = _retitle_scan(env, live=live, why=_RELINK_SCAN_WHY)
+    _converge_destinations(env, records)       # D17: one store per account
+
+    keys = (_relink_account_scope(env, flags.account, live)
+            if flags.account else None)
+
+    def in_account(rec):
+        return keys is None or _relink_store_key(rec.store) in keys
+
+    row_path = only_cid = None
+    if flags.only:
+        shown = _only_display(flags.only)
+        want = flags.only.lower()
+        if want.startswith("local_"):
+            hit = [rec for rec in records if in_account(rec)
+                   and rec.name[:-len(".json")].lower().startswith(want)]
+            if not hit:
+                raise Refusal("no row matches --only {0!r} (a row id is local_ "
+                              "and a prefix of its uuid).".format(shown))
+            if len(hit) > 1:
+                raise Refusal("--only {0!r} matches {1} rows; give more of the "
+                              "id:\n{2}".format(shown, len(hit),
+                                                _relink_row_listing(env, hit)))
+            row_path = hit[0].path
+        else:
+            conversations = {}
+            for rec in records:
+                cid = _lineage_cli(rec.data)
+                if cid is not None:
+                    conversations.setdefault(cid, []).append(rec)
+            matches = {cid: recs for cid, recs in conversations.items()
+                       if cid.lower().startswith(want)
+                       or any(want in _relink_title(rec.data).lower()
+                              for rec in recs)}
+            if not matches:
+                raise Refusal("no row in any account matches --only {0!r} (a "
+                              "title substring, or a cliSessionId prefix)."
+                              .format(shown))
+            if len(matches) > 1:
+                # The listing slices each title, so one that is not a string
+                # is shown as untitled rather than raising.
+                listed = {cid: [dataclasses.replace(
+                              rec, data=dict(rec.data,
+                                             title=_relink_title(rec.data)))
+                                for rec in recs]
+                          for cid, recs in matches.items()}
+                raise Refusal("--only {0!r} matches {1} conversations; give the "
+                              "cliSessionId of the one you mean (a prefix is "
+                              "enough):\n{2}".format(
+                                  shown, len(matches),
+                                  _retitle_candidate_listing(env, listed)))
+            only_cid = next(iter(matches))
+
+    def in_scope(rec):
+        if not in_account(rec):
+            return False
+        if row_path is not None:
+            return rec.path == row_path
+        return only_cid is None or _lineage_cli(rec.data) == only_cid
+
+    rows, left_out, cycles = _relink_plan_rows(records, _relink_tids(env),
+                                               in_scope)
+    # Rows left out do not count: only the rows a proof would change.
+    if only_cid is not None and len(rows) > 1:
+        raise Refusal("--only {0!r} leaves {1} rows to change; name one by its "
+                      "row id, so a proof touches one row:\n{2}".format(
+                          shown, len(rows), "\n".join(
+                              "   {0}   {1}".format(r["name"][:-len(".json")],
+                                                    _listing_label(r["label"]))
+                              for r in rows)))
+    m = {"op_type": "relink", "lineage_format": LINEAGE_FORMAT,
+         "only": flags.only, "account_filter": flags.account,
+         # A corroborated --live records no assertion, as converge's.
+         "live_asserted": (live.account_uuid
+                           if flags.live and live
+                           and live.resolved_from == "user" else ""),
+         "lineage_cycles": cycles, "rows": rows, "left_out": left_out}
+    if dis:
+        m["identity_disagreement"] = {"oauth": dis[0], "config": dis[1]}
+    return m
+
+
 if __name__ == "__main__":
     sys.exit(main())
