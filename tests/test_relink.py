@@ -25,7 +25,7 @@ import pytest
 
 import claude_code_sessions as ct
 from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O2, O3, O4, ORG, TASK,
-                           identity_files, lrow, side_link, t_entries)
+                           SimulatedCrash, identity_files, lrow, side_link, t_entries)
 
 
 @pytest.fixture(autouse=True)
@@ -2059,6 +2059,7 @@ def test_the_verify_is_by_value(monkeypatch, mkenv, tmp_path, write_transcript, 
             return real(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
         return real(path, data)
     monkeypatch.setattr(ct, "atomic_write", wrong_for_c2)
+    saves = record_saves(monkeypatch)
     with pytest.raises(ct.LayoutError) as exc:
         ct.run_relink(env, m)
     om = the_op(env).manifest                        # the manifest on disk
@@ -2069,6 +2070,138 @@ def test_the_verify_is_by_value(monkeypatch, mkenv, tmp_path, write_transcript, 
     assert om["rows"][0]["written"] is True and om["rows"][1]["written"] is False
     assert om["status"] == "writing"
     assert "spawnedFrom" not in data_of(paths["local_c3"])
+    # marked and saved before the raise, by the write loop itself; then the way-out save
+    assert [(who, marks) for who, _, marks in saves][-2:] == [
+        ("_relink_write_rows", [True, False]), ("execute_relink_op", [True, False])]
+
+
+def record_saves(monkeypatch, fail_in=()):
+    """Wrap save_manifest: each call is recorded as (the calling function, the status saved,
+    each row's written mark), and a call from a function named in FAIL_IN raises OSError
+    instead of saving."""
+    real = ct.save_manifest
+    saves = []
+
+    def save(op):
+        who = sys._getframe(1).f_code.co_name
+        saves.append((who, op.manifest.get("status"),
+                      [r.get("written") for r in op.manifest.get("rows") or []]))
+        if who in fail_in:
+            raise OSError(28, "No space left on device")
+        return real(op)
+    monkeypatch.setattr(ct, "save_manifest", save)
+    return saves
+
+
+@pytest.mark.parametrize("fail_in", [("_relink_write_rows",),
+                                     ("_relink_write_rows", "execute_relink_op")],
+                         ids=["inner", "inner-and-way-out"])
+def test_a_failed_save_never_replaces_the_verify_error(
+        fail_in, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    real = ct.atomic_write
+
+    def wrong_for_c2(path, data):
+        if same_file(path, paths["local_c2"]):
+            return real(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", wrong_for_c2)
+    saves = record_saves(monkeypatch, fail_in=fail_in)
+    with pytest.raises(ct.LayoutError) as exc:       # never the OSError, never a traceback
+        ct.run_relink(env, m)
+    assert str(exc.value).startswith("verify failed on local_c2.json: ")
+    assert str(exc.value).endswith(
+        "{0} takes out what it can check and names the rest.".format(recover_hint(m["op_id"])))
+    assert [who for who, _, _ in saves][-2:] == ["_relink_write_rows", "execute_relink_op"]
+    om = the_op(env).manifest
+    assert om["status"] == "writing"
+    # the way-out save tries again: the mark reaches the disk unless that save fails too
+    assert om["rows"][0]["written"] is (len(fail_in) == 1)
+    assert ct.read_lock(env) is None
+
+
+def test_a_failed_completed_save_refuses_with_the_runnable_hint(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    real = ct.save_manifest
+
+    def full_at_completed(op):
+        # the real set_status sets the status in memory, then saves it
+        if op.manifest.get("status") == "completed":
+            raise OSError(28, "No space left on device")
+        return real(op)
+    monkeypatch.setattr(ct, "save_manifest", full_at_completed)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    op = the_op(env)
+    assert str(exc.value) == (
+        "could not save the operation record in {0} ([Errno 28] No space left on device). The "
+        "op is left at 'writing' - {1} takes out what landed.".format(
+            op.op_dir, recover_hint(op.manifest["op_id"])))
+    assert op.manifest["status"] == "writing"
+    assert [r["written"] for r in op.manifest["rows"]] == [True, True]
+    assert "spawnedFrom" in data_of(paths["local_c2"]) and "spawnedFrom" in data_of(paths["local_c3"])
+    assert ct.read_lock(env) is None
+
+
+def test_a_row_that_landed_before_its_mark_is_marked_again_without_a_write(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+
+    def crash(point):
+        if point == "relink-before-mark":
+            raise SimulatedCrash()
+    ct._crash_hook = crash
+    with pytest.raises(SimulatedCrash):
+        ct.run_relink(env, m)
+    ct._crash_hook = None
+    op = the_op(env)                                 # the record on disk
+    rows = op.manifest["rows"]
+    assert op.manifest["status"] == "writing"
+    assert [r["written"] for r in rows] == [False, False]
+    landed = raw_of(paths["local_c2"])
+    assert hashlib.sha256(landed).hexdigest() == rows[0]["post_sha256"]
+    assert "spawnedFrom" not in data_of(paths["local_c3"]) and ct.read_lock(env) is None
+    # the write loop again, as forward recovery will run it: the landed row is marked from
+    # its bytes, never written a second time; the pending one is written
+    real = ct.atomic_write
+    written = []
+
+    def record(path, data):
+        written.append(os.path.basename(path))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", record)
+    ct._relink_write_rows(op, op.manifest, ct._retitle_roots(env),
+                          ct._RelinkSaver(op, then=ct._relink_apply_then(op.manifest)))
+    assert "local_c2.json" not in written and written.count("local_c3.json") == 1
+    assert raw_of(paths["local_c2"]) == landed
+    assert [r["written"] for r in the_op(env).manifest["rows"]] == [True, True]
+    assert data_of(paths["local_c3"])["spawnedFrom"] == tool_link("local_p3")
+
+
+def test_a_crash_after_the_rows_leaves_every_mark_on_disk(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+
+    def crash(point):
+        if point == "relink-after-rows":
+            raise SimulatedCrash()
+    ct._crash_hook = crash
+    with pytest.raises(SimulatedCrash):
+        ct.run_relink(env, m)
+    om = the_op(env).manifest
+    assert om["status"] == "writing" and [r["written"] for r in om["rows"]] == [True, True]
+    for r in om["rows"]:
+        assert hashlib.sha256(raw_of(r["dest_path"])).hexdigest() == r["post_sha256"]
+    assert ct.read_lock(env) is None
 
 
 def test_a_record_that_does_not_match_its_row_is_not_written_from(
