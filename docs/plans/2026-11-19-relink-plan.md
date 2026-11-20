@@ -1899,6 +1899,80 @@ def test_an_unfinished_relink_recovers_in_the_moved_store(direction, ...):
 - [ ] **Step 3: Commit** - `docs: relink - what it adds and leaves out, its journal, undo and
   recovery`.
 
+### Task 11: Partial undo (I-1, the maintainer's ruling, 2026-11-20)
+
+*(Added 2026-11-20, after the whole-branch review, on the maintainer's ruling: build `realign`'s
+model. The spec's "`undo`, as amended (I-1)" is the authority, revised after three review rounds of
+its own, the third's fixes not re-reviewed. Task 8's step 4 refusal on an unreadable row, its step 5 refusal on a live claim, its
+step 6 marking rule and its step 7 status are superseded where that section differs. The desktop
+window keeps parking a completed relink; no GUI change.)*
+
+**Files:**
+- Modify `claude_code_sessions.py`:
+  - `undo_relink` and `_relink_undo_disposition`, which gains the row's claimed keys and its
+    `undo_done`, and returns per key what the spec's step 2 table says, claims judged apart from
+    the row's state;
+  - `_relink_claims`: a later relink whose matching row holds a malformed `new`, `kept` or
+    `undo_done` makes its record damaged; a later relink's row claims its `new` keys not in its
+    `undo_done`, and its `kept` keys only while one of those remains;
+  - `_relink_back_disposition` and `_relink_back`: when `back` leaves a row's `startChain`,
+    waiting or changed by the app, it leaves the `spawnedFrom` the relink wrote too, names it
+    `the chain beside it was left` in `back_left`, and leaves the row unmarked;
+  - `_retitle_claimed_elsewhere`: a written, unrestored row of a relink with `undo_started`
+    claims by path;
+  - `_relink_claims_refusal`: the damaged line says "cannot be read or is damaged"; the live
+    line's sentence on a claimant that cannot be undone speaks of the keys it claims only; every
+    claimant named. The undo's own refusal (rows that cannot be read, with the repair; that an
+    earlier pass's changes stand) needs facts that are not claims: give it a composer of its own
+    or new arguments, and keep `back`'s refusal as it is;
+  - `_relink_shape_error`: `undo_started` and `undo_waiting` per operation, `undo_done` per
+    row, each optional;
+  - `_public_relink_manifest`, `_ANON_STRUCTURAL_KEYS`: `undo_waiting` beside `undo_left`,
+    `--anonymize` alike, its keys registered;
+  - `rotate_ops` (`_collides`) and `_relink_left_something`: a completed relink with
+    `undo_started` is kept, and while one is, so is every operation whose journal names a row of
+    it not yet restored and every record whose rows cannot be read as paths; `rotate_ops`
+    gathers those paths before it judges any operation;
+  - `cmd_undo`: the relink preview line says keys may wait; after `result:`, the `left` lines,
+    the waiting lines and the way on; exit 1 on `"partial"`;
+  - the stale "undo refuses" comments above the undo section and in `_relink_claims`.
+- Modify `README.md` (the relink section's undo paragraph) and `docs/internals.md` (the claims,
+  rotation, recovery and undo paragraphs).
+- Test: `tests/test_relink.py`; `tests/test_anonymize.py` (the structural-key test and the
+  odd-title fixture, with a populated `undo_waiting`); `tests/test_realign.py` if an inventory
+  pins the new fields.
+
+**Interfaces:**
+- Consumes: Tasks 7 to 9 (`_relink_claims`, `_relink_undo_disposition`, `_relink_left_entry`,
+  `_relink_left_line`, `_RELINK_CLAIM_UNREADABLE`, `RELINK_LIST_CAP`, `_relink_back`'s mapping of
+  live claims to keys per row).
+- Produces: `undo_relink(env, op) -> str`, `"undone"` or `"partial"`; the journal fields
+  `undo_started` (per operation, `true`), `undo_done` (per row, a list of key names) and
+  `undo_waiting` (per operation, entries `{name, label, what, why, op_ids}`); a waiting-line
+  function beside `_relink_left_line`.
+
+- [ ] **Step 1: Write the tests** - the spec's list under "`undo`, as amended (I-1)", fake cast, in
+  two groups: the ones that fail today, and regression pins that already pass (a restored row
+  claims nothing; the unlisted-journal refusal; the preview's count). Rewrite the existing tests
+  the spec names to expect `partial`, find any other whose claim or unreadable row covers only
+  some rows, and update the pinned sentences that change.
+- [ ] **Step 2: Run them** - `python -m pytest tests/test_relink.py tests/test_anonymize.py -q`;
+  the first group fails, the pins pass.
+- [ ] **Step 3: Implement the judgment and the writes** in `undo_relink`, in the spec's order:
+  the record's own checks; the save of `undo_started`; the other whole refusals; one claims
+  judgment and one read per row; the per-key table; the save of `undo_waiting` before any write;
+  per row, write, verify, then one save of `undo_done`, new `left:` entries and `restored`
+  through the saver; the end-of-pass save outside the budget; then the ending of the spec's step
+  5, the refusal included, with every save failure a `Refusal` naming `undo --id <op_id>
+  --apply`.
+- [ ] **Step 4: The claim checks, `back`, the shape check, the projection, rotation and the CLI**,
+  as the Files list says.
+- [ ] **Step 5: README and internals** to the amended behaviour, in the house style and fake cast;
+  the fix wave's sentences ("if one cannot be undone, neither can the relink") are replaced.
+- [ ] **Step 6: Run** the full suite and the 18 check scripts; the public-safety checker finds 0.
+- [ ] **Step 7: Commit** - `feat(relink): partial undo - keys nobody claims are taken out, the
+  rest wait, named, and the relink stays resumable (I-1)`, then the docs commit.
+
 ## Departures from the spec
 
 Recorded so the spec's authority can be checked against them. Departures 1, 2, 3, 5, 6, 7 and 8
