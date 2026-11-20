@@ -972,6 +972,22 @@ def test_every_emitted_report_key_is_in_the_structural_set(
     assert any(r["lineage"]["notes"] for r in ml["rows"])
     assert any(r["lineage"]["root_row"] for r in ml["rows"])
     bad = walk_fixed_keys(ml, bad=bad)
+    # A relink plan with rows and a left-out row, and by hand the fields an
+    # apply, an undo and a recovery set later.
+    from test_relink import relink_store
+    env7 = mkenv(tmp_path / "relink")
+    paths7 = relink_store(env7, write_transcript, write_row)
+    os.unlink(paths7["local_p3"])
+    m7 = ct.plan_relink(env7, ct.RelinkFlags())
+    assert m7["rows"] and m7["left_out"]
+    m7["op_id"] = "20990101T000000Z-aaaaaa"
+    m7["identity_disagreement"] = {"oauth": A1, "config": A2}
+    m7["since_plan"] = {"changed": 1, "dropped": 0, "gained": 0}
+    m7["undo_left"] = [{"name": "local_c2.json", "label": "bob@example.com",
+                        "what": "spawnedFrom", "why": "the app changed it since"}]
+    m7["rows"][0].update(skipped="gone", skip_detail="gone from the store",
+                         restored=True)
+    bad = walk_fixed_keys(ct._public_relink_manifest(env7, m7), bad=bad)
     assert bad == []
 
 

@@ -6,12 +6,16 @@ key-by-key apply and the state comparison; then the resolution core, which
 decides row by row what to write and what to leave out; then plan_relink,
 the strict scan, the refusals and the narrowing around it. Fake cast only:
 Northwind, ACME-REVIEW, the A/LP/LC ids and local_p/local_c/local_r rows of
-the converge tests.
+the converge tests. Last, the report: the per-account listing, the totals,
+and the public projection --json and --anonymize print.
 """
 import hashlib
+import io
 import json
 import os
+import re
 import shutil
+import sys
 import types
 
 import pytest
@@ -1162,3 +1166,388 @@ def test_live_is_recorded_only_when_it_arbitrates(mkenv, tmp_path, write_transcr
     # a --live naming the account the files agree on arbitrates nothing
     identity_files(env, A1, A1, oauth_org=O1)
     assert plan(env, live="alice@example.com")["live_asserted"] == ""
+
+
+# ---------------------------------------------------------------- the report
+# Task 4: the per-account listing, the totals counted from the plan, and the
+# public projection --json and --anonymize print (spec "What it prints").
+
+PUB_ROW_FIELDS = ["account", "label", "name", "session_id", "title", "parent_title",
+                  "store_path", "dest_path", "adds", "keeps", "lineage", "written"]
+C_LINE = "   {0}  'ACME-REVIEW side task'   "          # a row line up to its last column
+WRONG_DEPTH = {"startChain": {"firstSessionId": "local_r2", "depth": 3}}
+SESSION_LABEL = r"<session-[0-9a-f]{4}>"
+
+
+def public(env, m):
+    return ct._public_relink_manifest(env, m)
+
+
+def report(env, m, verbose=False):
+    lines = []
+    ct._print_relink_report(lines.append, m, public(env, m), verbose=verbose)
+    return lines
+
+
+def test_dry_run_lists_rows_per_account_then_the_totals(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])
+    m = plan(env)
+    assert [(r["account"], r["name"]) for r in m["rows"]] == [(A2, "local_c2.json")]
+    label = m["rows"][0]["label"]
+    assert label
+    assert report(env, m) == [
+        "-> " + label,
+        "   local_c2  'ACME-REVIEW side task'   link under 'Northwind kickoff'",
+        "",
+        "links   : 1 to add, 1 left out (no row for the parent in that account 1)"]
+
+
+def test_both_keys_print_link_and_chain_and_a_chain_only_row_prints_chain(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    m = plan(env)
+    assert [(r["name"], list(r["new"])) for r in m["rows"]] == [
+        ("local_c2.json", ["spawnedFrom", "startChain"]), ("local_c3.json", ["startChain"])]
+    label2, label3 = (r["label"] for r in m["rows"])
+    assert report(env, m) == [
+        "-> " + label2,
+        C_LINE.format("local_c2") + "link and chain",
+        "",
+        "-> " + label3,
+        C_LINE.format("local_c3") + "chain",
+        "",
+        "links   : 1 to add",
+        "chains  : 2 to add"]
+
+
+def test_counts_come_from_written_keys_and_the_left_out_list(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    m = plan(env)
+    # the chain-only row's record names its kept link, so the records alone count two links
+    assert ct._lineage_summary(m["rows"])["links"]["carried"] == 2
+    assert ct._relink_summary(m) == {
+        "links": {"carried": 1, "left_out": {}}, "chains": {"carried": 2, "left_out": 0},
+        "changes": {"changed": 0, "dropped": 0, "gained": 0}}
+    assert ct._relink_plan_lines(m) == ["links   : 1 to add", "chains  : 2 to add"]
+    # a left-out entry counts on the links line by its first link code, and on the chains
+    # line by any chain code; a written row counts there when its chain was left out
+    def note(code):
+        return {"code": code, "detail": "d"}
+    hand = {"rows": [{"new": {"spawnedFrom": {}}, "lineage": {"notes": [
+                         note("lineage_chain_dropped"), note("lineage_chain_dropped")]}}],
+            "left_out": [{"notes": [note("own_link_differs"), note("lineage_chain_dropped")]},
+                         {"notes": [note("lineage_no_app_link")]},
+                         {"notes": [note("own_link_differs"), note("lineage_cycle")]},
+                         {"notes": [note("own_chain_differs")]}],
+            "lineage_cycles": 2}
+    s = ct._relink_summary(hand)
+    assert s["links"] == {"carried": 1,
+                          "left_out": {"own_link_differs": 2, "lineage_no_app_link": 1}}
+    assert s["chains"] == {"carried": 0, "left_out": 3}
+    assert ct._relink_plan_lines(hand) == [
+        "links   : 1 to add, 3 left out (the row's own link names no usable row 2, "
+        "no app-written link backs it 1)",
+        "chains  : 3 left out",
+        "cycles  : 2 already present, left as they are"]
+    # the codes of a row or an entry, in order, each once; the tag names the first of a kind
+    assert ct._relink_codes(hand["rows"][0]) == ["lineage_chain_dropped"]
+    assert ct._relink_codes(hand["left_out"][2]) == ["own_link_differs", "lineage_cycle"]
+    assert ct._relink_tag(["lineage_chain_dropped", "own_link_differs"]) == \
+        "[link: the row's own link names no usable row]"
+    assert ct._relink_tag(["own_chain_differs", "lineage_chain_dropped"]) == \
+        "[chain: the row's own chain disagrees with its holders']"
+    assert ct._relink_tag([]) == "" == ct._relink_tag(["lineage_retargeted"])
+
+
+def test_the_apply_lines_say_added_and_since_the_plan():
+    def row(*keys):
+        return {"new": {k: {} for k in keys}, "lineage": {"notes": []}}
+    m = {"rows": [row("spawnedFrom", "startChain"), row("spawnedFrom")],
+         "left_out": [{"notes": [{"code": "parent_not_in_account", "detail": "d"}]}],
+         "lineage_cycles": 1}
+    assert ct._relink_apply_lines(m) == [
+        "links   : 2 added, 1 left out (no row for the parent in that account 1)",
+        "chains  : 1 added"]
+    m["since_plan"] = {"changed": 1, "dropped": 0, "gained": 2}
+    assert ct._relink_summary(m)["changes"] == {"changed": 1, "dropped": 0, "gained": 2}
+    assert ct._relink_apply_lines(m)[0] == (
+        "links   : 2 added, 1 left out (no row for the parent in that account 1); "
+        "since the plan: 1 changed, 2 gained")
+    # with no other part the links line is the since-the-plan part alone
+    quiet = {"rows": [], "left_out": [], "since_plan": {"changed": 0, "dropped": 3, "gained": 0}}
+    assert ct._relink_apply_lines(quiet) == ["links   : since the plan: 3 dropped"]
+    assert ct._relink_apply_lines({"rows": [], "left_out": []}) == []
+
+
+def test_a_chain_code_is_counted_on_the_chains_line_only(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True, local_c2=WRONG_DEPTH)
+    m = plan(env)
+    # Task 2, as built: local_c2's kept chain disagrees with local_c1's, and local_c1's with
+    # local_c2's, so a wrong kept chain leaves its partner row out too; local_c3 gains its
+    # link, and its chain is left out because its two sources disagree
+    assert [(e["name"], note_codes(e)) for e in m["left_out"]] == [
+        ("local_c1.json", ["own_chain_differs"]), ("local_c2.json", ["own_chain_differs"])]
+    assert [(r["name"], row_codes(r)) for r in m["rows"]] == [
+        ("local_c3.json", ["lineage_chain_dropped"])]
+    # all three on the chains line; none of them on the links line
+    assert ct._relink_plan_lines(m) == ["links   : 1 to add", "chains  : 3 left out"]
+    assert ct._relink_summary(m)["links"]["left_out"] == {}
+
+
+def test_a_written_row_whose_chain_was_left_out_carries_a_chain_tag(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True)
+    os.unlink(paths["local_r3"])
+    m = plan(env)
+    assert [(r["name"], list(r["new"]), row_codes(r)) for r in m["rows"]] == [
+        ("local_c2.json", ["spawnedFrom", "startChain"], []),
+        ("local_c3.json", ["spawnedFrom"], ["lineage_chain_dropped"])]
+    lines = report(env, m)
+    assert lines[1] == C_LINE.format("local_c2") + "link and chain"
+    assert lines[4] == (C_LINE.format("local_c3") + "link under 'Northwind kickoff'"
+                        "   [chain: the chain was left out]")
+    assert lines[-2:] == ["links   : 2 to add", "chains  : 1 to add, 1 left out"]
+
+
+def test_the_listing_is_capped_at_15_and_verbose_lists_all_with_left_out_tags(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])
+    title, longest = "ACME-REVIEW side task", "ACME-REVIEW side task, the longest copy"
+    extra = "abcdefghijklmnop"                       # 16 more rows of C in A2, 17 in all
+    for ch in extra:
+        put_row(env, write_row, A2, "local_c2" + ch, LC, longest if ch == "p" else title)
+    m = plan(env)
+    stems = [r["name"][:-len(".json")] for r in m["rows"]]
+    assert stems == ["local_c2"] + ["local_c2" + ch for ch in extra]
+    assert ct.RELINK_LIST_CAP == 15
+    label2, label3 = m["rows"][0]["label"], m["left_out"][0]["label"]
+    totals = "links   : 17 to add, 1 left out (no row for the parent in that account 1)"
+
+    def line(stem, width):
+        shown = repr(longest if stem == "local_c2p" else title)
+        return "   {0}  {1:<{w}}   link under 'Northwind kickoff'".format(stem, shown, w=width)
+    # the longest title is on the 17th row, which is not printed: nothing is padded to it
+    assert report(env, m) == (["-> " + label2]
+                              + [line(s, len(repr(title))) for s in stems[:15]]
+                              + ["   ... and 2 more", "", totals])
+    assert report(env, m, verbose=True) == (
+        ["-> " + label2]
+        + [line(s, len(repr(longest))) for s in stems]
+        + ["", "-> " + label3,
+           "   local_c3  'ACME-REVIEW side task'   [link: no row for the parent in that account]",
+           "", totals])
+
+
+def test_nothing_to_add(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row, local_c2={"spawnedFrom": side_link("local_p2")},
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    m = plan(env)
+    assert m["rows"] == [] and m["left_out"] == []
+    assert report(env, m) == ["nothing to add"]
+    assert report(env, m, verbose=True) == ["nothing to add"]
+
+
+def test_no_rows_with_left_out_rows_prints_totals_then_nothing_to_add(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    for stem in ("local_p2", "local_p3"):
+        os.unlink(paths[stem])
+    m = plan(env)
+    lines = report(env, m)
+    assert lines == ["links   : 2 left out (no row for the parent in that account 2)",
+                     "nothing to add"]
+    assert lines.count("nothing to add") == 1
+    assert not any(ln.startswith("->") for ln in lines)
+    pub = public(env, m)
+    assert pub["rows"] == [] and len(pub["left_out"]) == 2
+
+
+def test_the_three_new_phrases_print(mkenv, tmp_path, write_transcript, write_row):
+    # own_link_differs
+    env = mkenv(tmp_path / "own_link")
+    relink_store(env, write_transcript, write_row, local_c3={"spawnedFrom": {}})
+    lines = report(env, plan(env), verbose=True)
+    assert "links   : 1 to add, 1 left out (the row's own link names no usable row 1)" in lines
+    assert C_LINE.format("local_c3") + "[link: the row's own link names no usable row]" in lines
+    # lineage_no_app_link
+    env = mkenv(tmp_path / "no_app_link")
+    relink_store(env, write_transcript, write_row, link=tool_link("local_p1"))
+    lines = report(env, plan(env), verbose=True)
+    assert "links   : 2 left out (no app-written link backs it 2)" in lines
+    assert C_LINE.format("local_c2") + "[link: no app-written link backs it]" in lines
+    # own_chain_differs, on the chains line as the planner counts it (three rows, as in
+    # test_a_chain_code_is_counted_on_the_chains_line_only) and as a left-out row's tag
+    env = mkenv(tmp_path / "own_chain")
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True, local_c2=WRONG_DEPTH)
+    lines = report(env, plan(env), verbose=True)
+    assert "chains  : 3 left out" in lines
+    for stem in ("local_c1", "local_c2"):
+        assert C_LINE.format(stem) + "[chain: the row's own chain disagrees with its holders']" \
+            in lines
+
+
+def test_the_identity_warning_names_relink(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    m = plan(env)
+    lines = ct._identity_warning_lines(env, m, command="relink")
+    remedies = [ln for ln in lines if "--live" in ln]
+    assert len(remedies) == 2
+    assert all("claude-code-sessions relink --live" in ln for ln in remedies)
+    # converge keeps its own command, and nothing but the command word differs
+    assert ct._identity_warning_lines(env, m) == [
+        ln.replace(" relink ", " converge ") for ln in lines]
+
+
+def test_the_public_projection_omits_old_new_kept_and_hashes(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])
+    m = plan(env)
+    pub = public(env, m)
+    assert list(pub) == ["op_type", "only", "account_filter", "live_asserted", "lineage_format",
+                         "lineage_cycles", "rows", "left_out"]
+    for r in pub["rows"]:
+        assert not {"old", "new", "kept", "pre_sha256", "post_sha256"} & set(r)
+    r = pub["rows"][0]
+    assert list(r) == PUB_ROW_FIELDS
+    assert r["adds"] == ["spawnedFrom"] and r["keeps"] == []
+    src = m["rows"][0]
+    assert [r[k] for k in ("account", "label", "name", "session_id", "title", "parent_title",
+                           "store_path", "dest_path", "written")] == [
+        src[k] for k in ("account", "label", "name", "session_id", "title", "parent_title",
+                         "store_path", "dest_path", "written")]
+    assert r["lineage"] == src["lineage"] and r["lineage"] is not src["lineage"]
+    r["lineage"]["notes"].append({"code": "lineage_cycle", "detail": "d"})
+    assert src["lineage"]["notes"] == []                    # a copy, not the plan's own
+    assert pub["left_out"] == m["left_out"] and list(pub["left_out"][0]) == LEFT_FIELDS
+    pub["left_out"][0]["notes"][0]["detail"] = "changed"
+    assert m["left_out"][0]["notes"][0]["detail"] != "changed"
+    # both keys in RELINK_KEYS order, and a kept link named under keeps
+    env = mkenv(tmp_path / "chain")
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    m = plan(env)
+    assert [(r["adds"], r["keeps"]) for r in public(env, m)["rows"]] == [
+        (["spawnedFrom", "startChain"], []), (["startChain"], ["spawnedFrom"])]
+    # the fields an apply, an undo and a recovery set later, carried when present
+    later = {"op_id": OPEN_ID, "identity_disagreement": {"oauth": A1, "config": A2},
+             "since_plan": {"changed": 1, "dropped": 0, "gained": 0},
+             "undo_left": [{"name": "local_c2.json", "label": "bob@example.com",
+                            "what": "spawnedFrom", "why": "the app changed it since"}]}
+    m.update(later)
+    m["rows"][0].update(skipped="gone", skip_detail="gone from the store", restored=True)
+    pub = public(env, m)
+    assert {k: pub[k] for k in later} == later
+    assert list(pub)[-2:] == ["rows", "left_out"]
+    assert list(pub["rows"][0])[-3:] == ["skipped", "skip_detail", "restored"]
+    assert (pub["rows"][0]["skipped"], pub["rows"][0]["restored"]) == ("gone", True)
+    assert "skipped" not in pub["rows"][1]
+
+
+def test_the_anonymized_projection_hides_titles_paths_and_both_filters(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    ct._ANONYMIZE = True
+    m = plan(env, only="local_c2", account=A2[:8])
+    out = public(env, m)
+    assert out["only"] == "<only-filter>" and out["account_filter"] == "<account-filter>"
+    r = out["rows"][0]
+    assert r["title"].startswith("<session-") and r["parent_title"].startswith("<session-")
+    assert "store_path" not in r and "dest_path" not in r
+    assert r["account"] == A2[:8] + "…"
+    text = json.dumps(out)
+    assert "Northwind" not in text and "ACME" not in text
+    assert m["only"] == "local_c2" and m["rows"][0]["title"] == "ACME-REVIEW side task"
+    # every note detail and a skip detail are scrubbed, which nothing else would do
+    os.unlink(paths["local_p3"])
+    m = plan(env)
+    m["rows"][0]["lineage"]["notes"].append(
+        {"code": "lineage_chain_dropped", "detail": "under 'Northwind kickoff'"})
+    m["rows"][0].update(skipped="gone", skip_detail="'ACME-REVIEW side task' is gone")
+    m["left_out"][0]["notes"][0]["detail"] += ", under 'Northwind kickoff'"
+    m["undo_left"] = [{"name": "local_c2.json", "label": "bob@example.com",
+                       "what": "spawnedFrom", "why": "the app changed it since"}]
+    out = public(env, m)
+    text = json.dumps(out)
+    assert "Northwind" not in text and "ACME" not in text and "bob@" not in text
+    assert re.fullmatch("under '" + SESSION_LABEL + "'",
+                        out["rows"][0]["lineage"]["notes"][0]["detail"])
+    assert re.fullmatch("'" + SESSION_LABEL + "' is gone", out["rows"][0]["skip_detail"])
+    assert re.search(", under '" + SESSION_LABEL + "'$", out["left_out"][0]["notes"][0]["detail"])
+    assert out["rows"][0]["skipped"] == "gone"
+    assert out["undo_left"][0]["what"] == "spawnedFrom"
+
+
+def test_odd_titles_survive_the_report_and_the_anonymized_json(
+        mkenv, tmp_path, write_transcript, write_row, monkeypatch):
+    env = mkenv(tmp_path)
+    odd = "Café ☕ Northwind"
+    titled = {stem: {"title": odd} for stem in ("local_p1", "local_p2", "local_p3")}
+    titled.update({stem: {"title": "left_out"} for stem in ("local_c1", "local_c2", "local_c3")})
+    paths = relink_store(env, write_transcript, write_row, **titled)
+    os.unlink(paths["local_p3"])
+    m = plan(env)
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    def say(line):
+        # cmd_realign's console fallback; cmd_relink's own is Task 6's
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            print(line.encode(enc, "replace").decode(enc, "replace"))
+    ct._print_relink_report(say, m, public(env, m), verbose=True)
+    stream.flush()
+    printed = stream.buffer.getvalue().decode("cp1252").splitlines()
+    assert "   local_c2  'left_out'   link under 'Café ? Northwind'" in printed
+    assert "   local_c3  'left_out'   [link: no row for the parent in that account]" in printed
+    # --json --anonymize: a title that is a report key leaves the key a key
+    ct._ANONYMIZE = True
+    out = public(env, m)
+    assert isinstance(out["left_out"], list) and isinstance(out["rows"], list)
+    assert [e["name"] for e in out["left_out"]] == ["local_c3.json"]
+    for entry in out["rows"] + out["left_out"]:
+        assert re.fullmatch(SESSION_LABEL, entry["title"])
+    assert re.fullmatch(SESSION_LABEL, out["rows"][0]["parent_title"])
+    assert "Caf" not in json.dumps(out, ensure_ascii=False)
+    ct._print_relink_report(say, m, out, verbose=True)        # raises nothing either
+
+
+def test_a_title_equal_to_a_schema_value_corrupts_neither_report(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    titled = {stem: {"title": "parent_not_in_account"} for stem in ("local_p1", "local_p2")}
+    titled.update({stem: {"title": "spawnedFrom"} for stem in ("local_c1", "local_c2", "local_c3")})
+    paths = relink_store(env, write_transcript, write_row, **titled)
+    os.unlink(paths["local_p3"])
+    ct._ANONYMIZE = True
+    m = plan(env)
+    pub = public(env, m)
+    assert [r["adds"] for r in pub["rows"]] == [["spawnedFrom"]]
+    assert [note_codes(e) for e in pub["left_out"]] == [["parent_not_in_account"]]
+    assert re.fullmatch(SESSION_LABEL, pub["rows"][0]["title"])
+    lines = []
+    ct._print_relink_report(lines.append, m, pub)
+    assert "links   : 1 to add, 1 left out (no row for the parent in that account 1)" in lines
+    assert any(re.fullmatch("   local_c2  '{0}'   link under '{0}'".format(SESSION_LABEL), ln)
+               for ln in lines)
