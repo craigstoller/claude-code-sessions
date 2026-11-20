@@ -1284,6 +1284,447 @@ from 837 listings, and most of its 2.5 s is decoding the stores' rows. Most of `
 7. Three converge helpers were renamed so `sync` shares them: `_lineage_dependency_skip`,
    `_lineage_rows_by_name`, `_op_link_report`.
 
+##### Repairing rows already in place: relink (design `docs/specs/2026-11-19-relink-design.md`)
+
+*(the code is the `# ====== relink` section of `claude_code_sessions.py`, the relink branches of
+`classify_op`, `recover_op`, `cmd_undo`, `cmd_recover` and `rotate_ops`, and the three ownership
+checks below; pinned by `tests/test_relink.py` and the relink entries of the op-type and
+row-reader inventories in `tests/test_realign.py` and `tests/test_journal_reroot.py`)*
+
+0.18.0 writes the translated link only on rows `converge` and `sync` write. `relink` gives an
+existing row the link (`spawnedFrom`) and chain (`startChain`) its conversation's rows carry in
+other accounts, translated by the same resolver, and changes no other key. It is a command of
+its own on `realign`'s per-key journal (D1, D3): its undo puts back the two keys and keeps
+whatever else the app wrote since, which is what the design relies on to edit the app's own
+rows.
+
+**Planning, in order.** `plan_relink` writes nothing.
+1. It records an identity disagreement for the dry run's warning and `--json`, and resolves
+   `--live` at account scope, as `converge` does.
+2. D18 (below): it refuses while another operation is unfinished or a record cannot be read.
+3. `_retitle_scan` reads every row of every account strictly, with `_RELINK_SCAN_WHY` as what its
+   refusal says cannot be told. One unreadable row anywhere refuses the plan. The scan is
+   `converge`'s, and refuses on more rows than D16's candidate, holder or target.
+4. `_converge_destinations` refuses an account with rows in two org folders (D17).
+5. `--account` (`_relink_account_scope`) matches every account directory, empty org folders and
+   the signed-in account included. The printed `acct/org` pair goes through `_pair_query` and
+   `_pair_matches` and is never a substring search; any other value is a case-insensitive
+   substring of the account id, org id, email or store path (`_path_hay`, so a trailing separator
+   matches the path's end), as `repoint --store` tests them. The scope is the matched folders of
+   one account, so one account's empty org folders beside its populated store are no ambiguity.
+   No match, or matches in two accounts, refuses with every account directory listed.
+6. An `--only` that starts `local_` is a row id: a case-insensitive prefix of a row's stem within
+   the `--account` scope, refused on no match or several ("give more of the id", with ", or add
+   --account to name its account" when two accounts hold it). Any other `--only` is a
+   conversation, by `cliSessionId` prefix or title substring, refused on no match, and on
+   several with their listing (`_retitle_candidate_listing`).
+7. `_relink_plan_rows` decides every row (below), over the transcript set `_relink_tids` lists
+   once per plan through `iter_transcripts`, as `plan_converge` does; the per-plan index `sync`
+   uses is not used here.
+8. A conversation `--only` that leaves more than one row to write refuses and lists them, so a
+   proof touches one row. Rows left out do not count.
+
+The narrowing only picks the rows that may be written or reported (`in_scope`); the judgement,
+the holders, the targets and the cycle graph always read every record.
+
+**Deciding each row.** `_relink_plan_rows` builds one `_lineage_index` per account over every
+scanned row and groups the rows by `cliSessionId`. A conversation is planned when one of its
+rows' `spawnedFrom` passes `_lineage_variant_ok`. `_relink_judge` then applies D12 across all
+its rows in every account, whatever the narrowing: links naming two parents are
+`lineage_parent_disagree`, and two usable `taskId`s among the links naming the parent are
+`lineage_task_disagree`. A row in scope is a link candidate when it has no `spawnedFrom`
+object, and a chain candidate when it has no `startChain` object and a holder (a row of the
+conversation in another account) has one. `_relink_row_decision` is the one place a row's codes
+are chosen, the first line that applies winning:
+1. The conversation disagrees: its note, plus `lineage_chain_dropped` for a chain candidate.
+2. The row keeps a link that names no usable row of its own account, or that lacks a usable
+   `taskId` equal to the agreed one: `own_link_differs`, plus `lineage_chain_dropped` for a
+   chain candidate. A wrong but usable `taskId` never gets here; it is the conversation's
+   disagreement.
+3. The row keeps a chain and a holder has one: `own_chain_differs` unless the holders' chains
+   name one root with one integer `depth` of at least 1 (`_relink_agreed_chain`) and the row's
+   names a usable row of that root at that depth (`_relink_chain_agrees`).
+4. Neither a link candidate nor a chain candidate: in neither list.
+5. `_lineage_resolve` runs unchanged, its holders the other accounts' rows, its destination the
+   row's own account, nothing held, and the transcript set.
+6. A link candidate the resolver gave no link: the resolver's notes, its chain note only for a
+   chain candidate. With no note left the row is in neither list.
+7. A link candidate that no app-written holder backs (D11, below): `lineage_no_app_link`, plus
+   `lineage_chain_dropped` for a chain candidate. The resolver's link and chain are dropped
+   whole.
+8. A link candidate that keeps its own chain: the chain is taken out of the proposal and
+   `lineage_chain_dropped` out of its notes.
+9. A chain-only candidate whose resolver chain is missing: that note. Otherwise D11 over every
+   row of the conversation, the row's own included; failing it is `lineage_chain_dropped` with
+   the detail "no app-written link backs the chain". A chain that passes is proposed alone.
+
+Each account's proposals then pass `_lineage_drop_cycles` against `_lineage_existing_edges`
+over that account's rows on disk: every row's links, whatever D12 or candidacy decided about
+it, so a kept link is an existing edge, never a proposed one. A proposal whose link a cycle
+took, or for a chain-only row whose chain, is left out with the resolver's notes. The cycles
+the accounts already hold are counted over every account, whatever the narrowing, as
+`lineage_cycles`. Rows and left-out entries are sorted by account, conversation and row name,
+and a left-out entry's link codes come before its chain codes, since the counts and the report
+read the first.
+
+**D11, a predicate of its own.** A link is written only when an app-written link backs it,
+which `_relink_app_written` decides:
+
+```python
+if link.get("sideSession") is True:
+    return True
+title = link.get("title")
+return (set(link) == {"sessionId", "taskId", "title"}
+        and isinstance(title, str) and title != "")
+```
+
+`_lineage_variant_ok` also clears this tool's own `{sessionId, taskId}`, because a link
+`converge` or `sync` wrote must be carried again ("The cleared variants, and why those",
+above). That is not enough to write a link into a row that has none: a tool copy shows only
+that this tool once copied a link, so a copy supports agreement and never justifies a link
+alone, and a row whose app-written link was taken away is not re-nested from this tool's
+copies. For a link candidate the backing link must be among the holders that yield the agreed
+parent; for a chain-only candidate any row of the conversation that names the parent counts,
+the row's own kept link included. For a link candidate D11 is asked only once the resolver has
+produced a link, which means some yielding holder is a cleared variant with a usable `taskId`. So
+`lineage_no_app_link` ("no app-written link backs it", in `LINEAGE_LEFT_OUT`) means exactly that
+the holders are cleared and none of them was written by the app. When the resolver produces no
+link its own note stands: `lineage_variant` when no yielding holder is a cleared variant,
+`lineage_no_task` when none has a usable `taskId`. The spec's limits stand as written: the
+provenance is read from the shape, not proved, and a row whose own account's app removed its
+link is re-nested while another account still holds an app-written one.
+
+**Kept keys.** A present object is never replaced (D5), so a row's own link or chain is judged,
+not written. A kept link must name a usable row of its own account (`_lineage_named_conversation`)
+and carry a usable `taskId` equal to the agreed one, or the row is `own_link_differs`: a kept link
+with no `taskId` is the shape Phase 0 measured hiding the child, which `relink` may not replace
+and must surface rather than count as agreeing. A kept chain is judged only when a holder
+carries one; when none does it stands unjudged, outside the record. The `lineage` record of a
+row to write says what `relink` stands behind, and for a kept key its fields are rebuilt from the
+kept object, never left as the resolver set them. The resolver names `_lineage_pick`'s row, which
+need not be the row a kept key names when the account holds several rows of that conversation.
+- A kept link: `parent_row` its `sessionId`, `parent_session` the conversation that row opens,
+  `parent_planned` false, `carried_keys` the kept link's keys in order, and `dropped_keys` only
+  the resolver's `startChain.*` entries.
+- A kept chain, judged and agreeing: `root_row` its `firstSessionId` and `root_session` what that
+  row opens. An unjudged kept chain leaves both `""`.
+- `notes` are the resolver's, less `lineage_chain_dropped` when the row keeps its own chain.
+- `*_planned` is always false, since a relink plans no row.
+
+**The journal.** `op_type: "relink"`, `lineage_format: 1`. It holds no row images (D15): rows
+average 135 KB on the store the design measured, and 931 images would make a manifest of about
+167 MB, rewritten after every row. A row to write records:
+- `pre_sha256` of the bytes found, and `post_sha256` of the found value with relink's keys set,
+  serialized as `_relink_row_bytes` writes it (`json.dumps(d, separators=(",", ":"))`);
+- `old` (`{present, value}` per written key, the value never an object), `new` (the values
+  written) and `kept` (the row's own link or chain objects);
+- `account`, `label`, `name`, `dest_path`, `store_path`, `session_id`, and `title` and
+  `parent_title`, each `""` when that title is not a string, so the tool never journals what
+  its own shape check calls damaged;
+- the `lineage` record, and `written: false`.
+
+With no image to fall back on, `_relink_row_agrees` stands in for one before anything is written
+from the record: each written key must be absent or present as `old` says, present only as the
+same non-object value, and the row with `new` set must hash to `post_sha256`. The apply and
+forward recovery raise a `LayoutError` for a row that fails it rather than write from it.
+
+The status fields take their siblings' names, so the generic readers see them: a row's `written`
+(realign's rows'), `restored` (realign's copies') and `skipped` with `skip_detail` (converge's
+rows'), and `back_keys`, the keys `back` is putting back, saved before its write. `restored`
+means that no relink-written key remains at its `new` value on the row; undo and `back` set it
+only then. The manifest gains `since_plan` at the apply, `undo_left` from undo, and
+`rolling_back`, `back_left` and `back_restored` from `back`, beside `only`, `account_filter`,
+`live_asserted`, `lineage_cycles`, `left_out` and, when the files disagreed at plan time,
+`identity_disagreement`.
+
+`_RelinkSaver` saves the manifest as rows land, under a 32 MB budget (`sync`'s). It estimates one
+save once, as the indented manifest's length plus 4096 bytes, and saves nothing once the budget
+no longer covers one. The apply, undo and recovery also save with every status change and on
+the way out of any exception. A failed save there never replaces the error in flight, and a
+failed final save is a `Refusal` with a runnable next step. A record coarser than the disk is
+harmless, since recovery and undo read the rows.
+
+`_relink_shape_error` checks every field above before the apply creates the op, and before
+`classify_relink_op`, undo and recovery act on a record. A row's `lineage` is checked against its
+`new` and `kept`, since there are no bytes to check it against. The name rule is the scan's: a
+`local_*.json` equal to the file `dest_path` names, so a copy-named row file such as
+`local_c2 - Copy.json` is a legitimate row, while two rows naming one file is damage. Because the
+check runs before `new_op`, a record that would fail it is never journaled, and a locked re-plan
+with no rows ends `unchanged` with no op.
+
+**The apply.** `run_relink` runs `_guard_mutation` (the app closed, Windows only), D18 and the
+lock, then `_relink_recheck`: RULING 5 through `_ruling5_recheck`, which the realign and converge
+rechecks share, then `plan_relink` again with the plan's own `only`, `account_filter` and
+`live_asserted` (passed back as `--live` and resolved at account scope by its uuid). The fresh
+plan is what is journaled. `since_plan` counts, by `(account, name)`, the rows in both plans whose
+`new` differs, those in the first plan only and those in the fresh one only. Then the shape
+check, `new_op` (an `OSError` is a `Refusal` with nothing written) and `execute_relink_op`, with
+roots from discovery. Each row not yet written is taken in journal order from one read:
+- gone, unreadable, or opening another conversation (D19): a refusal;
+- bytes at `post_sha256`: marked written, a write that landed;
+- bytes other than `pre_sha256`: a refusal;
+- a record that does not agree with its row: a `LayoutError`;
+- otherwise `_relink_apply_new` sets exactly the written keys, in place or appended, and
+  `_relink_put` writes the row and reads it back, checking it by value.
+A failed verify marks the row written and saves before its `LayoutError`, as realign and retitle
+do, so recovery finds it. Every refusal leaves the op at `writing`, with `recover --resolve
+<op_id> --back --apply` as its next step.
+
+**Claims (D13).** Undo, and recovery's `back`, leave alone what a later live operation owns.
+`_relink_claims` reads every other record on its own (`_relink_load_ops`), so one bad manifest
+never aborts the check, and judges each by these rules in this order, liveness before damage:
+1. A record that cannot be read claims every row asked about, all keys.
+2. An undone or rolled-back operation of any type claims nothing, a relink whatever its rows'
+   `restored`. Neither does a finished `undo` operation, nor one earlier than this relink by
+   `_relink_sort_key`; a record whose `history` gives no creation time counts as later.
+3. Rows that are not a list of objects with string paths claim every row, all keys.
+4. A `realign` claims nothing: it writes other keys (D13's first per-key exception).
+5. A relink claims, on each row naming the same file that it has not `restored` and that is
+   `written` or belongs to an unfinished relink, the keys of its `new` and `kept` among this
+   row's `new`, since a chain it wrote relies on the link it kept (the second exception).
+6. A `move`, or an unfinished `undo`, claims every row it names, all keys: it rewrites each row
+   it journals and records no flag (the moveish rule).
+7. Any other operation claims, all keys, each row naming the same file that it wrote, or that
+   it names while unfinished.
+
+A journal folder that exists and cannot be listed claims every row, under no op id. A record
+that cannot be read, or is damaged, claims under its folder's name, since the folder is what is
+repaired or moved out of the journal; any other claimant claims under its op id, with the why
+`operation <op_id> wrote it since`.
+
+A finished `undo` claims nothing because no command undoes an undo: `cmd_undo` never selects one
+and `plan_undo` refuses one, so its claim could never clear, and the move it reversed is undone
+and claims nothing either. D13's text lists an `undo` among the whole-row claimants; an
+unfinished one still claims every row it names.
+
+`restored` decides a claim only within a live relink, liveness being D13's (`realign`'s test).
+An `undone` or `rolled_back` relink claims nothing, whatever its rows' marks; a `completed` one
+claims its written rows not restored; a non-terminal one claims every row it names that is not
+restored, written or not. Under D18 that last case cannot reach undo or `back`, which refuse
+first while another operation is unfinished; `_relink_claims` keeps it, and a test calls it
+directly.
+
+A claim makes undo refuse as a whole, before it writes, and the relink stays `completed`. A live
+claimant is named, to be undone first; a damaged record is named by its folder, with the note
+that no command repairs a record, so it is repaired, or its folder moved out of the journal,
+with the app closed. `back` must close the record, so it leaves a live claimant's keys at `new`
+and names them. A claim by a record that cannot be read or is damaged, or by a journal that
+cannot be listed, covers every key, and a `back` that left them all and closed would strand them
+where no command reaches, so `back` refuses those as undo does.
+
+**The three ownership checks.** Other operations' checks learn relink beside their own code:
+- `_retitle_claimed_elsewhere` compares a relink's rows by `post_sha256`, since a relink keeps
+  no `post_b64`, in a branch of its own ahead of the status filter. An earlier or withdrawn
+  relink is passed over: it wrote the bytes the retitle then read as its pre-image, and without
+  that an earlier relink and a later retitle that left the same bytes would each wait on the
+  other. Rows marked `restored` are passed over too.
+- `_repoint_claimed_later` counts any other terminal operation that wrote the row, whatever its
+  order, but a relink only when it is later than the repoint, not undone or rolled back, and its
+  row is not `restored` and is `written` (or the relink is unfinished). An earlier relink wrote
+  the very bytes the repoint read as its pre-image, so counting it would decline every rollback
+  of a repoint of a relinked row.
+- `_realign_claimed_later` passes over a relink on its type, before reading anything of it: a
+  relink writes no key realign writes, so even a damaged relink record claims nothing there.
+
+The first two read a relink in `_relink_claimant_standing`'s order, liveness before damage:
+"pass" for an undone, rolled-back or earlier relink; "claim" when a sort key cannot be computed
+or its rows are not a list of objects with string paths; else its rows are judged. `rotate_ops`
+counts relink among its claimants, so a finished relink is not pruned while an unfinished
+claimant names one of its written rows.
+
+**Undo.** `undo_relink`, under the lock, checks the type and the `completed` status, then the
+shape. A record whose `history` gives no creation time refuses, named by its folder: another
+operation's check would count it as a claimant while this undo counted every other operation as
+later, and the two would wait on each other with neither saying why. Then the guard, D18 with its
+own op id as `mine`, a refusal for rows in a store this version does not read
+(`_unresolved_rows`), and roots from discovery. Every row written and not restored is read once,
+and an unreadable one refuses with nothing changed. Each read is judged
+(`_relink_undo_disposition`) and the claims over those rows are judged before anything is
+written:
+- a row gone, or opening another conversation now (D19), is one `the row` entry, and nothing is
+  written to it; on the latter a key still at `new` stays, and while one does the row is not
+  marked;
+- otherwise each written key goes by what it holds (`_relink_key_state`, by value, members in
+  any order, `True` never `1`): at `new` it goes back (`_relink_apply_old` pops a key that was
+  absent and restores a non-object exactly), at `old` it counts as back, and anything else is
+  the app's, left and named "the app changed it since".
+
+The keys of a row go back in one write, verified by value; a failed verify raises with the row
+unmarked, so a resumed undo reads it afresh. A row's entries are appended to `undo_left`,
+deduplicated, before its `restored` mark, and reach the disk with that mark at the saver's tick
+or on the way out of any exception. The op ends `undone`, and `cmd_undo` prints each entry as a
+`left    :` line. Taking out a link leaves no other link dangling, so there is no link report.
+The resume hint names the op, `undo --id <op_id> --apply`, because a bare `undo --apply` takes
+the latest completed operation, which may by then be another one.
+
+**Recovery by key.** `classify_relink_op` gives the first that applies: a damaged record, or one
+whose `history` gives no creation time (named by its folder), offers nothing; a finished one
+points at undo; while D18 holds it (`_relink_d18_note`, with its own op as `mine`), nothing; once
+`back` has begun (`rolling_back`), only `back`; otherwise forward and back. For a relink with
+rows in a store this version does not read, `classify_op` asks this classifier before its
+unresolved-row gate, so a verdict that offers nothing comes first and it never offers a `back`
+that `recover_op` would refuse. `recover_op` refuses a direction the classification does not
+offer, quoting its note, before it dispatches. `_recover_relink` refuses the same damaged
+records and D18, then takes roots from discovery for every read and write in either direction.
+Rows in a store this version does not read (`stray`) are never read.
+
+Recovery reads the disk, never resolves again, and goes by what each written key holds now: a row
+with any written key at `new` has landed, whatever the others hold. The matrix below is one
+journal row, by its `written` flag and what one read finds. A row already `restored` is passed
+over by both directions, and a `skipped` one by forward. In each direction the first line that
+applies decides, and `-` is a cell that direction never reaches.
+
+| written | read | conversation | keys at `new` | forward | back |
+|---|---|---|---|---|---|
+| yes | any | any | any | not looked at again | decided by the `yes` lines at the end |
+| no | absent | - | - | skip `gone` | passed over |
+| no | unreadable | - | - | skip `unreadable` | passed over |
+| no | readable | other | some or all | skip `repointed`, its link left | marked `written`, `the row` left and named ("now opens another conversation; its link was left"), not restored |
+| no | readable | other | none | skip `repointed` | passed over |
+| no | readable | same | some or all | marked `written` | marked `written`, then as the `yes`, same, some or all line |
+| no | readable | same | none; bytes at `pre_sha256`; the record disagrees with the row | refused, a damaged record | passed over |
+| no | readable | same | none; bytes at `pre_sha256`; a target gone, unreadable or repointed | skip `parent_changed` | passed over |
+| no | readable | same | none; bytes at `pre_sha256`; the edge closes a cycle | skip `lineage_cycle` | passed over |
+| no | readable | same | none; bytes at `pre_sha256`; the account's links not all readable | skip `edges_unreadable` | passed over |
+| no | readable | same | none; bytes at `pre_sha256`; every check passes | written, marked `written` | passed over |
+| no | readable | same | none; bytes not at `pre_sha256` | skip `changed_since_plan` | passed over (a residual, below) |
+| yes | absent | - | - | - | `the row` named ("gone from the store"), restored |
+| yes | unreadable | - | - | - | `the row` named ("could not be read"), not restored |
+| yes | readable | other | some or all | - | `the row` left and named ("now opens another conversation; its link was left"), not restored |
+| yes | readable | other | none | - | `the row` named ("now opens another conversation"), restored |
+| yes | readable | same | some or all | - | the unclaimed keys at `new` put back; each claimed key and each changed key named; restored unless a claimed key stays at `new` |
+| yes | readable | same | none | - | nothing written; each changed key named; restored |
+
+Forward refuses while `rolling_back` is set: a key `back` took out and marked `restored` would be
+written again where undo and the claim checks no longer look. It refuses `stray` rows. It decides
+every row from one read before anything changes, so a record that does not match its row refuses
+with nothing changed. A pending row is checked again against the rows its write relies on
+(`_relink_dependency_skip`, over `_lineage_dependency_skip`): always its parent's row, since a
+chain-only row stands behind the link it keeps, and its chain root only when it writes the chain.
+Then, for the keys it writes only, it is checked against the account's links, read once per store
+(`_lineage_store_rows(..., light=True)`), plus the edges of rows this pass decided to write before
+it. An edge that reaches back to the row closes a cycle; a store with rows it could not read
+cannot rule one out, and skips with `edges_unreadable`, never `lineage_cycle`. The guard runs only
+when a row will be written. Then the decisions are recorded, each row is written and verified,
+the op completes, and the forward link report (`_op_link_report(..., forward=True)`) names a
+landed link whose target has gone or now opens another conversation. `cmd_recover` prints a
+`skipped :` line for each skipped row.
+
+`back` takes the rows in reverse journal order, reads every one once and judges the claims before
+any write, and refuses as a whole on a claim it cannot judge (Claims, above). Only landed rows
+are acted on or reported. The guard runs only when a key will go back. Before its first write,
+`back` sets `rolling_back` and saves it, its durable intent, so from then on only `back` is
+offered. Each landed row then goes in five steps, the saves in steps 1 and 4 the budget
+saver's:
+1. It is marked written and the keys about to go back are added to `back_keys`, and saved, so a
+   crash mid-row never leaves it looking untouched.
+2. Those keys go back in one write.
+3. A failed verify saves and raises with the row unmarked and `rolling_back` kept, so a second
+   `back` retries it.
+4. Its entries, which replace any an earlier pass left for it, and `back_restored`, counted from
+   the rows whose `back_keys` is not empty, are saved before the next step.
+5. Its `restored` mark, set only when no relink-written key stays at `new`.
+
+`back_left` and `back_restored` live in the manifest, so `abort_reason` (`back restored <n>
+row(s); left <k>: ...`), built from them at the end, covers every pass, and a resumed pass neither
+loses a row nor counts one twice. The op ends `rolled_back`. `rollback_residue` is not used for a
+row relink can read: `doctor` reports residue with advice to delete the session, which is wrong
+for a row relink only edited. Only rows in a store this version does not read are recorded there,
+as realign's back records them.
+
+Recovery reads every row before its guard, which runs only when a row will be written, so the
+app may have written a row as it closed. Once the guard has passed,
+each row about to be written is read again (`_relink_reread`) and refused, with nothing changed
+and the same direction's hint, unless it still holds the bytes its decision read.
+
+**Containment and hints.** The apply (`execute_relink_op`), `undo_relink` and both directions of
+`_recover_relink` each call `_retitle_roots(env)` fresh, which refuses when discovery fails.
+`_relink_read` and `_relink_put` each run `_retitle_contained`: the row must sit inside a
+discovered store root and directly in its journaled `store_path`. A root never comes from the
+journal, whose paths are what the check tests. Every printed hint runs as printed: `recover
+--resolve <op_id> --back --apply`, `--forward --apply` where forward is offered, and `undo --id
+<op_id> --apply`. A hint without `--apply` would only preview.
+
+**D18 and D19.** `relink`, its apply, its undo and its recovery refuse while any operation of any
+type other than their own is non-terminal, naming it (`_relink_refuse_open`). An interrupted
+`converge` or `sync` rolled back after a relink would delete a parent row a new link names, and
+one rolled forward would meet rows whose bytes a relink changed. A record that cannot be read
+refuses on its own line, named by its folder, whether or not an operation is also open, and a
+journal folder that exists and cannot be listed refuses with the listing error. A journal folder
+that does not exist is no operations, as `list_ops` reads it. Only a folder holding
+`manifest.json` is an operation; the lock file and stray entries are not. Undo and recovery pass
+their own op id as `mine`; the plan and the apply have none yet. This costs liveness: one
+unfinished operation from any command holds every relink route, the dry run included, until it
+is recovered, and a damaged record holds them until someone repairs it or moves its folder out
+by hand. The refusal says so. `plan_realign` holds only the conversations an open operation
+involves; relink holds the whole run, which is simpler and costs a `recover` first.
+
+D19: every per-row pass checks identity first. A row whose `cliSessionId` is not the journaled
+conversation refuses the apply, is skipped `repointed` by forward, and is named and left by undo
+and `back`; a link that landed on such a row is left on it and named ("now opens another
+conversation; its link was left").
+
+**The writer bound.** As for every mutating command, the guarantee holds while the desktop app
+stays closed (`_guard_mutation`) and this tool's lock is held. An app started during an apply
+could write a row between relink's read and its replace, and nothing here would see it; the run
+sheet's instruction is to keep the app closed throughout.
+
+**This build's departures from the spec.**
+1. The listing's first column is the row id (`local_` and 8 characters, `_lineage_short`), not
+   the spec sample's bare 8 characters. It pastes into `--only`, and tells apart two rows of one
+   conversation in one account.
+2. One unreadable row anywhere refuses the plan, since the scan is `converge`'s: more than D16's
+   candidate, holder and target.
+3. A `LayoutError`, a failed verify among them, exits 2, as `main` gives every command; D9 says 1
+   for an error. A refusal is 1.
+4. A chain-only D11 failure is `lineage_chain_dropped`, detail "no app-written link backs the
+   chain"; the spec names a code only for the link's D11 failure.
+5. D13's non-terminal claim cannot reach undo or `back` under D18 (Claims, above).
+6. The repoint interop is tested in two halves. `undo_repoint` refuses on byte drift and never
+   asks `_repoint_claimed_later`, so "a later relink blocks a repoint's undo and a restored one
+   does not" is pinned through `undo_repoint` and the bytes, and the `_repoint_claimed_later`
+   change on `recover --back` with an earlier relink.
+7. RULING 5 is checked in `_relink_recheck`, not by `_guard_mutation`, which checks only the
+   platform and the running app.
+8. The status fields follow their siblings: realign's rows carry only `written`, so `restored`
+   follows its copies, and `skipped` with `skip_detail` follows converge's rows.
+9. Recovery goes by key: forward marks a row written whenever a written key holds `new`, a key
+   back at `old` beside it included, and skips it as `changed_since_plan` only when no key is at
+   `new`; `back` acts on rows marked written or so landed.
+10. A kept link must carry a usable `taskId` equal to the agreed one, or it is
+    `own_link_differs`; D12 names that code only for a link naming no usable row.
+11. A D11 failure has its own code, `lineage_no_app_link`, where the spec's step 4 reports
+    `lineage_variant`, whose phrase "not a cleared link variant" would be false for holders that
+    are cleared but written by this tool.
+12. A conversation `--only` counts only the rows that would be written; candidates left out do
+    not count.
+13. Forward recovery of a chain-only row re-checks the kept parent link the chain relies on.
+14. `--account` matches every account directory, empty org folders included, and takes the
+    printed `acct/org` pair, where the spec matched the stores D17 resolves.
+15. A finished `undo` operation claims nothing (Claims, above), where D13 lists an `undo` among
+    the whole-row claimants.
+16. `back` refuses as a whole on a claim by a record that cannot be read or is damaged, or by a
+    journal that cannot be listed, where the spec's `back` always terminates: such a claim
+    covers every key, and closing after leaving them all would strand them.
+
+**Residuals, recorded rather than changed.**
+- `doctor`'s advice for `rollback_residue` (delete the session from the app if it is not wanted)
+  is wrong for a row relink only edited. A relink `back` writes residue only for rows in a store
+  this version does not read, as realign's does, and the advice is left as it is for every
+  operation.
+- `list_ops` reads every manifest unguarded, so one unreadable `manifest.json` anywhere in the
+  journal raises a `LayoutError` out of `rotate_ops`, which every relink route calls after its
+  writes. That is existing behaviour for every operation type. The relink's own work stands,
+  since its rows are written and its journal saved with its final status before `rotate_ops`
+  runs; only the rotation is lost, and `doctor` and the next run's D18 name the damaged record.
+- An operation whose `history` `list_ops` cannot sort fails `list_ops` in every command, and the
+  three ownership checks' broad `except` then returns no claim, as it does for every type.
+- A row whose write landed, whose `written` mark was lost, and every one of whose written keys
+  the app has since changed is in neither undo's list (it is not `written`) nor `back`'s report
+  (no key is at `new`, so it is not provably landed). Forward skips it as `changed_since_plan`,
+  which names it once. Nothing is destroyed: the app's values stand, and relink has nothing of
+  its own left on the row.
+
 ##### When the app orphans a conversation, and nothing here can stop it (2026-08-21)
 
 The first incident where **no guard in this tool was applicable**, and the most instructive so
