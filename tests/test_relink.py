@@ -3,20 +3,22 @@
 Implements docs/specs/2026-11-19-relink-design.md. This file starts with the
 value helpers every later step builds on: the app-written shape check, the
 key-by-key apply and the state comparison; then the resolution core, which
-decides row by row what to write and what to leave out. Fake cast only:
+decides row by row what to write and what to leave out; then plan_relink,
+the strict scan, the refusals and the narrowing around it. Fake cast only:
 Northwind, ACME-REVIEW, the A/LP/LC ids and local_p/local_c/local_r rows of
 the converge tests.
 """
 import hashlib
 import json
 import os
+import shutil
 import types
 
 import pytest
 
 import claude_code_sessions as ct
-from test_converge import (A1, A2, A3, LC, LP, LX, LY, NUM, ORG, TASK, lrow,
-                           side_link, t_entries)
+from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O3, O4, ORG, TASK,
+                           identity_files, lrow, side_link, t_entries)
 
 
 @pytest.fixture(autouse=True)
@@ -771,3 +773,341 @@ def test_a_stem_mismatched_row_is_repaired_and_never_a_target(
     assert rows[0]["old"] == {"spawnedFrom": {"present": False, "value": None}}
     assert [(e["name"], note_codes(e)) for e in left] == [
         ("local_c3.json", ["parent_not_in_account"])]
+
+
+# ------------------------------------------------------------------ the plan
+# Task 3: plan_relink - the strict scan (D16), one store per account (D17),
+# no unfinished operation (D18), the identity disclosure and the narrowing.
+
+OX = "77777777-0000-0000-0000-000000000007"   # an empty org folder; never a real id
+OY = "66666666-0000-0000-0000-000000000066"   # another empty one; never a real id
+OPEN_ID = "20990101T000000Z-aaaaaa"           # a hand-made operation's id
+D18_OPEN = ("relink waits while another operation is unfinished ({0}): an unfinished "
+            "operation of any kind may yet roll back or finish over rows a relink reads or "
+            "changes - a converge or sync rolled back after a relink, for one, could delete a "
+            "parent row a new link names. One unfinished operation holds every relink, its dry "
+            "run included, until it is recovered. Run 'claude-code-sessions recover' and finish "
+            "it first. Nothing was changed.")
+
+
+def names(entries):
+    return [e["name"] for e in entries]
+
+
+def plan(env, **flags):
+    return ct.plan_relink(env, ct.RelinkFlags(**flags))
+
+
+def refusal(env, **flags):
+    with pytest.raises(ct.Refusal) as exc:
+        plan(env, **flags)
+    return str(exc.value)
+
+
+def put_op(env, folder, body):
+    """A hand-made journal record: BODY is the manifest (a dict) or its raw text."""
+    d = os.path.join(env.ops_dir, folder)
+    os.makedirs(d)
+    with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as fh:
+        fh.write(body if isinstance(body, str) else json.dumps(body))
+
+
+def open_op(op_id=OPEN_ID, status="writing", **extra):
+    m = {"op_id": op_id, "op_type": "converge", "status": status,
+         "history": [{"status": status, "at": 1_800_000_000.0}], "rows": []}
+    m.update(extra)
+    return m
+
+
+def store_dir(env, acct, org):
+    return os.path.join(env.store_candidates[0], acct, org)
+
+
+def test_plan_relink_returns_the_journal_shape(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    assert set(m) == {"op_type", "lineage_format", "only", "account_filter", "live_asserted",
+                      "lineage_cycles", "rows", "left_out"}
+    assert m["op_type"] == "relink" and m["lineage_format"] == 1
+    assert m["only"] == "" == m["account_filter"] and m["live_asserted"] == ""
+    assert names(m["rows"]) == ["local_c2.json", "local_c3.json"] and m["left_out"] == []
+    assert all(r["written"] is False for r in m["rows"])
+    assert (m["rows"], m["left_out"], m["lineage_cycles"]) == plan_rows(env)
+    # the flags are journaled as typed: the apply's locked replan passes them back
+    m = plan(env, only="local_c2", account=A2[:8])
+    assert m["only"] == "local_c2" and m["account_filter"] == A2[:8]
+
+
+def test_only_by_row_id_narrows_to_that_row(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    assert names(plan(env, only="local_c2")["rows"]) == ["local_c2.json"]
+    assert names(plan(env, only="LOCAL_C3")["rows"]) == ["local_c3.json"]   # any case
+    # a prefix every account's row shares names one row within --account's store
+    assert names(plan(env, only="local_c", account=A3[:8])["rows"]) == ["local_c3.json"]
+
+
+def test_only_by_conversation_with_two_rows_to_change_refuses(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    head, *lines = refusal(env, only="ACME-REVIEW").split("\n")
+    assert head == ("--only 'ACME-REVIEW' leaves 2 rows to change; name one by its row id, "
+                    "so a proof touches one row:")
+    assert lines == ["   local_c2   cccccccc (cccccccc/dddddddd)",
+                     "   local_c3   eeeeeeee (eeeeeeee/ffffffff)"]
+    assert names(plan(env, only=LC[:8], account=A2[:8])["rows"]) == ["local_c2.json"]
+    # a row that would be left out does not count: one row to change is not refused
+    os.unlink(paths["local_p3"])
+    m = plan(env, only="ACME-REVIEW")
+    assert names(m["rows"]) == ["local_c2.json"]
+    assert [(e["name"], note_codes(e)) for e in m["left_out"]] == [
+        ("local_c3.json", ["parent_not_in_account"])]
+
+
+def test_only_refuses_no_match_and_an_ambiguous_one(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    assert refusal(env, only="Nothing-matches") == (
+        "no row in any account matches --only 'Nothing-matches' (a title substring, or a "
+        "cliSessionId prefix).")
+    assert refusal(env, only="local_zz") == (
+        "no row matches --only 'local_zz' (a row id is local_ and a prefix of its uuid).")
+    assert refusal(env, only="local_c1", account=A2[:8]).startswith(
+        "no row matches --only 'local_c1'")
+    head, *lines = refusal(env, only="local_c").split("\n")
+    assert head == "--only 'local_c' matches 3 rows; give more of the id:"
+    assert [ln.split()[0] for ln in lines] == ["local_c1", "local_c2", "local_c3"]
+    assert lines[0] == "   local_c1   aaaaaaaa (aaaaaaaa/bbbbbbbb)   ACME-REVIEW side task"
+    # a second conversation whose title holds the first one's
+    write_transcript(env, "C--p", LD, t_entries())
+    put_row(env, write_row, A1, "local_d1", LD, "ACME-REVIEW side task, round two")
+    head, *lines = refusal(env, only="ACME-REVIEW").split("\n")
+    assert head == ("--only 'ACME-REVIEW' matches 2 conversations; give the cliSessionId of "
+                    "the one you mean (a prefix is enough):")
+    assert [ln.split()[0] for ln in lines] == [LC[:8], LD[:8]]
+    # the conversation is matched over every account, whatever --account narrows: LD has
+    # rows in A1 only, and still makes the title ambiguous within A2
+    assert refusal(env, only="ACME-REVIEW", account=A2[:8]).split("\n")[0] == head
+    # a newest row whose title is not a string lists as untitled, without a traceback
+    set_keys(paths["local_c3"], title=5, lastActivityAt=1_756_000_000_000)
+    head, *lines = refusal(env, only="0").split("\n")        # LC and LD both start with 0
+    assert head.startswith("--only '0' matches 2 conversations")
+    assert lines[0].split()[:2] == [LC[:8], "(untitled)"]
+
+
+def test_only_with_no_candidate_plans_nothing(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    # P's rows carry no link to resolve; local_c1 carries its own
+    for only in ("Northwind kickoff", "local_c1"):
+        m = plan(env, only=only)
+        assert m["rows"] == [] and m["left_out"] == [], only
+
+
+def test_account_narrows_to_one_store_the_signed_in_one_included(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    identity_files(env, A2, A2, email="bob@example.com")
+    for value in ("bob@", "BOB@EXAMPLE", A2[:8]):
+        assert names(plan(env, account=value)["rows"]) == ["local_c2.json"], value
+    assert names(plan(env, account=O3[:8])["rows"]) == ["local_c3.json"]
+    # A1's store path, in either separator and any case: its row carries the link already
+    for value in (os.path.join(A1, O1), A1 + "/" + O1, (A1 + "\\" + O1).upper()):
+        m = plan(env, account=value)
+        assert m["rows"] == [] and m["left_out"] == [], value
+
+
+def test_account_matches_empty_org_folders_without_ambiguity(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    for org in (OX, OY):
+        os.makedirs(store_dir(env, A2, org))
+    assert names(plan(env, account=A2[:8])["rows"]) == ["local_c2.json"]
+    m = plan(env, account=OX[:8])
+    assert m["rows"] == [] and m["left_out"] == []
+    # a signed-in account whose only org folder is empty
+    env = mkenv(tmp_path / "a4")
+    relink_store(env, write_transcript, write_row)
+    os.makedirs(store_dir(env, A4, O4))
+    identity_files(env, A4, A4, email="bob@example.com", oauth_org=O4)
+    for value in (A4[:8], "bob@"):
+        m = plan(env, account=value)
+        assert m["rows"] == [] and m["left_out"] == [], value
+
+
+def test_account_refuses_no_match_or_several_accounts(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    identity_files(env, A2, A2, email="bob@example.com")
+    head, *lines = refusal(env, account="zzzz").split("\n")
+    assert head == ("no account store matches --account 'zzzz' (an account id, org id, store "
+                    "path or email).")
+    shown = (A1[:8], "bob@example.com", A3[:8])
+    assert len(lines) == 3
+    for line, acct, label in zip(lines, (A1, A2, A3), shown):
+        assert line.startswith("   {0} ({1}/{2})   ".format(label, acct[:8], ORG[acct][:8]))
+        assert line.endswith(os.path.join(acct, ORG[acct]))
+    assert "   bob@example.com (cccccccc/dddddddd)   " in lines[1]
+    head, *again = refusal(env, account="-0000-0000-").split("\n")
+    assert head == "--account '-0000-0000-' matches 3 accounts; give more of it:"
+    assert again == lines
+    # under --anonymize the typed value and the email are scrubbed
+    ct._ANONYMIZE = True
+    msg = refusal(env, account="alice@example.com")       # no account here carries it
+    assert msg.startswith("no account store matches --account '<account-filter>' (")
+    assert "bob@" not in msg
+    assert ct._relink_account_filter_display("") == ""
+    ct._ANONYMIZE = False
+    assert ct._relink_account_filter_display("bob@") == "bob@"
+
+
+def test_a_selected_row_of_a_disagreeing_conversation_is_listed(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row,
+                 local_c3={"spawnedFrom": side_link("local_q3")})
+    lq_rows(env, write_transcript, write_row)
+    for flags in ({"account": A2[:8]}, {"only": "local_c2"}):
+        m = plan(env, **flags)
+        assert m["rows"] == []
+        assert [(e["name"], note_codes(e)) for e in m["left_out"]] == [
+            ("local_c2.json", ["lineage_parent_disagree"])], flags
+
+
+def test_an_unreadable_record_refuses_with_its_own_line(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    bad = ["20990101T000000Z-cccccc", "20990101T000000Z-bbbbbb"]
+    for folder in bad:
+        put_op(env, folder, "{not json")
+    # neither the lock file nor a folder without a manifest.json is an operation
+    with open(os.path.join(env.ops_dir, "lock"), "w", encoding="utf-8") as fh:
+        fh.write("4242 20990101T000000Z-dddddd")
+    os.makedirs(os.path.join(env.ops_dir, "a stray folder"))
+    unreadable = ("relink waits: the record(s) in 20990101T000000Z-bbbbbb, "
+                  "20990101T000000Z-cccccc could not be read, so whether they are unfinished "
+                  "cannot be told. Nothing was changed.")
+    msg = refusal(env)
+    assert msg == unreadable
+    assert "(" + "the journal" not in msg
+    assert ct._relink_open_others(env) == ([], sorted(bad))
+    # beside an open operation the one refusal carries both lines, the open one's first
+    put_op(env, OPEN_ID, open_op())
+    assert refusal(env).split("\n") == [D18_OPEN.format(OPEN_ID), unreadable]
+    assert ct._relink_open_others(env) == ([OPEN_ID], sorted(bad))
+    # an operation's own undo or recovery passes its id and never waits on itself
+    assert ct._relink_open_others(env, mine=OPEN_ID) == ([], sorted(bad))
+    with pytest.raises(ct.Refusal) as exc:
+        ct._relink_refuse_open(env, "relink's undo", mine=OPEN_ID)
+    assert str(exc.value) == unreadable.replace("relink waits", "relink's undo waits")
+
+
+def test_each_record_is_read_on_its_own_and_rerooted(mkenv, tmp_path):
+    env = mkenv(tmp_path)
+    old = os.path.join(str(tmp_path), "an old store")
+    env.store_moves = [(old, env.store_candidates[0])]
+    put_op(env, "r1", "[1]")                                       # not an object
+    put_op(env, "r2", {"status": "writing"})                       # no op_id
+    put_op(env, "r3", {"op_id": 7, "status": "writing"})           # an op_id not a string
+    put_op(env, "r4", {"op_id": "", "status": "writing"})          # an empty op_id names nothing
+    put_op(env, OPEN_ID, open_op(rows=[{"dest_path": os.path.join(old, A2, "local_c2.json")}]))
+    done = "20990101T000000Z-eeeeee"
+    put_op(env, done, open_op(done, status="completed"))
+    got = ct._relink_load_ops(env)
+    assert [name for name, _ in got] == sorted([OPEN_ID, done, "r1", "r2", "r3", "r4"])
+    loaded = dict(got)
+    assert [loaded[r] for r in ("r1", "r2", "r3", "r4")] == [None] * 4
+    assert loaded[done]["status"] == "completed"
+    assert loaded[OPEN_ID]["rows"][0]["dest_path"] == os.path.join(
+        os.path.realpath(env.store_candidates[0]), A2, "local_c2.json")
+    assert ct._relink_open_others(env) == ([OPEN_ID], ["r1", "r2", "r3", "r4"])
+
+
+@pytest.mark.parametrize("bad", ["local_c2", "local_c1", "local_p2", "local_p3"])
+def test_an_unreadable_candidate_holder_target_or_kept_target_refuses(
+        bad, mkenv, tmp_path, write_transcript, write_row):
+    # a candidate, a holder, a link's target, and the target local_c3's kept link names
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row,
+                         local_c3={"spawnedFrom": side_link("local_p3")})
+    with open(paths[bad], "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    for flags in ({}, {"account": A2[:8]}, {"only": "local_c2"}):   # the scan is never narrowed
+        msg = refusal(env, **flags)
+        assert "the row {0!r}".format(bad + ".json") in msg and "could not be read" in msg
+        assert ct._RELINK_SCAN_WHY in msg
+
+
+def test_an_account_in_two_org_folders_refuses(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    write_row(env, 0, A2, O4, "local_c2b", lrow(LC, "local_c2b", "ACME-REVIEW side task"))
+    assert "account {0} holds rows in more than one org directory".format(A2[:8]) in \
+        refusal(env)
+
+
+def test_a_missing_journal_folder_means_no_operations(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    shutil.rmtree(env.ops_dir)      # mkenv always creates it; in use only acquire_lock does
+    assert names(plan(env)["rows"]) == ["local_c2.json", "local_c3.json"]
+    assert ct._relink_open_others(env) == ([], [])
+    assert ct._relink_load_ops(env) == []
+    # a journal path that exists and cannot be listed refuses, on a line of its own
+    with open(env.ops_dir, "w", encoding="utf-8") as fh:
+        fh.write("not a folder")
+    msg = refusal(env)
+    assert msg.startswith("relink waits: the journal folder could not be listed (")
+    assert msg.endswith("). Nothing was changed.") and "\n" not in msg
+    with pytest.raises(OSError):
+        ct._relink_load_ops(env)
+    ids, unreadable = ct._relink_open_others(env)
+    assert ids == [] and isinstance(unreadable, str) and unreadable
+
+
+def test_an_unfinished_operation_refuses_the_plan(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    done = "20990101T000000Z-eeeeee"
+    put_op(env, done, open_op(done, status="completed"))
+    assert names(plan(env)["rows"]) == ["local_c2.json", "local_c3.json"]   # terminal: no wait
+    put_op(env, OPEN_ID, open_op())
+    msg = refusal(env)
+    assert "relink waits while another operation is unfinished ({0})".format(OPEN_ID) in msg
+    assert msg == D18_OPEN.format(OPEN_ID)
+    assert refusal(env, only="local_c2") == msg              # the narrowed dry run waits too
+    later = "20990101T000000Z-ffffff"
+    put_op(env, later, open_op(later, status="journaled"))
+    assert refusal(env) == D18_OPEN.format(OPEN_ID + ", " + later)
+
+
+def test_the_plan_records_an_identity_disagreement(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    identity_files(env, A1, A2)
+    m = plan(env)
+    assert m["identity_disagreement"] == {"oauth": A1, "config": A2}
+    assert m["live_asserted"] == "" and names(m["rows"]) == ["local_c2.json", "local_c3.json"]
+    identity_files(env, A1, A1)
+    assert "identity_disagreement" not in plan(env)
+
+
+def test_live_is_recorded_only_when_it_arbitrates(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    # A1 has two org folders, so its email resolves only at account scope
+    os.makedirs(store_dir(env, A1, OX))
+    identity_files(env, A1, A2)
+    for live in (A1[:8], "alice@example.com"):
+        assert plan(env, live=live)["live_asserted"] == A1, live
+    assert plan(env)["live_asserted"] == ""
+    # a --live naming the account the files agree on arbitrates nothing
+    identity_files(env, A1, A1, oauth_org=O1)
+    assert plan(env, live="alice@example.com")["live_asserted"] == ""
