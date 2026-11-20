@@ -1755,6 +1755,13 @@ def _left(**changes):
     (lambda m: m["rows"][0].__setitem__("back_keys", ["cwd"]), "'back_keys'"),
     (lambda m: m["rows"][0].__setitem__("back_keys", [["spawnedFrom"]]), "'back_keys'"),
     (lambda m: m["rows"][1].__setitem__("back_keys", ["spawnedFrom"]), "'back_keys'"),
+    # two rows of one record naming one file: undo builds each row's write from one read
+    # taken before any write, so the second would put the first's keys back at new
+    (lambda m: m["rows"].__setitem__(1, json.loads(json.dumps(m["rows"][0]))), "'dest_path'"),
+    (lambda m: m["rows"].__setitem__(1, dict(
+        json.loads(json.dumps(m["rows"][0])),
+        dest_path=os.path.join(m["rows"][0]["store_path"], ".", m["rows"][0]["name"]))),
+     "'dest_path'"),
 ])
 def test_every_other_checked_field_is_named(
         damage, named, mkenv, tmp_path, write_transcript, write_row):
@@ -3167,12 +3174,17 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(
 # (D13), and an unfinished one holds it (D18). cmd_undo previews and dispatches
 # it, and the window parks a relink as it parks a realign.
 
-UNDO_THEN = "The relink stays 'completed' - run 'undo --apply' again to resume it."
 APP_CHANGED = "the app changed it since"
 GONE = "gone from the store"
 REPOINTED = "now opens another conversation"
 EARLIER = {"op_id": "20000101T000000Z-eeeeee",               # an earlier relink's record
            "history": [{"status": "journaled", "at": 1_000_000_000.0}]}
+
+
+def undo_then(op_id):
+    # it names the op: a plain 'undo --apply' takes the latest completed one
+    return "The relink stays 'completed' - run 'undo --id {0} --apply' again to resume " \
+           "it.".format(op_id)
 
 
 def op_of(env, op_id):
@@ -3285,6 +3297,27 @@ def test_undo_leaves_and_names_a_key_the_app_changed(
     assert [r["restored"] for r in om["rows"]] == [True, True]
 
 
+def test_undo_puts_back_one_key_and_leaves_the_other_the_app_changed(
+        mkenv, tmp_path, write_transcript, write_row):
+    # the one write that keeps part of what the relink wrote: the link still at new goes
+    # back, and the chain the app changed is neither put back over nor reported wrongly
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True)
+    before = data_of(paths["local_c2"])
+    op = relink_now(env)
+    c2 = row_of(op, "local_c2")
+    assert list(c2["new"]) == ["spawnedFrom", "startChain"]
+    changed = dict(c2["new"]["startChain"], depth=9)
+    set_keys(paths["local_c2"], startChain=changed)
+    final, om = undo(env, op)
+    assert final == "undone"
+    after = data_of(paths["local_c2"])
+    assert after == dict(before, startChain=changed)
+    assert list(after) == list(before) + ["startChain"]
+    assert om["undo_left"] == [entry(c2, "startChain", APP_CHANGED)]
+    assert row_of(types.SimpleNamespace(manifest=om), "local_c2")["restored"] is True
+
+
 @pytest.mark.parametrize("change", ["gone", "repointed"])
 def test_undo_skips_and_names_a_missing_or_repointed_row(
         change, mkenv, tmp_path, write_transcript, write_row):
@@ -3392,7 +3425,8 @@ def test_an_unreadable_row_refuses_the_undo_before_any_write(
     before = raw_of(paths["local_c2"])
     assert undo_refusal(env, op) == (
         "could not read row local_c3.json ({0}), so nothing was changed; the relink stays "
-        "'completed' and 'undo --apply' resumes it once the row can be read.".format(c3["label"]))
+        "'completed' and 'undo --id {1} --apply' resumes it once the row can be read.".format(
+            c3["label"], op.manifest["op_id"]))
     assert raw_of(paths["local_c2"]) == before and "spawnedFrom" in data_of(paths["local_c2"])
     assert raw_of(os.path.join(op.op_dir, "manifest.json")) == record
     om = op_of(env, op.manifest["op_id"]).manifest
@@ -3421,8 +3455,8 @@ def test_an_interrupted_undo_keeps_what_it_left_and_reports_it_once(
     monkeypatch.setattr(ct, "atomic_write", full_for_c3)
     msg = undo_refusal(env, op)
     assert msg == "could not write row local_c3.json ({0}): [Errno 28] No space left on " \
-                  "device. {1}".format(c3["label"], UNDO_THEN)
-    assert "run 'undo --apply' again" in msg
+                  "device. {1}".format(c3["label"], undo_then(op.manifest["op_id"]))
+    assert "run 'undo --id {0} --apply' again".format(op.manifest["op_id"]) in msg
     monkeypatch.setattr(ct, "atomic_write", real)
     om = op_of(env, op.manifest["op_id"]).manifest
     assert om["status"] == "completed"
@@ -3452,8 +3486,8 @@ def test_a_failed_verify_leaves_the_row_unmarked_and_undo_again_reads_the_disk(
         ct.undo_relink(env, op_of(env, op.manifest["op_id"]))
     assert str(exc.value) == (
         "verify failed restoring row local_c3.json: the row on disk is not the row read "
-        "with relink's keys put back. 'undo --apply' again re-reads it and goes by what "
-        "each key holds.")
+        "with relink's keys put back. 'undo --id {0} --apply' again re-reads it and goes by "
+        "what each key holds.".format(op.manifest["op_id"]))
     assert [who for who, _, _ in saves] == ["tick", "undo_relink"]
     monkeypatch.undo()
     om = op_of(env, op.manifest["op_id"]).manifest
@@ -3481,7 +3515,7 @@ def test_a_failed_save_of_undone_refuses_and_undo_again_finishes(
         ct.undo_relink(env, target)
     assert str(exc.value) == (
         "could not save the operation record in {0} ([Errno 28] No space left on device). "
-        "{1}".format(target.op_dir, UNDO_THEN))
+        "{1}".format(target.op_dir, undo_then(op.manifest["op_id"])))
     monkeypatch.setattr(ct, "save_manifest", real)
     om = op_of(env, op.manifest["op_id"]).manifest
     assert om["status"] == "completed" and [r["restored"] for r in om["rows"]] == [True, True]
@@ -3538,8 +3572,9 @@ def test_undo_refuses_another_type_or_a_relink_not_completed(
     assert ct.read_lock(env) is None
 
 
-@pytest.mark.parametrize("damage", ["old", "history missing", "history empty",
-                                    "history not a list", "no time", "time not a number"])
+@pytest.mark.parametrize("damage", ["old", "two rows, one file", "history missing",
+                                    "history empty", "history not a list", "no time",
+                                    "time not a number"])
 def test_a_damaged_record_or_one_with_no_usable_history_refuses_the_undo(
         damage, mkenv, tmp_path, write_transcript, write_row):
     # a record with no usable history cannot say which operations came after it, so its
@@ -3548,8 +3583,12 @@ def test_a_damaged_record_or_one_with_no_usable_history_refuses_the_undo(
     paths, op = applied(env, write_transcript, write_row)
     target = op_of(env, op.manifest["op_id"])
     m = target.manifest
+    shape = {"old": "row 0 has no usable 'old'",
+             "two rows, one file": "row 1's 'dest_path' names the same file as row 0's"}
     if damage == "old":
         m["rows"][0]["old"] = {"spawnedFrom": 5}
+    elif damage == "two rows, one file":
+        m["rows"][1] = json.loads(json.dumps(m["rows"][0]))
     elif damage == "history missing":
         del m["history"]
     else:
@@ -3561,10 +3600,10 @@ def test_a_damaged_record_or_one_with_no_usable_history_refuses_the_undo(
     before = raws(paths)
     with pytest.raises(ct.Refusal) as exc:
         ct.undo_relink(env, target)
-    if damage == "old":
+    if damage in shape:
         assert str(exc.value) == (
-            "the record for {0} is damaged (row 0 has no usable 'old'); refusing rather than "
-            "guess. Nothing was changed.".format(m["op_id"]))
+            "the record for {0} is damaged ({1}); refusing rather than guess. Nothing was "
+            "changed.".format(m["op_id"], shape[damage]))
     else:
         assert str(exc.value) == (
             "the record in {0} is damaged (its 'history' gives no time it was made, so which "
