@@ -926,6 +926,9 @@ _ROW_READERS = {
     "_realign_undo_blocker": "undo_realign refuses unresolved rows first; "
                              "_retitle_contained per row",
     "_realign_undo_conversation": "reached only after _realign_undo_blocker passed",
+    "_relink_read": "checks the row with _retitle_contained first; the apply reads only rows "
+                    "its own locked plan scanned, undo_relink refuses unresolved rows first, "
+                    "and recover_op passes them in to be skipped",
     "execute_op": "runs _validate_manifest_paths before touching a row",
     "_lineage_target": "its callers pass only the store of a row the op's gate "
                        "resolved (_unresolved_rows); it reads one direct child "

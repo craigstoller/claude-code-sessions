@@ -6,9 +6,12 @@ key-by-key apply and the state comparison; then the resolution core, which
 decides row by row what to write and what to leave out; then plan_relink,
 the strict scan, the refusals and the narrowing around it. Fake cast only:
 Northwind, ACME-REVIEW, the A/LP/LC ids and local_p/local_c/local_r rows of
-the converge tests. Last, the report: the per-account listing, the totals,
-and the public projection --json and --anonymize print.
+the converge tests. Then the report: the per-account listing, the totals,
+and the public projection --json and --anonymize print; the journal's shape
+check and saver. Last, the apply: the locked re-plan, the row writes verified
+by value, the CLI, and the one RULING 5 text the three apply rechecks share.
 """
+import argparse
 import hashlib
 import io
 import json
@@ -1854,3 +1857,664 @@ def test_the_saver_saves_per_row_while_the_budget_lasts(
     msg = str(exc.value)
     assert msg.startswith("could not save the operation record in {0} (".format(op.op_dir))
     assert "Permission denied" in msg and msg.endswith(". " + THEN)
+
+
+# ----------------------------------------------------------------- the apply
+# Task 6: run_relink re-plans under the lock, journals, writes each row with
+# only its two keys changed and verifies it by value; cmd_relink and the
+# parser; the RULING 5 text realign, converge and relink share.
+
+REOPEN = ("Reopen the app and check that the relinked rows show under their parents. 'undo' "
+          "takes the links out again, key by key.")
+APP_RUNNING = [(4242, "C:\\Program Files\\Claude\\claude.exe")]
+
+
+def ns(**kw):
+    d = {"json": False, "verbose": False, "anonymize": False, "apply": False,
+         "only": "", "account": "", "live": ""}
+    d.update(kw)
+    return types.SimpleNamespace(**d)
+
+
+def recover_hint(op_id):
+    return "'recover --resolve {0} --back --apply'".format(op_id)
+
+
+def the_op(env):
+    (op,) = ct.list_ops(env)
+    return op
+
+
+def same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def mid_rows(edit):
+    """A crash hook that runs EDIT at 'relink-mid-rows', before the second row of the
+    base store, and lets the apply go on."""
+    def hook(point):
+        if point == "relink-mid-rows":
+            edit()
+    return hook
+
+
+def raws(paths, stems=("local_c2", "local_c3")):
+    return {stem: raw_of(paths[stem]) for stem in stems}
+
+
+def test_apply_writes_each_row_and_journals_it(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    before = {stem: data_of(p) for stem, p in paths.items()}
+    untouched = raws(paths, [s for s in paths if s not in ("local_c2", "local_c3")])
+    m = plan(env)
+    assert ct.run_relink(env, m) == "completed"
+    assert data_of(paths["local_c2"]) == {
+        **before["local_c2"], "spawnedFrom": {"sessionId": "local_p2", "taskId": "task_7f"}}
+    assert data_of(paths["local_c3"]) == {
+        **before["local_c3"], "spawnedFrom": {"sessionId": "local_p3", "taskId": TASK}}
+    assert raws(paths, untouched) == untouched
+    om = the_op(env).manifest
+    assert om["op_id"] == m["op_id"]
+    assert om["op_type"] == "relink" and om["status"] == "completed"
+    assert [h["status"] for h in om["history"]] == ["journaled", "writing", "completed"]
+    assert om["since_plan"] == {"changed": 0, "dropped": 0, "gained": 0}
+    assert names(om["rows"]) == ["local_c2.json", "local_c3.json"]
+    for r in om["rows"]:
+        assert r["written"] is True and "restored" not in r
+        assert r["post_sha256"] == hashlib.sha256(raw_of(r["dest_path"])).hexdigest()
+    assert _no_b64_keys(om["rows"])
+    assert ct._relink_shape_error(om) is None
+    assert ct.read_lock(env) is None and ct.nonterminal_ops(env) == []
+
+
+def test_a_row_with_many_app_keys_keeps_all_of_them_in_order(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row, local_c2=APP_KEYS)
+    before = data_of(paths["local_c2"])
+    assert set(APP_KEYS) <= set(before)
+    assert ct.run_relink(env, plan(env)) == "completed"
+    after = data_of(paths["local_c2"])
+    assert list(after) == list(before) + ["spawnedFrom"]
+    assert json.dumps({k: after[k] for k in before}) == json.dumps(before)   # order and type
+    assert raw_of(paths["local_c2"]) == ct._relink_row_bytes(after)
+
+
+def test_an_unfinished_operation_refuses_the_apply_and_journals_nothing(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    put_op(env, OPEN_ID, open_op())
+    before = raws(paths)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert str(exc.value) == D18_OPEN.format(OPEN_ID)
+    assert [o.manifest["op_id"] for o in ct.list_ops(env)] == [OPEN_ID]
+    assert raws(paths) == before and ct.read_lock(env) is None
+
+
+def test_the_apply_refuses_while_the_app_runs(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    before = raws(paths)
+    env.process_lister = lambda: APP_RUNNING
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert "refusing to add links to rows in the session store while it is" in str(exc.value)
+    assert ct.RELINK_GUARD_WHY in str(exc.value)
+    assert ct.list_ops(env) == [] and ct.read_lock(env) is None and raws(paths) == before
+
+
+def test_a_row_changed_after_the_locked_plan_refuses_and_leaves_writing(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    ct._crash_hook = mid_rows(
+        lambda: set_keys(paths["local_c3"], lastFocusedAt=1_800_000_000_000))
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    (op,) = ct.nonterminal_ops(env)
+    om = op.manifest
+    assert om["status"] == "writing"
+    assert str(exc.value) == (
+        "row local_c3.json ({0}) changed since this relink was planned - writing would discard "
+        "whatever changed it, most likely the app. The op is left at 'writing' - {1} takes out "
+        "what landed, then re-run to replan.".format(om["rows"][1]["label"],
+                                                     recover_hint(om["op_id"])))
+    assert [r["written"] for r in om["rows"]] == [True, False]
+    assert "spawnedFrom" in data_of(paths["local_c2"])
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+    assert ct.read_lock(env) is None
+
+
+def test_a_store_path_that_is_not_the_rows_folder_is_unsafe(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    a1_store = os.path.dirname(paths["local_c1"])
+    before = raw_of(paths["local_c3"])
+    ct._crash_hook = mid_rows(lambda: m["rows"][1].__setitem__("store_path", a1_store))
+    with pytest.raises(ct.LayoutError) as exc:
+        ct.run_relink(env, m)
+    assert "not a direct child" in str(exc.value)
+    assert raw_of(paths["local_c3"]) == before
+    assert the_op(env).manifest["status"] == "writing"
+
+
+def test_a_row_repointed_mid_run_refuses(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    ct._crash_hook = mid_rows(lambda: set_keys(paths["local_c3"], cliSessionId=LD))
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    om = the_op(env).manifest
+    msg = str(exc.value)
+    assert msg.startswith("row local_c3.json ({0}) now opens another conversation".format(
+        om["rows"][1]["label"]))
+    assert msg.endswith("The op is left at 'writing' - {0} takes out what landed.".format(
+        recover_hint(om["op_id"])))
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+    assert om["status"] == "writing" and [r["written"] for r in om["rows"]] == [True, False]
+
+
+@pytest.mark.parametrize("edit, said", [("delete", "is gone from the store"),
+                                        ("corrupt", "could not be read")])
+def test_a_row_gone_or_unreadable_mid_run_refuses(
+        edit, said, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+
+    def change():
+        if edit == "delete":
+            os.unlink(paths["local_c3"])
+        else:
+            with open(paths["local_c3"], "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+    ct._crash_hook = mid_rows(change)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    om = the_op(env).manifest
+    msg = str(exc.value)
+    assert msg.startswith("row local_c3.json ({0}) {1}".format(om["rows"][1]["label"], said))
+    assert recover_hint(om["op_id"]) in msg
+    assert om["status"] == "writing" and [r["written"] for r in om["rows"]] == [True, False]
+
+
+def test_the_verify_is_by_value(monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    real = ct.atomic_write
+
+    def wrong_for_c2(path, data):
+        # every other path, the manifest's among them, goes to the real writer
+        if same_file(path, paths["local_c2"]):
+            return real(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", wrong_for_c2)
+    with pytest.raises(ct.LayoutError) as exc:
+        ct.run_relink(env, m)
+    om = the_op(env).manifest                        # the manifest on disk
+    assert str(exc.value) == (
+        "verify failed on local_c2.json: the row on disk is not the found value with exactly "
+        "relink's keys set. {0} takes out what it can check and names the rest.".format(
+            recover_hint(om["op_id"])))
+    assert om["rows"][0]["written"] is True and om["rows"][1]["written"] is False
+    assert om["status"] == "writing"
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+def test_a_record_that_does_not_match_its_row_is_not_written_from(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    before = raw_of(paths["local_c3"])
+    ct._crash_hook = mid_rows(lambda: m["rows"][1]["old"].__setitem__(
+        "spawnedFrom", {"present": True, "value": "x"}))
+    with pytest.raises(ct.LayoutError) as exc:
+        ct.run_relink(env, m)
+    om = the_op(env).manifest
+    assert str(exc.value) == ("the record for {0} does not match row local_c3.json; refusing "
+                              "rather than write from it".format(om["op_id"]))
+    assert raw_of(paths["local_c3"]) == before and om["status"] == "writing"
+
+
+def test_a_write_that_fails_names_the_recover_command(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    real = ct.atomic_write
+
+    def refuse_c3(path, data):
+        if same_file(path, paths["local_c3"]):
+            raise OSError(13, "Permission denied")
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", refuse_c3)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    om = the_op(env).manifest
+    msg = str(exc.value)
+    assert "recover --resolve " + om["op_id"] + " --back --apply" in msg   # never a preview
+    assert msg == ("could not write row local_c3.json ({0}): [Errno 13] Permission denied. The "
+                   "op is left at 'writing' - {1} takes out what landed.".format(
+                       om["rows"][1]["label"], recover_hint(om["op_id"])))
+    assert om["status"] == "writing" and [r["written"] for r in om["rows"]] == [True, False]
+
+
+def test_a_row_outside_every_discovered_root_is_refused(
+        tmp_path, mkenv, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    elsewhere = tmp_path / "elsewhere" / A3 / O3
+    copy = str(elsewhere / "local_c3.json")
+
+    def move_out():
+        elsewhere.mkdir(parents=True)
+        shutil.copyfile(paths["local_c3"], copy)
+        m["rows"][1].update(dest_path=copy, store_path=str(elsewhere))
+    ct._crash_hook = mid_rows(move_out)
+    with pytest.raises(ct.LayoutError) as exc:
+        ct.run_relink(env, m)
+    assert "outside every recognized root" in str(exc.value)
+    # the roots came from discovery, not from the journal that named the copy
+    assert raw_of(copy) == raw_of(paths["local_c3"])
+    assert "spawnedFrom" not in data_of(copy)
+
+
+@pytest.mark.parametrize("fails", ["new_op", "set_status"])
+def test_a_journal_that_cannot_be_written_refuses_before_any_row(
+        fails, monkeypatch, capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    before = raws(paths)
+    if fails == "new_op":
+        def no_space(env_, manifest):
+            raise OSError(28, "No space left on device")
+        monkeypatch.setattr(ct, "new_op", no_space)
+    else:
+        real = ct.set_status
+
+        def no_space(op, status):
+            if status == "writing":
+                raise OSError(28, "No space left on device")
+            return real(op, status)
+        monkeypatch.setattr(ct, "set_status", no_space)
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    assert ct.main(["relink", "--apply", "--verbose"]) == 1
+    err = capsys.readouterr().err
+    if fails == "new_op":
+        assert err == ("refused: could not write the operation record ([Errno 28] No space "
+                       "left on device). The journal is written before any row is touched, so "
+                       "nothing landed - fix the space or permissions under {0} and re-run.\n"
+                       .format(env.ops_dir))
+        assert ct.list_ops(env) == []
+    else:
+        op = the_op(env)
+        assert op.manifest["status"] == "journaled"
+        assert err == ("refused: could not save the operation record in {0} ([Errno 28] No "
+                       "space left on device). Nothing landed; the op is left at 'journaled' - "
+                       "{1} closes it.\n".format(op.op_dir, recover_hint(op.manifest["op_id"])))
+    assert raws(paths) == before and ct.read_lock(env) is None
+
+
+def test_the_apply_replans_under_the_lock_and_says_what_changed(
+        capsys, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    real = ct.acquire_lock
+
+    def change_then_lock(env_, op_id):
+        # cmd_relink plans and applies in one call: the store changes between the two
+        os.unlink(paths["local_p3"])
+        write_transcript(env, "C--p", LD, t_entries())
+        put_row(env, write_row, A1, "local_d1", LD, "Northwind notes",
+                spawnedFrom=side_link("local_p1"))
+        paths["local_d2"] = put_row(env, write_row, A2, "local_d2", LD, "Northwind notes")
+        return real(env_, op_id)
+    monkeypatch.setattr(ct, "acquire_lock", change_then_lock)
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert any(ln.startswith("   local_c3  ") for ln in out)       # the plan printed it
+    om = the_op(env).manifest
+    assert om["since_plan"] == {"changed": 0, "dropped": 1, "gained": 1}
+    assert names(om["rows"]) == ["local_c2.json", "local_d2.json"]
+    assert [(e["name"], note_codes(e)) for e in om["left_out"]] == [
+        ("local_c3.json", ["parent_not_in_account"])]
+    i = out.index("result  : completed")
+    assert out[i + 1:] == [
+        "links   : 2 added, 1 left out (no row for the parent in that account 1); since the "
+        "plan: 1 dropped, 1 gained", REOPEN]
+    assert data_of(paths["local_d2"])["spawnedFrom"] == tool_link("local_p2")
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+def test_nothing_to_add_journals_nothing(capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row, local_c2={"spawnedFrom": side_link("local_p2")},
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count("nothing to add") == 1 and out[-1] == "result  : unchanged"
+    assert ct.list_ops(env) == [] and ct.read_lock(env) is None
+
+
+def test_a_plan_with_only_left_out_rows_prints_once_and_never_the_apply_hint(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    for stem in ("local_p2", "local_p3"):
+        os.unlink(paths[stem])
+    totals = "links   : 2 left out (no row for the parent in that account 2)"
+    assert ct.cmd_relink(env, ns()) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count(totals) == 1 and out.count("nothing to add") == 1
+    assert not any("dry run" in ln for ln in out)
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count(totals) == 1 and out.count("nothing to add") == 1
+    assert out[-1] == "result  : unchanged"
+    assert out.index("nothing to add") < out.index("result  : unchanged")
+    assert not any("dry run" in ln for ln in out)
+    assert ct.cmd_relink(env, ns(apply=True, json=True)) == 0
+    got = json.loads(capsys.readouterr().out)
+    assert got["rows"] == [] and len(got["left_out"]) == 2 and got["result"] == "unchanged"
+    assert ct.list_ops(env) == []
+
+
+def test_a_locked_replan_that_leaves_nothing_says_so_after_the_result(
+        capsys, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    real = ct.acquire_lock
+
+    def remove_parents_then_lock(env_, op_id):
+        for stem in ("local_p2", "local_p3"):
+            os.unlink(paths[stem])
+        return real(env_, op_id)
+    monkeypatch.setattr(ct, "acquire_lock", remove_parents_then_lock)
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    i = out.index("result  : unchanged")
+    assert out[i + 1:] == [
+        "links   : 2 left out (no row for the parent in that account 2); since the plan: "
+        "2 dropped",
+        "nothing to add"]
+    assert out.count("nothing to add") == 1
+    assert ct.list_ops(env) == [] and ct.read_lock(env) is None
+
+
+def test_an_unreadable_row_at_apply_refuses_and_journals_nothing(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    with open(paths["local_p2"], "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    before = raws(paths)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert "the row 'local_p2.json'" in str(exc.value) and "could not be read" in str(exc.value)
+    assert ct.list_ops(env) == [] and ct.read_lock(env) is None and raws(paths) == before
+
+
+def test_rows_left_out_still_exit_0_and_json_carries_the_result(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])
+    assert ct.cmd_relink(env, ns(apply=True, json=True)) == 0
+    got = json.loads(capsys.readouterr().out)
+    assert got["result"] == "completed" and got["op_id"] == the_op(env).manifest["op_id"]
+    assert [(r["name"], r["written"]) for r in got["rows"]] == [("local_c2.json", True)]
+    assert [e["name"] for e in got["left_out"]] == ["local_c3.json"]
+    assert got["since_plan"] == {"changed": 0, "dropped": 0, "gained": 0}
+    # the text report: "N added" is the rows the journal holds written
+    env = mkenv(tmp_path / "text")
+    paths = relink_store(env, write_transcript, write_row)
+    os.unlink(paths["local_p3"])
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    written = sum(1 for r in the_op(env).manifest["rows"] if r["written"] is True)
+    assert written == 1
+    assert out[out.index("result  : completed") + 1:] == [
+        "links   : 1 added, 1 left out (no row for the parent in that account 1)", REOPEN]
+
+
+def test_the_help_texts():
+    p = ct.build_parser()
+    sub = next(a for a in p._actions if isinstance(a, argparse._SubParsersAction))
+    rl = sub.choices["relink"]
+    assert {c.dest: c.help for c in sub._choices_actions}["relink"] == (
+        "give existing rows of a side session the parent link another account's row carries")
+    assert rl.description == (
+        "Give existing rows of a side session the parent link (spawnedFrom), and its chain "
+        "(startChain), that another account's row carries, translated to that account's own "
+        "rows as converge writes them on a new row. Only those two keys change, and only "
+        "where a row has no link object; rows whose accounts disagree are left out with the "
+        "reason. Undoable per key.")
+    helps = {a.dest: a.help for a in rl._actions}
+    assert helps["only"] == (
+        "narrow to one conversation (a title substring, or a cliSessionId prefix) or to one "
+        "row (local_ and a prefix of its id) - must resolve to exactly one; a conversation "
+        "that leaves more than one row to change refuses and lists their ids")
+    assert helps["account"] == (
+        "narrow to one account's store: an account id, org id, store path or email substring "
+        "that resolves to exactly one account, the signed-in account's included")
+    assert helps["live"] == ("assert which account the desktop app is signed into (RULING 5), "
+                             "when the identity files disagree")
+    assert helps["apply"] == (
+        "actually add the links. Needs the desktop app fully closed and no unfinished "
+        "operation. Exits 0 when rows were left out - each is counted by its reason")
+    assert helps["json"] == "print the plan as JSON"
+    got = p.parse_args(["relink"])
+    assert (got.only, got.account, got.live, got.apply, got.json, got.verbose,
+            got.anonymize) == ("", "", "", False, False, False, False)
+    got = p.parse_args(["relink", "--only", "local_c2", "--account", "bob@", "--live",
+                        "alice@", "--apply", "--json", "--verbose"])
+    assert (got.only, got.account, got.live, got.apply, got.json, got.verbose) == (
+        "local_c2", "bob@", "alice@", True, True, True)
+
+
+def test_odd_titles_print_through_cmd_relink_on_a_cp1252_console(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    odd = "Café ☕ Northwind"
+    titled = {stem: {"title": odd} for stem in ("local_p1", "local_p2", "local_p3")}
+    titled.update({stem: {"title": "left_out"} for stem in ("local_c1", "local_c2", "local_c3")})
+    paths = relink_store(env, write_transcript, write_row, **titled)
+    os.unlink(paths["local_p3"])
+    for verbose in (False, True):
+        stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+        monkeypatch.setattr(sys, "stdout", stream)
+        assert ct.cmd_relink(env, ns(verbose=verbose)) == 0
+        stream.flush()
+        printed = stream.buffer.getvalue().decode("cp1252").splitlines()
+        assert "   local_c2  'left_out'   link under 'Café ? Northwind'" in printed
+        assert "dry run - pass --apply to add them" in printed
+        assert any("Caf" in ln for ln in printed) and not any("☕" in ln for ln in printed)
+
+
+RULING5_REALIGN = (
+    "~/.claude.json (aaaaaaaa) and config.json (cccccccc) disagree about the signed-in account "
+    "(RULING 5). The designed remedy is to assert which account the desktop app is on and "
+    "re-plan:\n"
+    "   claude-code-sessions {0} --live <email, or acct/org as reports print it> --apply\n"
+    "If it is the CLI's record that is stale, re-authenticating the CLI as the desktop's "
+    "account (run 'claude', then /login) also clears this. Nothing was written.")
+RULING5_CONVERGE = (
+    "~/.claude.json (aaaaaaaa) and config.json (cccccccc) disagree about the signed-in account "
+    "(RULING 5). The designed remedy is to assert which account the desktop app is on and "
+    "re-plan:\n"
+    "   claude-code-sessions converge --live <email, or acct/org as reports print it> --apply\n"
+    "If it is the CLI's record that is stale, re-authenticating the CLI as the desktop's "
+    "account (run 'claude', then /login) also clears this. Switching the desktop app may not "
+    "- config.json has been measured both tracking a switch (2026-08-02) and keeping the "
+    "previous account across one (2026-08-29) - and re-authenticating never writes it. --live "
+    "exists for exactly that case. Nothing was written.")
+
+
+@pytest.mark.parametrize("command", ["realign", "converge", "relink"])
+def test_the_ruling5_refusal_is_one_text_per_command(command, mkenv, tmp_path):
+    # realign's and converge's pass before _ruling5_recheck exists: they guard the move
+    env = mkenv(tmp_path)
+    identity_files(env, A1, A2)
+    recheck = getattr(ct, "_{0}_recheck".format(command))
+    with pytest.raises(ct.Refusal) as exc:
+        recheck(env, {"live_asserted": ""})
+    want = RULING5_CONVERGE if command == "converge" else RULING5_REALIGN.format(command)
+    assert str(exc.value) == want
+
+
+def test_a_rerun_adds_only_what_the_first_run_made_resolvable(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    # (a) every chain resolved the first time: a re-run adds nothing and journals nothing
+    env = mkenv(tmp_path / "base")
+    relink_store(env, write_transcript, write_row)
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    capsys.readouterr()
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count("nothing to add") == 1 and out[-1] == "result  : unchanged"
+    assert len(ct.list_ops(env)) == 1
+    # (b) Codex's two-account store: A1's row has an app-written link and no chain, A2's a
+    # usable chain and no link; the first run gives A2 its link, and only the second can
+    # give A1 the chain
+    env = mkenv(tmp_path / "two")
+    for sid in (LP, LC, LR):
+        write_transcript(env, "C--p", sid, t_entries())
+    for acct in (A1, A2):
+        put_row(env, write_row, acct, "local_p" + NUM[acct], LP, "Northwind kickoff")
+        put_row(env, write_row, acct, "local_r" + NUM[acct], LR, "Northwind board")
+    c1 = put_row(env, write_row, A1, "local_c1", LC, "ACME-REVIEW side task",
+                 spawnedFrom=side_link("local_p1"))
+    kept = {"firstSessionId": "local_r2", "depth": 2}
+    c2 = put_row(env, write_row, A2, "local_c2", LC, "ACME-REVIEW side task", startChain=kept)
+    first = plan(env)
+    assert [(r["name"], r["new"], r["kept"]) for r in first["rows"]] == [
+        ("local_c2.json", {"spawnedFrom": tool_link("local_p2")}, {"startChain": kept})]
+    assert first["rows"][0]["lineage"]["root_row"] == ""             # its kept chain unjudged
+    assert [(e["name"], note_codes(e)) for e in first["left_out"]] == [
+        ("local_c1.json", ["lineage_chain_dropped"])]
+    c1_before, c2_before = data_of(c1), data_of(c2)
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    assert data_of(c2) == {**c2_before, "spawnedFrom": tool_link("local_p2")}
+    assert data_of(c1) == c1_before
+    second = plan(env)
+    assert [(r["name"], r["new"]) for r in second["rows"]] == [
+        ("local_c1.json", {"startChain": {"firstSessionId": "local_r1", "depth": 2}})]
+    assert second["left_out"] == []
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    assert data_of(c1) == {**c1_before,
+                           "startChain": {"firstSessionId": "local_r1", "depth": 2}}
+    capsys.readouterr()
+    assert ct.cmd_relink(env, ns(apply=True)) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out.count("nothing to add") == 1 and out[-1] == "result  : unchanged"
+    assert len(ct.list_ops(env)) == 2
+
+
+# The contracts earlier reviews set for the apply, each pinned on its own.
+
+@pytest.mark.parametrize("key", ["live_asserted", "only", "account_filter"])
+@pytest.mark.parametrize("value", [7, None])
+def test_a_scope_the_plan_does_not_hold_as_a_string_refuses(
+        key, value, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    m[key] = value
+    before = raws(paths)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert str(exc.value) == (
+        "this plan's {0!r} is not a string, so the apply cannot repeat its scope under the "
+        "lock. Nothing was written - re-run to replan.".format(key))
+    assert ct.list_ops(env) == [] and raws(paths) == before and ct.read_lock(env) is None
+
+
+def test_the_apply_shape_checks_its_record_before_journaling_it(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    before = raws(paths)
+    seen = []
+
+    def damaged(record):
+        seen.append(record)
+        return "row 0 has no usable 'new'"
+    monkeypatch.setattr(ct, "_relink_shape_error", damaged)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert str(exc.value) == ("this relink's own record is damaged (row 0 has no usable 'new'); "
+                              "refusing rather than journal it or write from it. Nothing was "
+                              "written.")
+    assert len(seen) == 1 and seen[0] is m and names(m["rows"]) == ["local_c2.json",
+                                                                    "local_c3.json"]
+    assert ct.list_ops(env) == [] and raws(paths) == before and ct.read_lock(env) is None
+
+
+def test_the_row_reader_and_writer(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    r = dict(plan(env)["rows"][0])
+    roots = ct._retitle_roots(env)
+    assert ct._relink_read(r, roots) == ("present", data_of(paths["local_c2"]),
+                                         raw_of(paths["local_c2"]))
+    value = ct._relink_apply_new(data_of(paths["local_c2"]), r["new"])
+    assert ct._relink_put(r, value, roots, THEN) is True
+    assert raw_of(paths["local_c2"]) == ct._relink_row_bytes(value)
+    # a parse failure, a duplicate key and a non-object are unreadable, with their bytes
+    for body in (b"{not json", b'{"title": "A", "title": "B"}', b"[1]"):
+        with open(r["dest_path"], "wb") as fh:
+            fh.write(body)
+        assert ct._relink_read(r, roots) == ("unreadable", None, body)
+    os.unlink(r["dest_path"])
+    assert ct._relink_read(r, roots) == ("absent", None, None)
+    os.makedirs(r["dest_path"])                                  # an OSError on open
+    assert ct._relink_read(r, roots) == ("unreadable", None, None)
+    os.rmdir(r["dest_path"])
+    # containment first, for the writer as for the reader: nothing lands outside the roots
+    out = os.path.join(str(tmp_path), "x", A2, O2)
+    away = dict(r, dest_path=os.path.join(out, "local_c2.json"), store_path=out)
+    for call in (lambda: ct._relink_read(away, roots),
+                 lambda: ct._relink_put(away, value, roots, THEN)):
+        with pytest.raises(ct.LayoutError):
+            call()
+    assert not os.path.exists(out)
+
+
+def test_the_record_agrees_with_its_row_or_not(mkenv, tmp_path, write_transcript, write_row):
+    m = chain_plan(mkenv(tmp_path / "chain"), write_transcript, write_row)
+    r = m["rows"][0]                                  # local_c2 gains its link and chain
+    data = data_of(r["dest_path"])
+    assert ct._relink_row_agrees(r, data) is True
+    for other in (dict(data, startChain={"firstSessionId": "local_r2", "depth": 2}),  # an object
+                  dict(data, spawnedFrom=None),                    # the record says absent
+                  dict(data, cwd="C:/work/elsewhere")):            # the post hash differs
+        assert ct._relink_row_agrees(r, other) is False
+    assert ct._relink_row_agrees(dict(r, post_sha256="0" * 64), data) is False
+    # a non-object old value agrees only as the same value: False is not 0, though the post
+    # bytes are the same either way
+    env = mkenv(tmp_path / "false")
+    relink_store(env, write_transcript, write_row, local_c2={"spawnedFrom": False})
+    r = by_name(plan(env)["rows"])["local_c2.json"]
+    data = data_of(r["dest_path"])
+    assert r["old"] == {"spawnedFrom": {"present": True, "value": False}}
+    assert ct._relink_row_agrees(r, data) is True
+    assert ct._relink_row_agrees(r, dict(data, spawnedFrom=0)) is False
+    assert ct._relink_row_agrees(dict(r, old={"spawnedFrom": {"present": 1, "value": False}}),
+                                 data) is False
+    for bad in ({}, None, dict(r, old=[]), dict(r, new="x")):
+        assert ct._relink_row_agrees(bad, data) is False
+    assert ct._relink_row_agrees(r, None) is False
