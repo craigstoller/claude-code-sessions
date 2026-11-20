@@ -4295,7 +4295,10 @@ def test_forward_skips_a_repointed_row_landed_or_not(
     final, om = recover(env, op, "forward")
     assert final == "completed"
     r = om["rows"][i]
-    assert (r["skipped"], r["skip_detail"]) == ("repointed", "now opens another conversation")
+    # a landed link stays on the row, which is left unwritten, so neither undo nor a claim
+    # reaches it: the detail says so
+    assert (r["skipped"], r["skip_detail"]) == (
+        "repointed", THE_ROW_LEFT if landed else "now opens another conversation")
     assert r["written"] is False and raw_of(paths[stem]) == before
     assert ("spawnedFrom" in data_of(paths[stem])) is landed     # a landed link stays on it
     other = om["rows"][1 - i]
@@ -4735,6 +4738,151 @@ def test_every_route_passes_discovered_roots(
             ct.recover_op(env_r, stuck, direction)
         assert "store discovery failed: boom" in str(exc.value)
     assert seen == []
+
+
+@pytest.mark.parametrize("direction", ["forward", "back"])
+def test_recovery_refuses_a_row_the_app_wrote_after_it_was_read(
+        direction, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    # recovery reads before the guard, which runs only when a row will be written, so the
+    # app may have been running at the read and written the row as it closed
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows" if direction == "forward" else "relink-after-rows")
+    oid = op.manifest["op_id"]
+    c2, record = raw_of(paths["local_c2"]), manifest_raw(op)
+    real, flushed = ct._guard_mutation, []
+
+    def flush_then_guard(*a, **k):
+        if not flushed:                        # the app's last write, as it exits
+            set_keys(paths["local_c3"], lastFocusedAt=1_800_000_000_000)
+            flushed.append(raw_of(paths["local_c3"]))
+        return real(*a, **k)
+    monkeypatch.setattr(ct, "_guard_mutation", flush_then_guard)
+    assert recover_refusal(env, op, direction) == (
+        "row local_c3.json ({0}) changed while recovery read it, most likely the app writing "
+        "it as it closed. Nothing was changed. The op is left at 'writing' - run 'recover "
+        "--resolve {1} --{2} --apply' again; it goes on from what each row holds now.".format(
+            row_of(op, "local_c3")["label"], oid, direction))
+    monkeypatch.undo()
+    assert flushed and raw_of(paths["local_c3"]) == flushed[0]      # the app's bytes stand
+    assert raw_of(paths["local_c2"]) == c2 and manifest_raw(op) == record
+    assert ct.read_lock(env) is None
+    # run again, recovery reads the row afresh
+    final, om = recover(env, op, direction)
+    r3 = om["rows"][1]
+    if direction == "forward":
+        assert final == "completed" and r3["skipped"] == "changed_since_plan"
+        assert raw_of(paths["local_c3"]) == flushed[0]
+    else:
+        assert final == "rolled_back" and r3["restored"] is True
+        after = data_of(paths["local_c3"])
+        assert "spawnedFrom" not in after and after["lastFocusedAt"] == 1_800_000_000_000
+
+
+def test_back_refuses_while_a_record_that_cannot_be_read_claims_its_rows(
+        mkenv, tmp_path, write_transcript, write_row):
+    # such a record claims every key; a back that left them all and closed would strand
+    # them, since undo takes only a completed relink and back cannot run again
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    c2, c3 = row_of(op, "local_c2"), row_of(op, "local_c3")
+    # readable and finished, so D18 does not hold it; its rows cannot be read
+    put_op(env, OPEN_ID, '{"op_id": "x", "status": "completed", "rows": [5]}')
+    before, record = raws(paths), manifest_raw(op)
+    assert recover_refusal(env, op, "back") == (
+        "cannot roll back {0}: the record(s) in {1} cannot be read, so whether they wrote "
+        "row(s) local_c3.json ({2}), local_c2.json ({3}) after it cannot be told. No command "
+        "repairs a record: with the app closed, repair each one, or move its folder out of "
+        "the journal. Nothing was changed. The op is left at 'writing' - run 'recover "
+        "--resolve {0} --back --apply' again; it goes on from what each row holds now."
+        .format(oid, OPEN_ID, c3["label"], c2["label"]))
+    assert raws(paths) == before and manifest_raw(op) == record     # rolling_back not set
+    assert ct.read_lock(env) is None
+    shutil.rmtree(os.path.join(env.ops_dir, OPEN_ID))              # moved out by hand
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back" and [r["restored"] for r in om["rows"]] == [True, True]
+
+
+def test_back_refuses_while_the_journal_cannot_be_listed_for_the_claims(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    # the same stranding as a record that cannot be read: every key is claimed
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    target = op_of(env, oid)
+    real, calls = ct._relink_load_ops, []
+
+    def load(env):
+        # D18 lists the journal first; by the claims' turn it cannot be listed
+        calls.append(1)
+        if len(calls) > 1:
+            raise PermissionError(13, "Access is denied")
+        return real(env)
+    monkeypatch.setattr(ct, "_relink_load_ops", load)
+    before, record = raws(paths), manifest_raw(op)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._recover_relink(env, target, "back", [])
+    assert str(exc.value) == (
+        "cannot roll back {0}: the journal folder could not be listed ([Errno 13] Access is "
+        "denied), so whether a later operation wrote its rows cannot be told. Nothing was "
+        "changed. The op is left at 'writing' - run 'recover --resolve {0} --back --apply' "
+        "again; it goes on from what each row holds now.".format(oid))
+    assert len(calls) == 2
+    assert raws(paths) == before and manifest_raw(op) == record
+
+
+def test_a_later_back_drops_what_an_earlier_pass_left_on_a_row_it_restores(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    c3 = row_of(op, "local_c3")
+    landed = raw_of(paths["local_c3"])
+    write_raw(paths["local_c3"], "{not json")
+    with pytest.raises(SimulatedCrash):                  # at local_c2, after its write
+        recover(env, op, "back", hook=crash_on("relink-back-before-mark", 2))
+    om = op_of(env, oid).manifest
+    assert om["back_left"] == [entry(c3, "the row", "could not be read")]
+    assert "restored" not in om["rows"][1]
+    with open(paths["local_c3"], "wb") as fh:              # readable again
+        fh.write(landed)
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert om["back_left"] == [] and om["abort_reason"] == "back restored 2 row(s)"
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+
+
+def test_a_journaled_relink_closes_with_back(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    # the apply's refusal when 'writing' cannot be saved promises that back closes it
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    before = raws(paths, list(paths))
+    m = plan(env)
+    real = ct.set_status
+
+    def no_space(op, status):
+        if status == "writing":
+            raise OSError(28, "No space left on device")
+        return real(op, status)
+    monkeypatch.setattr(ct, "set_status", no_space)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.run_relink(env, m)
+    assert "{0} closes it".format(recover_hint(m["op_id"])) in str(exc.value)
+    monkeypatch.undo()
+    op = op_of(env, m["op_id"])
+    assert op.manifest["status"] == "journaled"
+    env.process_lister = lambda: APP_RUNNING        # it writes no row, so needs no guard
+    assert ct.classify_op(env, op)["resolutions"] == ["forward", "back"]
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back" and om["abort_reason"] == "back restored 0 row(s)"
+    assert "rolling_back" not in om and not any(r["written"] for r in om["rows"])
+    assert raws(paths, list(paths)) == before and ct.read_lock(env) is None
 
 
 # The recovery matrix: one journal row, local_c3, by its `written` flag and what a
