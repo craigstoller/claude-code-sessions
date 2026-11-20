@@ -20033,5 +20033,266 @@ def _public_relink_manifest(env, m):
     return out
 
 
+# The journal (Global Constraints, "Journal fields, verbatim"; D15): the
+# shape check undo and recovery run before they write anything back, and the
+# saver that journals rows as they land, under a byte budget.
+
+_RELINK_SHA_HEX = re.compile(r"[0-9a-f]{64}")
+_RELINK_SINCE_KEYS = ("changed", "dropped", "gained")
+_RELINK_LEFT_KEYS = ("name", "label", "what", "why")    # undo_left, back_left
+
+
+def _relink_count(v):
+    """An int, not a bool, of at least 0."""
+    return type(v) is int and v >= 0
+
+
+def _relink_entries_ok(v, keys):
+    """A list of objects, each with a string at every one of KEYS."""
+    return isinstance(v, list) and all(
+        isinstance(e, dict) and all(isinstance(e.get(k), str) for k in keys)
+        for e in v)
+
+
+def _relink_unknown_code(notes):
+    """The first code among NOTES, objects already checked to hold a string
+    code, that LINEAGE_PHRASES does not hold, or None."""
+    return next((n["code"] for n in notes if n["code"] not in LINEAGE_PHRASES),
+                None)
+
+
+def _relink_link_ok(v):
+    """The written link: exactly sessionId and taskId, non-empty strings."""
+    return (isinstance(v, dict) and set(v) == {"sessionId", "taskId"}
+            and all(isinstance(x, str) and x != "" for x in v.values()))
+
+
+def _relink_chain_ok(v):
+    """The written chain: exactly a non-empty string firstSessionId and a
+    depth that is an int (not a bool) of at least 1."""
+    return (isinstance(v, dict) and set(v) == {"firstSessionId", "depth"}
+            and isinstance(v["firstSessionId"], str)
+            and v["firstSessionId"] != ""
+            and type(v["depth"]) is int and v["depth"] >= 1)
+
+
+def _relink_old_ok(v):
+    """One `old` entry as _relink_apply_old reads it: exactly present, a
+    bool, and value, never an object, and None when the key was absent."""
+    return (isinstance(v, dict) and set(v) == {"present", "value"}
+            and isinstance(v["present"], bool)
+            and not isinstance(v["value"], dict)
+            and (v["present"] or v["value"] is None))
+
+
+def _relink_left_error(e):
+    """What is wrong with one left-out entry, as the end of a sentence, or
+    None."""
+    if not isinstance(e, dict):
+        return "is not an object"
+    for k in ("account", "name", "session_id"):
+        if not isinstance(e.get(k), str):
+            return "has no usable {0!r}".format(k)
+    notes = e.get("notes")
+    if not (isinstance(notes, list) and notes and all(
+            isinstance(n, dict) and isinstance(n.get("code"), str)
+            and isinstance(n.get("detail"), str) for n in notes)):
+        return "has no usable 'notes'"
+    code = _relink_unknown_code(notes)
+    if code is not None:
+        return "has a note {0!r} this version does not know".format(code)
+    return None
+
+
+def _relink_lineage_error(i, lin, new, kept):
+    """What is wrong with row I's `lineage` record, or None: 0.18.0's shape
+    (_lineage_record_error), and agreement with the row's NEW and KEPT keys
+    rather than with bytes, which the journal does not hold (D15). The parent
+    is the link's in NEW, else in KEPT; the root the chain's in NEW, else ""
+    or, for a chain KEPT judged or not, that chain's root. NEW and KEPT have
+    passed _relink_row_error's own checks, so one of them holds the link."""
+    where = "row {0}'s lineage".format(i)
+    bad = _lineage_record_error(lin, where)
+    if bad:
+        return bad
+    link = new["spawnedFrom"] if "spawnedFrom" in new else kept["spawnedFrom"]
+    if lin["parent_row"] == "" or lin["parent_row"] != link.get("sessionId"):
+        return "{0} parent_row does not agree with its 'new' and 'kept'".format(
+            where)
+    if "startChain" in new:
+        roots = (new["startChain"]["firstSessionId"],)
+    elif "startChain" in kept:
+        roots = ("", kept["startChain"].get("firstSessionId"))
+    else:
+        roots = ("",)
+    if lin["root_row"] not in roots:
+        return "{0} root_row does not agree with its 'new' and 'kept'".format(
+            where)
+    for row_k, session_k in (("parent_row", "parent_session"),
+                             ("root_row", "root_session")):
+        if (lin[row_k] == "") != (lin[session_k] == ""):
+            has, lacks = ((row_k, session_k) if lin[row_k] else
+                          (session_k, row_k))
+            return "{0} has a {1} and no {2}".format(where, has, lacks)
+    for k in ("parent_planned", "root_planned"):
+        if lin[k]:
+            return "{0} {1} is true, and a relink plans no row".format(where, k)
+    code = _relink_unknown_code(lin["notes"])
+    if code is not None:
+        return "{0} has a note {1!r} this version does not know".format(
+            where, code)
+    return None
+
+
+def _relink_row_error(i, r):
+    """What is wrong with row I of a relink record, as a sentence naming its
+    first damaged field, or None."""
+    if not isinstance(r, dict):
+        return "row {0} is not an object".format(i)
+    for k in ("account", "name", "dest_path", "store_path", "session_id"):
+        if not isinstance(r.get(k), str) or r[k] == "":
+            return "row {0} has no usable {1!r}".format(i, k)
+    for k in ("label", "title", "parent_title"):
+        if not isinstance(r.get(k), str):
+            return "row {0} has no usable {1!r}".format(i, k)
+    name, dest, store = r["name"], r["dest_path"], r["store_path"]
+    if not (name.endswith(".json")
+            and _LINEAGE_ROW_ID.fullmatch(name[:-len(".json")])
+            and os.path.basename(dest) == name):
+        return "row {0}'s 'name' is not the row file its 'dest_path' names" \
+            .format(i)
+    if _relink_store_key(store) != _relink_store_key(os.path.dirname(dest)):
+        return "row {0}'s 'store_path' is not the folder of its 'dest_path'" \
+            .format(i)
+    if os.path.basename(os.path.dirname(os.path.normpath(store))) \
+            != r["account"]:
+        return "row {0}'s 'account' is not the account folder of its " \
+            "'store_path'".format(i)
+    for k in ("pre_sha256", "post_sha256"):
+        if not isinstance(r.get(k), str) or not _RELINK_SHA_HEX.fullmatch(r[k]):
+            return "row {0} has no usable {1!r}".format(i, k)
+
+    new = r.get("new")
+    if not (isinstance(new, dict) and new and set(new) <= set(RELINK_KEYS)
+            and ("spawnedFrom" not in new or _relink_link_ok(new["spawnedFrom"]))
+            and ("startChain" not in new or _relink_chain_ok(new["startChain"]))):
+        return "row {0} has no usable 'new'".format(i)
+    old = r.get("old")
+    if not (isinstance(old, dict) and set(old) == set(new)
+            and all(_relink_old_ok(v) for v in old.values())):
+        return "row {0} has no usable 'old'".format(i)
+    kept = r.get("kept")
+    if not (isinstance(kept, dict) and set(kept) <= set(RELINK_KEYS)
+            and all(isinstance(v, dict) for v in kept.values())
+            and not set(kept) & set(new)):
+        return "row {0} has no usable 'kept'".format(i)
+    if "startChain" in new and "spawnedFrom" not in new \
+            and "spawnedFrom" not in kept:
+        return "row {0} adds a startChain with no spawnedFrom in its 'new' or " \
+            "'kept'".format(i)
+    bad = _relink_lineage_error(i, r.get("lineage"), new, kept)
+    if bad:
+        return bad
+
+    if not isinstance(r.get("written"), bool):
+        return "row {0} has no usable 'written'".format(i)
+    if "restored" in r and not isinstance(r["restored"], bool):
+        return "row {0} has no usable 'restored'".format(i)
+    if "skipped" in r:
+        if not (isinstance(r["skipped"], str)
+                and r["skipped"] in RELINK_SKIP_REASONS):
+            return "row {0} has no usable 'skipped'".format(i)
+        if not isinstance(r.get("skip_detail"), str):
+            return "row {0} has no usable 'skip_detail'".format(i)
+    if "back_keys" in r:
+        bk = r["back_keys"]
+        if not (isinstance(bk, list)
+                and all(isinstance(k, str) and k in new for k in bk)):
+            return "row {0} has no usable 'back_keys'".format(i)
+    return None
+
+
+def _relink_shape_error(m):
+    """A sentence naming the first damaged field of this relink record, or
+    None. NEVER RAISES: an unexpected exception is "its record could not be
+    read". Undo, recovery and classify_op call it before they act on a row,
+    and _relink_apply_old trusts every `old` entry a record it passed holds.
+
+    Every journal field (Global Constraints) is checked for its shape, and a
+    row's `lineage` against its `new` and `kept`. Whether a row's store is
+    one this version reads is the resolution gate's test (_unresolved_rows),
+    which those callers run before acting on a row, so this check reads no
+    env and nothing on disk."""
+    try:
+        if not isinstance(m, dict):
+            return "it is not an object"
+        fmt = m.get("lineage_format")
+        if type(fmt) is not int or fmt != 1:
+            return "its 'lineage_format' is not one this version reads"
+        if "lineage_cycles" in m and not _relink_count(m["lineage_cycles"]):
+            return "its 'lineage_cycles' is not a count"
+        rows = m.get("rows")
+        if not isinstance(rows, list) or not rows:
+            return "its 'rows' is not a non-empty list"
+        if "left_out" in m:
+            if not isinstance(m["left_out"], list):
+                return "its 'left_out' is not a list"
+            for i, e in enumerate(m["left_out"]):
+                bad = _relink_left_error(e)
+                if bad:
+                    return "its 'left_out' entry {0} {1}".format(i, bad)
+        if "since_plan" in m:
+            sp = m["since_plan"]
+            if not (isinstance(sp, dict) and set(sp) == set(_RELINK_SINCE_KEYS)
+                    and all(_relink_count(sp[k]) for k in _RELINK_SINCE_KEYS)):
+                return "its 'since_plan' is not a count of the changed, " \
+                    "dropped and gained rows"
+        if "rolling_back" in m and not isinstance(m["rolling_back"], bool):
+            return "its 'rolling_back' is not true or false"
+        if "back_restored" in m and not _relink_count(m["back_restored"]):
+            return "its 'back_restored' is not a count"
+        for k in ("undo_left", "back_left"):
+            if k in m and not _relink_entries_ok(m[k], _RELINK_LEFT_KEYS):
+                return "its {0!r} is not a list of entries with a name, " \
+                    "label, what and why".format(k)
+        for i, r in enumerate(rows):
+            bad = _relink_row_error(i, r)
+            if bad:
+                return bad
+        return None
+    except Exception:
+        return "its record could not be read"
+
+
+class _RelinkSaver:
+    """Saves an operation's record as its rows land, while the byte budget
+    lasts (D15, after sync's): one save is estimated once, as the indented
+    manifest's length plus 4096, and each tick spends that much on a save or,
+    once the budget no longer covers one, saves nothing. Its callers also
+    save on the way out and with every status change, so a tick past the
+    budget only coarsens the record, and the apply, recovery and undo read
+    the disk. THEN is the caller's next step, the text it gives _relink_put,
+    ending the refusal a failed save raises."""
+
+    def __init__(self, op, budget=None, then=""):
+        self.op = op
+        self.then = then
+        self.per_save = len(json.dumps(op.manifest, indent=1)) + 4096
+        self.left = RELINK_JOURNAL_BYTE_BUDGET if budget is None else budget
+
+    def tick(self):
+        """Save the record when the budget still covers one save. An OSError
+        from the save is a Refusal, never a traceback."""
+        if self.left < self.per_save:
+            return
+        self.left -= self.per_save
+        try:
+            save_manifest(self.op)
+        except OSError as exc:
+            raise Refusal("could not save the operation record in {0} ({1}). "
+                          .format(self.op.op_dir, str(exc) or repr(exc))
+                          + self.then)
+
+
 if __name__ == "__main__":
     sys.exit(main())
