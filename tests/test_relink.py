@@ -1551,3 +1551,282 @@ def test_a_title_equal_to_a_schema_value_corrupts_neither_report(
     assert "links   : 1 to add, 1 left out (no row for the parent in that account 1)" in lines
     assert any(re.fullmatch("   local_c2  '{0}'   link under '{0}'".format(SESSION_LABEL), ln)
                for ln in lines)
+
+
+# --------------------------------------------------------------- the journal
+# Task 5: the shape check undo and recovery trust before they write anything
+# back, and the saver that journals rows on a byte budget (D15).
+
+THEN = "The op is left at 'writing' - run 'claude-code-sessions recover' to finish it."
+
+
+def chain_plan(env, write_transcript, write_row):
+    """The plan of the chain store: local_c2 gains its link and chain (A2), local_c3, which
+    keeps side_link('local_p3'), its chain only (A3)."""
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    m = plan(env)
+    assert [(r["name"], list(r["new"]), list(r["kept"])) for r in m["rows"]] == [
+        ("local_c2.json", ["spawnedFrom", "startChain"], []),
+        ("local_c3.json", ["startChain"], ["spawnedFrom"])]
+    return m
+
+
+def outside_plan(env, write_transcript, write_row):
+    """The plan of Task 2's "outside the record" store: local_c2 gains its link and keeps a
+    chain no holder judged. Returns (plan, local_c2's row)."""
+    kept = {"firstSessionId": "local_r2", "depth": 5}
+    relink_store(env, write_transcript, write_row, roots=True, local_c2={"startChain": kept})
+    m = plan(env)
+    c2 = by_name(m["rows"])["local_c2.json"]
+    assert c2["kept"] == {"startChain": kept} and list(c2["new"]) == ["spawnedFrom"]
+    assert c2["lineage"]["root_row"] == "" == c2["lineage"]["root_session"]
+    return m, c2
+
+
+def test_a_planned_manifest_passes_the_shape_check(mkenv, tmp_path, write_transcript, write_row):
+    m = chain_plan(mkenv(tmp_path / "chain"), write_transcript, write_row)
+    assert ct._relink_shape_error(m) is None
+    # Task 2's non-string-title store
+    env = mkenv(tmp_path / "titles")
+    relink_store(env, write_transcript, write_row, local_c2={"title": 5},
+                 local_p2={"title": None})
+    m = plan(env)
+    assert by_name(m["rows"])["local_c2.json"]["title"] == ""
+    assert ct._relink_shape_error(m) is None
+    # Task 2's two-parent-rows store: the kept link's record names the kept target
+    env = mkenv(tmp_path / "two")
+    relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                 local_c3={"spawnedFrom": side_link("local_p3")})
+    put_row(env, write_row, A3, "local_p3b", LP, "Northwind kickoff, later copy",
+            lastActivityAt=1_756_000_000_000)
+    m = plan(env)
+    assert by_name(m["rows"])["local_c3.json"]["lineage"]["parent_row"] == "local_p3"
+    assert ct._relink_shape_error(m) is None
+    # a non-object old value, here a list, is journaled as it stood
+    env = mkenv(tmp_path / "list")
+    relink_store(env, write_transcript, write_row, local_c2={"spawnedFrom": []})
+    m = plan(env)
+    assert by_name(m["rows"])["local_c2.json"]["old"] == {
+        "spawnedFrom": {"present": True, "value": []}}
+    assert ct._relink_shape_error(m) is None
+
+
+def test_a_link_only_row_that_keeps_an_unjudged_chain_passes(
+        mkenv, tmp_path, write_transcript, write_row):
+    m, _ = outside_plan(mkenv(tmp_path), write_transcript, write_row)
+    assert ct._relink_shape_error(m) is None
+
+
+def test_a_kept_chain_record_may_name_it_or_not(mkenv, tmp_path, write_transcript, write_row):
+    m, c2 = outside_plan(mkenv(tmp_path), write_transcript, write_row)
+    assert ct._relink_shape_error(m) is None                       # root_row ""
+    c2["lineage"]["root_row"] = "local_r2"                         # the kept chain's own
+    c2["lineage"]["root_session"] = LR
+    assert ct._relink_shape_error(m) is None
+    c2["lineage"]["root_row"] = "local_r9"
+    bad = ct._relink_shape_error(m)
+    assert isinstance(bad, str) and "lineage" in bad
+
+
+@pytest.mark.parametrize("damage, named", [
+    (lambda m: m["rows"][0].__setitem__("old", []), "'old'"),
+    (lambda m: m["rows"][0]["old"]["spawnedFrom"].__setitem__("value", {}), "'old'"),
+    (lambda m: m["rows"][0]["new"].__setitem__("cwd", "C:\\x"), "'new'"),
+    (lambda m: m["rows"][0]["new"]["spawnedFrom"].__setitem__("title", "N"), "'new'"),
+    (lambda m: m["rows"][0]["kept"].__setitem__("spawnedFrom", {}), "'kept'"),
+    (lambda m: m["rows"][0]["lineage"].__setitem__("parent_row", "local_p9"), "lineage"),
+    (lambda m: m["rows"][0].__setitem__("pre_sha256", "xyz"), "'pre_sha256'"),
+    (lambda m: m["rows"][0].__setitem__("title", 5), "'title'"),
+    (lambda m: m["rows"][0].__setitem__("written", "yes"), "'written'"),
+    (lambda m: m["rows"][0].__setitem__("restored", 1), "'restored'"),
+    (lambda m: m["rows"][0].__setitem__("skipped", "because"), "'skipped'"),
+    (lambda m: m["rows"][0].__setitem__("name", "..\\x.json"), "'name'"),
+    (lambda m: m.__setitem__("lineage_format", 2), "lineage_format"),
+    (lambda m: m.__setitem__("rows", ["x"]), "row 0"),
+    (lambda m: m["rows"][0]["lineage"].__setitem__("parent_session", ""), "lineage"),
+    (lambda m: m["rows"][0]["lineage"]["notes"].append({"code": "made_up", "detail": "x"}),
+     "lineage"),
+    (lambda m: m["rows"][0].__setitem__("store_path", m["rows"][1]["store_path"]),
+     "'store_path'"),
+    (lambda m: m["rows"][0].__setitem__("account", m["rows"][1]["account"]), "'account'"),
+    (lambda m: m.__setitem__("since_plan", {"changed": True, "dropped": 0, "gained": 0}),
+     "since_plan"),
+    (lambda m: m.__setitem__("rolling_back", "yes"), "rolling_back"),
+    (lambda m: m.__setitem__("back_restored", True), "back_restored"),
+    (lambda m: m.__setitem__("back_left", [{"name": "local_c2.json"}]), "back_left"),
+])
+def test_damaged_fields_are_named(damage, named, mkenv, tmp_path, write_transcript, write_row):
+    m = chain_plan(mkenv(tmp_path), write_transcript, write_row)
+    damage(m)
+    bad = ct._relink_shape_error(m)
+    assert isinstance(bad, str) and named in bad, bad
+
+
+def _left(**changes):
+    e = {"account": A1, "label": "x", "name": "local_c9.json", "session_id": LC, "title": "",
+         "notes": [{"code": "own_link_differs", "detail": "x"}]}
+    e.update(changes)
+    return e
+
+
+# The checks the list above does not reach, each by a damage of its own.
+@pytest.mark.parametrize("damage, named", [
+    (lambda m: m.__setitem__("lineage_cycles", -1), "lineage_cycles"),
+    (lambda m: m.__setitem__("lineage_cycles", True), "lineage_cycles"),
+    (lambda m: m.__setitem__("lineage_format", True), "lineage_format"),
+    (lambda m: m.__setitem__("rows", []), "'rows'"),
+    (lambda m: m.__setitem__("left_out", {}), "left_out"),
+    (lambda m: m.__setitem__("left_out", ["x"]), "left_out"),
+    (lambda m: m.__setitem__("left_out", [_left(session_id=None)]), "left_out"),
+    (lambda m: m.__setitem__("left_out", [_left(notes=[])]), "left_out"),
+    (lambda m: m.__setitem__("left_out", [_left(notes=[{"code": "own_link_differs"}])]),
+     "left_out"),
+    (lambda m: m.__setitem__("left_out", [_left(notes=[{"code": "made_up", "detail": "x"}])]),
+     "left_out"),
+    (lambda m: m.__setitem__("since_plan", {"changed": 0, "dropped": 0}), "since_plan"),
+    (lambda m: m.__setitem__("since_plan", {"changed": -1, "dropped": 0, "gained": 0}),
+     "since_plan"),
+    (lambda m: m.__setitem__("back_restored", -1), "back_restored"),
+    (lambda m: m.__setitem__("undo_left", [{"name": "local_c2.json", "label": "x",
+                                            "what": "spawnedFrom"}]), "undo_left"),
+    (lambda m: m.__setitem__("undo_left", {}), "undo_left"),
+    (lambda m: m["rows"][0].__setitem__("session_id", ""), "'session_id'"),
+    (lambda m: m["rows"][0].__setitem__("dest_path", ""), "'dest_path'"),
+    (lambda m: m["rows"][0].__setitem__("label", None), "'label'"),
+    (lambda m: m["rows"][0].__setitem__("parent_title", None), "'parent_title'"),
+    (lambda m: m["rows"][0].__setitem__("name", "local_c9.json"), "'name'"),
+    (lambda m: m["rows"][0].__setitem__("name", "local_c2.txt"), "'name'"),
+    (lambda m: m["rows"][0].__setitem__("post_sha256",
+                                        m["rows"][0]["post_sha256"].upper()), "'post_sha256'"),
+    (lambda m: m["rows"][0].__setitem__("new", {}), "'new'"),
+    (lambda m: m["rows"][0]["new"]["spawnedFrom"].__setitem__("taskId", ""), "'new'"),
+    (lambda m: m["rows"][0]["new"]["startChain"].__setitem__("depth", True), "'new'"),
+    (lambda m: m["rows"][0]["new"]["startChain"].__setitem__("depth", 0), "'new'"),
+    (lambda m: m["rows"][0]["new"]["startChain"].__setitem__("title", "N"), "'new'"),
+    (lambda m: m["rows"][0]["old"]["spawnedFrom"].__setitem__("present", 1), "'old'"),
+    (lambda m: m["rows"][0]["old"]["spawnedFrom"].__setitem__("value", "x"), "'old'"),
+    (lambda m: m["rows"][0]["old"]["spawnedFrom"].__setitem__("was", None), "'old'"),
+    (lambda m: m["rows"][0]["old"].__delitem__("startChain"), "'old'"),
+    (lambda m: m["rows"][0]["old"].__setitem__("spawnedFrom", None), "'old'"),
+    (lambda m: m["rows"][0]["kept"].__setitem__("cwd", {}), "'kept'"),
+    (lambda m: m["rows"][1]["kept"].__setitem__("spawnedFrom", "local_p3"), "'kept'"),
+    (lambda m: m["rows"][1].__setitem__("kept", {}), "'kept'"),
+    (lambda m: m["rows"][0].__setitem__("lineage", "x"), "lineage"),
+    (lambda m: m["rows"][0]["lineage"].__setitem__("root_row", ""), "lineage"),
+    (lambda m: m["rows"][0]["lineage"].__setitem__("root_session", ""), "lineage"),
+    (lambda m: m["rows"][0]["lineage"].__setitem__("root_planned", True), "lineage"),
+    (lambda m: m["rows"][1]["lineage"].__setitem__("parent_row", "local_p9"), "lineage"),
+    (lambda m: m["rows"][1]["lineage"].__setitem__("root_row", "local_r9"), "lineage"),
+    (lambda m: m["rows"][0].__delitem__("written"), "'written'"),
+    (lambda m: m["rows"][0].__setitem__("skipped", "gone"), "'skip_detail'"),
+    (lambda m: m["rows"][0].__setitem__("skipped", ["gone"]), "'skipped'"),
+    (lambda m: m["rows"][0].__setitem__("back_keys", ["cwd"]), "'back_keys'"),
+    (lambda m: m["rows"][0].__setitem__("back_keys", [["spawnedFrom"]]), "'back_keys'"),
+    (lambda m: m["rows"][1].__setitem__("back_keys", ["spawnedFrom"]), "'back_keys'"),
+])
+def test_every_other_checked_field_is_named(
+        damage, named, mkenv, tmp_path, write_transcript, write_row):
+    m = chain_plan(mkenv(tmp_path), write_transcript, write_row)
+    damage(m)
+    bad = ct._relink_shape_error(m)
+    assert isinstance(bad, str) and named in bad, bad
+    assert bad != "its record could not be read", "a damage the checks name, not the fallback"
+
+
+def test_the_later_fields_pass_when_well_formed(mkenv, tmp_path, write_transcript, write_row):
+    m = chain_plan(mkenv(tmp_path), write_transcript, write_row)
+    entry = {"name": "local_c2.json", "label": "x", "what": "spawnedFrom",
+             "why": "the app changed it since"}
+    m.update(since_plan={"changed": 0, "dropped": 1, "gained": 0}, rolling_back=True,
+             back_restored=0, undo_left=[entry], back_left=[], op_id=OPEN_ID,
+             status="writing", history=[])
+    m["rows"][0].update(written=True, restored=False, skipped="gone",
+                        skip_detail="gone from the store", back_keys=["startChain"])
+    m["rows"][0]["old"]["spawnedFrom"] = {"present": True, "value": False}
+    m["left_out"] = [_left()]
+    assert ct._relink_shape_error(m) is None
+
+
+def test_the_shape_check_never_raises(mkenv, tmp_path, write_transcript, write_row):
+    class Boom(dict):
+        def get(self, *a):
+            raise RuntimeError("boom")
+
+        def __getitem__(self, k):
+            raise RuntimeError("boom")
+
+    for m in ({}, None, [], "x", {"lineage_format": 1, "rows": None},
+              {"lineage_format": 1, "rows": [{}]}):
+        assert isinstance(ct._relink_shape_error(m), str)
+    m = chain_plan(mkenv(tmp_path), write_transcript, write_row)
+    m["rows"][0]["lineage"] = "x"
+    assert isinstance(ct._relink_shape_error(m), str)
+    m["rows"] = None
+    assert isinstance(ct._relink_shape_error(m), str)
+    assert ct._relink_shape_error(Boom(lineage_format=1)) == "its record could not be read"
+    m = chain_plan(mkenv(tmp_path / "again"), write_transcript, write_row)
+    m["rows"][0] = Boom(m["rows"][0])
+    assert ct._relink_shape_error(m) == "its record could not be read"
+
+
+def _no_b64_keys(x):
+    if isinstance(x, dict):
+        return all(not str(k).endswith("_b64") and _no_b64_keys(v) for k, v in x.items())
+    if isinstance(x, list):
+        return all(_no_b64_keys(v) for v in x)
+    return True
+
+
+def test_the_journal_holds_no_row_images_and_a_row_costs_a_bounded_size(
+        mkenv, tmp_path, write_transcript, write_row):
+    # Why 60 and not the design's 931: the bound is per row, so a row of 135 KB costing under
+    # 3 KB is what scales to 931 rows (under 3 MB, against about 126 MB of row bytes), and 60
+    # rows prove it without 15 MB of fixtures in every suite run.
+    env = mkenv(tmp_path)
+    write_transcript(env, "C--p", LP, t_entries())
+    put_row(env, write_row, A1, "local_p1", LP, "Northwind kickoff")
+    put_row(env, write_row, A2, "local_p2", LP, "Northwind kickoff")
+    filler = "FILLER" * (16 * 1024 // 6)
+    for n in range(1, 61):
+        kid = "0ccc{0:04x}-2222-4000-8000-00000000000c".format(n)       # LC-like; fake
+        put_row(env, write_row, A1, "local_1aaa{0:04x}-0000-4000-8000-000000000001".format(n),
+                kid, "ACME-REVIEW side task", spawnedFrom=side_link("local_p1"))
+        put_row(env, write_row, A2, "local_2bbb{0:04x}-0000-4000-8000-000000000002".format(n),
+                kid, "ACME-REVIEW side task", filler=filler)
+    m = plan(env)
+    assert len(m["rows"]) == 60 and {r["account"] for r in m["rows"]} == {A2}
+    assert ct._relink_shape_error(m) is None
+    for r in m["rows"]:
+        assert len(json.dumps(r, indent=1).encode()) < 3072
+    dump = json.dumps(m, indent=1)
+    assert len(dump.encode()) < 60 * 3072
+    assert "FILLER" not in dump
+    assert _no_b64_keys(m["rows"])
+
+
+def test_the_saver_saves_per_row_while_the_budget_lasts(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    op = ct.new_op(env, plan(env))
+    saves = []
+    monkeypatch.setattr(ct, "save_manifest", saves.append)
+    per_save = len(json.dumps(op.manifest, indent=1)) + 4096
+    saver = ct._RelinkSaver(op, budget=2 * per_save, then=THEN)
+    assert (saver.per_save, saver.left) == (per_save, 2 * per_save)
+    for _ in range(5):
+        saver.tick()
+    assert saves == [op, op] and saver.left == 0
+    # with no budget given, the module's figure is read when the saver is made
+    monkeypatch.setattr(ct, "RELINK_JOURNAL_BYTE_BUDGET", 3 * per_save)
+    assert ct._RelinkSaver(op).left == 3 * per_save
+
+    def refuse(o):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(ct, "save_manifest", refuse)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._RelinkSaver(op, then=THEN).tick()
+    msg = str(exc.value)
+    assert msg.startswith("could not save the operation record in {0} (".format(op.op_dir))
+    assert "Permission denied" in msg and msg.endswith(". " + THEN)
