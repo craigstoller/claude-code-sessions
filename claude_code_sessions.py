@@ -1409,8 +1409,11 @@ def rotate_ops(env):
     # Retitle ops carry the same exposure since 0.11.0: their undo/back
     # ownership rule (_retitle_claimed_elsewhere) reads other ops' journals
     # for the same dest_path, so a terminal claimant is evidence there too.
-    # Realign's (_realign_claimed_later) reads them the same way.
-    claimants = ("sync", "retitle", "realign")
+    # Realign's (_realign_claimed_later) reads them the same way. A relink
+    # is both sides at once (spec D13): its back reads other ops' journals
+    # through _relink_claims, and a retitle's back reads a relink's through
+    # _retitle_claimed_elsewhere.
+    claimants = ("sync", "retitle", "realign", "relink")
     live = set()
     for o in ops:
         om = o.manifest
@@ -10656,6 +10659,16 @@ def _repoint_claimed_later(env, m, r):
     operation's work. So the question is not "who went last" but "can we prove
     these bytes are ours" - and if another op wrote the same row, we cannot.
 
+    A relink is the one exception (spec D13 and its Integration section). It
+    sets two keys on a row it found and leaves every other byte as it was, so
+    a relink EARLIER than this repoint wrote the very bytes this repoint then
+    read as its pre-image: counting it would decline every rollback of a
+    repoint of a relinked row, for good. So a relink counts only when it is
+    later than this repoint, not undone or rolled back, and its row is not
+    marked `restored` and is `written` (or the relink is unfinished). Its
+    branch reads it before any status filter, in a try of its own: a relink
+    record that cannot be read that far is a claim, never the None below.
+
     Never raises - every caller is on a path that must terminate.
     """
     try:
@@ -10664,7 +10677,30 @@ def _repoint_claimed_later(env, m, r):
         for o in list_ops(env):
             om = o.manifest
             oid = om.get("op_id") or ""
-            if oid == mine or om.get("status") not in TERMINAL:
+            if oid == mine:
+                continue
+            if om.get("op_type") == "relink":
+                try:
+                    later = _op_sort_key(om) > _op_sort_key(m)
+                    orows = om.get("rows")
+                    if not isinstance(orows, list) or not all(
+                            isinstance(x, dict) and isinstance(x.get("dest_path"), str)
+                            for x in orows):
+                        return oid
+                    if not later or om.get("status") in ("undone", "rolled_back"):
+                        continue
+                    unfinished = om.get("status") in NONTERMINAL
+                    for orow in orows:
+                        if orow.get("restored") is True:
+                            continue
+                        if not (orow.get("written") or unfinished):
+                            continue
+                        if os.path.normcase(os.path.abspath(orow["dest_path"])) == dest:
+                            return oid
+                except Exception:
+                    return oid
+                continue
+            if om.get("status") not in TERMINAL:
                 continue
             for orow in om.get("rows") or []:
                 p = orow.get("dest_path")
@@ -12520,6 +12556,17 @@ def _retitle_claimed_elsewhere(env, m, r):
     previous op's post-image, and that previous op must then still be
     undoable.
 
+    A relink journals no row images, only the sha256 of the bytes it wrote
+    (spec D15), so its rows are compared by post_sha256, in a branch of their
+    own (spec D13 and its Integration section). A relink earlier than this
+    retitle is passed over: it wrote the bytes this retitle then read as its
+    pre-image, and a later retitle that left the same bytes would otherwise
+    wait on it while it waits on the retitle, forever. So is one undone or
+    rolled back, as the loop below passes over any withdrawn op, and a row it
+    marked `restored`. The branch runs before that loop's status filter, in
+    a try of its own: a relink record that cannot be read that far is a
+    claim, never the None below.
+
     Never raises - every caller is on a path that must terminate.
     """
     try:
@@ -12530,6 +12577,28 @@ def _retitle_claimed_elsewhere(env, m, r):
             om = o.manifest
             oid = om.get("op_id") or ""
             if oid == mine:
+                continue
+            if om.get("op_type") == "relink":
+                try:
+                    earlier = _op_sort_key(om) < _op_sort_key(m)
+                    orows = om.get("rows")
+                    if not isinstance(orows, list) or not all(
+                            isinstance(x, dict) and isinstance(x.get("dest_path"), str)
+                            for x in orows):
+                        return oid
+                    if earlier or om.get("status") in ("undone", "rolled_back"):
+                        continue
+                    digest = hashlib.sha256(post).hexdigest()
+                    for orow in orows:
+                        if orow.get("restored") is True or not orow.get("written"):
+                            continue
+                        if os.path.normcase(os.path.abspath(orow["dest_path"])) != dest:
+                            continue
+                        theirs = orow.get("post_sha256")
+                        if not isinstance(theirs, str) or theirs == digest:
+                            return oid
+                except Exception:
+                    return oid
                 continue
             if om.get("status") in ("undone", "rolled_back"):
                 continue                     # claim withdrawn
@@ -13852,7 +13921,12 @@ def _realign_claimed_later(env, m, r):
     op id), or None. Realign's post-image is a function of the store, so
     bytes prove nothing: ownership goes by row path and journal order. A
     total order, so of two operations journaled in the same instant exactly
-    one is later and neither can lock the other out. Never raises."""
+    one is later and neither can lock the other out. A relink is passed over
+    on its type, before its sort key or any of its rows is read: it sets
+    only spawnedFrom and startChain, never a key realign writes (spec D13's
+    per-key exception), so even a damaged relink record claims nothing here,
+    and cannot reach the except below to hide a later claimant. Never
+    raises."""
     try:
         mine = m.get("op_id") or ""
         my_key = _op_sort_key(m)
@@ -13860,6 +13934,8 @@ def _realign_claimed_later(env, m, r):
         for o in list_ops(env):
             om = o.manifest
             oid = om.get("op_id") or ""
+            if om.get("op_type") == "relink":
+                continue
             if oid == mine or om.get("status") in ("undone", "rolled_back"):
                 continue
             if _op_sort_key(om) <= my_key:
@@ -20613,6 +20689,123 @@ def cmd_relink(env, ns):
         else:
             say("nothing to add")
     return code
+
+
+# The claims (spec D13): which of a relink's rows a later live operation owns,
+# so undo refuses and recovery's back leaves the claimed keys. Every record is
+# read on its own and fails closed without crashing. The other operations'
+# own checks learn relink beside their code: _retitle_claimed_elsewhere,
+# _repoint_claimed_later and _realign_claimed_later, and rotate_ops keeps a
+# relink a live claimant names.
+
+_RELINK_CLAIM_UNREADABLE = "its record cannot be read"
+
+
+def _relink_claims(env, m, rows):
+    """D13: [{"row": r, "op_id": str, "keys": set, "why": str}], one entry per
+    row of ROWS (rows of relink op M) and operation claiming it, KEYS the
+    claimed subset of r["new"]. NEVER RAISES.
+
+    A journal folder that does not exist claims nothing; one that exists and
+    cannot be listed claims every row asked about, with op_id "" and a `why`
+    naming the listing error (D18 refuses that journal before undo or
+    recovery asks). Each operation other than M's own, by these rules in
+    this order:
+    - a record that cannot be read, or whose rows are not a list of objects
+      with string paths (by _journal_rows' path for its type): every row, all
+      keys, `why` _RELINK_CLAIM_UNREADABLE;
+    - earlier than M (a sort key that cannot be computed counts as later),
+      undone or rolled back (a relink included, whatever its rows' restored),
+      or a realign (it writes other keys): nothing;
+    - a relink: per row naming the same file, not `restored` and `written`
+      or the relink unfinished, the keys of its new and kept among r["new"],
+      when any (a chain it wrote relies on the link it kept);
+    - a move or an undo: every row it names, all keys (it rewrites each one
+      and records no flag);
+    - any other: per row naming the same file, `written` or the operation
+      unfinished, all keys."""
+    try:
+        asked = []
+        for r in rows:
+            new = r.get("new") if isinstance(r, dict) else None
+            keys = set(new) if isinstance(new, dict) else set()
+            try:
+                p = r.get("dest_path")
+                where = os.path.normcase(os.path.abspath(p)) if isinstance(p, str) else None
+            except Exception:
+                where = None
+            asked.append((r, where, keys))
+    except Exception:
+        return []
+    if not asked:
+        return []
+    at_path = {}                            # a normalised path -> its indexes in asked
+    for i, (_r, where, _keys) in enumerate(asked):
+        if where is not None:
+            at_path.setdefault(where, []).append(i)
+    mine = m.get("op_id") if isinstance(m, dict) else None
+    mine = mine if isinstance(mine, str) else ""
+    try:
+        loaded = _relink_load_ops(env)
+    except Exception as exc:
+        why = "the journal folder could not be listed ({0})".format(str(exc) or repr(exc))
+        return [{"row": r, "op_id": "", "keys": set(keys), "why": why}
+                for r, _where, keys in asked]
+    out = []
+    for folder, om in loaded:
+        # _relink_load_ops gives a record read only with a non-empty op_id;
+        # one that could not be read is known by its folder, named by its id.
+        oid = om["op_id"] if om is not None else folder
+        if oid == mine:
+            continue
+        try:
+            found = _journal_rows(om) if om is not None else []
+            rows_of = om.get("rows") if om is not None else None
+            damaged = not (isinstance(rows_of, list) and len(found) == len(rows_of)
+                           and all(isinstance(p, str) for _r, p, _s in found))
+        except Exception:
+            damaged = True
+        claimed = {}                        # an index in asked -> its claimed keys
+        if not damaged:
+            try:
+                try:
+                    later = _op_sort_key(om) > _op_sort_key(m)
+                except Exception:
+                    later = True
+                kind = om.get("op_type", "move")
+                status = om.get("status")
+                if not later or status in ("undone", "rolled_back") or kind == "realign":
+                    continue
+                unfinished = status in NONTERMINAL
+                for orow, p, _s in found:
+                    for i in at_path.get(os.path.normcase(os.path.abspath(p)), ()):
+                        keys = asked[i][2]
+                        if kind == "relink":
+                            if orow.get("restored") is True \
+                                    or not (orow.get("written") or unfinished):
+                                continue
+                            onew, okept = orow.get("new"), orow.get("kept")
+                            if isinstance(onew, dict) and isinstance(okept, dict):
+                                got = (set(onew) | set(okept)) & keys
+                            else:
+                                got = set(keys)    # which keys it holds cannot be told
+                        elif kind in ("move", "undo") or orow.get("written") \
+                                or unfinished:
+                            got = set(keys)
+                        else:
+                            continue
+                        if got:
+                            claimed[i] = claimed.get(i, set()) | got
+            except Exception:
+                damaged = True
+        if damaged:
+            claimed = {i: set(keys) for i, (_r, _w, keys) in enumerate(asked)}
+        why = (_RELINK_CLAIM_UNREADABLE if damaged
+               else "operation {0} wrote it since".format(oid))
+        for i in sorted(claimed):
+            out.append({"row": asked[i][0], "op_id": oid, "keys": claimed[i],
+                        "why": why})
+    return out
 
 
 if __name__ == "__main__":
