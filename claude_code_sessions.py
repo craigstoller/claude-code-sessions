@@ -5987,8 +5987,10 @@ def cmd_undo(env, ns):
     # "converge", "realign", "relink" (or missing, which in practice never
     # happens - every manifest sets op_type) - is eligible as "the operation
     # to undo". A realign undo can be partial (per conversation, D5): the op
-    # stays 'completed' and stays the candidate, so a re-run retries the rest;
-    # an interrupted relink undo stays 'completed' too, and resumes the same way.
+    # stays 'completed' and stays the candidate, so a re-run retries the rest.
+    # An interrupted relink undo stays 'completed' too, and its refusal names
+    # 'undo --id <op_id> --apply' to resume it: a later operation may be the
+    # candidate by then.
     # A completed *undo* op is itself
     # terminal from cmd_undo's point of view - plan_undo always refuses an
     # undo-of-undo ("to redo, run move again") - so selecting one here would
@@ -20341,8 +20343,9 @@ def _relink_shape_error(m):
     read". Undo, recovery and classify_op call it before they act on a row,
     and _relink_apply_old trusts every `old` entry a record it passed holds.
 
-    Every journal field (Global Constraints) is checked for its shape, and a
-    row's `lineage` against its `new` and `kept`. Whether a row's store is
+    Every journal field (Global Constraints) is checked for its shape, a
+    row's `lineage` against its `new` and `kept`, and no two rows may name
+    one file. Whether a row's store is
     one this version reads is the resolution gate's test (_unresolved_rows),
     which those callers run before acting on a row, so this check reads no
     env and nothing on disk."""
@@ -20382,6 +20385,18 @@ def _relink_shape_error(m):
             bad = _relink_row_error(i, r)
             if bad:
                 return bad
+        # One row per file: undo and back build each row's write from one
+        # read taken before any write, so a second row naming the same file
+        # would put the first's keys back at new and both would be marked
+        # restored. The plan never journals two (one row per account and
+        # name), so only an edited record holds them.
+        seen = {}
+        for i, r in enumerate(rows):
+            where = os.path.normcase(os.path.abspath(r["dest_path"]))
+            if where in seen:
+                return "row {0}'s 'dest_path' names the same file as row {1}'s" \
+                    .format(i, seen[where])
+            seen[where] = i
         return None
     except Exception:
         return "its record could not be read"
@@ -20891,8 +20906,12 @@ def _relink_claims(env, m, rows):
 # anything is written. `restored` means no key the relink wrote is left at its
 # new value on the row.
 
-_RELINK_UNDO_THEN = ("The relink stays 'completed' - run 'undo --apply' again "
-                     "to resume it.")
+def _relink_undo_then(op_id):
+    """Undo's next step after a refusal mid-way. It names the op: a plain
+    'undo --apply' takes the latest completed operation, which may be
+    another one."""
+    return ("The relink stays 'completed' - run 'undo --id {0} --apply' again "
+            "to resume it.".format(op_id))
 
 
 def _relink_left_entry(r, what, why):
@@ -20980,7 +20999,8 @@ def undo_relink(env, op):
     restored, in journal order: its keys still at new go back to old, and
     whatever it leaves is appended to undo_left before its restored mark.
     A failed write or verify stops the undo with the rows done so far kept
-    on disk, and 'undo --apply' again resumes it from what each row holds.
+    on disk, and 'undo --id <op_id> --apply' again resumes it from what each
+    row holds.
     Returns "undone"; a relink undone claims nothing (D13). Containment
     roots come from discovery, fresh, never from the journal."""
     m = op.manifest
@@ -21022,14 +21042,14 @@ def undo_relink(env, op):
             if state == "unreadable":
                 raise Refusal("could not read row {0} ({1}), so nothing was "
                               "changed; the relink stays 'completed' and 'undo "
-                              "--apply' resumes it once the row can be read."
-                              .format(r["name"], r["label"]))
+                              "--id {2} --apply' resumes it once the row can be "
+                              "read.".format(r["name"], r["label"], m["op_id"]))
             work.append((r, data) + _relink_undo_disposition(r, state, data))
         claims = _relink_claims(env, m, todo)
         if claims:
             raise Refusal(_relink_undo_claims_refusal(m["op_id"], claims))
         left = m.setdefault("undo_left", [])
-        then = _RELINK_UNDO_THEN
+        then = _relink_undo_then(m["op_id"])
         saver = _RelinkSaver(op, then=then)
         try:
             for r, data, back, entries, stays in work:
@@ -21043,8 +21063,8 @@ def undo_relink(env, op):
                         raise LayoutError(
                             "verify failed restoring row {0}: the row on disk is "
                             "not the row read with relink's keys put back. 'undo "
-                            "--apply' again re-reads it and goes by what each key "
-                            "holds.".format(r["name"]))
+                            "--id {1} --apply' again re-reads it and goes by what "
+                            "each key holds.".format(r["name"], m["op_id"]))
                 for e in entries:
                     if e not in left:
                         left.append(e)
