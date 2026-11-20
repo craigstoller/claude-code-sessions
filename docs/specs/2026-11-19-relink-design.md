@@ -897,7 +897,7 @@ ordinary ones: `undo --apply` takes the step out, and the design comes back for 
     the app setting a key to exactly relink's value between a crash after a verified write and
     the next pass, is kept as a residual in the section; after the likelier crash, before the
     write lands, followed by the app touching the row, the record would leave relink's link in
-    place for good.
+    place for good. *(Confirmed by the maintainer, 2026-11-20: kept as a residual.)*
 - **Review of the I-1 amendment, round 3, the last (2026-11-20; Codex, DeepSeek and Kimi
   reported, DeepSeek and Kimi "Blockers: none"; Gemini failed, agy's `command` denial twice).**
   Applied, **not re-reviewed**:
