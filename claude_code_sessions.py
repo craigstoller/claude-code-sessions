@@ -19602,25 +19602,33 @@ def _relink_store_key(path):
 
 
 def _relink_account_scope(env, value, live):
-    """The store keys --account VALUE scopes the run to: a case-insensitive
-    substring of an account id, org id, store path (both sides folded by
-    _path_match_key) or email, over every account directory, empty org
-    folders and the signed-in account's included. The folders of one
-    account are the scope: its rows all sit in its one populated store
-    (D17), so its empty org folders matching beside it are no ambiguity.
-    No match, or matches in two or more accounts, refuses with every
-    account directory listed."""
+    """The store keys --account VALUE scopes the run to, over every account
+    directory, empty org folders and the signed-in account's included. The
+    printed account form (`acct/org` prefixes, the listing's own label) is
+    parsed and matched by _pair_matches, never searched; any other VALUE is
+    a case-insensitive substring of an account id, org id, email or store
+    path, the path through _path_hay so a trailing separator matches its
+    end, as repoint's --store tests them. The folders of one account are
+    the scope: its rows all sit in its one populated store (D17), so its
+    empty org folders matching beside it are no ambiguity. No match, or
+    matches in two or more accounts, refuses with every account directory
+    listed."""
     dirs = _account_dirs(env)
     emails = {}
     for acct, _org, _path in dirs:
         if acct not in emails:
             e = _email_of(env, acct, live)
             emails[acct] = e if isinstance(e, str) else ""
-    want = value.lower()
-    want_path = _path_match_key(value)
-    hits = [(a, o, p) for a, o, p in dirs
-            if want in a.lower() or want in o.lower()
-            or want in emails[a].lower() or want_path in _path_match_key(p)]
+    pair = _pair_query(value)
+    if pair is not None:
+        hits = [(a, o, p) for a, o, p in dirs if _pair_matches(pair, a, o)]
+    else:
+        want = value.lower()
+        want_path = _path_match_key(value)
+        hits = [(a, o, p) for a, o, p in dirs
+                if want in a.lower() or want in o.lower()
+                or want in emails[a].lower()
+                or want_path in _path_hay(p, value)]
     accounts = {a for a, _o, _p in hits}
     if len(accounts) == 1:
         return {_relink_store_key(p) for _a, _o, p in hits}
@@ -19684,9 +19692,12 @@ def plan_relink(env, flags):
                 raise Refusal("no row matches --only {0!r} (a row id is local_ "
                               "and a prefix of its uuid).".format(shown))
             if len(hit) > 1:
-                raise Refusal("--only {0!r} matches {1} rows; give more of the "
-                              "id:\n{2}".format(shown, len(hit),
-                                                _relink_row_listing(env, hit)))
+                # A stem two accounts hold is told apart by --account alone.
+                more = "give more of the id"
+                if len({rec.account for rec in hit}) > 1:
+                    more += ", or add --account to name its account"
+                raise Refusal("--only {0!r} matches {1} rows; {2}:\n{3}".format(
+                    shown, len(hit), more, _relink_row_listing(env, hit)))
             row_path = hit[0].path
         else:
             conversations = {}
@@ -19729,7 +19740,8 @@ def plan_relink(env, flags):
     # Rows left out do not count: only the rows a proof would change.
     if only_cid is not None and len(rows) > 1:
         raise Refusal("--only {0!r} leaves {1} rows to change; name one by its "
-                      "row id, so a proof touches one row:\n{2}".format(
+                      "row id (with --account when two accounts hold that "
+                      "id), so a proof touches one row:\n{2}".format(
                           shown, len(rows), "\n".join(
                               "   {0}   {1}".format(r["name"][:-len(".json")],
                                                     _listing_label(r["label"]))
