@@ -4144,6 +4144,55 @@ def test_forward_does_not_skip_a_chain_only_row_for_a_cycle_through_its_kept_lin
     assert data_of(paths["local_c3"])["startChain"] == r3["new"]["startChain"]
 
 
+def test_forward_does_not_recheck_a_chain_the_row_keeps(
+        mkenv, tmp_path, write_transcript, write_row):
+    # local_c3 keeps its own agreeing chain and gains its link only: its record names the
+    # kept chain's root, which is not this relink's to re-check
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                         local_c3={"startChain": {"firstSessionId": "local_r3", "depth": 2}})
+    op = crashed(env, "relink-mid-rows")
+    c3 = row_of(op, "local_c3")
+    assert list(c3["new"]) == ["spawnedFrom"] and c3["lineage"]["root_row"] == "local_r3"
+    os.unlink(paths["local_r3"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert r3["written"] is True and "skipped" not in r3
+    assert data_of(paths["local_c3"])["spawnedFrom"] == tool_link("local_p3")
+
+
+@pytest.mark.parametrize("direction", ["forward", "back"])
+def test_recovery_takes_the_guard_only_when_a_row_will_be_written(
+        direction, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    before, record = raws(paths), manifest_raw(op)
+    env.process_lister = lambda: APP_RUNNING
+    msg = recover_refusal(env, op, direction)
+    said = "add links to rows in" if direction == "forward" else "take links out of rows in"
+    assert "refusing to {0} the session store while it is".format(said) in msg
+    assert ct.RELINK_GUARD_WHY in msg
+    # refused before anything changed: rolling_back is not set, so forward is still offered
+    assert raws(paths) == before and manifest_raw(op) == record
+    assert ct.read_lock(env) is None
+    # a recovery that writes no row closes with the app running: the marks are the journal's
+    if direction == "forward":
+        env2 = mkenv(tmp_path / "landed")
+        relink_store(env2, write_transcript, write_row)
+        done = crashed(env2, "relink-after-rows")
+    else:
+        env2 = mkenv(tmp_path / "gone")
+        paths2 = relink_store(env2, write_transcript, write_row)
+        done = crashed(env2, "relink-mid-rows")
+        os.unlink(paths2["local_c2"])
+    env2.process_lister = lambda: APP_RUNNING
+    final, _om = recover(env2, done, direction)
+    assert final == ("completed" if direction == "forward" else "rolled_back")
+
+
 def test_forward_writes_a_pending_row_and_skips_one_whose_parent_row_is_gone(
         monkeypatch, mkenv, tmp_path, write_transcript, write_row):
     env = mkenv(tmp_path)
@@ -4404,7 +4453,7 @@ def test_a_failed_verify_in_back_leaves_the_row_for_a_second_back(
 
 
 def test_back_marks_a_landed_row_written_before_putting_its_keys_back(
-        mkenv, tmp_path, write_transcript, write_row):
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
     env = mkenv(tmp_path)
     paths = chain_store(env, write_transcript, write_row)
     pre = data_of(paths["local_c2"])
@@ -4413,8 +4462,20 @@ def test_back_marks_a_landed_row_written_before_putting_its_keys_back(
     c2 = row_of(op, "local_c2")
     changed = dict(c2["new"]["startChain"], depth=9)
     set_keys(paths["local_c2"], startChain=changed)
-    with pytest.raises(SimulatedCrash):                  # after the write, before the mark
-        recover(env, op, "back", hook=crash_on("relink-back-before-mark"))
+    real_write, real_save, killed = ct.atomic_write, ct.save_manifest, []
+
+    def write_then_die(path, data):
+        # a hard kill the moment local_c2's write lands: nothing more reaches the disk, the
+        # save on the way out included, so the record holds only what was saved before it
+        real_write(path, data)
+        if same_file(path, paths["local_c2"]):
+            killed.append(path)
+            raise SimulatedCrash()
+    monkeypatch.setattr(ct, "atomic_write", write_then_die)
+    monkeypatch.setattr(ct, "save_manifest", lambda o: None if killed else real_save(o))
+    with pytest.raises(SimulatedCrash):
+        recover(env, op, "back")
+    monkeypatch.undo()
     om = op_of(env, oid).manifest
     r2 = om["rows"][0]
     assert r2["written"] is True and "restored" not in r2 and r2["back_keys"] == ["spawnedFrom"]
