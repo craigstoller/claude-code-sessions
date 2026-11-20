@@ -940,8 +940,10 @@ def test_a_title_equal_to_a_schema_value_corrupts_neither_report(...):
        not a bool; `undo_left` and `back_left`, when present, lists of objects with string `name`,
        `label`, `what`, `why`.
     2. Each row: an object; `account`, `name`, `dest_path`, `store_path`, `session_id` non-empty
-       strings; `label`, `title`, `parent_title` strings; `name` is `_LINEAGE_ROW_ID` plus `.json`
-       and equals `os.path.basename(dest_path)`; `store_path` is `os.path.dirname(dest_path)`
+       strings; `label`, `title`, `parent_title` strings; `name` starts `local_`, ends `.json` and
+       equals `os.path.basename(dest_path)`, the scan's own filter, so a copy-named row the scan
+       reads still passes (as built 2026-11-19; the first text required `_LINEAGE_ROW_ID`, which a
+       fresh plan could fail); `store_path` is `os.path.dirname(dest_path)`
        (compared normcased and normpathed) and `os.path.basename(os.path.dirname(store_path))` is
        `account`; `pre_sha256`, `post_sha256` 64 lowercase hex. That the store is one this
        version reads is the resolution gate's test (`_row_resolved` with the row's store, through
