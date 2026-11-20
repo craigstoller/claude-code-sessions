@@ -1440,6 +1440,15 @@ def rotate_ops(env):
                 isinstance(c, dict) and c.get("moved")
                 for c in om.get("copies") or []):
             return True
+        # A relink writes no rollback_residue for a row it can read (doctor's
+        # advice for residue is wrong for a row it only edited), so what its
+        # undo or back left - a key the app changed, a claimed key, a row
+        # that opens another conversation now - is recorded only in
+        # undo_left or back_left, and a written row not marked restored may
+        # still hold its value. Pruning it in the call that wrote it would
+        # leave only the printout. Hold it, as residue is held.
+        if om.get("op_type") == "relink" and _relink_left_something(om):
+            return True
         if not live or om.get("op_type") not in claimants:
             return False
         if om.get("status") in ("undone", "rolled_back"):
@@ -5673,8 +5682,8 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp, verbose_help="full paths and ids (default output is redacted)"):
-        # VERBOSE_HELP lets a command say what more its --verbose lists;
-        # every other command keeps the shared text.
+        # The verbose_help parameter lets a command say what more its
+        # --verbose lists; every other command keeps the shared text.
         sp.add_argument("--verbose", action="store_true", help=verbose_help)
 
         sp.add_argument("--anonymize", action="store_true",
@@ -19066,10 +19075,11 @@ def _print_converge_report(say, m):
 
 
 def _identity_warning_lines(env, m, command="converge"):
-    """Change 1 of 0.13.0: the warning block for a converge manifest that
-    carries an identity_disagreement no valid --live arbitrated. [] when
-    there is nothing to warn about. COMMAND is the subcommand the remedy
-    lines rerun (relink passes its own; converge keeps the default).
+    """Change 1 of 0.13.0: the warning block for a converge or relink
+    manifest that carries an identity_disagreement no valid --live
+    arbitrated. [] when there is nothing to warn about.
+    COMMAND is the subcommand the remedy lines rerun (relink passes its
+    own; converge keeps the default).
 
     RULING 5 is evaluated only inside _converge_recheck, so a 0.12.0 plan
     could read `0 held` while --apply was always going to refuse for a
@@ -19710,15 +19720,23 @@ def _relink_open_others(env, mine=""):
     return sorted(ids), sorted(unreadable)
 
 
+# The way out of a journal record that cannot be read: recover cannot read it
+# either, so no command clears it, and the line that names it says so.
+_RELINK_REPAIR_ROUTE = ("No command repairs a record: with the app closed, "
+                        "repair each one, or move its folder out of the journal.")
+
+
 def _relink_unreadable_line(what, unreadable):
     """D18's line for a journal that could not be fully read, never posing
-    as an op id. UNREADABLE is _relink_open_others' second value."""
+    as an op id. UNREADABLE is _relink_open_others' second value. A record
+    that cannot be read is named by its folder, with the way out by hand
+    (_RELINK_REPAIR_ROUTE), since recover cannot read it either."""
     if isinstance(unreadable, str):
         return ("{0} waits: the journal folder could not be listed ({1}). "
                 "Nothing was changed.".format(what, unreadable))
     return ("{0} waits: the record(s) in {1} could not be read, so whether "
-            "they are unfinished cannot be told. Nothing was changed.".format(
-                what, ", ".join(sorted(unreadable))))
+            "they are unfinished cannot be told. {2} Nothing was changed."
+            .format(what, ", ".join(sorted(unreadable)), _RELINK_REPAIR_ROUTE))
 
 
 def _relink_refuse_open(env, what, mine=""):
@@ -19846,6 +19864,12 @@ def plan_relink(env, flags):
             if not hit:
                 raise Refusal("no row matches --only {0!r} (a row id is local_ "
                               "and a prefix of its uuid).".format(shown))
+            # A whole row id is a prefix of a copy's (`local_x - Copy`), so
+            # no longer prefix of it exists: the one row whose stem is the
+            # value is taken. Two such rows (two accounts) still refuse.
+            whole = [rec for rec in hit if rec.name[:-len(".json")].lower() == want]
+            if len(whole) == 1:
+                hit = whole
             if len(hit) > 1:
                 # A stem two accounts hold is told apart by --account alone.
                 more = "give more of the id"
@@ -20529,8 +20553,9 @@ def _relink_row_agrees(r, data):
 
 
 def _relink_apply_then(m):
-    """The apply's and forward's next step after a refusal, every hint
-    runnable: the op's status as it is when the text is built."""
+    """The apply's next step after a refusal, every hint runnable: the op's
+    status as it is when the text is built. Forward's is
+    _relink_forward_then."""
     return ("The op is left at '{0}' - 'recover --resolve {1} --back --apply' "
             "takes out what landed.".format(m.get("status", ""),
                                             m.get("op_id", "")))
@@ -20604,6 +20629,11 @@ def _relink_write_rows(op, m, roots, saver):
                           "relink planned its link for. {1}".format(where, then))
         sha = _relink_sha(raw)
         if sha == r["post_sha256"]:
+            # Defensive: the apply runs only from 'journaled', and nothing
+            # writes a row before that, so today only a test reaches this.
+            # It is kept because forward recovery and a resumed write loop
+            # rely on the same rule: a row already at its post-image landed,
+            # and is marked, never written again.
             r["written"] = True
             saver.tick()
             continue
@@ -20962,6 +20992,23 @@ def _relink_left_line(e):
         e.get("what"), e.get("why"))
 
 
+def _relink_left_something(m):
+    """Whether relink record M holds what its undo or back left, so that
+    rotate_ops keeps it: an entry in undo_left or back_left, or, once M is
+    undone or rolled back, a row marked written and not restored, which may
+    still hold relink's value. A completed relink's written rows are its
+    work, not something left, and it rotates as before; a row never written
+    holds nothing of relink's. Never raises."""
+    if not isinstance(m, dict):
+        return False
+    if m.get("undo_left") or m.get("back_left"):
+        return True
+    if m.get("status") not in ("undone", "rolled_back"):
+        return False
+    return any(r.get("written") and r.get("restored") is not True
+               for r in _journal_dict_rows(m))
+
+
 def _relink_undo_disposition(r, state, data):
     """What undo does with written row R, from its one read (STATE, DATA):
     (keys to put back, entries to leave, whether a key the relink wrote stays
@@ -20988,8 +21035,11 @@ def _relink_claims_refusal(op_id, claims, what="undo"):
     that cannot be read is named by its folder, to be repaired or moved out
     of the journal by hand, since no command does either; a journal that
     could not be listed (op_id "") names no op id. One line each, in that
-    order, each naming its rows once, each saying `cannot <WHAT> <op_id>`:
-    undo refuses on every claim, recovery's back on the last two only."""
+    order, each naming its rows once, at most RELINK_LIST_CAP of them and
+    then `... and <n> more`, each saying `cannot <WHAT> <op_id>`: undo
+    refuses on every claim, recovery's back on the last two only. A live
+    claimant that cannot itself be undone leaves the relink un-undoable
+    too, and the line says so."""
     def rows_of(cs):
         out = []
         for c in cs:
@@ -20997,6 +21047,11 @@ def _relink_claims_refusal(op_id, claims, what="undo"):
             shown = "{0} ({1})".format(r.get("name"), r.get("label", ""))
             if shown not in out:
                 out.append(shown)
+        # A damaged record claims every row asked about: a bulk relink's
+        # would otherwise name every row of it on one line.
+        if len(out) > RELINK_LIST_CAP:
+            out = out[:RELINK_LIST_CAP] + [
+                "... and {0} more".format(len(out) - RELINK_LIST_CAP)]
         return ", ".join(out)
     unlisted = [c for c in claims if not c["op_id"]]
     damaged = [c for c in claims
@@ -21007,17 +21062,16 @@ def _relink_claims_refusal(op_id, claims, what="undo"):
     if live:
         lines.append(
             "cannot {0} {1}: operation(s) {2} wrote row(s) {3} after it - undo "
-            "those first. Nothing was changed.".format(
+            "those first; if one cannot be undone, this relink cannot be undone "
+            "either. Nothing was changed.".format(
                 what, op_id, ", ".join(sorted({c["op_id"] for c in live})),
                 rows_of(live)))
     if damaged:
         lines.append(
             "cannot {0} {1}: the record(s) in {2} cannot be read, so whether they "
-            "wrote row(s) {3} after it cannot be told. No command repairs a "
-            "record: with the app closed, repair each one, or move its folder out "
-            "of the journal. Nothing was changed.".format(
-                what, op_id, ", ".join(sorted({c["op_id"] for c in damaged})),
-                rows_of(damaged)))
+            "wrote row(s) {3} after it cannot be told. {4} Nothing was changed."
+            .format(what, op_id, ", ".join(sorted({c["op_id"] for c in damaged})),
+                    rows_of(damaged), _RELINK_REPAIR_ROUTE))
     if unlisted:
         lines.append(
             "cannot {0} {1}: {2}, so whether a later operation wrote its rows "
@@ -21347,6 +21401,14 @@ def _relink_rerun_then(m, direction):
                 m.get("status", ""), m.get("op_id", ""), direction))
 
 
+def _relink_forward_then(m):
+    """Forward's next step after a failed write or save: forward again,
+    which goes on from what each row holds now, as after a transient error;
+    back stays named as the other way out."""
+    return (_relink_rerun_then(m, "forward") + " 'recover --resolve {0} --back "
+            "--apply' takes out what landed instead.".format(m.get("op_id", "")))
+
+
 def _relink_reread(m, r, raw, roots, direction):
     """Once the guard has passed, before the first write: row R read again,
     refused with nothing changed unless it still holds RAW, the bytes its
@@ -21381,7 +21443,7 @@ def _relink_forward(env, op, roots, stray):
     if stray:
         raise Refusal("cannot finish {0}: {1}; forward cannot run on them. Nothing "
                       "was changed.".format(m.get("op_id"), _unresolved_clause(stray)))
-    then = _relink_apply_then(m)
+    then = _relink_forward_then(m)
     by_name, graphs = _lineage_rows_by_name(m), {}
     decided = [(r,) + _relink_forward_decision(m, r, roots, by_name, graphs)
                for r in m["rows"] if not r["written"] and not r.get("skipped")]
