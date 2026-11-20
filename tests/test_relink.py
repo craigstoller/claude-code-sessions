@@ -1612,6 +1612,19 @@ def test_a_planned_manifest_passes_the_shape_check(mkenv, tmp_path, write_transc
     assert ct._relink_shape_error(m) is None
 
 
+def test_a_copy_named_row_the_scan_reads_passes_the_shape_check(
+        mkenv, tmp_path, write_transcript, write_row):
+    # the scan reads every local_*.json, an Explorer copy's name among them, and the plan
+    # repairs a stem-mismatched row as a candidate; its own record must pass its own check
+    env = mkenv(tmp_path)
+    relink_store(env, write_transcript, write_row)
+    put_row(env, write_row, A2, "local_c2 - Copy", LC, "ACME-REVIEW side task",
+            sessionId="local_c2")
+    m = plan(env)
+    assert names(m["rows"]) == ["local_c2 - Copy.json", "local_c2.json", "local_c3.json"]
+    assert ct._relink_shape_error(m) is None
+
+
 def test_a_link_only_row_that_keeps_an_unjudged_chain_passes(
         mkenv, tmp_path, write_transcript, write_row):
     m, _ = outside_plan(mkenv(tmp_path), write_transcript, write_row)
@@ -1697,6 +1710,17 @@ def _left(**changes):
     (lambda m: m["rows"][0].__setitem__("parent_title", None), "'parent_title'"),
     (lambda m: m["rows"][0].__setitem__("name", "local_c9.json"), "'name'"),
     (lambda m: m["rows"][0].__setitem__("name", "local_c2.txt"), "'name'"),
+    # a separator in the name never equals its dest_path's file, even with the path to match
+    (lambda m: m["rows"][0].__setitem__("name", os.path.join("local_c1", "..", "local_c2.json")),
+     "'name'"),
+    (lambda m: m["rows"][0].update(
+        name=os.path.join("local_c1", "..", "local_c2.json"),
+        dest_path=os.path.join(m["rows"][0]["store_path"], "local_c1", "..", "local_c2.json")),
+     "'name'"),
+    # a file that is not a row's, though it is its dest_path's
+    (lambda m: m["rows"][0].update(
+        name="c2.json", dest_path=os.path.join(m["rows"][0]["store_path"], "c2.json")),
+     "'name'"),
     (lambda m: m["rows"][0].__setitem__("post_sha256",
                                         m["rows"][0]["post_sha256"].upper()), "'post_sha256'"),
     (lambda m: m["rows"][0].__setitem__("new", {}), "'new'"),
