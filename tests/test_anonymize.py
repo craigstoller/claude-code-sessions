@@ -985,9 +985,15 @@ def test_every_emitted_report_key_is_in_the_structural_set(
     m7["since_plan"] = {"changed": 1, "dropped": 0, "gained": 0}
     m7["undo_left"] = [{"name": "local_c2.json", "label": "bob@example.com",
                         "what": "spawnedFrom", "why": "the app changed it since"}]
+    m7["undo_waiting"] = [{"name": "local_c3.json", "label": "bob@example.com",
+                           "what": "spawnedFrom", "op_ids": ["20990101T000001Z-bbbbbb"],
+                           "why": "operation(s) 20990101T000001Z-bbbbbb wrote it since"}]
     m7["rows"][0].update(skipped="gone", skip_detail="gone from the store",
                          restored=True)
-    bad = walk_fixed_keys(ct._public_relink_manifest(env7, m7), bad=bad)
+    pub7 = ct._public_relink_manifest(env7, m7)
+    # Sanity, so the walk cannot pass vacuously: a partial undo's waits are here.
+    assert pub7["undo_waiting"][0]["op_ids"] == ["20990101T000001Z-bbbbbb"]
+    bad = walk_fixed_keys(pub7, bad=bad)
     assert bad == []
 
 
