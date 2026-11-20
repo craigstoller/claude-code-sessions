@@ -184,6 +184,9 @@ once more for the pre-flight conflict scan (Revisions), also not re-reviewed. No
   is no operations, as `list_ops` reads it (Task 3). When both apply, the refusal carries both
   lines, the open operations' first. Undo and recovery pass their own op id as `mine`, so a
   relink never waits on itself; the plan and the apply have no op yet and pass none.
+  *(As built 2026-11-20: the unreadable-record line also says how to clear it - with the app
+  closed, repair the record or move its folder out of the journal - since `recover` cannot read
+  it either. The code's wording governs.)*
 - **Containment roots come from discovery, at every mutation route.** The apply
   (`execute_relink_op`), `undo_relink` and both directions of `_recover_relink` each call
   `_retitle_roots(env)` fresh, which refuses (`LayoutError`) when discovery fails, and pass those
@@ -1441,6 +1444,10 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(...):
     5. `_relink_claims(env, m, todo)`: any entry refuses: `cannot undo <op>: operation(s) <ids,
        sorted, each once> wrote row(s) <rows> after it - undo those first. Nothing was changed.`
        The relink stays `completed`.
+       *(As built 2026-11-20: a claim from a record that cannot be read names its folder and the
+       manual route instead; the list of rows is capped at `RELINK_LIST_CAP`; and the refusal adds
+       that if a claimant cannot itself be undone, this relink cannot be either. The code's wording
+       governs.)*
     6. **Writes**, per row of `todo` in journal order, with a `_RelinkSaver(op, then=<undo's
        then>)`, inside `try ... except BaseException: save_manifest(op); raise`: a row with keys to
        put back gets one `_relink_put(r, _relink_apply_old(data, r["old"], keys), roots, <undo's
