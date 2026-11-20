@@ -2445,23 +2445,31 @@ def test_the_help_texts():
     assert rl.description == (
         "Give existing rows of a side session the parent link (spawnedFrom), and its chain "
         "(startChain), that another account's row carries, translated to that account's own "
-        "rows as converge writes them on a new row. Only those two keys change, and only "
-        "where a row has no link object; rows whose accounts disagree are left out with the "
-        "reason. Undoable per key.")
+        "rows as converge writes them on a new row. Only those two keys change, each only "
+        "where the row has no object of that key: a link or chain a row already has is never "
+        "replaced. Rows whose accounts disagree are left out with the reason. Undoable per key.")
     helps = {a.dest: a.help for a in rl._actions}
     assert helps["only"] == (
         "narrow to one conversation (a title substring, or a cliSessionId prefix) or to one "
         "row (local_ and a prefix of its id) - must resolve to exactly one; a conversation "
         "that leaves more than one row to change refuses and lists their ids")
     assert helps["account"] == (
-        "narrow to one account's store: an account id, org id, store path or email substring "
-        "that resolves to exactly one account, the signed-in account's included")
+        "narrow to one account: an account id, org id, store path or email substring, or the "
+        "acct/org pair reports print (e.g. 'aaaa1111/cccc3333'), that resolves to exactly one "
+        "account, the signed-in account's included")
     assert helps["live"] == ("assert which account the desktop app is signed into (RULING 5), "
                              "when the identity files disagree")
     assert helps["apply"] == (
         "actually add the links. Needs the desktop app fully closed and no unfinished "
         "operation. Exits 0 when rows were left out - each is counted by its reason")
     assert helps["json"] == "print the plan as JSON"
+    # relink's --verbose says what more it lists; every other command keeps the shared text
+    assert helps["verbose"] == (
+        "full paths and ids (default output is redacted), every row to change rather than the "
+        "first 15 per account, and each row left out with its reason")
+    shared = "full paths and ids (default output is redacted)"
+    assert all({a.dest: a.help for a in sp._actions}["verbose"] == shared
+               for name, sp in sub.choices.items() if name != "relink")
     got = p.parse_args(["relink"])
     assert (got.only, got.account, got.live, got.apply, got.json, got.verbose,
             got.anonymize) == ("", "", "", False, False, False, False)
