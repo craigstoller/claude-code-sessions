@@ -5721,9 +5721,13 @@ def test_a_pass_stopped_after_its_first_write_is_kept_and_an_older_retitle_waits
     with pytest.raises(ct.Refusal) as exc:
         ct.undo_retitle(env, op_of(env, rid))
     assert "operation {0} also records writing these bytes".format(oid) in str(exc.value)
-    final, om = undo(env, op)
-    assert final == "undone" and om["undo_left"] == []
-    assert ct.undo_retitle(env, op_of(env, rid)) == "undone"
+    # the resume counts local_c2's key, back at old, as finished, and names nothing: ended
+    # with no undo_left entry (one would keep it), the relink no longer holds the rotation,
+    # which takes both records
+    assert ct.undo_relink(env, op_of(env, oid)) == "undone"
+    assert raw_of(paths["local_c2"]) == retitle_image
+    assert "spawnedFrom" not in data_of(paths["local_c3"])
+    assert not os.path.exists(op.op_dir) and not os.path.exists(rt.op_dir)
 
 
 def test_rotation_holds_a_started_undo_and_every_record_it_may_wait_on(
@@ -5899,7 +5903,7 @@ def test_two_claimants_of_one_key_are_both_named_and_the_waits_are_replaced_each
     env = mkenv(tmp_path / "verbose")
     paths, op = applied(env, write_transcript, write_row)
     whole_op(env, "sync", paths["local_c2"])
-    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True)) == 1
+    assert ct.cmd_undo(env, undo_ns(apply=True, verbose=True, op_id=op.manifest["op_id"])) == 1
     out = capsys.readouterr().out.splitlines()
     assert out[0] == "result: partial" and out[1].startswith("waiting : local_c2 -> ")
 
