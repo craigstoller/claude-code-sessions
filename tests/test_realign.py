@@ -844,8 +844,8 @@ def test_a_damaged_record_is_refused_by_undo_and_recover(world):
 # listed.
 _OP_TYPE_BRANCHES = {
     "rotate_ops": ("names it", "names it"),
-    "classify_op": ("names it", "pending: Task 9 adds the relink arm"),
-    "recover_op": ("names it", "pending: Task 9 adds the relink arm"),
+    "classify_op": ("names it", "names it"),
+    "recover_op": ("names it", "names it"),
     "gather_doctor": ("names it",
                       "reads a relink op as any other, by status and "
                       "rollback_residue; a relink creates no row to vanish "
@@ -886,7 +886,7 @@ _OP_TYPE_BRANCHES = {
         "converge row's"),
     "cmd_recover": ("prints the rows converge's forward recovery skipped "
                     "over their link; a realign op has no such skip",
-                    "pending: Task 9 prints relink's skipped rows"),
+                    "names it"),
     "_relink_claims": ("names it", "names it"),
     "_retitle_claimed_elsewhere": ("a realign row carries post_b64, compared by bytes as "
                                    "any other op's", "names it"),

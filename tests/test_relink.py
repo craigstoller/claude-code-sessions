@@ -12,7 +12,9 @@ check and saver. Then the apply: the locked re-plan, the row writes verified
 by value, the CLI, and the one RULING 5 text the three apply rechecks share.
 Then the claims: which rows a later live operation owns (D13), and the other
 operations' ownership checks, which neither ignore a relink nor wait on one.
-Last, undo: key by key, leaving and naming what the app changed since.
+Then undo: key by key, leaving and naming what the app changed since. Last,
+recovery: forward finishes an interrupted relink by what each key holds now,
+and back takes out what landed, naming what it left.
 """
 import argparse
 import hashlib
@@ -3865,3 +3867,931 @@ def test_undoing_a_converge_whose_created_parent_a_relink_linked_to_reports_it_d
     assert rep["dangling"] == [{"row": "local_c3", "target": made_id, "kind": "parent"}]
     assert "link left dangling: local_c3 (its parent's row was removed)" in \
         capsys.readouterr().out.splitlines()
+
+
+# ------------------------------------------------------------------ recovery
+# Task 9: recover's two ways out of an interrupted relink. Forward finishes the
+# rows still to write by what each key holds now: a row with a key at new
+# landed and is marked, a row still at its pre-image is re-checked against its
+# targets and the account's links and written, and anything else is skipped and
+# named. Back takes out every key that landed, key by key, and names in
+# abort_reason what it left; once it has begun, only back is offered. The
+# recovery matrix at the end pins every line of the table in both directions.
+
+THE_ROW_LEFT = "now opens another conversation; its link was left"
+FORWARD_NOTE = ("relink: {0} row(s) written, {1} pending; forward finishes from the journal by "
+                "what each key holds now, skipping and naming any row it cannot attribute; back "
+                "takes out what landed, key by key")
+ROLLING_NOTE = ("relink: a back recovery began and stopped part-way; only back is offered - "
+                "'recover --resolve {0} --back --apply' goes on from what each row holds now")
+NO_HISTORY = ("its 'history' gives no time it was made, so which operations came after it "
+              "cannot be told")
+
+
+def crash_on(point, nth=1):
+    """A crash hook raising SimulatedCrash at the NTH hit of POINT."""
+    hits = []
+
+    def hook(p):
+        if p == point:
+            hits.append(p)
+            if len(hits) == nth:
+                raise SimulatedCrash()
+    return hook
+
+
+def crashed(env, point, nth=1):
+    """The apply of a fresh plan, cut off at the NTH hit of POINT, the lock released. Returns
+    the unfinished op as the journal holds it."""
+    m = plan(env)
+    ct._crash_hook = crash_on(point, nth)
+    with pytest.raises(SimulatedCrash):
+        ct.run_relink(env, m)
+    ct._crash_hook = None
+    ct.release_lock(env)
+    op = op_of(env, m["op_id"])
+    assert op.manifest["status"] == "writing"
+    return op
+
+
+def recover(env, op, direction, hook=None):
+    """recover_op on OP as the journal holds it now, with HOOK as the crash hook: (its result,
+    the record after)."""
+    oid = op.manifest["op_id"]
+    ct._crash_hook = hook
+    try:
+        final = ct.recover_op(env, op_of(env, oid), direction)
+    finally:
+        ct._crash_hook = None
+    return final, op_of(env, oid).manifest
+
+
+def recover_refusal(env, op, direction, exc_type=ct.Refusal):
+    with pytest.raises(exc_type) as exc:
+        ct.recover_op(env, op_of(env, op.manifest["op_id"]), direction)
+    return str(exc.value)
+
+
+def recover_ns(op_id, direction):
+    return types.SimpleNamespace(op_id=op_id, forward=direction == "forward",
+                                 back=direction == "back", apply=True, verbose=False)
+
+
+def chain_store(env, write_transcript, write_row):
+    """chain_plan's store: local_c2 gains its link and chain, local_c3, which keeps
+    side_link('local_p3'), its chain only. Returns {stem: path}."""
+    return relink_store(env, write_transcript, write_row, chain=CHAIN, roots=True,
+                        local_c3={"spawnedFrom": side_link("local_p3")})
+
+
+def write_raw(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def drop_key(path, key):
+    """Rewrite one row without KEY, as the app may."""
+    d = data_of(path)
+    d.pop(key)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(d, fh)
+
+
+def manifest_raw(op):
+    return raw_of(os.path.join(op.op_dir, "manifest.json"))
+
+
+def test_recovery_waits_while_another_operation_is_unfinished(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    before = raws(paths)
+    put_op(env, OPEN_ID, open_op())
+    waits = ("relink: recovery waits while another operation is unfinished ({0}); recover that "
+             "first".format(OPEN_ID))
+    c = ct.classify_op(env, op_of(env, oid))
+    assert (c["resolutions"], c["note"]) == ([], waits)
+    for direction in ("forward", "back"):
+        assert waits in recover_refusal(env, op, direction)
+    target = op_of(env, oid)            # held: list_ops cannot read the record put next
+    with pytest.raises(ct.Refusal) as exc:
+        ct._recover_relink(env, target, "back", [])
+    assert str(exc.value) == D18_OPEN.replace("relink waits", "relink's recovery waits",
+                                              1).format(OPEN_ID)
+    bad = "20990101T000001Z-bbbbbb"
+    put_op(env, bad, "{not json")
+    unreadable = ("recovery waits: the record(s) in {0} could not be read, so whether they are "
+                  "unfinished cannot be told. Nothing was changed.".format(bad))
+    c = ct.classify_op(env, target)
+    assert (c["resolutions"], c["note"]) == ([], waits + "; " + unreadable)
+    shutil.rmtree(os.path.join(env.ops_dir, OPEN_ID))
+    c = ct.classify_op(env, target)
+    assert (c["resolutions"], c["note"]) == ([], "relink: " + unreadable)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.recover_op(env, target, "back")
+    assert unreadable in str(exc.value)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._recover_relink(env, target, "back", [])
+    assert str(exc.value) == "relink's " + unreadable
+    assert raws(paths) == before and record_of(target)["status"] == "writing"
+    assert ct.read_lock(env) is None
+
+
+def test_a_relink_alone_recovers_without_waiting_on_itself(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    c = ct.classify_op(env, op)
+    assert (c["resolutions"], c["note"]) == (["forward", "back"], FORWARD_NOTE.format(1, 1))
+    final, om = recover(env, op, "forward")
+    assert final == "completed" and om["status"] == "completed"
+    assert [r["written"] for r in om["rows"]] == [True, True]
+    assert not any("skipped" in r for r in om["rows"])
+    assert data_of(paths["local_c3"])["spawnedFrom"] == tool_link("local_p3")
+    assert ct.read_lock(env) is None and ct.nonterminal_ops(env) == []
+
+
+def test_classify_puts_d18_before_the_unresolved_row_gate(
+        mkenv, tmp_path, write_transcript, write_row):
+    from test_journal_reroot import UNREAD, packaged, strand
+    env = mkenv(tmp_path)
+    packaged(env, tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    strand(env, tmp_path)
+    files = {p: raw_of(p) for p in paths.values()}
+    c = ct.classify_op(env, op_of(env, oid))
+    assert c["resolutions"] == ["back"] and UNREAD in c["note"]   # the gate, nothing else open
+    put_op(env, OPEN_ID, open_op())
+    c = ct.classify_op(env, op_of(env, oid))
+    assert c["resolutions"] == []                                 # never ["back"]
+    assert c["note"] == ("relink: recovery waits while another operation is unfinished ({0}); "
+                         "recover that first".format(OPEN_ID))
+    with pytest.raises(ct.Refusal):
+        ct.recover_op(env, op_of(env, oid), "back")
+    shutil.rmtree(os.path.join(env.ops_dir, OPEN_ID))
+    # back alone, with the rows it cannot read left alone and recorded for doctor
+    assert recover_refusal(env, op, "forward").startswith("'forward' is not a safe resolution")
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back" and UNREAD in om["rollback_residue"]
+    assert {p: raw_of(p) for p in files} == files
+
+
+def test_forward_marks_a_row_whose_keys_all_hold_new_as_landed(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-before-mark")
+    assert [r["written"] for r in op.manifest["rows"]] == [False, False]
+    landed = raw_of(paths["local_c2"])
+    real, written = ct.atomic_write, []
+
+    def record(path, data):
+        written.append(os.path.basename(path))
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", record)
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    assert [r["written"] for r in om["rows"]] == [True, True]
+    assert "local_c2.json" not in written and raw_of(paths["local_c2"]) == landed
+    assert data_of(paths["local_c3"])["spawnedFrom"] == tool_link("local_p3")
+
+
+def test_forward_marks_landed_a_row_with_one_key_new_and_one_changed(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-before-mark")
+    c2, c3 = row_of(op, "local_c2"), row_of(op, "local_c3")
+    set_keys(paths["local_c2"], startChain=dict(c2["new"]["startChain"], depth=9))
+    landed = raw_of(paths["local_c2"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    assert [r["written"] for r in om["rows"]] == [True, True]
+    assert raw_of(paths["local_c2"]) == landed
+    assert data_of(paths["local_c3"])["startChain"] == c3["new"]["startChain"]
+
+
+def test_forward_marks_landed_a_row_with_one_key_new_and_one_back_at_old(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    pre = data_of(paths["local_c2"])
+    op = crashed(env, "relink-before-mark")
+    drop_key(paths["local_c2"], "startChain")             # the app took the chain out
+    final, om = recover(env, op, "forward")
+    assert final == "completed" and om["rows"][0]["written"] is True
+    # undo puts back the key still at new and counts the one at old as back
+    final, um = undo(env, op)
+    assert final == "undone" and um["undo_left"] == []
+    assert data_of(paths["local_c2"]) == pre
+
+
+@pytest.mark.parametrize("edit", ["old", "post_sha256"])
+def test_forward_refuses_a_record_that_does_not_match_its_pending_row(
+        edit, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    target = op_of(env, oid)
+    r3 = target.manifest["rows"][1]
+    if edit == "old":
+        r3["old"]["spawnedFrom"] = {"present": True, "value": "x"}
+    else:
+        r3["post_sha256"] = "0" * 64
+    ct.save_manifest(target)
+    assert ct._relink_shape_error(target.manifest) is None
+    before, record = raw_of(paths["local_c3"]), manifest_raw(target)
+    assert recover_refusal(env, op, "forward", ct.LayoutError) == (
+        "the record for {0} does not match row local_c3.json; refusing rather than write from "
+        "it. Nothing was changed.".format(oid))
+    assert raw_of(paths["local_c3"]) == before and manifest_raw(target) == record
+    assert op_of(env, oid).manifest["status"] == "writing" and ct.read_lock(env) is None
+
+
+def test_forward_skips_a_pending_chain_only_row_whose_kept_parent_row_is_gone(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    os.unlink(paths["local_p3"])
+    before = raw_of(paths["local_c3"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert (r3["skipped"], r3["skip_detail"]) == (
+        "parent_changed",
+        "its parent {0}'s row is gone since this operation was journaled".format(LP[:8]))
+    assert r3["written"] is False and raw_of(paths["local_c3"]) == before
+    assert "startChain" not in data_of(paths["local_c3"])
+
+
+def test_forward_does_not_skip_a_chain_only_row_for_a_cycle_through_its_kept_link(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    set_keys(paths["local_p3"], spawnedFrom=side_link("local_c3"))     # C <-> P on disk
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert r3["written"] is True and "skipped" not in r3
+    assert data_of(paths["local_c3"])["startChain"] == r3["new"]["startChain"]
+
+
+def test_forward_writes_a_pending_row_and_skips_one_whose_parent_row_is_gone(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = plan(env)
+    real = ct.atomic_write
+
+    def cut(path, data):
+        # the apply cut off at its first row's write, before a byte of it: both rows pending
+        if same_file(path, paths["local_c2"]):
+            raise SimulatedCrash()
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", cut)
+    with pytest.raises(SimulatedCrash):
+        ct.run_relink(env, m)
+    monkeypatch.setattr(ct, "atomic_write", real)
+    op = op_of(env, m["op_id"])
+    assert op.manifest["status"] == "writing"
+    assert [r["written"] for r in op.manifest["rows"]] == [False, False]
+    os.unlink(paths["local_p3"])
+    before = raw_of(paths["local_c3"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r2, r3 = om["rows"]
+    assert r2["written"] is True and "skipped" not in r2
+    assert data_of(paths["local_c2"])["spawnedFrom"] == tool_link("local_p2")
+    assert r3["skipped"] == "parent_changed" and LP[:8] in r3["skip_detail"]
+    assert r3["written"] is False and raw_of(paths["local_c3"]) == before
+
+
+def test_forward_names_a_landed_row_whose_parent_row_is_gone_since(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    os.unlink(paths["local_p2"])
+    capsys.readouterr()
+    assert ct.cmd_recover(env, recover_ns(oid, "forward")) == 0
+    om = op_of(env, oid).manifest
+    assert om["status"] == "completed"
+    assert om["link_report"]["dangling"] == [
+        {"row": "local_c2", "target": "local_p2", "kind": "parent"}]
+    assert capsys.readouterr().out.splitlines() == [
+        "result: completed", "link left dangling: local_c2 (its parent's row was removed)"]
+
+
+def test_forward_skips_a_pending_edge_that_now_closes_a_cycle(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    set_keys(paths["local_p3"], spawnedFrom=side_link("local_c3"))
+    before = raw_of(paths["local_c3"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert (r3["skipped"], r3["skip_detail"]) == ("lineage_cycle", "it would close a cycle now")
+    assert r3["written"] is False and raw_of(paths["local_c3"]) == before
+
+
+def test_forward_skips_a_row_whose_accounts_links_cannot_all_be_read(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    write_raw(os.path.join(os.path.dirname(paths["local_c3"]), "local_zz.json"), "{not json")
+    before = raws(paths)
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert (r3["skipped"], r3["skip_detail"]) == (
+        "edges_unreadable",
+        "the account's links could not all be read, so a cycle cannot be ruled out")
+    assert r3["written"] is False and raws(paths) == before
+
+
+def test_forward_skips_a_row_changed_after_the_plan(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    set_keys(paths["local_c3"], lastFocusedAt=1_800_000_000_000)
+    before = raw_of(paths["local_c3"])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r3 = om["rows"][1]
+    assert (r3["skipped"], r3["skip_detail"]) == ("changed_since_plan", "changed since the plan")
+    assert r3["written"] is False and raw_of(paths["local_c3"]) == before
+
+
+@pytest.mark.parametrize("landed", [True, False])
+def test_forward_skips_a_repointed_row_landed_or_not(
+        landed, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-before-mark" if landed else "relink-mid-rows")
+    stem, i = ("local_c2", 0) if landed else ("local_c3", 1)
+    set_keys(paths[stem], cliSessionId=LQ)
+    before = raw_of(paths[stem])
+    final, om = recover(env, op, "forward")
+    assert final == "completed"
+    r = om["rows"][i]
+    assert (r["skipped"], r["skip_detail"]) == ("repointed", "now opens another conversation")
+    assert r["written"] is False and raw_of(paths[stem]) == before
+    assert ("spawnedFrom" in data_of(paths[stem])) is landed     # a landed link stays on it
+    other = om["rows"][1 - i]
+    assert other["written"] is True and "skipped" not in other
+
+
+def test_cmd_recover_prints_each_skipped_row(capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    os.unlink(paths["local_p3"])
+    capsys.readouterr()
+    assert ct.cmd_recover(env, recover_ns(oid, "forward")) == 0
+    r3 = op_of(env, oid).manifest["rows"][1]
+    detail = "its parent {0}'s row is gone since this operation was journaled".format(LP[:8])
+    line = "skipped : local_c3 -> {0}: parent_changed - {1}".format(r3["label"], detail)
+    assert r3["label"] == "{0} ({0}/{1})".format(A3[:8], O3[:8])
+    assert ct._relink_skip_line(r3) == line
+    assert capsys.readouterr().out.splitlines() == ["result: completed", line]
+
+
+def test_back_takes_out_what_landed_and_terminates(mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    before = data_of(paths["local_c2"])
+    op = crashed(env, "relink-mid-rows")
+    pending = raw_of(paths["local_c3"])
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back" and om["status"] == "rolled_back"
+    after = data_of(paths["local_c2"])
+    assert after == before and list(after) == list(before)
+    assert raw_of(paths["local_c3"]) == pending
+    r2, r3 = om["rows"]
+    assert (r2["written"], r2["restored"], r2["back_keys"]) == (True, True, ["spawnedFrom"])
+    assert r3["written"] is False and "restored" not in r3 and "back_keys" not in r3
+    assert om["rolling_back"] is True and om["back_left"] == [] and om["back_restored"] == 1
+    assert om["abort_reason"] == "back restored 1 row(s)"
+    assert "rollback_residue" not in om and ct._relink_shape_error(om) is None
+    assert ct.read_lock(env) is None and ct.nonterminal_ops(env) == []
+
+
+def test_back_takes_out_a_landed_key_beside_one_the_app_reverted(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    pre = data_of(paths["local_c2"])
+    op = crashed(env, "relink-before-mark")
+    drop_key(paths["local_c2"], "startChain")
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert data_of(paths["local_c2"]) == pre
+    r2 = om["rows"][0]
+    assert (r2["written"], r2["restored"], r2["back_keys"]) == (True, True, ["spawnedFrom"])
+    assert om["back_left"] == [] and om["abort_reason"] == "back restored 1 row(s)"
+
+
+def test_an_interrupted_back_offers_only_back_and_a_second_back_finishes(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    assert [r["written"] for r in op.manifest["rows"]] == [True, True]
+    with pytest.raises(SimulatedCrash):
+        recover(env, op, "back", hook=crash_on("relink-back-mid-rows"))
+    ct.release_lock(env)
+    om = op_of(env, oid).manifest                       # the record on disk
+    assert om["status"] == "writing" and om["rolling_back"] is True
+    r2, r3 = om["rows"]
+    # back reaches local_c3 first, in reverse journal order, and stops before local_c2's write
+    assert r3["restored"] is True and "spawnedFrom" not in data_of(paths["local_c3"])
+    assert "restored" not in r2 and "spawnedFrom" in data_of(paths["local_c2"])
+    c = ct.classify_op(env, op_of(env, oid))
+    assert (c["resolutions"], c["note"]) == (["back"], ROLLING_NOTE.format(oid))
+    msg = recover_refusal(env, op, "forward")
+    assert "began and stopped part-way" in msg and ROLLING_NOTE.format(oid) in msg
+    with pytest.raises(ct.Refusal) as exc:      # the arm's own check, should it be reached
+        ct._recover_relink(env, op_of(env, oid), "forward", [])
+    assert str(exc.value) == ROLLING_NOTE.format(oid) + ". Nothing was changed."
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert not any("spawnedFrom" in data_of(paths[s]) for s in ("local_c2", "local_c3"))
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+    assert om["back_restored"] == 2 and om["abort_reason"] == "back restored 2 row(s)"
+    # rolled back, it claims nothing (spec D13): nothing it wrote is left outside undo's reach
+    asked = [like(row_of(op, s)) for s in ("local_c2", "local_c3")]
+    assert ct._relink_claims(env, EARLIER, asked) == []
+
+
+def test_back_names_a_landed_unmarked_row_repointed_since(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-before-mark")
+    oid = op.manifest["op_id"]
+    c2 = row_of(op, "local_c2")
+    set_keys(paths["local_c2"], cliSessionId=LQ)        # its link kept
+    before = raw_of(paths["local_c2"])
+    asked = [like(c2)]
+    # unfinished, it claims every row it names (spec D13)
+    assert claimed(ct._relink_claims(env, EARLIER, asked)) == [
+        (oid, "local_c2.json", {"spawnedFrom"})]
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert raw_of(paths["local_c2"]) == before
+    assert data_of(paths["local_c2"])["spawnedFrom"] == c2["new"]["spawnedFrom"]
+    assert om["back_left"] == [entry(c2, "the row", THE_ROW_LEFT)]
+    assert om["abort_reason"] == (
+        "back restored 0 row(s); left 1: local_c2 the row ({0})".format(THE_ROW_LEFT))
+    r2 = om["rows"][0]
+    assert r2["written"] is True and "restored" not in r2
+    assert ct._relink_claims(env, EARLIER, asked) == []      # rolled back, it claims nothing
+
+
+@pytest.mark.parametrize("saves_fail", [False, True], ids=["saved", "saves-fail"])
+def test_a_failed_verify_in_back_leaves_the_row_for_a_second_back(
+        saves_fail, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    # back reaches local_c3 first, in reverse journal order, so local_c2's write is the one
+    # whose verify fails, with local_c3 already restored
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    real_write, real_save, broken = ct.atomic_write, ct.save_manifest, []
+
+    def wrong_for_c2(path, data):
+        if same_file(path, paths["local_c2"]):
+            broken.append(path)
+            return real_write(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
+        return real_write(path, data)
+
+    def save(o):
+        # with SAVES_FAIL, every save after the wrong write fails: the verify's error stands
+        if saves_fail and broken:
+            raise OSError(28, "No space left on device")
+        return real_save(o)
+    monkeypatch.setattr(ct, "atomic_write", wrong_for_c2)
+    monkeypatch.setattr(ct, "save_manifest", save)
+    msg = recover_refusal(env, op, "back", ct.LayoutError)    # never the OSError
+    assert msg == (
+        "verify failed restoring row local_c2.json: the row on disk is not the row read with "
+        "relink's keys put back - run 'recover --resolve {0} --back --apply' again; it re-reads "
+        "the row and goes by what each key holds.".format(oid))
+    monkeypatch.undo()
+    om = op_of(env, oid).manifest
+    assert om["status"] == "writing" and om["rolling_back"] is True
+    r2, r3 = om["rows"]
+    assert "restored" not in r2 and r2["back_keys"] == ["spawnedFrom"]
+    assert r3["restored"] is True
+    assert ct.read_lock(env) is None
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back" and om["back_restored"] == 2
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+
+
+def test_back_marks_a_landed_row_written_before_putting_its_keys_back(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = chain_store(env, write_transcript, write_row)
+    pre = data_of(paths["local_c2"])
+    op = crashed(env, "relink-before-mark")
+    oid = op.manifest["op_id"]
+    c2 = row_of(op, "local_c2")
+    changed = dict(c2["new"]["startChain"], depth=9)
+    set_keys(paths["local_c2"], startChain=changed)
+    with pytest.raises(SimulatedCrash):                  # after the write, before the mark
+        recover(env, op, "back", hook=crash_on("relink-back-before-mark"))
+    om = op_of(env, oid).manifest
+    r2 = om["rows"][0]
+    assert r2["written"] is True and "restored" not in r2 and r2["back_keys"] == ["spawnedFrom"]
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+    assert data_of(paths["local_c2"])["startChain"] == changed
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert om["back_left"] == [entry(c2, "startChain", APP_CHANGED)]
+    assert om["abort_reason"] == (
+        "back restored 1 row(s); left 1: local_c2 startChain (the app changed it since)")
+    assert om["rows"][0]["restored"] is True and om["back_restored"] == 1
+    assert data_of(paths["local_c2"]) == dict(pre, startChain=changed)
+
+
+def test_a_resumed_back_reports_the_rows_its_first_pass_handled(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    c3 = row_of(op, "local_c3")
+    set_keys(paths["local_c3"], spawnedFrom=dict(c3["new"]["spawnedFrom"], taskId="task_app"))
+    left = [entry(c3, "spawnedFrom", APP_CHANGED)]
+    with pytest.raises(SimulatedCrash):                  # at local_c2, after its write
+        recover(env, op, "back", hook=crash_on("relink-back-before-mark", 2))
+    om = op_of(env, oid).manifest
+    r2, r3 = om["rows"]
+    assert om["back_left"] == left
+    assert r3["restored"] is True and "back_keys" not in r3
+    assert r2["back_keys"] == ["spawnedFrom"] and "restored" not in r2
+    assert "spawnedFrom" not in data_of(paths["local_c2"])
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    # built from the record, so the first pass's rows count, though the second wrote nothing
+    assert om["abort_reason"] == (
+        "back restored 1 row(s); left 1: local_c3 spawnedFrom (the app changed it since)")
+    assert om["back_restored"] == 1 and om["back_left"] == left
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+
+
+@pytest.mark.parametrize("change", ["repointed", "gone", "unreadable"])
+def test_back_never_reports_an_untouched_pending_row(
+        change, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    before = data_of(paths["local_c2"])
+    op = crashed(env, "relink-mid-rows")
+    if change == "repointed":
+        set_keys(paths["local_c3"], cliSessionId=LQ)
+    elif change == "gone":
+        os.unlink(paths["local_c3"])
+    else:
+        write_raw(paths["local_c3"], "{not json")
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert om["abort_reason"] == "back restored 1 row(s)" and om["back_left"] == []
+    r2, r3 = om["rows"]
+    assert r2["restored"] is True and data_of(paths["local_c2"]) == before
+    assert r3["written"] is False and "restored" not in r3
+
+
+def test_back_leaves_a_claimed_key_and_names_it_in_abort_reason(
+        capsys, mkenv, tmp_path, write_transcript, write_row):
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    oid = op.manifest["op_id"]
+    c2 = row_of(op, "local_c2")
+    sync = whole_op(env, "sync", paths["local_c2"])     # later, completed, and wrote the row
+    sid = sync.manifest["op_id"]
+    capsys.readouterr()
+    assert ct.cmd_recover(env, recover_ns(oid, "back")) == 0
+    om = op_of(env, oid).manifest
+    reason = ("back restored 1 row(s); left 1: local_c2 spawnedFrom (operation {0} wrote it "
+              "since)".format(sid))
+    assert om["abort_reason"] == reason
+    assert capsys.readouterr().out.splitlines() == ["result: rolled_back", "reason: " + reason]
+    r2, r3 = om["rows"]
+    assert "restored" not in r2
+    assert data_of(paths["local_c2"])["spawnedFrom"] == c2["new"]["spawnedFrom"]
+    assert r3["restored"] is True and "spawnedFrom" not in data_of(paths["local_c3"])
+    # rolled back, the relink claims nothing (spec D13); the sync still does
+    assert [c["op_id"] for c in ct._relink_claims(env, EARLIER, [like(c2)])] == [sid]
+
+
+def test_back_leaves_no_rollback_residue_for_an_existing_row(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    os.unlink(paths["local_c2"])
+    write_raw(paths["local_c3"], "{not json")
+    final, om = recover(env, op, "back")
+    assert final == "rolled_back"
+    assert "rollback_residue" not in om and "rollback_residue_paths" not in om
+    assert om["abort_reason"] == ("back restored 0 row(s); left 2: local_c3 the row (could not "
+                                  "be read), local_c2 the row (gone from the store)")
+    r2, r3 = om["rows"]
+    assert r2["restored"] is True and "restored" not in r3
+    assert ct.gather_doctor(env)["rollback_residue"] == []
+
+
+@pytest.mark.parametrize("direction", ["forward", "back"])
+def test_a_failed_final_save_refuses_with_the_runnable_hint_and_recovery_again_closes(
+        direction, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    final_status = "completed" if direction == "forward" else "rolled_back"
+    real = ct.save_manifest
+
+    def full_at_final(o):
+        # the real set_status sets the status in memory, then saves it
+        if o.manifest.get("status") == final_status:
+            raise OSError(28, "No space left on device")
+        return real(o)
+    monkeypatch.setattr(ct, "save_manifest", full_at_final)
+    target = op_of(env, oid)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.recover_op(env, target, direction)
+    monkeypatch.setattr(ct, "save_manifest", real)
+    then = ("The op is left at 'writing' - {0} takes out what landed.".format(recover_hint(oid))
+            if direction == "forward" else
+            "The op is left at 'writing' - run {0} again; it goes on from what each row holds "
+            "now.".format(recover_hint(oid)))
+    assert str(exc.value) == ("could not save the operation record in {0} ([Errno 28] No space "
+                              "left on device). {1}".format(target.op_dir, then))
+    om = op_of(env, oid).manifest
+    assert om["status"] == "writing" and ct.read_lock(env) is None
+    final, om = recover(env, op, direction)
+    assert final == final_status
+    if direction == "forward":
+        assert [r["written"] for r in om["rows"]] == [True, True]
+    else:
+        assert om["back_restored"] == 1 and om["rows"][0]["restored"] is True
+        assert "spawnedFrom" not in data_of(paths["local_c2"])
+
+
+def test_a_relink_whose_own_history_gives_no_time_is_refused_as_damaged_by_its_folder(
+        mkenv, tmp_path, write_transcript, write_row):
+    # back orders every other operation against this one (D13), so a record that cannot say
+    # when it was made is refused as undo refuses it, named by its folder
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    target = op_of(env, oid)
+    for h in target.manifest["history"]:
+        h.pop("at")
+    ct.save_manifest(target)
+    folder = os.path.basename(target.op_dir)
+    before, record = raws(paths), manifest_raw(target)
+    c = ct.classify_op(env, op_of(env, oid))
+    assert (c["resolutions"], c["note"]) == ([], (
+        "relink: the record in {0} is damaged ({1}), so neither direction can be run from "
+        "it".format(folder, NO_HISTORY)))
+    for direction in ("forward", "back"):
+        assert "is damaged" in recover_refusal(env, op, direction)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._recover_relink(env, op_of(env, oid), "back", [])
+    assert str(exc.value) == ("the record in {0} is damaged ({1}), so neither direction can be "
+                              "run from it. Nothing was changed.".format(folder, NO_HISTORY))
+    assert raws(paths) == before and manifest_raw(target) == record
+
+
+_RECOVERY_DAMAGE = {                                    # three of Task 5's damages
+    "old": lambda m: m["rows"][0].__setitem__("old", []),
+    "lineage": lambda m: m["rows"][0]["lineage"].__setitem__("parent_row", "local_p9"),
+    "rolling_back": lambda m: m.__setitem__("rolling_back", "yes"),
+}
+
+
+@pytest.mark.parametrize("damage", sorted(_RECOVERY_DAMAGE))
+def test_a_damaged_record_refuses_through_classify_undo_and_recover(
+        damage, mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    target = op_of(env, oid)
+    _RECOVERY_DAMAGE[damage](target.manifest)
+    ct.save_manifest(target)
+    bad = ct._relink_shape_error(target.manifest)
+    assert isinstance(bad, str)
+    before, record = raws(paths), manifest_raw(target)
+    c = ct.classify_op(env, op_of(env, oid))
+    assert (c["resolutions"], c["note"]) == ([], (
+        "relink: this operation's record is damaged ({0}), so neither direction can be run "
+        "from it".format(bad)))
+    for direction in ("forward", "back"):
+        assert "is damaged" in recover_refusal(env, op, direction)
+    with pytest.raises(ct.Refusal) as exc:
+        ct._recover_relink(env, op_of(env, oid), "back", [])
+    assert str(exc.value) == ("the record for {0} is damaged ({1}), so neither direction can be "
+                              "run from it. Nothing was changed.".format(oid, bad))
+    assert raws(paths) == before and manifest_raw(target) == record
+    # a completed relink with the same damage: its undo refuses too
+    env2 = mkenv(tmp_path / "completed")
+    relink_store(env2, write_transcript, write_row)
+    done = relink_now(env2)
+    _RECOVERY_DAMAGE[damage](done.manifest)
+    ct.save_manifest(done)
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_relink(env2, op_of(env2, done.manifest["op_id"]))
+    assert "is damaged" in str(exc.value)
+
+
+def test_every_route_passes_discovered_roots(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    seen = []
+    real_read, real_put = ct._relink_read, ct._relink_put
+
+    def read(r, roots):
+        seen.append(list(roots))
+        return real_read(r, roots)
+
+    def put(r, value, roots, then):
+        seen.append(list(roots))
+        return real_put(r, value, roots, then)
+    monkeypatch.setattr(ct, "_relink_read", read)
+    monkeypatch.setattr(ct, "_relink_put", put)
+    for route in ("apply", "undo", "forward", "back"):
+        env = mkenv(tmp_path / route)
+        relink_store(env, write_transcript, write_row)
+        if route == "apply":
+            seen.clear()
+            assert ct.run_relink(env, plan(env)) == "completed"
+        elif route == "undo":
+            op = relink_now(env)
+            seen.clear()
+            assert undo(env, op)[0] == "undone"
+        else:
+            op = crashed(env, "relink-mid-rows")
+            seen.clear()
+            assert recover(env, op, route)[0] == (
+                "completed" if route == "forward" else "rolled_back")
+        want = ct.discover_stores(env).roots
+        journaled = {r[k] for o in ct.list_ops(env) for r in o.manifest["rows"]
+                     for k in ("store_path", "dest_path")}
+        assert seen, route
+        assert all(s == want for s in seen), route
+        assert not journaled & {p for s in seen for p in s}, route
+    # a discovery error refuses undo and recovery before any row is read
+    env_u, env_r = mkenv(tmp_path / "error-undo"), mkenv(tmp_path / "error-recover")
+    relink_store(env_u, write_transcript, write_row)
+    relink_store(env_r, write_transcript, write_row)
+    done = op_of(env_u, relink_now(env_u).manifest["op_id"])
+    stuck = op_of(env_r, crashed(env_r, "relink-mid-rows").manifest["op_id"])
+    monkeypatch.setattr(ct, "discover_stores", lambda env: ct.StoreDiscovery("error", [], "boom"))
+    seen.clear()
+    with pytest.raises(ct.LayoutError) as exc:
+        ct.undo_relink(env_u, done)
+    assert "store discovery failed: boom" in str(exc.value)
+    for direction in ("forward", "back"):
+        with pytest.raises(ct.LayoutError) as exc:
+            ct.recover_op(env_r, stuck, direction)
+        assert "store discovery failed: boom" in str(exc.value)
+    assert seen == []
+
+
+# The recovery matrix: one journal row, local_c3, by its `written` flag and what a
+# read finds; each line is built by a crash point and one edit, and each direction's
+# cell is asserted exactly (the skip reason, written and restored as the record on
+# disk holds them, the row's bytes, and whether abort_reason names it). local_c2 is
+# written before every crash point used, and back always takes it out.
+
+_CRASHES = {"pending": ("relink-mid-rows", 1),     # local_c3 never written: its pre-image
+            "landed": ("relink-before-mark", 2),   # local_c3 landed, its mark never saved
+            "written": ("relink-after-rows", 1)}   # local_c3 written and marked
+
+
+def _matrix_edit(edit, env, paths, op):
+    c3 = paths["local_c3"]
+    if edit == "delete":
+        os.unlink(c3)
+    elif edit == "corrupt":
+        write_raw(c3, "{not json")
+    elif edit == "repoint":
+        set_keys(c3, cliSessionId=LQ)
+    elif edit == "repoint, unlinked":
+        drop_key(c3, "spawnedFrom")
+        set_keys(c3, cliSessionId=LQ)
+    elif edit == "record":
+        target = op_of(env, op.manifest["op_id"])
+        target.manifest["rows"][1]["old"]["spawnedFrom"] = {"present": True, "value": "x"}
+        ct.save_manifest(target)
+    elif edit == "parent gone":
+        os.unlink(paths["local_p3"])
+    elif edit == "cycle":
+        set_keys(paths["local_p3"], spawnedFrom=side_link("local_c3"))
+    elif edit == "unreadable store":
+        write_raw(os.path.join(os.path.dirname(c3), "local_zz.json"), "{not json")
+    elif edit == "touched":
+        set_keys(c3, lastFocusedAt=1_800_000_000_000)
+    elif edit == "app changed":
+        set_keys(c3, spawnedFrom=dict(tool_link("local_p3"), taskId="task_app"))
+    else:
+        assert edit == "none"
+
+
+def _cell(skip=None, written=False, restored=False, row="same", named=None, refused=False):
+    """A cell: ROW is "same" (as before recovery, there or not), "linked" (the pre-image with
+    the link) or "unlinked" (the pre-image); NAMED is what abort_reason says of local_c3."""
+    return {"skip": skip, "written": written, "restored": restored, "row": row,
+            "named": named, "refused": refused}
+
+
+_MATRIX = [
+    # line                    crash      edit                 forward              back
+    ("written", "written", "repoint", _cell(written=True), None),
+    ("absent", "pending", "delete", _cell(skip="gone"), _cell()),
+    ("unreadable", "pending", "corrupt", _cell(skip="unreadable"), _cell()),
+    ("other, new", "landed", "repoint", _cell(skip="repointed"),
+     _cell(written=True, named="the row ({0})".format(THE_ROW_LEFT))),
+    ("other, none", "pending", "repoint", _cell(skip="repointed"), _cell()),
+    ("same, new", "landed", "none", _cell(written=True),
+     _cell(written=True, restored=True, row="unlinked")),
+    ("record disagrees", "pending", "record", _cell(refused=True), _cell()),
+    ("target gone", "pending", "parent gone", _cell(skip="parent_changed"), _cell()),
+    ("cycle", "pending", "cycle", _cell(skip="lineage_cycle"), _cell()),
+    ("links unreadable", "pending", "unreadable store", _cell(skip="edges_unreadable"),
+     _cell()),
+    ("checks pass", "pending", "none", _cell(written=True, row="linked"), _cell()),
+    ("bytes differ", "pending", "touched", _cell(skip="changed_since_plan"), _cell()),
+    ("written, absent", "written", "delete", None,
+     _cell(written=True, restored=True, named="the row (gone from the store)")),
+    ("written, unreadable", "written", "corrupt", None,
+     _cell(written=True, named="the row (could not be read)")),
+    ("written, other, new", "written", "repoint", None,
+     _cell(written=True, named="the row ({0})".format(THE_ROW_LEFT))),
+    ("written, other, none", "written", "repoint, unlinked", None,
+     _cell(written=True, restored=True, named="the row (now opens another conversation)")),
+    ("written, same, new", "written", "none", None,
+     _cell(written=True, restored=True, row="unlinked")),
+    ("written, same, none", "written", "app changed", None,
+     _cell(written=True, restored=True, named="spawnedFrom (the app changed it since)")),
+]
+_MATRIX_CASES = [(direction, line) for line, _c, _e, fwd, back in _MATRIX
+                 for direction, cell in (("forward", fwd), ("back", back)) if cell is not None]
+
+
+@pytest.mark.parametrize("direction, line", _MATRIX_CASES,
+                         ids=["{0}: {1}".format(d, ln) for d, ln in _MATRIX_CASES])
+def test_recovery_matrix(direction, line, mkenv, tmp_path, write_transcript, write_row):
+    _l, crash, edit, fwd, back = next(e for e in _MATRIX if e[0] == line)
+    want = fwd if direction == "forward" else back
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    c3 = paths["local_c3"]
+    pre = data_of(c3)
+    op = crashed(env, *_CRASHES[crash])
+    oid = op.manifest["op_id"]
+    _matrix_edit(edit, env, paths, op)
+    before = raw_of(c3) if os.path.exists(c3) else None
+    if want["refused"]:
+        assert "does not match row local_c3.json" in recover_refusal(env, op, direction,
+                                                                     ct.LayoutError)
+        status = "writing"
+    else:
+        status = "completed" if direction == "forward" else "rolled_back"
+        assert recover(env, op, direction)[0] == status
+    om = op_of(env, oid).manifest
+    assert om["status"] == status
+    r3 = om["rows"][1]
+    assert r3.get("skipped") == want["skip"]
+    assert r3["written"] is want["written"]
+    assert r3.get("restored", False) is want["restored"]
+    if want["row"] == "same":
+        assert (raw_of(c3) if os.path.exists(c3) else None) == before
+    else:
+        assert data_of(c3) == (dict(pre, spawnedFrom=tool_link("local_p3"))
+                               if want["row"] == "linked" else pre)
+    if direction == "back":
+        if want["named"]:
+            assert "local_c3 " + want["named"] in om["abort_reason"]
+        else:
+            assert "local_c3" not in om["abort_reason"]
+        assert om["rows"][0]["restored"] is True
+        assert "spawnedFrom" not in data_of(paths["local_c2"])

@@ -517,6 +517,53 @@ def test_unfinished_converge_forward_finishes_in_the_moved_store(
         assert os.path.exists(at(r["dest_path"], old, new))
 
 
+def relinked(mkenv, tmp_path, write_transcript, write_row, crash_at=None):
+    """A relink of test_relink's base store (local_c2 and local_c3 gain their link) in the
+    packaged store: completed, or cut off at the first hit of CRASH_AT with the lock
+    released. Returns (env, la, claude, the old store, {stem: path})."""
+    from test_relink import relink_store
+    env = _monotonic_now(mkenv(tmp_path))
+    la, claude = packaged(env, tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    m = ct.plan_relink(env, ct.RelinkFlags())
+    if crash_at:
+        def hook(p):
+            if p == crash_at:
+                raise SimulatedCrash()
+        ct._crash_hook = hook
+        try:
+            with pytest.raises(SimulatedCrash):
+                ct.run_relink(env, m)
+        finally:
+            ct._crash_hook = None
+        ct.release_lock(env)
+    else:
+        assert ct.run_relink(env, m) == "completed"
+    return env, la, claude, env.store_candidates[0], paths
+
+
+def test_relink_undo_takes_the_link_out_in_the_moved_store(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, la, claude, old, paths = relinked(mkenv, tmp_path, write_transcript, write_row)
+    new = relocate(env, la, claude)
+    assert ct.undo_relink(env, ct.list_ops(env)[-1]) == "undone"
+    with open(at(paths["local_c2"], old, new), encoding="utf-8") as fh:
+        assert "spawnedFrom" not in json.load(fh)
+
+
+@pytest.mark.parametrize("direction", ["forward", "back"])
+def test_an_unfinished_relink_recovers_in_the_moved_store(
+        direction, mkenv, tmp_path, write_transcript, write_row):
+    env, la, claude, old, paths = relinked(mkenv, tmp_path, write_transcript, write_row,
+                                           crash_at="relink-mid-rows")
+    new = relocate(env, la, claude)
+    assert ct.recover_op(env, ct.nonterminal_ops(env)[0], direction) == (
+        "completed" if direction == "forward" else "rolled_back")
+    stem = "local_c3" if direction == "forward" else "local_c2"
+    with open(at(paths[stem], old, new), encoding="utf-8") as fh:
+        assert ("spawnedFrom" in json.load(fh)) is (direction == "forward")
+
+
 def test_unfinished_new_row_back_removes_the_row(
         mkenv, tmp_path, write_transcript, write_row):
     env, la, claude, old, op = new_rowed(mkenv, tmp_path, write_transcript, write_row)
