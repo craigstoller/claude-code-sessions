@@ -20978,13 +20978,14 @@ def _relink_undo_disposition(r, state, data):
             False)
 
 
-def _relink_undo_claims_refusal(op_id, claims):
-    """undo's refusal for D13's CLAIMS (_relink_claims' entries), worded by
-    each claim's `why`: a live operation's names it, to be undone first; a
-    record that cannot be read is named by its folder, to be repaired or
-    moved out of the journal by hand, since no command does either; a
-    journal that could not be listed (op_id "") names no op id. One line
-    each, in that order, each naming its rows once."""
+def _relink_claims_refusal(op_id, claims, what="undo"):
+    """The refusal for D13's CLAIMS (_relink_claims' entries), worded by each
+    claim's `why`: a live operation's names it, to be undone first; a record
+    that cannot be read is named by its folder, to be repaired or moved out
+    of the journal by hand, since no command does either; a journal that
+    could not be listed (op_id "") names no op id. One line each, in that
+    order, each naming its rows once, each saying `cannot <WHAT> <op_id>`:
+    undo refuses on every claim, recovery's back on the last two only."""
     def rows_of(cs):
         out = []
         for c in cs:
@@ -21001,21 +21002,23 @@ def _relink_undo_claims_refusal(op_id, claims):
     lines = []
     if live:
         lines.append(
-            "cannot undo {0}: operation(s) {1} wrote row(s) {2} after it - undo "
+            "cannot {0} {1}: operation(s) {2} wrote row(s) {3} after it - undo "
             "those first. Nothing was changed.".format(
-                op_id, ", ".join(sorted({c["op_id"] for c in live})), rows_of(live)))
+                what, op_id, ", ".join(sorted({c["op_id"] for c in live})),
+                rows_of(live)))
     if damaged:
         lines.append(
-            "cannot undo {0}: the record(s) in {1} cannot be read, so whether they "
-            "wrote row(s) {2} after it cannot be told. No command repairs a "
+            "cannot {0} {1}: the record(s) in {2} cannot be read, so whether they "
+            "wrote row(s) {3} after it cannot be told. No command repairs a "
             "record: with the app closed, repair each one, or move its folder out "
             "of the journal. Nothing was changed.".format(
-                op_id, ", ".join(sorted({c["op_id"] for c in damaged})),
+                what, op_id, ", ".join(sorted({c["op_id"] for c in damaged})),
                 rows_of(damaged)))
     if unlisted:
         lines.append(
-            "cannot undo {0}: {1}, so whether a later operation wrote its rows "
-            "cannot be told. Nothing was changed.".format(op_id, unlisted[0]["why"]))
+            "cannot {0} {1}: {2}, so whether a later operation wrote its rows "
+            "cannot be told. Nothing was changed.".format(what, op_id,
+                                                           unlisted[0]["why"]))
     return "\n".join(lines)
 
 
@@ -21076,7 +21079,7 @@ def undo_relink(env, op):
             work.append((r, data) + _relink_undo_disposition(r, state, data))
         claims = _relink_claims(env, m, todo)
         if claims:
-            raise Refusal(_relink_undo_claims_refusal(m["op_id"], claims))
+            raise Refusal(_relink_claims_refusal(m["op_id"], claims))
         left = m.setdefault("undo_left", [])
         then = _relink_undo_then(m["op_id"])
         saver = _RelinkSaver(op, then=then)
@@ -21278,11 +21281,12 @@ def _recover_relink(env, op, direction, stray):
 
 
 def _relink_forward_decision(m, r, roots, by_name, graphs):
-    """(what, detail, data) for pending row R of relink M, from one read, by
-    the recovery matrix: `what` is "landed" (a key at new: mark it written),
-    "write" (still at its pre-image and every check passes; DATA is the row
-    as read), or a skip reason with its detail. D19 comes first: a row gone,
-    unreadable or opening another conversation is skipped, landed or not. A
+    """(what, detail, data, raw) for pending row R of relink M, from one read,
+    by the recovery matrix: `what` is "landed" (a key at new: mark it
+    written), "write" (still at its pre-image and every check passes; DATA
+    and RAW are the row as read), or a skip reason with its detail. D19 comes
+    first: a row gone, unreadable or opening another conversation is
+    skipped, landed or not, and a landed one is said to keep its link. A
     row at its pre-image is re-checked against its targets
     (_relink_dependency_skip) and, for the keys it writes only, against the
     account's links on disk and those of the rows this pass decided to write
@@ -21292,22 +21296,24 @@ def _relink_forward_decision(m, r, roots, by_name, graphs):
     not match its row, and for a row outside the discovered roots."""
     state, data, raw = _relink_read(r, roots)
     if state == "absent":
-        return "gone", "gone from the store", None
+        return "gone", "gone from the store", None, None
     if state == "unreadable":
-        return "unreadable", "could not be read", None
+        return "unreadable", "could not be read", None, None
+    landed = _relink_landed(_relink_row_states(r, data))
     if data.get("cliSessionId") != r["session_id"]:
-        return "repointed", "now opens another conversation", None
-    if _relink_landed(_relink_row_states(r, data)):
-        return "landed", "", None
+        return ("repointed", "now opens another conversation; its link was left"
+                if landed else "now opens another conversation", None, None)
+    if landed:
+        return "landed", "", None, None
     if _relink_sha(raw) != r["pre_sha256"]:
-        return "changed_since_plan", "changed since the plan", None
+        return "changed_since_plan", "changed since the plan", None, None
     if not _relink_row_agrees(r, data):
         raise LayoutError("the record for {0} does not match row {1}; refusing "
                           "rather than write from it. Nothing was changed."
                           .format(m.get("op_id", ""), r["name"]))
     skip = _relink_dependency_skip(m, r, by_name)
     if skip:
-        return skip[0], skip[1], None
+        return skip[0], skip[1], None, None
     store = _relink_store_key(r["store_path"])
     if store not in graphs:
         found, unread = _lineage_store_rows(r["store_path"], light=True)
@@ -21320,24 +21326,49 @@ def _relink_forward_decision(m, r, roots, by_name, graphs):
                                              ("startChain", "root_session"))
                if key in r["new"]]
     if any(_lineage_reaches(graph, t, child) for t in targets):
-        return "lineage_cycle", "it would close a cycle now", None
+        return "lineage_cycle", "it would close a cycle now", None, None
     if unread:
         return ("edges_unreadable", "the account's links could not all be "
-                "read, so a cycle cannot be ruled out", None)
+                "read, so a cycle cannot be ruled out", None, None)
     for t in targets:
         _lineage_edge_add(graph, child, t)
-    return "write", "", data
+    return "write", "", data, raw
+
+
+def _relink_rerun_then(m, direction):
+    """Recovery's next step after a refusal or a failed save: the same
+    direction again, which goes by what each row holds now."""
+    return ("The op is left at '{0}' - run 'recover --resolve {1} --{2} "
+            "--apply' again; it goes on from what each row holds now.".format(
+                m.get("status", ""), m.get("op_id", ""), direction))
+
+
+def _relink_reread(m, r, raw, roots, direction):
+    """Once the guard has passed, before the first write: row R read again,
+    refused with nothing changed unless it still holds RAW, the bytes its
+    decision was made from. Recovery is the one route that reads before the
+    guard (the guard runs only when a row will be written), so the app may
+    have been running at that read and written the row as it closed; a write
+    built from the earlier read would replace that write."""
+    state, _data, now = _relink_read(r, roots)
+    if state != "present" or now != raw:
+        raise Refusal("row {0} ({1}) changed while recovery read it, most likely "
+                      "the app writing it as it closed. Nothing was changed. {2}"
+                      .format(r["name"], r.get("label", ""),
+                              _relink_rerun_then(m, direction)))
 
 
 def _relink_forward(env, op, roots, stray):
     """recover --forward: every row not written and not skipped, in journal
     order, is read once and decided (_relink_forward_decision) before
     anything changes, so a record that does not match its row refuses with
-    nothing changed. Then, under the guard only when a row will be written,
-    the decisions are recorded and each row to write gets exactly relink's
-    keys set, verified by value; then the op completes and the link report
-    names a landed link whose target has gone since. A landed, marked row
-    is not looked at again: undo names it later if it changed."""
+    nothing changed. Then, only when a row will be written, the guard, and
+    each row to write is read again and refused unless it is still the
+    bytes its decision read (_relink_reread). Then the decisions are
+    recorded and each row to write gets exactly relink's keys set, verified
+    by value; then the op completes and the link report names a landed link
+    whose target has gone since. A landed, marked row is not looked at
+    again: undo names it later if it changed."""
     m = op.manifest
     if m.get("rolling_back"):
         # A key back took out and marked restored would be written again
@@ -21350,20 +21381,23 @@ def _relink_forward(env, op, roots, stray):
     by_name, graphs = _lineage_rows_by_name(m), {}
     decided = [(r,) + _relink_forward_decision(m, r, roots, by_name, graphs)
                for r in m["rows"] if not r["written"] and not r.get("skipped")]
-    writes = [(r, data) for r, what, _detail, data in decided if what == "write"]
+    writes = [(r, data, raw) for r, what, _detail, data, raw in decided
+              if what == "write"]
     if writes:
         _guard_mutation(env, "add links to rows in", NEW_ROW_STORE,
                         because=RELINK_GUARD_WHY)
+        for r, _data, raw in writes:
+            _relink_reread(m, r, raw, roots, "forward")
     saver = _RelinkSaver(op, then=then)
     try:
-        for r, what, detail, _data in decided:
+        for r, what, detail, _data, _raw in decided:
             if what == "landed":
                 r["written"] = True
             elif what != "write":
                 r["skipped"], r["skip_detail"] = what, detail
         if decided:
             saver.tick()
-        for r, data in writes:
+        for r, data, _raw in writes:
             ok = _relink_put(r, _relink_apply_new(data, r["new"]), roots, then)
             r["written"] = True
             if not ok:
@@ -21389,14 +21423,6 @@ def _relink_forward(env, op, roots, stray):
                     forward=True)
     rotate_ops(env)
     return "completed"
-
-
-def _relink_back_then(m):
-    """back's next step after a refusal or a failed save: back again, which
-    goes by what each row holds now."""
-    return ("The op is left at '{0}' - run 'recover --resolve {1} --back "
-            "--apply' again; it goes on from what each row holds now.".format(
-                m.get("status", ""), m.get("op_id", "")))
 
 
 def _relink_back_disposition(r, state, data, claimed):
@@ -21451,49 +21477,61 @@ def _relink_back(env, op, roots, stray):
     journal order, and always terminate. A row has landed when it is marked
     written, or when a read finds a key of it at new; only landed rows are
     acted on or reported. Every row is read once, and the claims (D13) are
-    judged, before anything is written; the guard runs only when a key will
-    go back. rolling_back is saved before the first write, so from then on
-    only back is offered. Per landed row: (1) one save marks it written and
-    adds the keys about to go back to back_keys, so a crash mid-row never
-    leaves it looking untouched; (2) those keys go back in one write; (3) a
-    failed verify leaves the row unmarked for a second back; (4) its left
-    entries and the back_restored count are saved before (5) its restored
-    mark, set only when no key the relink wrote stays at new. back_left and
-    back_restored are kept in the record, so a resumed back reports the
-    rows an earlier pass handled. Rows in STRAY are never read, and are
-    recorded as residue unless restored; no other row ever is."""
+    judged, before anything is written. A claim by a record that cannot be
+    read, or a journal that cannot be listed, refuses the whole back with
+    nothing changed, as undo refuses it: it claims every key, and a back
+    that left them all and closed would strand them where no command
+    reaches. The guard runs only when a key will go back, and each row about
+    to be written is then read again (_relink_reread). rolling_back is saved
+    before the first write, so from then on only back is offered. Per landed
+    row: (1) one save marks it written and adds the keys about to go back to
+    back_keys, so a crash mid-row never leaves it looking untouched; (2)
+    those keys go back in one write; (3) a failed verify leaves the row
+    unmarked for a second back; (4) its left entries, which replace any an
+    earlier pass recorded for it, and the back_restored count are saved
+    before (5) its restored mark, set only when no key the relink wrote
+    stays at new. back_left and back_restored are kept in the record, so a
+    resumed back reports the rows an earlier pass handled. Rows in STRAY
+    are never read, and are recorded as residue unless restored; no other
+    row ever is."""
     m = op.manifest
     op_id = m.get("op_id", "")
+    then = _relink_rerun_then(m, "back")
     stray_ids = {id(r) for r, _p in stray}
     work = []
     for r in reversed(m["rows"]):
         if id(r) in stray_ids or r.get("restored"):
             continue
         try:
-            state, data, _raw = _relink_read(r, roots)
+            state, data, raw = _relink_read(r, roots)
         except LayoutError:
             if r["written"]:
                 raise
             continue                     # never landed, and not this op's to read
         if r["written"] or (state == "present"
                             and _relink_landed(_relink_row_states(r, data))):
-            work.append((r, state, data))
+            work.append((r, state, data, raw))
+    claims = _relink_claims(env, m, [r for r, _s, _d, _w in work])
+    unknown = [c for c in claims
+               if not c["op_id"] or c["why"] == _RELINK_CLAIM_UNREADABLE]
+    if unknown:
+        raise Refusal(_relink_claims_refusal(op_id, unknown, what="roll back")
+                      + " " + then)
     claimed = {}                         # id(row) -> {key: why it is left}
-    for c in _relink_claims(env, m, [r for r, _s, _d in work]):
-        why = c["why"]
-        if why == _RELINK_CLAIM_UNREADABLE:
-            why = "the record in {0} cannot be read".format(c["op_id"])
+    for c in claims:
         held = claimed.setdefault(id(c["row"]), {})
         for k in RELINK_KEYS:
             if k in c["keys"]:
-                held.setdefault(k, why)
-    plan = [(r, data) + _relink_back_disposition(r, state, data,
-                                                 claimed.get(id(r), {}))
-            for r, state, data in work]
-    if any(back for _r, _d, back, _e, _s in plan):
+                held.setdefault(k, c["why"])
+    plan = [(r, data, raw) + _relink_back_disposition(r, state, data,
+                                                      claimed.get(id(r), {}))
+            for r, state, data, raw in work]
+    if any(back for _r, _d, _w, back, _e, _s in plan):
         _guard_mutation(env, "take links out of rows in", NEW_ROW_STORE,
                         because=RELINK_GUARD_WHY)
-    then = _relink_back_then(m)
+        for r, _data, raw, back, _e, _s in plan:
+            if back:
+                _relink_reread(m, r, raw, roots, "back")
     if plan and m.get("rolling_back") is not True:
         m["rolling_back"] = True
         try:
@@ -21506,7 +21544,7 @@ def _relink_back(env, op, roots, stray):
     saver = _RelinkSaver(op, then=then)
     first = True
     try:
-        for r, data, back, entries, stays in plan:
+        for r, data, _raw, back, entries, stays in plan:
             changed = not r["written"]
             r["written"] = True
             if back:
@@ -21521,8 +21559,9 @@ def _relink_back(env, op, roots, stray):
                 if not first:
                     _maybe_crash("relink-back-mid-rows")
                 first = False
-                # The lock is held and the app closed, so the row is as the
-                # read found it.
+                # The row was read again after the guard passed, and still
+                # held the bytes its disposition was judged from; the lock is
+                # held, so nothing of this tool's has written it since.
                 if not _relink_put(r, _relink_apply_old(data, r["old"], back),
                                    roots, then):
                     # Left unmarked, so a second back reads it afresh.
@@ -21536,6 +21575,12 @@ def _relink_back(env, op, roots, stray):
                         "--resolve {1} --back --apply' again; it re-reads the row "
                         "and goes by what each key holds.".format(r["name"], op_id))
             _maybe_crash("relink-back-before-mark")
+            # A row read again in this pass is judged afresh: what an earlier
+            # pass left on it is replaced, so abort_reason never names a row
+            # as left that this pass restored. A restored row is never read
+            # again, so its entries stay.
+            left[:] = [e for e in left
+                       if (e.get("name"), e.get("label")) != (r["name"], r["label"])]
             for e in entries:
                 if e not in left:
                     left.append(e)
