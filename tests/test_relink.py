@@ -861,6 +861,28 @@ def test_only_by_row_id_narrows_to_that_row(mkenv, tmp_path, write_transcript, w
     assert names(plan(env, only="local_c", account=A3[:8])["rows"]) == ["local_c3.json"]
 
 
+def test_only_by_a_whole_row_id_takes_that_row_beside_a_copy_named_sibling(
+        mkenv, tmp_path, write_transcript, write_row):
+    # an Explorer copy's stem starts with the whole stem it was copied from, so no longer
+    # prefix of the original exists: the one row whose stem is the value is taken (review M-1)
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    copy = os.path.join(os.path.dirname(paths["local_c2"]), "local_c2 - Copy.json")
+    shutil.copyfile(paths["local_c2"], copy)
+    for flags in ({"only": "local_c2"}, {"only": "LOCAL_C2"},
+                  {"only": "local_c2", "account": A2[:8]}):
+        assert names(plan(env, **flags)["rows"]) == ["local_c2.json"], flags
+    assert names(plan(env, only="local_c2 - Copy")["rows"]) == ["local_c2 - Copy.json"]
+    # a prefix of both still refuses, and lists both
+    head, *lines = refusal(env, only="local_c", account=A2[:8]).split("\n")
+    assert head == "--only 'local_c' matches 2 rows; give more of the id:"
+    assert sorted(ln.split("   ")[1] for ln in lines) == ["local_c2", "local_c2 - Copy"]
+    # the same holds for any stem that another one extends
+    os.unlink(copy)
+    put_row(env, write_row, A2, "local_c2b", LC, "ACME-REVIEW side task")
+    assert names(plan(env, only="local_c2")["rows"]) == ["local_c2.json"]
+
+
 def test_only_by_conversation_with_two_rows_to_change_refuses(
         mkenv, tmp_path, write_transcript, write_row):
     env = mkenv(tmp_path)
@@ -895,10 +917,11 @@ def test_only_refuses_no_match_and_an_ambiguous_one(mkenv, tmp_path, write_trans
                     "to name its account:")                 # the rows span three accounts
     assert [ln.split()[0] for ln in lines] == ["local_c1", "local_c2", "local_c3"]
     assert lines[0] == "   local_c1   aaaaaaaa (aaaaaaaa/bbbbbbbb)   ACME-REVIEW side task"
-    # rows of one account are told apart by more of the id alone
+    # rows of one account are told apart by more of the id alone (a whole row id that is
+    # also a prefix of another takes its own row: test_only_by_a_whole_row_id_...)
     extra = put_row(env, write_row, A2, "local_c2b", LC, "ACME-REVIEW side task")
-    head, *lines = refusal(env, only="local_c2", account=A2[:8]).split("\n")
-    assert head == "--only 'local_c2' matches 2 rows; give more of the id:"
+    head, *lines = refusal(env, only="local_c", account=A2[:8]).split("\n")
+    assert head == "--only 'local_c' matches 2 rows; give more of the id:"
     assert [ln.split()[0] for ln in lines] == ["local_c2", "local_c2b"]
     os.unlink(extra)
     # a second conversation whose title holds the first one's
@@ -1054,9 +1077,11 @@ def test_an_unreadable_record_refuses_with_its_own_line(
     with open(os.path.join(env.ops_dir, "lock"), "w", encoding="utf-8") as fh:
         fh.write("4242 20990101T000000Z-dddddd")
     os.makedirs(os.path.join(env.ops_dir, "a stray folder"))
+    # recover cannot read such a record either, so the line gives the way out by hand
     unreadable = ("relink waits: the record(s) in 20990101T000000Z-bbbbbb, "
                   "20990101T000000Z-cccccc could not be read, so whether they are unfinished "
-                  "cannot be told. Nothing was changed.")
+                  "cannot be told. No command repairs a record: with the app closed, repair "
+                  "each one, or move its folder out of the journal. Nothing was changed.")
     msg = refusal(env)
     assert msg == unreadable
     assert "(" + "the journal" not in msg
@@ -1889,8 +1914,8 @@ def ns(**kw):
     return types.SimpleNamespace(**d)
 
 
-def recover_hint(op_id):
-    return "'recover --resolve {0} --back --apply'".format(op_id)
+def recover_hint(op_id, direction="back"):
+    return "'recover --resolve {0} --{1} --apply'".format(op_id, direction)
 
 
 def the_op(env):
@@ -3549,7 +3574,9 @@ def test_undo_waits_while_another_operation_is_unfinished(
         ct.undo_relink(env, target)
     assert str(exc.value).split("\n") == [
         waits, "relink's undo waits: the record(s) in {0} could not be read, so whether they "
-               "are unfinished cannot be told. Nothing was changed.".format(bad)]
+               "are unfinished cannot be told. No command repairs a record: with the app "
+               "closed, repair each one, or move its folder out of the journal. Nothing was "
+               "changed.".format(bad)]
     assert raws(paths) == before and record_of(target)["status"] == "completed"
     assert ct.read_lock(env) is None
 
@@ -3633,9 +3660,11 @@ def test_a_later_live_op_refuses_the_undo_and_names_it(
     assert ct.run_retitle(env, pm) == "completed"
     (rt,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "retitle"]
     before = raws(paths)
+    # the refusal says what follows when the claimant itself cannot be undone (review I-1)
     assert undo_refusal(env, op) == (
         "cannot undo {0}: operation(s) {1} wrote row(s) local_c2.json ({2}), local_c3.json "
-        "({3}) after it - undo those first. Nothing was changed.".format(
+        "({3}) after it - undo those first; if one cannot be undone, this relink cannot be "
+        "undone either. Nothing was changed.".format(
             op.manifest["op_id"], rt.manifest["op_id"], c2["label"], c3["label"]))
     assert op_of(env, op.manifest["op_id"]).manifest["status"] == "completed"
     assert raws(paths) == before
@@ -3650,8 +3679,8 @@ def test_a_later_relink_of_the_same_key_refuses_and_of_the_other_key_only_does_n
     same = journal_op(env, "relink", [like(c2)])
     assert undo_refusal(env, op) == (
         "cannot undo {0}: operation(s) {1} wrote row(s) local_c2.json ({2}) after it - undo "
-        "those first. Nothing was changed.".format(op.manifest["op_id"], same.manifest["op_id"],
-                                                    c2["label"]))
+        "those first; if one cannot be undone, this relink cannot be undone either. Nothing "
+        "was changed.".format(op.manifest["op_id"], same.manifest["op_id"], c2["label"]))
     assert "spawnedFrom" in data_of(paths["local_c2"])
     shutil.rmtree(same.op_dir)
     # a chain written beside no kept link touches none of this relink's keys
@@ -3991,7 +4020,9 @@ def test_recovery_waits_while_another_operation_is_unfinished(
     bad = "20990101T000001Z-bbbbbb"
     put_op(env, bad, "{not json")
     unreadable = ("recovery waits: the record(s) in {0} could not be read, so whether they are "
-                  "unfinished cannot be told. Nothing was changed.".format(bad))
+                  "unfinished cannot be told. No command repairs a record: with the app closed, "
+                  "repair each one, or move its folder out of the journal. Nothing was "
+                  "changed.".format(bad))
     c = ct.classify_op(env, target)
     assert (c["resolutions"], c["note"]) == ([], waits + "; " + unreadable)
     shutil.rmtree(os.path.join(env.ops_dir, OPEN_ID))
@@ -4609,10 +4640,11 @@ def test_a_failed_final_save_refuses_with_the_runnable_hint_and_recovery_again_c
     with pytest.raises(ct.Refusal) as exc:
         ct.recover_op(env, target, direction)
     monkeypatch.setattr(ct, "save_manifest", real)
-    then = ("The op is left at 'writing' - {0} takes out what landed.".format(recover_hint(oid))
-            if direction == "forward" else
-            "The op is left at 'writing' - run {0} again; it goes on from what each row holds "
-            "now.".format(recover_hint(oid)))
+    # each direction's hint names itself again first; forward's names back as the other way
+    then = ("The op is left at 'writing' - run {0} again; it goes on from what each row holds "
+            "now.".format(recover_hint(oid, direction)))
+    if direction == "forward":
+        then += " {0} takes out what landed instead.".format(recover_hint(oid))
     assert str(exc.value) == ("could not save the operation record in {0} ([Errno 28] No space "
                               "left on device). {1}".format(target.op_dir, then))
     om = op_of(env, oid).manifest
@@ -5012,3 +5044,125 @@ def test_recovery_matrix(direction, line, mkenv, tmp_path, write_transcript, wri
             assert "local_c3" not in om["abort_reason"]
         assert om["rows"][0]["restored"] is True
         assert "spawnedFrom" not in data_of(paths["local_c2"])
+
+
+# ------------------------------------------------ the whole-branch review's findings
+# The final review of dc08ad5..f38427e (2026-11-20); each test below fails first.
+
+def test_the_claims_refusal_names_at_most_the_cap_of_rows_and_counts_the_rest():
+    # a damaged record claims every row asked about, so on a bulk relink one line would
+    # otherwise name every row of it (review M-2); undo and back share the line
+    rows = [{"name": "local_c{0:02d}.json".format(i), "label": "L"} for i in range(17)]
+    shown = ", ".join("local_c{0:02d}.json (L)".format(i) for i in range(ct.RELINK_LIST_CAP))
+    other = "20990101T000000Z-bbbbbb"
+    live = [{"row": r, "op_id": OPEN_ID, "keys": {"spawnedFrom"},
+             "why": "operation {0} wrote it since".format(OPEN_ID)} for r in rows]
+    live.append(dict(live[0], op_id=other, why="operation {0} wrote it since".format(other)))
+    assert ct._relink_claims_refusal("OP", live) == (     # a row two operations claim is one
+        "cannot undo OP: operation(s) {0}, {1} wrote row(s) {2}, ... and 2 more after it - "
+        "undo those first; if one cannot be undone, this relink cannot be undone either. "
+        "Nothing was changed.".format(OPEN_ID, other, shown))
+    damaged = [{"row": r, "op_id": "F", "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}
+               for r in rows]
+    assert ct._relink_claims_refusal("OP", damaged, what="roll back") == (
+        "cannot roll back OP: the record(s) in F cannot be read, so whether they wrote "
+        "row(s) {0}, ... and 2 more after it cannot be told. No command repairs a record: "
+        "with the app closed, repair each one, or move its folder out of the journal. "
+        "Nothing was changed.".format(shown))
+    # at the cap, every row is named and none is counted
+    msg = ct._relink_claims_refusal("OP", live[:ct.RELINK_LIST_CAP])
+    assert "wrote row(s) " + shown + " after it" in msg and " more " not in msg
+
+
+def later_finished_ops(env, n=10):
+    """N finished operations journaled now, each naming no row: rotation's window of ten
+    then passes over everything journaled before them."""
+    for i in range(n):
+        journal_op(env, "retitle", [], cli_session_id="x%d" % i, new_title="Northwind")
+
+
+def test_rotation_keeps_an_undone_relink_whose_undo_left_a_key(
+        mkenv, tmp_path, write_transcript, write_row):
+    # undo_left is the one record of a key undo left; the undo's own rotation would
+    # otherwise prune it in the call that wrote it (review M-4)
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    c2 = row_of(op, "local_c2")
+    set_keys(paths["local_c2"], spawnedFrom=dict(c2["new"]["spawnedFrom"], taskId="task_app"))
+    later_finished_ops(env)
+    assert ct.undo_relink(env, op_of(env, op.manifest["op_id"])) == "undone"
+    assert os.path.isdir(op.op_dir)
+    om = record_of(op)
+    assert om["undo_left"] == [entry(c2, "spawnedFrom", "the app changed it since")]
+    assert [r["restored"] for r in om["rows"]] == [True, True]
+    assert ct.rotate_ops(env) == [] and os.path.isdir(op.op_dir)
+
+
+def test_rotation_prunes_an_undone_relink_that_left_nothing(
+        mkenv, tmp_path, write_transcript, write_row):
+    env = mkenv(tmp_path)
+    paths, op = applied(env, write_transcript, write_row)
+    later_finished_ops(env)
+    assert ct.undo_relink(env, op_of(env, op.manifest["op_id"])) == "undone"
+    assert not os.path.exists(op.op_dir)            # the undo's own rotation pruned it
+
+
+def test_rotation_keeps_a_rolled_back_relink_whose_back_left_a_claimed_key(
+        mkenv, tmp_path, write_transcript, write_row):
+    # the key a later sync claims stays at relink's value, named only in back_left
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-after-rows")
+    whole_op(env, "sync", paths["local_c2"])            # later, completed, and wrote the row
+    later_finished_ops(env)
+    assert ct.recover_op(env, op_of(env, op.manifest["op_id"]), "back") == "rolled_back"
+    assert os.path.isdir(op.op_dir)
+    om = record_of(op)
+    assert [(e["name"], e["what"]) for e in om["back_left"]] == [
+        ("local_c2.json", "spawnedFrom")]
+    assert "restored" not in om["rows"][0]
+    assert ct.rotate_ops(env) == [] and os.path.isdir(op.op_dir)
+
+
+@pytest.mark.parametrize("status", ["undone", "rolled_back"])
+def test_rotation_keeps_a_withdrawn_relink_while_a_written_row_is_not_restored(
+        status, mkenv, tmp_path, write_transcript, write_row):
+    # a written row not marked restored may still hold relink's value, whatever back_left
+    # and undo_left say; a row restored, or never written, holds none of it
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    later_finished_ops(env)
+    op = op_of(env, m["op_id"])
+    ct.set_status(op, status)
+    assert "back_left" not in op.manifest and "undo_left" not in op.manifest
+    assert ct.rotate_ops(env) == [] and os.path.isdir(op.op_dir)
+    c2, c3 = op.manifest["rows"]
+    c2["restored"] = True
+    c3["written"] = False
+    ct.save_manifest(op)
+    assert ct.rotate_ops(env) == [m["op_id"]] and not os.path.exists(op.op_dir)
+
+
+def test_a_forward_write_that_fails_names_forward_again_then_back(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    # after a write error the next step is forward again, from what each row holds now;
+    # back stays named as the other way out (review M-6)
+    env = mkenv(tmp_path)
+    paths = relink_store(env, write_transcript, write_row)
+    op = crashed(env, "relink-mid-rows")
+    oid = op.manifest["op_id"]
+    real = ct.atomic_write
+
+    def refuse_c3(path, data):
+        if same_file(path, paths["local_c3"]):
+            raise OSError(13, "Permission denied")
+        return real(path, data)
+    monkeypatch.setattr(ct, "atomic_write", refuse_c3)
+    assert recover_refusal(env, op, "forward") == (
+        "could not write row local_c3.json ({0}): [Errno 13] Permission denied. The op is left "
+        "at 'writing' - run {1} again; it goes on from what each row holds now. {2} takes out "
+        "what landed instead.".format(row_of(op, "local_c3")["label"],
+                                      recover_hint(oid, "forward"), recover_hint(oid)))
+    assert op_of(env, oid).manifest["status"] == "writing" and ct.read_lock(env) is None
+    monkeypatch.setattr(ct, "atomic_write", real)
+    final, om = recover(env, op, "forward")
+    assert final == "completed" and [r["written"] for r in om["rows"]] == [True, True]

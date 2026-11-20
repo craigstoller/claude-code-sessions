@@ -853,9 +853,7 @@ _OP_TYPE_BRANCHES = {
     "cmd_undo": ("names it", "names it"),
     "undo_realign": ("names it", "its own type"),
     "undo_relink": ("its own type", "names it"),
-    "_collides": ("names it",
-                  "relink is one of rotate_ops' claimants, which _collides reads; "
-                  "a relink sets no copy aside"),
+    "_collides": ("names it", "names it"),
     "plan_realign": ("names it",
                      "a relink writes no key realign plans from; an "
                      "unfinished relink is in nonterminal_ops already"),
