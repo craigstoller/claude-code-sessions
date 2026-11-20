@@ -248,8 +248,10 @@ once more for the pre-flight conflict scan (Revisions), also not re-reviewed. No
   and undo takes the key out; a member added by the app makes the key "changed", left and named.
   Pinned in Task 8 (`test_undo_takes_out_a_reordered_link_and_leaves_an_extended_one`).
 - **A row whose `sessionId` is not its stem, and a holder whose `spawnedFrom` is not an object.**
-  Neither is ever a link target or a source, the plan never raises, and the stem-mismatched row is
-  still repaired as a candidate. Pinned in Task 2
+  The stem-mismatched row is never a link target, and the holder whose link is not an object is
+  never a source; the plan never raises, and the stem-mismatched row is still repaired as a
+  candidate. A stem-mismatched holder whose `spawnedFrom` is an object still yields its parent,
+  as in 0.18.0's resolver, which this plan does not change (built 2026-11-19). Pinned in Task 2
   (`test_a_stem_mismatched_row_is_repaired_and_never_a_target`).
 
 ---
@@ -598,7 +600,11 @@ def test_a_kept_chain_with_no_holder_chain_stands_outside_the_record(...):
 def test_a_kept_chain_with_the_wrong_root_or_depth_is_own_chain_differs(...):
     # chain=CHAIN, roots=True; parametrize local_c2 startChain in ({"firstSessionId": "local_q2",
     # "depth": 2}, {"firstSessionId": "local_r2", "depth": 3}): local_c2 left out
-    # ["own_chain_differs"], no row for it; local_c3 planned with link and chain
+    # ["own_chain_differs"], no row for it; local_c3 planned with its link only, its record's
+    # notes holding lineage_chain_dropped (the unchanged resolver takes local_c2's chain as a
+    # chain source, so the sources disagree). local_c1, judged against local_c2's chain, is
+    # left out own_chain_differs too. (As built 2026-11-19; the first sketch said local_c3 got
+    # link and chain, which the brief's holder rule rules out.)
 def test_a_link_left_out_drops_its_chain(...):
     # chain=CHAIN, roots=True, local_p3 removed -> local_c3 ["parent_not_in_account",
     # "lineage_chain_dropped"]
@@ -867,7 +873,9 @@ def test_both_keys_print_link_and_chain_and_a_chain_only_row_prints_chain(...):
 def test_counts_come_from_written_keys_and_the_left_out_list(...):
     # a chain-only row is not counted on links; "links   : 1 to add" and "chains  : 2 to add"
 def test_a_chain_code_is_counted_on_the_chains_line_only(...):
-    # an own_chain_differs row -> "chains  : ... 1 left out"; no "own chain" phrase on links
+    # own_chain_differs rows -> "chains  : ... N left out", N the rows the fixture leaves out
+    # own_chain_differs: on an unscoped plan a wrong kept chain leaves its partner row out too
+    # (Task 2, as built), so pin the planner's count; no "own chain" phrase on links
 def test_a_written_row_whose_chain_was_left_out_carries_a_chain_tag(...):
     # "   [chain: the chain was left out]" ends local_c3's line
 def test_the_listing_is_capped_at_15_and_verbose_lists_all_with_left_out_tags(...):
@@ -881,7 +889,8 @@ def test_no_rows_with_left_out_rows_prints_totals_then_nothing_to_add(...):
 def test_the_three_new_phrases_print(...):
     # local_c3 keeps {}: "links   : 1 to add, 1 left out (the row's own link names no usable
     # row 1)"; link=tool_link("local_p1"): "links   : 2 left out (no app-written link backs it
-    # 2)"; "chains  : ... 1 left out" for own_chain_differs
+    # 2)"; "chains  : ... N left out" for own_chain_differs, N as the planner counts it (see
+    # test_a_chain_code_is_counted_on_the_chains_line_only)
 def test_the_identity_warning_names_relink(...):
     # identity_files(env, A1, A2): every remedy line of _identity_warning_lines(env, m,
     # command="relink") contains "claude-code-sessions relink --live"
