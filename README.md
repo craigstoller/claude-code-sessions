@@ -876,14 +876,16 @@ left    : local_q2 -> bob@example.com (cccc1111/dddd2222): startChain (the app c
 ```
 
 It refuses as a whole, writing nothing, while a row cannot be read, and while a later operation
-that wrote one of the rows still stands, naming it to be undone first. A `realign`, which writes
-other keys, and a finished `undo`, which no command can undo, do not count. A journal record
-that cannot be read refuses the undo too, named by its folder (above). An undo cut short resumes
-with `undo --id <op_id> --apply`, since a bare `undo --apply` takes the latest completed
-operation, which may by then be another. Like every operation's undo, it works only while the
-relink is in the journal, which keeps the ten most recent finished operations. `relink` is
-CLI-only, and while a relink is the latest operation the window offers no undo, as for
-`realign`; an operation before it is undone from the CLI.
+that wrote one of the rows still stands, naming it to be undone first. If that operation cannot
+itself be undone, neither can the relink. A `retitle` cannot be undone once the app has
+rewritten any row it wrote. A `realign`, which writes other keys, and a finished `undo`, which
+no command can undo, do not count. A journal record that cannot be read refuses the undo too,
+named by its folder (above). An undo cut short resumes with `undo --id <op_id> --apply`, since
+a bare `undo --apply` takes the latest completed operation, which may by then be another. Like
+every operation's undo, it works only while the relink is in the journal, which keeps the ten
+most recent finished operations. `relink` is CLI-only, and while a relink is the latest
+operation the window offers no undo, as for `realign`; an operation before it is undone from the
+CLI.
 
 An interrupted apply recovers in both directions, by what each row holds now. `recover
 --forward` counts a row that still opens its conversation and has a key already at relink's

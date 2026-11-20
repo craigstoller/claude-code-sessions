@@ -1315,9 +1315,11 @@ the release's run sheet (D2).
    one account, so one account's empty org folders beside its populated store are no ambiguity.
    No match, or matches in two accounts, refuses with every account directory listed.
 6. An `--only` that starts `local_` is a row id: a case-insensitive prefix of a row's stem within
-   the `--account` scope, refused on no match or several ("give more of the id", with ", or add
-   --account to name its account" when two accounts hold it). Any other `--only` is a
-   conversation, by `cliSessionId` prefix or title substring, refused on no match, and on
+   the `--account` scope. When exactly one of the matching rows has the whole value as its stem,
+   that row is taken, since a whole stem is also a prefix of a copy's (`local_c2 - Copy`) and no
+   longer prefix exists. Otherwise it is refused on no match or several ("give more of the id",
+   with ", or add --account to name its account" when two accounts hold it). Any other `--only`
+   is a conversation, by `cliSessionId` prefix or title substring, refused on no match, and on
    several with their listing (`_retitle_candidate_listing`).
 7. `_relink_plan_rows` decides every row (below), over the transcript set `_relink_tids` lists
    once per plan through `iter_transcripts`, as `plan_converge` does; the per-plan index `sync`
@@ -1509,12 +1511,15 @@ first while another operation is unfinished; `_relink_claims` keeps it, and a te
 directly.
 
 A claim makes undo refuse as a whole, before it writes, and the relink stays `completed`. A live
-claimant is named, to be undone first; a damaged record is named by its folder, with the note
-that no command repairs a record, so it is repaired, or its folder moved out of the journal,
-with the app closed. `back` must close the record, so it leaves a live claimant's keys at `new`
-and names them. A claim by a record that cannot be read or is damaged, or by a journal that
-cannot be listed, covers every key, and a `back` that left them all and closed would strand them
-where no command reaches, so `back` refuses those as undo does.
+claimant is named, to be undone first; the line adds that if one cannot be undone, the relink
+cannot be undone either (a `retitle` cannot once the app has rewritten a row it wrote). A damaged
+record is named by its folder, with the note that no command repairs a record, so it is
+repaired, or its folder moved out of the journal, with the app closed (`_RELINK_REPAIR_ROUTE`).
+Each line names at most `RELINK_LIST_CAP` rows, then `... and <n> more`: a damaged record
+claims every row asked about. `back` must close the record, so it leaves a live claimant's keys
+at `new` and names them. A claim by a record that cannot be read or is damaged, or by a journal
+that cannot be listed, covers every key, and a `back` that left them all and closed would strand
+them where no command reaches, so `back` refuses those as undo does.
 
 **The three ownership checks.** Other operations' checks learn relink beside their own code:
 - `_retitle_claimed_elsewhere` compares a relink's rows by `post_sha256`, since a relink keeps
@@ -1534,7 +1539,12 @@ The first two read a relink in `_relink_claimant_standing`'s order, liveness bef
 "pass" for an undone, rolled-back or earlier relink; "claim" when a sort key cannot be computed
 or its rows are not a list of objects with string paths; else its rows are judged. `rotate_ops`
 counts relink among its claimants, so a finished relink is not pruned while an unfinished
-claimant names one of its written rows.
+claimant names one of its written rows. Its `_collides` also keeps a relink that left something
+(`_relink_left_something`): an entry in `undo_left` or `back_left`, or, once it is undone or
+rolled back, a row marked `written` and not `restored`. Relink writes no `rollback_residue` for a
+row it can read, so those are the only record of a key left at relink's value, and the undo's or
+`back`'s own rotation would otherwise prune them in the call that wrote them. A completed relink
+rotates as before, and a row never written holds nothing of relink's.
 
 **Undo.** `undo_relink`, under the lock, checks the type and the `completed` status, then the
 shape. A record whose `history` gives no creation time refuses, named by its folder: another
@@ -1648,7 +1658,10 @@ unless it still holds the bytes its decision read.
 discovered store root and directly in its journaled `store_path`. A root never comes from the
 journal, whose paths are what the check tests. Every printed hint runs as printed: `recover
 --resolve <op_id> --back --apply`, `--forward --apply` where forward is offered, and `undo --id
-<op_id> --apply`. A hint without `--apply` would only preview.
+<op_id> --apply`. A hint without `--apply` would only preview. The apply's refusals name `--back`
+(`_relink_apply_then`). Forward's failed write or save names `--forward --apply` again first,
+since it goes on from what each row holds, then `--back` as the other way out
+(`_relink_forward_then`).
 
 **D18 and D19.** `relink`, its apply, its undo and its recovery refuse while any operation of any
 type other than their own is non-terminal, naming it (`_relink_refuse_open`). An interrupted
@@ -1661,8 +1674,9 @@ that does not exist is no operations, as `list_ops` reads it. Only a folder hold
 their own op id as `mine`; the plan and the apply have none yet. This costs liveness: one
 unfinished operation from any command holds every relink route, the dry run included, until it
 is recovered, and a damaged record holds them until someone repairs it or moves its folder out
-by hand. The open-operation line says so; the unreadable-record line names the folder and stops
-there. `plan_realign` holds only the conversations an open operation
+by hand. The open-operation line says so; the unreadable-record line names the folder and gives
+that way out (`_RELINK_REPAIR_ROUTE`, the claims refusal's sentence), since `recover` cannot read
+the record either. `plan_realign` holds only the conversations an open operation
 involves; relink holds the whole run, which is simpler and costs a `recover` first.
 
 D19: every per-row pass checks identity first. A row whose `cliSessionId` is not the journaled
@@ -1712,6 +1726,9 @@ sheet's instruction is to keep the app closed throughout.
 16. `back` refuses as a whole on a claim by a record that cannot be read or is damaged, or by a
     journal that cannot be listed, where the spec's `back` always terminates: such a claim
     covers every key, and closing after leaving them all would strand them.
+17. A row-id `--only` that is a prefix of several rows' stems and the whole stem of exactly one
+    takes that one (Planning, step 6), where the spec refuses more than one match: a whole stem
+    is a prefix of its copy's, so the row beside a copy could not be named at all.
 
 **Residuals, recorded rather than changed.**
 - `doctor`'s advice for `rollback_residue` (delete the session from the app if it is not wanted)
