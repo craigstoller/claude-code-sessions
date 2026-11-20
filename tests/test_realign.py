@@ -843,8 +843,7 @@ def test_a_damaged_record_is_refused_by_undo_and_recover(world):
 # test does not catch a missing op-type branch. Fails until a new one is
 # listed.
 _OP_TYPE_BRANCHES = {
-    "rotate_ops": ("names it",
-                   "pending: Task 7 adds relink to the claimants"),
+    "rotate_ops": ("names it", "names it"),
     "classify_op": ("names it", "pending: Task 9 adds the relink arm"),
     "recover_op": ("names it", "pending: Task 9 adds the relink arm"),
     "gather_doctor": ("names it",
@@ -854,7 +853,8 @@ _OP_TYPE_BRANCHES = {
     "cmd_undo": ("names it", "pending: Task 8 adds the relink arm"),
     "undo_realign": ("names it", "its own type"),
     "_collides": ("names it",
-                  "pending: Task 7 makes relink one of rotate_ops' claimants"),
+                  "relink is one of rotate_ops' claimants, which _collides reads; "
+                  "a relink sets no copy aside"),
     "plan_realign": ("names it",
                      "a relink writes no key realign plans from; an "
                      "unfinished relink is in nonterminal_ops already"),
@@ -866,8 +866,7 @@ _OP_TYPE_BRANCHES = {
                       "store_path"),
     "_unresolved_rows": ("tells moves apart; realign rows carry `written`",
                          "tells moves apart; relink rows carry written"),
-    "_realign_claimed_later": ("names it",
-                               "pending: Task 7 passes over a relink"),
+    "_realign_claimed_later": ("names it", "names it"),
     "plan_undo": ("undo of a move only", "undo of a move only"),
     "undo_new_row": ("its own type", "its own type"),
     "undo_sync": ("its own type", "its own type"),
@@ -887,6 +886,11 @@ _OP_TYPE_BRANCHES = {
     "cmd_recover": ("prints the rows converge's forward recovery skipped "
                     "over their link; a realign op has no such skip",
                     "pending: Task 9 prints relink's skipped rows"),
+    "_relink_claims": ("names it", "names it"),
+    "_retitle_claimed_elsewhere": ("a realign row carries post_b64, compared by bytes as "
+                                   "any other op's", "names it"),
+    "_repoint_claimed_later": ("a realign that wrote the row claims it, as any terminal "
+                               "op does", "names it"),
 }
 
 

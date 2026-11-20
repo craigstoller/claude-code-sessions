@@ -8,8 +8,10 @@ the strict scan, the refusals and the narrowing around it. Fake cast only:
 Northwind, ACME-REVIEW, the A/LP/LC ids and local_p/local_c/local_r rows of
 the converge tests. Then the report: the per-account listing, the totals,
 and the public projection --json and --anonymize print; the journal's shape
-check and saver. Last, the apply: the locked re-plan, the row writes verified
+check and saver. Then the apply: the locked re-plan, the row writes verified
 by value, the CLI, and the one RULING 5 text the three apply rechecks share.
+Last, the claims: which rows a later live operation owns (D13), and the other
+operations' ownership checks, which neither ignore a relink nor wait on one.
 """
 import argparse
 import hashlib
@@ -25,7 +27,8 @@ import pytest
 
 import claude_code_sessions as ct
 from test_converge import (A1, A2, A3, A4, LC, LD, LP, LX, LY, NUM, O1, O2, O3, O4, ORG, TASK,
-                           SimulatedCrash, identity_files, lrow, side_link, t_entries)
+                           SimulatedCrash, _monotonic_now, identity_files, lrow, side_link,
+                           t_entries)
 
 
 @pytest.fixture(autouse=True)
@@ -2651,3 +2654,406 @@ def test_the_record_agrees_with_its_row_or_not(mkenv, tmp_path, write_transcript
     for bad in ({}, None, dict(r, old=[]), dict(r, new="x")):
         assert ct._relink_row_agrees(bad, data) is False
     assert ct._relink_row_agrees(r, None) is False
+
+
+# ---------------------------------------------------------------- the claims
+# Task 7: _relink_claims (spec D13), which tells relink's undo and recovery when
+# a later live operation owns a row they would put back, and the other
+# operations' ownership checks, which must neither ignore a relink's claim nor
+# wait forever behind one. A later operation is hand-made in its type's real
+# row shape and journaled with new_op after the relink, on a clock that ticks
+# per call; a move and its undo come from a real run.
+
+UNREADABLE_CLAIM = "its record cannot be read"
+A2_LABEL = "{0} ({0}/{1})".format(A2[:8], O2[:8])
+
+
+def relinked(mkenv, tmp_path, write_transcript, write_row, before=None):
+    """A completed relink of local_c2 and local_c3 on a monotonic clock, so every
+    operation journaled after it sorts later. BEFORE(env, paths) runs first, for an
+    operation journaled before the relink. Returns (env, {stem: path}, the relink's
+    journaled manifest, {stem: its row})."""
+    env = _monotonic_now(mkenv(tmp_path))
+    paths = relink_store(env, write_transcript, write_row)
+    if before is not None:
+        before(env, paths)
+    assert ct.run_relink(env, plan(env)) == "completed"
+    (op,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "relink"]
+    return env, paths, op.manifest, {r["name"][:-len(".json")]: r for r in op.manifest["rows"]}
+
+
+def journal_op(env, op_type, rows, status="completed", **top):
+    """A hand-made operation journaled now, then set to STATUS."""
+    op = ct.new_op(env, dict(top, op_type=op_type, rows=rows))
+    if status != "journaled":
+        ct.set_status(op, status)
+    return op
+
+
+def whole_op(env, op_type, path, written=True, status="completed", post=None):
+    """A whole-row writer of OP_TYPE naming PATH, in its type's real shape: the row's
+    pre-image and POST (default: other bytes), `written` as its apply marks it, and the
+    store where its type keeps it."""
+    raw = raw_of(path)
+    store, name = os.path.split(path)
+    row = {"name": name, "dest_path": path, "title": "ACME-REVIEW side task",
+           "pre_b64": ct.b64(raw), "post_b64": ct.b64(raw + b" " if post is None else post),
+           "is_update": True, "written": written}
+    top = {"sync": {"dest_path": store},
+           "retitle": {"cli_session_id": LC, "new_title": "Northwind", "store_path": store},
+           "repoint": {"store_path": store, "name": name, "to_session": LQ},
+           "new-row": {"store_path": store}, "converge": {}}[op_type]
+    if op_type == "sync":
+        row["session_id"] = LC
+    if op_type in ("new-row", "converge"):
+        row.update(pre_b64=None, is_update=False)
+    if op_type == "converge":
+        row.update(store_path=store, account=A2, label=A2_LABEL)
+    return journal_op(env, op_type, [row], status=status, **top)
+
+
+def realign_op(env, path, status="completed"):
+    """A realign that wrote PATH's cwd, in realign's real row shape."""
+    raw = raw_of(path)
+    store, name = os.path.split(path)
+    row = {"session_id": LC, "name": name, "dest_path": path, "store_path": store,
+           "label": A2_LABEL, "account": A2, "archived": False,
+           "old": {"cwd": {"present": False, "value": None}}, "new": {"cwd": "C:/work/northwind"},
+           "old_folder": "", "pre_b64": ct.b64(raw),
+           "post_b64": ct.b64(ct._relink_row_bytes(dict(data_of(path), cwd="C:/work/northwind"))),
+           "is_update": True, "written": True}
+    return journal_op(env, "realign", [row], status=status, only="", include_identical=False,
+                      live_asserted="", conversations=[{"session_id": LC}], held=[], copies=[])
+
+
+def like(row, **changes):
+    """A copy of relink row ROW with CHANGES: a later relink's row for the same file."""
+    out = json.loads(json.dumps(row))
+    out.update(changes)
+    return out
+
+
+def set_row(op, **changes):
+    """Change OP's first row and save its record; a None value takes the key out."""
+    r = op.manifest["rows"][0]
+    for k, v in changes.items():
+        if v is None:
+            r.pop(k, None)
+        else:
+            r[k] = v
+    ct.save_manifest(op)
+
+
+def claimed(claims):
+    return [(c["op_id"], c["row"]["name"], c["keys"]) for c in claims]
+
+
+def wrote_it(op_id):
+    return "operation {0} wrote it since".format(op_id)
+
+
+@pytest.mark.parametrize("op_type", ["sync", "retitle", "repoint", "new-row", "converge"])
+def test_a_later_live_operation_that_wrote_the_row_claims_every_key(
+        op_type, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2, c3 = rows["local_c2"], rows["local_c3"]
+    later = whole_op(env, op_type, paths["local_c2"])
+    whole_op(env, op_type, paths["local_c3"], written=False)    # finished, never wrote it
+    oid = later.manifest["op_id"]
+    assert ct._relink_claims(env, m, [c2, c3]) == [
+        {"row": c2, "op_id": oid, "keys": set(c2["new"]), "why": wrote_it(oid)}]
+    assert set(c2["new"]) == {"spawnedFrom"}
+
+
+def test_a_later_move_and_its_undo_claim_the_row_without_a_written_flag(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    # the scheme evidence plan_move reads, as tests/test_journal_reroot.py's `moved` gives it
+    ev = "C:\\proj\\_ev"
+    os.makedirs(os.path.join(env.projects_root, ct.encode(ev, ct.SCHEME_CURRENT)))
+    write_row(env, 0, A1, O1, "local_ev", {"sessionId": "local_ev", "cliSessionId": "other",
+                                           "cwd": ev, "lastActivityAt": 2})
+    target = str(tmp_path / "target")
+    os.makedirs(target)
+    assert ct.run_move(env, ct.plan_move(env, LC, target, ct.MoveFlags())) == "completed"
+    (mv,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "move"]
+    assert sorted(os.path.basename(r["path"]) for r in mv.manifest["rows"]) == [
+        "local_c1.json", "local_c2.json", "local_c3.json"]
+    assert not any("written" in r for r in mv.manifest["rows"])
+    assert data_of(paths["local_c2"])["cwd"] == os.path.normpath(target)
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (mv.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+    assert ct.run_undo(env, mv) == "completed"
+    by_type = {o.manifest["op_type"]: o.manifest for o in ct.list_ops(env)}
+    assert by_type["move"]["status"] == "undone"
+    assert not any("written" in r for r in by_type["undo"]["rows"])
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (by_type["undo"]["op_id"], "local_c2.json", {"spawnedFrom"})]
+
+
+def test_a_later_relink_claims_only_the_keys_it_wrote_or_kept(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    chain = {"firstSessionId": "local_r2", "depth": 1}
+    # a chain written on the link this relink wrote: the link is relied on, so it is claimed
+    one = journal_op(env, "relink", [like(c2, new={"startChain": chain},
+                                          kept={"spawnedFrom": c2["new"]["spawnedFrom"]})])
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (one.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+    shutil.rmtree(one.op_dir)
+    # a chain written beside no kept link touches none of this relink's keys
+    journal_op(env, "relink", [like(c2, new={"startChain": chain}, kept={})])
+    assert ct._relink_claims(env, m, [c2]) == []
+
+
+def test_a_later_realign_claims_nothing(mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    realign_op(env, paths["local_c2"])
+    realign_op(env, paths["local_c2"], status="writing")
+    assert ct._relink_claims(env, m, [rows["local_c2"]]) == []
+
+
+def test_a_non_terminal_later_op_naming_the_row_claims_it_written_or_not(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    sync = whole_op(env, "sync", paths["local_c2"], written=False, status="writing")
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (sync.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+    shutil.rmtree(sync.op_dir)
+    later = journal_op(env, "relink", [like(c2, written=False)], status="writing")
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (later.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+    ct.set_status(later, "completed")              # finished, and it never wrote the row
+    assert ct._relink_claims(env, m, [c2]) == []
+
+
+def test_an_earlier_or_withdrawn_op_and_a_restored_row_claim_nothing(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(
+        mkenv, tmp_path, write_transcript, write_row,
+        before=lambda env, paths: whole_op(env, "sync", paths["local_c2"]))
+    c2 = rows["local_c2"]
+    whole_op(env, "sync", paths["local_c2"], status="undone")
+    journal_op(env, "relink", [like(c2)], status="rolled_back")
+    journal_op(env, "relink", [like(c2, restored=True)])
+    assert [o.manifest["op_type"] for o in ct.list_ops(env)] == [
+        "sync", "relink", "sync", "relink", "relink"]
+    assert ct._relink_claims(env, m, [c2]) == []
+
+
+@pytest.mark.parametrize("status", ["undone", "rolled_back"])
+def test_an_undone_or_rolled_back_relink_claims_nothing_whatever_its_rows(
+        status, mkenv, tmp_path, write_transcript, write_row):
+    # spec D13: an undone or rolled-back operation has withdrawn its claim, a relink
+    # included, whatever its rows' `restored`
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    later = journal_op(env, "relink", [like(c2)], status=status)
+    r = later.manifest["rows"][0]
+    assert r["written"] is True and "restored" not in r
+    assert data_of(paths["local_c2"])["spawnedFrom"] == r["new"]["spawnedFrom"]   # left at new
+    assert ct._relink_claims(env, m, [c2]) == []
+    ct.set_status(later, "completed")
+    assert claimed(ct._relink_claims(env, m, [c2])) == [
+        (later.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+
+
+@pytest.mark.parametrize("bad", ["{not json", '{"op_id": "x", "rows": "nope"}',
+                                 '{"op_id": "x", "status": "completed", "rows": [5]}'])
+def test_an_unreadable_or_damaged_manifest_claims_every_row_without_crashing(
+        bad, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2, c3 = rows["local_c2"], rows["local_c3"]
+    sync = whole_op(env, "sync", paths["local_c3"])     # sorts before OPEN_ID's folder
+    put_op(env, OPEN_ID, bad)
+    oid = OPEN_ID if bad == "{not json" else "x"
+    sid = sync.manifest["op_id"]
+    assert ct._relink_claims(env, m, [c2, c3]) == [
+        {"row": c3, "op_id": sid, "keys": {"spawnedFrom"}, "why": wrote_it(sid)},
+        {"row": c2, "op_id": oid, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM},
+        {"row": c3, "op_id": oid, "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}]
+
+
+def test_a_sort_key_that_cannot_be_computed_counts_as_later(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    sync = whole_op(env, "sync", paths["local_c2"])
+    sync.manifest["history"] = []                  # _op_sort_key cannot index it
+    ct.save_manifest(sync)
+    with pytest.raises(IndexError):
+        ct._op_sort_key(sync.manifest)
+    assert claimed(ct._relink_claims(env, m, [rows["local_c2"]])) == [
+        (sync.manifest["op_id"], "local_c2.json", {"spawnedFrom"})]
+
+
+def test_the_lock_file_and_stray_entries_are_not_operations(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    ct.acquire_lock(env, "undo-" + m["op_id"])     # held through every undo and recovery
+    try:
+        os.makedirs(os.path.join(env.ops_dir, "stray"))
+        with open(os.path.join(env.ops_dir, "notes.txt"), "w", encoding="utf-8") as fh:
+            fh.write("not an operation")
+        assert sorted(os.listdir(env.ops_dir)) == sorted(
+            [m["op_id"], "lock", "notes.txt", "stray"])
+        assert ct._relink_claims(env, m, [rows["local_c2"]]) == []
+    finally:
+        ct.release_lock(env)
+
+
+def test_a_missing_journal_claims_nothing_and_an_unlistable_one_claims_every_row(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    shutil.rmtree(env.ops_dir)
+    assert ct._relink_claims(env, m, [c2]) == []
+    with open(env.ops_dir, "w", encoding="utf-8") as fh:   # there, and not a folder
+        fh.write("x")
+    (c,) = ct._relink_claims(env, m, [c2])
+    assert (c["row"], c["op_id"], c["keys"]) == (c2, "", {"spawnedFrom"})
+    assert c["why"].startswith("the journal folder could not be listed (")
+
+
+def test_retitle_claim_passes_an_earlier_relink_and_a_restored_row(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    raw = raw_of(paths["local_c2"])
+    assert hashlib.sha256(raw).hexdigest() == c2["post_sha256"]
+    rt = whole_op(env, "retitle", paths["local_c2"], post=raw)     # the same bytes
+    mine, r = rt.manifest, rt.manifest["rows"][0]
+    assert ct._retitle_claimed_elsewhere(env, mine, r) is None     # the relink is earlier
+    later = journal_op(env, "relink", [like(c2)])
+    lid = later.manifest["op_id"]
+    assert ct._retitle_claimed_elsewhere(env, mine, r) == lid
+    set_row(later, restored=True)
+    assert ct._retitle_claimed_elsewhere(env, mine, r) is None
+    set_row(later, restored=None, post_sha256="0" * 64)    # its bytes are not these
+    assert ct._retitle_claimed_elsewhere(env, mine, r) is None
+    set_row(later, post_sha256=7)                         # it cannot be told they are not
+    assert ct._retitle_claimed_elsewhere(env, mine, r) == lid
+    set_row(later, post_sha256=c2["post_sha256"])
+    for status in ("undone", "rolled_back"):             # spec D13: the claim is withdrawn
+        ct.set_status(later, status)
+        assert "restored" not in later.manifest["rows"][0]
+        assert ct._retitle_claimed_elsewhere(env, mine, r) is None
+
+
+def test_repoint_claim_counts_only_a_later_unrestored_relink_not_undone(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    c2 = rows["local_c2"]
+    rp = whole_op(env, "repoint", paths["local_c2"])
+    mine, r = rp.manifest, rp.manifest["rows"][0]
+    assert ct._repoint_claimed_later(env, mine, r) is None         # the relink is earlier
+    later = journal_op(env, "relink", [like(c2)])
+    lid = later.manifest["op_id"]
+    assert ct._repoint_claimed_later(env, mine, r) == lid
+    set_row(later, restored=True)
+    assert ct._repoint_claimed_later(env, mine, r) is None
+    for status in ("undone", "rolled_back"):             # spec D13: the claim is withdrawn
+        ct.set_status(later, status)
+        for restored in (True, None):
+            set_row(later, restored=restored)
+            assert ct._repoint_claimed_later(env, mine, r) is None
+    # an unwritten row counts only while the later relink is unfinished
+    ct.set_status(later, "completed")
+    set_row(later, written=False)
+    assert ct._repoint_claimed_later(env, mine, r) is None
+    ct.set_status(later, "writing")
+    assert ct._repoint_claimed_later(env, mine, r) == lid
+
+
+def test_realign_claim_passes_a_later_relink(mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(
+        mkenv, tmp_path, write_transcript, write_row,
+        before=lambda env, paths: realign_op(env, paths["local_c2"]))
+    (ra,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "realign"]
+    mine, r = ra.manifest, ra.manifest["rows"][0]
+    assert ct._op_sort_key(m) > ct._op_sort_key(mine) and rows["local_c2"]["written"] is True
+    assert ct._realign_claimed_later(env, mine, r) is None
+    later = realign_op(env, paths["local_c2"])           # the check still looks past it
+    assert ct._realign_claimed_later(env, mine, r) == later.manifest["op_id"]
+
+
+_RELINK_DAMAGE = {
+    '"rows": "nope"': lambda m: m.update(rows="nope"),
+    '"rows": [5]': lambda m: m.update(rows=[5]),
+    "a row whose dest_path is 7": lambda m: m["rows"][0].update(dest_path=7),
+    "a row whose session_id is a list": lambda m: m["rows"][0].update(session_id=[LC]),
+}
+
+
+@pytest.mark.parametrize("damage", ['"rows": "nope"', '"rows": [5]',
+                                    "a row whose dest_path is 7"])
+def test_a_malformed_later_relink_is_a_claim_in_the_retitle_and_repoint_checks(
+        damage, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    # unwritten, so neither of the two is a claimant in the other's check
+    rt = whole_op(env, "retitle", paths["local_c2"], written=False,
+                  post=raw_of(paths["local_c2"]))
+    rp = whole_op(env, "repoint", paths["local_c2"], written=False)
+    bad = journal_op(env, "relink", [like(rows["local_c2"])])     # names local_c2
+    _RELINK_DAMAGE[damage](bad.manifest)
+    ct.save_manifest(bad)
+    oid = bad.manifest["op_id"]
+    assert ct._retitle_claimed_elsewhere(env, rt.manifest, rt.manifest["rows"][0]) == oid
+    assert ct._repoint_claimed_later(env, rp.manifest, rp.manifest["rows"][0]) == oid
+
+
+@pytest.mark.parametrize("damage", ['"rows": "nope"', "a row whose session_id is a list"])
+def test_a_malformed_relink_does_not_hide_a_later_realigns_claim(
+        damage, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(
+        mkenv, tmp_path, write_transcript, write_row,
+        before=lambda env, paths: realign_op(env, paths["local_c2"]))
+    ops = {o.manifest["op_type"]: o for o in ct.list_ops(env)}
+    _RELINK_DAMAGE[damage](ops["relink"].manifest)
+    ct.save_manifest(ops["relink"])
+    later = realign_op(env, paths["local_c2"])
+    mine = ops["realign"].manifest
+    assert ct._realign_claimed_later(env, mine, mine["rows"][0]) == later.manifest["op_id"]
+
+
+def test_rotation_keeps_a_terminal_relink_a_live_claimant_names(
+        mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    for i in range(10):
+        journal_op(env, "retitle", [], cli_session_id="x%d" % i, new_title="Northwind")
+    live = whole_op(env, "retitle", paths["local_c2"], written=False, status="writing")
+    folder = os.path.join(env.ops_dir, m["op_id"])
+    assert len([o for o in ct.list_ops(env) if o.manifest["status"] == "completed"]) == 11
+    assert ct.rotate_ops(env) == [] and os.path.isdir(folder)
+    ct.set_status(live, "completed")                 # nothing unfinished names the row now
+    assert m["op_id"] in ct.rotate_ops(env) and not os.path.exists(folder)
+
+
+def test_an_earlier_relink_does_not_block_a_repoint_rollback(
+        monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+    env, paths, m, rows = relinked(mkenv, tmp_path, write_transcript, write_row)
+    write_transcript(env, "C--p", LQ, t_entries())
+    pre = raw_of(paths["local_c2"])
+    rpm = ct.plan_repoint(env, ct.RepointFlags(only="ACME-REVIEW", to_session=LQ,
+                                               store=A2[:8]))
+    assert same_file(rpm["rows"][0]["dest_path"], paths["local_c2"])
+    real = ct.set_status
+
+    def stall(op, status):                             # the write lands; the run dies
+        if op.manifest.get("op_type") == "repoint" and status == "completed":
+            raise SimulatedCrash()
+        real(op, status)
+    monkeypatch.setattr(ct, "set_status", stall)
+    with pytest.raises(SimulatedCrash):
+        ct.run_repoint(env, rpm)
+    monkeypatch.setattr(ct, "set_status", real)
+    (pending,) = ct.nonterminal_ops(env)
+    assert pending.manifest["rows"][0]["written"] is True
+    assert data_of(paths["local_c2"])["cliSessionId"] == LQ
+    assert ct.recover_op(env, pending, "back") == "rolled_back"
+    assert raw_of(paths["local_c2"]) == pre
+    (done,) = [o for o in ct.list_ops(env) if o.manifest["op_type"] == "repoint"]
+    assert done.manifest["status"] == "rolled_back"
+    assert "rollback_declined" not in done.manifest
