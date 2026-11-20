@@ -3707,7 +3707,10 @@ class SyncApp:
         and "converge" in 0.12.0; both are now also types this window itself
         creates (the Level tab), so they are offered rather than parked.
         "realign" joined with the command; it is CLI-only, so it is parked:
-        a completed realign on top means no undo is offered here.
+        a completed realign on top means no undo is offered here. "relink"
+        joined the same way and is parked as realign is: while a completed
+        relink is the latest operation, no undo is offered here, so a
+        converge before it is undone from the CLI.
 
         The descriptor carries what the confirmation needs: op_id, type, the
         written-row count, a button label naming what it reverses, and the
@@ -3723,7 +3726,8 @@ class SyncApp:
                                                              "repoint", "new-row",
                                                              "retitle",
                                                              "converge",
-                                                             "realign")]
+                                                             "realign",
+                                                             "relink")]
         except Exception:
             return None
         if not ops:

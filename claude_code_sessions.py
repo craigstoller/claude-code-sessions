@@ -5982,12 +5982,13 @@ def cmd_undo(env, ns):
                                              o.manifest.get("session_id", ""))
             print(line if ns.verbose else redact(env, line))
         return 0
-    # delta: only a completed op whose op_type is one of the seven this command
+    # delta: only a completed op whose op_type is one of the eight this command
     # can actually reverse - "move", "sync", "repoint", "new-row", "retitle",
-    # "converge", "realign" (or missing, which in practice never happens -
-    # every manifest sets op_type) - is eligible as "the operation to undo".
-    # A realign undo can be partial (per conversation, D5): the op stays
-    # 'completed' and stays the candidate, so a re-run retries the rest.
+    # "converge", "realign", "relink" (or missing, which in practice never
+    # happens - every manifest sets op_type) - is eligible as "the operation
+    # to undo". A realign undo can be partial (per conversation, D5): the op
+    # stays 'completed' and stays the candidate, so a re-run retries the rest;
+    # an interrupted relink undo stays 'completed' too, and resumes the same way.
     # A completed *undo* op is itself
     # terminal from cmd_undo's point of view - plan_undo always refuses an
     # undo-of-undo ("to redo, run move again") - so selecting one here would
@@ -6004,7 +6005,8 @@ def cmd_undo(env, ns):
                                                            "repoint", "new-row",
                                                            "retitle",
                                                            "converge",
-                                                           "realign")]
+                                                           "realign",
+                                                           "relink")]
     if ns.op_id:
         candidates = [o for o in candidates if o.manifest["op_id"] == ns.op_id]
     if not candidates:
@@ -6082,6 +6084,13 @@ def cmd_undo(env, ns):
                     "back out of the journal, each conversation only if it has "
                     "not moved on since); pass --apply to execute".format(
                         pm["op_id"], len(left), n_rows, n_copies))
+        elif prior.manifest.get("op_type") == "relink":
+            pm = prior.manifest
+            n_rows = sum(1 for r in _journal_dict_rows(pm)
+                         if r.get("written") and not r.get("restored"))
+            line = ("would undo {0} (relink: takes out the links and chains it "
+                    "added to {1} row(s), key by key; a key changed since is left "
+                    "and named); pass --apply to execute".format(pm["op_id"], n_rows))
         else:
             line = ("would undo {0} (session {1}); pass --apply to execute"
                     .format(prior.manifest["op_id"], prior.manifest.get("session_id")))
@@ -6104,9 +6113,17 @@ def cmd_undo(env, ns):
         final = undo_converge(env, prior)
     elif prior.manifest.get("op_type") == "realign":
         final = undo_realign(env, prior)
+    elif prior.manifest.get("op_type") == "relink":
+        final = undo_relink(env, prior)
     else:
         final = run_undo(env, prior)
     print("result: " + final)
+    # What a relink's undo left on the rows, key by key (spec "undo", step 4):
+    # taking out a link leaves no other link dangling, so no link report.
+    if prior.manifest.get("op_type") == "relink":
+        for e in prior.manifest.get("undo_left") or []:
+            line = _relink_left_line(e)
+            print(line if ns.verbose else redact(env, line))
     if prior.manifest.get("op_type") == "realign":
         titles = {c.get("session_id"): c.get("title", "")
                   for c in prior.manifest.get("conversations", [])}
@@ -20865,6 +20882,192 @@ def _relink_claims(env, m, rows):
             out.append({"row": asked[i][0], "op_id": oid, "keys": claimed[i],
                         "why": why})
     return out
+
+
+# Undo (spec "undo"; D8, D13, D18, D19): per row and per key. Each key the
+# relink wrote that still holds its new value goes back to its old one; a key
+# the app changed since is left and named, as is a row that is gone or opens
+# another conversation now. Every row is read, and every claim judged, before
+# anything is written. `restored` means no key the relink wrote is left at its
+# new value on the row.
+
+_RELINK_UNDO_THEN = ("The relink stays 'completed' - run 'undo --apply' again "
+                     "to resume it.")
+
+
+def _relink_left_entry(r, what, why):
+    """One undo_left (or back_left) entry for row R: WHAT is a key or "the
+    row"."""
+    return {"name": r["name"], "label": r["label"], "what": what, "why": why}
+
+
+def _relink_left_line(e):
+    """`left    : <row> -> <label>: <what> (<why>)` for one undo_left entry.
+    Never raises."""
+    e = e if isinstance(e, dict) else {}
+    return "left    : {0} -> {1}: {2} ({3})".format(
+        _lineage_short(_lineage_stem(e.get("name"))), e.get("label"),
+        e.get("what"), e.get("why"))
+
+
+def _relink_undo_disposition(r, state, data):
+    """What undo does with written row R, from its one read (STATE, DATA):
+    (keys to put back, entries to leave, whether a key the relink wrote stays
+    at its new value). A row gone, or opening another conversation (D19), is
+    one entry and nothing written; on the latter, a key still at new stays.
+    Otherwise each key by what it holds: at new it goes back, at old it
+    counts as restored, anything else is the app's and is left."""
+    if state == "absent":
+        return [], [_relink_left_entry(r, "the row", "gone from the store")], False
+    keys = [k for k in RELINK_KEYS if k in r["new"]]
+    held = {k: _relink_key_state(data, k, r["old"][k], r["new"][k]) for k in keys}
+    if data.get("cliSessionId") != r["session_id"]:
+        return ([], [_relink_left_entry(r, "the row", "now opens another conversation")],
+                "new" in held.values())
+    return ([k for k in keys if held[k] == "new"],
+            [_relink_left_entry(r, k, "the app changed it since")
+             for k in keys if held[k] == "other"],
+            False)
+
+
+def _relink_undo_claims_refusal(op_id, claims):
+    """undo's refusal for D13's CLAIMS (_relink_claims' entries), worded by
+    each claim's `why`: a live operation's names it, to be undone first; a
+    record that cannot be read is named by its folder, to be repaired or
+    moved out of the journal by hand, since no command does either; a
+    journal that could not be listed (op_id "") names no op id. One line
+    each, in that order, each naming its rows once."""
+    def rows_of(cs):
+        out = []
+        for c in cs:
+            r = c["row"]
+            shown = "{0} ({1})".format(r.get("name"), r.get("label", ""))
+            if shown not in out:
+                out.append(shown)
+        return ", ".join(out)
+    unlisted = [c for c in claims if not c["op_id"]]
+    damaged = [c for c in claims
+               if c["op_id"] and c["why"] == _RELINK_CLAIM_UNREADABLE]
+    live = [c for c in claims
+            if c["op_id"] and c["why"] != _RELINK_CLAIM_UNREADABLE]
+    lines = []
+    if live:
+        lines.append(
+            "cannot undo {0}: operation(s) {1} wrote row(s) {2} after it - undo "
+            "those first. Nothing was changed.".format(
+                op_id, ", ".join(sorted({c["op_id"] for c in live})), rows_of(live)))
+    if damaged:
+        lines.append(
+            "cannot undo {0}: the record(s) in {1} cannot be read, so whether they "
+            "wrote row(s) {2} after it cannot be told. No command repairs a "
+            "record: with the app closed, repair each one, or move its folder out "
+            "of the journal. Nothing was changed.".format(
+                op_id, ", ".join(sorted({c["op_id"] for c in damaged})),
+                rows_of(damaged)))
+    if unlisted:
+        lines.append(
+            "cannot undo {0}: {1}, so whether a later operation wrote its rows "
+            "cannot be told. Nothing was changed.".format(op_id, unlisted[0]["why"]))
+    return "\n".join(lines)
+
+
+def undo_relink(env, op):
+    """Take out, key by key, the links and chains this relink added (spec
+    "undo"). Refuses as a whole, with nothing written, on a damaged record,
+    the app running, another operation unfinished (D18), a row this version
+    cannot check or read, or a later live operation's claim (D13); the
+    relink then stays 'completed'. Otherwise each row written and not
+    restored, in journal order: its keys still at new go back to old, and
+    whatever it leaves is appended to undo_left before its restored mark.
+    A failed write or verify stops the undo with the rows done so far kept
+    on disk, and 'undo --apply' again resumes it from what each row holds.
+    Returns "undone"; a relink undone claims nothing (D13). Containment
+    roots come from discovery, fresh, never from the journal."""
+    m = op.manifest
+    acquire_lock(env, "undo-" + m["op_id"])
+    try:
+        if m.get("op_type") != "relink":
+            raise Refusal("not a relink op: " + str(m.get("op_id")))
+        if m.get("status") != "completed":
+            raise Refusal("op {0} is '{1}', not 'completed'".format(
+                m.get("op_id"), m.get("status")))
+        bad = _relink_shape_error(m)
+        if bad:
+            raise Refusal("the record for {0} is damaged ({1}); refusing rather "
+                          "than guess. Nothing was changed.".format(m.get("op_id"), bad))
+        # A record whose history gives no creation time cannot be ordered
+        # against the others: another operation's ownership check counts it
+        # as a claimant, and this undo would count every other operation as
+        # later, so the two would wait on each other with neither saying why.
+        if _relink_sort_key(m) is None:
+            raise Refusal("the record in {0} is damaged (its 'history' gives no "
+                          "time it was made, so which operations came after it "
+                          "cannot be told); refusing rather than guess. Nothing "
+                          "was changed.".format(os.path.basename(op.op_dir)))
+        _guard_mutation(env, "take links out of rows in", NEW_ROW_STORE,
+                        because=RELINK_GUARD_WHY)
+        _relink_refuse_open(env, "relink's undo", mine=m["op_id"])
+        stray = _unresolved_rows(_journal_discovery(env, "undo"), m, written_only=True)
+        if stray:
+            raise Refusal("cannot undo {0}: {1}. This version can neither check "
+                          "nor change them, so nothing was changed."
+                          .format(m["op_id"], _unresolved_clause(stray)))
+        roots = _retitle_roots(env)
+        # Preflight: every row read once, and judged from that read, before
+        # anything is written.
+        todo = [r for r in m["rows"] if r["written"] and not r.get("restored")]
+        work = []
+        for r in todo:
+            state, data, _raw = _relink_read(r, roots)
+            if state == "unreadable":
+                raise Refusal("could not read row {0} ({1}), so nothing was "
+                              "changed; the relink stays 'completed' and 'undo "
+                              "--apply' resumes it once the row can be read."
+                              .format(r["name"], r["label"]))
+            work.append((r, data) + _relink_undo_disposition(r, state, data))
+        claims = _relink_claims(env, m, todo)
+        if claims:
+            raise Refusal(_relink_undo_claims_refusal(m["op_id"], claims))
+        left = m.setdefault("undo_left", [])
+        then = _RELINK_UNDO_THEN
+        saver = _RelinkSaver(op, then=then)
+        try:
+            for r, data, back, entries, stays in work:
+                if back:
+                    # The lock is held and the app closed, so the row is as
+                    # the preflight read it.
+                    if not _relink_put(r, _relink_apply_old(data, r["old"], back),
+                                       roots, then):
+                        # Left unmarked, so a resumed undo judges it afresh;
+                        # the way-out save keeps what earlier rows recorded.
+                        raise LayoutError(
+                            "verify failed restoring row {0}: the row on disk is "
+                            "not the row read with relink's keys put back. 'undo "
+                            "--apply' again re-reads it and goes by what each key "
+                            "holds.".format(r["name"]))
+                for e in entries:
+                    if e not in left:
+                        left.append(e)
+                _maybe_crash("relink-undo-before-mark")
+                if not stays:
+                    r["restored"] = True
+                saver.tick()
+        except BaseException:
+            # A failed save never replaces the exception in flight (D15).
+            try:
+                save_manifest(op)
+            except Exception:
+                pass
+            raise
+        try:
+            set_status(op, "undone")
+        except OSError as exc:
+            raise Refusal("could not save the operation record in {0} ({1}). "
+                          .format(op.op_dir, exc) + then)
+        rotate_ops(env)
+        return "undone"
+    finally:
+        release_lock(env)
 
 
 if __name__ == "__main__":
