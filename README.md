@@ -127,10 +127,10 @@ read. See `docs/internals.md`, RULING 7.
 
 ## Before any move: close the Claude app.
 
-`move`, `undo`, `recover`, `repoint --apply`, `new-row --apply`, `realign --apply`, `relink --apply`, and every mutating `sync`
-route (`--apply`, `undo` of a completed sync, `recover --back` on a stuck one) all refuse
-while they can see the Claude desktop app running - whoever the identity files currently say
-is signed in. That includes `undo` of a completed `repoint` or `new-row`, and `recover` on an
+`move`, `undo`, `recover`, `repoint --apply`, `new-row --apply`, `realign --apply`,
+`relink --apply`, and every mutating `sync` route (`--apply`, `undo` of a completed sync,
+`recover --back` on a stuck one) all refuse while they can see the Claude desktop app
+running - whoever the identity files currently say is signed in. That includes `undo` of a completed `repoint` or `new-row`, and `recover` on an
 interrupted one wherever it would write or delete a row rather than only close the record. Closing the app first avoids
 the refusal and guarantees nothing is actively appending to the sidebar rows you're about to
 touch. A running Claude Code CLI session does **not** count: it's recognised by its own
@@ -759,19 +759,17 @@ as `converge` writes it on a new row, and the chain beside it when one resolves.
 It plans each conversation that some account's row links to its parent in a shape `converge`
 carries. A row of that conversation gains the link when it has no `spawnedFrom` object (the key
 is absent, or holds a non-object such as `null`) and its own account holds a row for the
-parent. The link comes from 0.18.0's resolver, unchanged, with the other accounts' rows as its
-holders, so a link is left out for the reasons `converge` gives above, in the same words. A row
-gains a chain only beside a link written in the same run, or beside a link of its own that
-agrees, so a row whose link is left out gains no chain. Archived rows are included. Beyond the
-resolver's rules:
+parent. The other accounts' rows are the holders `converge`'s resolver reads, so a link is left
+out for the reasons `converge` gives above, in the same words. A row gains a chain only beside
+a link written in the same run, or beside a link of its own that agrees, so a row whose link is
+left out gains no chain. Archived rows are included. Beyond the resolver's rules:
 
 - Agreement is judged across every account's rows of the conversation before any row is
-  resolved, whatever the options narrow. When their links name different parents or give
-  different `taskId`s, a row's own link among them, every row of the conversation is left out
-  (`holders disagree on the parent`, `holders disagree on taskId`).
+  resolved. When their links name different parents or give different `taskId`s, a row's own
+  link among them, every row of the conversation is left out (`holders disagree on the
+  parent`, `holders disagree on taskId`).
 - `the row's own link names no usable row`: the row already has a link object, and it names no
-  row of its own account, or lacks the `taskId` the accounts agree on. `relink` never replaces
-  an object, so the row gains nothing.
+  row of its own account, or lacks the `taskId` the accounts agree on. The row gains nothing.
 - `no app-written link backs it`: none of the other accounts' rows that name the parent carries
   a link in one of the two shapes the app writes, a link with `sideSession: true` or exactly
   `{sessionId, taskId, title}` with a non-empty title. This tool's own `{sessionId, taskId}`
@@ -792,7 +790,8 @@ replaced, even one that disagrees. Every other key, the app's own included, keep
 its place. The file is rewritten as compact JSON, as `realign` writes rows, so its bytes change;
 the apply reads each row back and checks it by value.
 
-What the app does with a link added to a row it wrote itself has not been measured. Every link
+What the app does with a link added to a row it wrote itself, or to an archived row, has not
+been measured. Every link
 looked at in the app so far, in the probes behind 0.18.0 and in its acceptance check, was on a
 row this tool had written. The release's run sheet measures it: one row shaped like the app's
 own first, then one row of each riskier kind (an archived child among them), each looked at in
@@ -803,10 +802,11 @@ the apply's last line asks for a look rather than saying the rows nest:
 Reopen the app and check that the relinked rows show under their parents. 'undo' takes the links out again, key by key.
 ```
 
-A dry run reads every row of every account's store, about 400 MB on the store the design
-measured, and lists every transcript name. One row anywhere that cannot be read refuses the
-whole run, as it refuses `converge`: an unreadable row could be a holder or a target, and
-"couldn't look" is never "nothing there". So does an account with rows in two org folders.
+A dry run reads every row of every account's store, about 400 MB across the three account
+stores the design measured, and lists every transcript name. One row anywhere that cannot be
+read refuses the whole run, as it refuses `converge`: an unreadable row could be a holder or a
+target, and "couldn't look" is never "nothing there". So does an account with rows in two org
+folders.
 
 `--only` narrows to one conversation, by a title substring or a `cliSessionId` prefix, or to
 one row, by its row id (`local_` and a prefix: the listing's first column). `--account` narrows
@@ -817,7 +817,8 @@ listed; agreement, holders and targets are always read from every account. `--li
 the app's account when the identity files disagree, at account scope as for `converge`, and
 the dry run reports the disagreement first, in `converge`'s words. `--verbose` lists every row,
 not only the first 15 per account, and each row left out with its reason. `--json` prints the
-plan without the link values, each row naming the keys it `adds` and `keeps`.
+plan without the link objects: each row names the keys it `adds` and `keeps`, and its
+`lineage` record the rows they point at.
 
 ```
 -> alice@example.com (aaaa1111/cccc3333)
@@ -849,20 +850,21 @@ a proof never touches two rows; a row id that two accounts hold needs `--account
 runs on Windows only, as every store mutation here does. It prints the plan, then makes it again
 under its lock against the stores as they then stand, and writes what that plan says. Its last
 lines count, in rows, what changed between the two, as `converge`'s do:
-`links   : 3 added, 3 left out (...); since the plan: 1 changed, 1 gained`. So an apply reads
+`links   : 4 added, 3 left out (...); since the plan: 1 changed, 1 gained`. So an apply reads
 every store twice, and the app stays closed through a full read of them as well as the writes.
 How long that takes on a large store has not been timed. A run that leaves rows out still exits
-0: a left-out row asks for no action, and holders that disagree stay that way until someone
-changes a row, so a non-zero code would follow every run. A refusal exits 1. A second run can
-add what the first made possible, a chain that resolves only through a link the first run
-wrote, so run the dry run again after an apply.
+0: a left-out row is one relink will not change, and holders that disagree stay that way until
+someone changes a row, so a non-zero code would follow every run. A refusal exits 1. A second
+run can add what the first made possible, a chain that resolves only through a link the first
+run wrote, so run the dry run again after an apply.
 
 While any operation in the journal is unfinished, of any kind, `relink` refuses, its dry run
 included, and a relink's `undo` and recovery refuse while any other one is, each naming the
 operation to recover first. An interrupted `converge` or `sync` rolled back after a relink could
 delete a parent row a new link names, and one finished forward would meet rows a relink
-changed. A journal record that cannot be read holds them the same way, named by its folder. The
-cost is running `recover` first.
+changed. The cost is running `recover` first. A journal record that cannot be read holds them
+the same way, named by its folder, and `recover` cannot clear it, since it cannot read that
+record either: with the app closed, repair the record or move its folder out of the journal.
 
 `undo` takes the links out key by key. A key that still holds what relink wrote goes back:
 removed where the row had none, set back to its exact old value where it held a non-object. A
@@ -876,8 +878,7 @@ left    : local_q2 -> bob@example.com (cccc1111/dddd2222): startChain (the app c
 It refuses as a whole, writing nothing, while a row cannot be read, and while a later operation
 that wrote one of the rows still stands, naming it to be undone first. A `realign`, which writes
 other keys, and a finished `undo`, which no command can undo, do not count. A journal record
-that cannot be read refuses the undo too, named by its folder; no command repairs a record, so
-with the app closed, repair it or move its folder out of the journal. An undo cut short resumes
+that cannot be read refuses the undo too, named by its folder (above). An undo cut short resumes
 with `undo --id <op_id> --apply`, since a bare `undo --apply` takes the latest completed
 operation, which may by then be another. Like every operation's undo, it works only while the
 relink is in the journal, which keeps the ten most recent finished operations. `relink` is
@@ -885,9 +886,9 @@ CLI-only, and while a relink is the latest operation the window offers no undo, 
 `realign`; an operation before it is undone from the CLI.
 
 An interrupted apply recovers in both directions, by what each row holds now. `recover
---forward` counts a row with a key already at relink's value as written, writes a row still as
-planned once its parent's row and the account's links pass again, and skips and names anything
-else:
+--forward` counts a row that still opens its conversation and has a key already at relink's
+value as written, writes a row still as planned once its parent's row and the account's links
+pass again, and skips and names anything else:
 
 ```
 skipped : local_c2 -> bob@example.com (cccc1111/dddd2222): changed_since_plan - changed since the plan
@@ -896,8 +897,8 @@ skipped : local_c2 -> bob@example.com (cccc1111/dddd2222): changed_since_plan - 
 It then names any link that landed whose target row has gone, or now opens another
 conversation. `recover --back` takes out every key that landed, key by key as `undo` does, and
 names what it left on its `reason:` line; once a `--back` has begun, only `--back` is offered.
-Either direction checks that the app is closed only when it will write a row, and then reads
-each such row again, refusing if it changed.
+Either direction needs the app closed only when it will write a row, and refuses a row that
+changed while it checked.
 
 ## Safety design
 
