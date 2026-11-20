@@ -1310,6 +1310,21 @@ window into `journaled`/`completed`/`rolled_back`.
   planned. `converge` recovery also keeps a row that landed before a hard kill: it records the
   row as written before re-checking anything, so `undo` still removes it, even after the app
   has rewritten it.
+- **0.18.1 removes the cost 0.18.0 added to `sync` planning.** 0.18.0's planning decoded both
+  stores a second time for the links. Planning now decodes each store once: the link pass keeps
+  only the six keys it reads from each row, takes the source from selection's own read, and its
+  one read of the destination also serves the duplicate check. Planning also finds transcripts
+  from one listing of `~/.claude/projects` per plan, where it used to look in every project
+  folder for each candidate row. On a store of about 3,000 rows (400 MB) with 838 project
+  folders, a dry run from an account of about 1,000 rows took a median of 4.0 s against
+  0.18.0's 29.4 s, and peaked at 237 MB against 882 MB. With `--update` it took 12.6 s against
+  50.1 s, and peaked at 472 MB against 1.13 GB. Those peaks are back near 0.17.0's 229 MB and
+  453 MB, measured on the same store earlier that day. Both versions printed the same report
+  and, run back to back, the same `--json` plan, with and without `--update` and `--verbatim`.
+  The apply still reads both stores again under the lock and looks transcripts up afresh, so a
+  store that changed after the plan is judged as it stands, and recovery still never resolves.
+  Example output in this README and in `docs/internals.md`, a docstring and one test's fixture
+  now use the fake cast's ids, or none.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
