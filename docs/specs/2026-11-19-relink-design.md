@@ -348,7 +348,8 @@ dry run - pass --apply to add them
    - a key that holds neither, because the app changed it, is left, and named in a `left:` line;
    - the row is marked `restored`, and the manifest saved, as the undo goes.
 3. An unreadable row, or a write that fails, refuses with the reason; the relink stays
-   `completed`, and `undo --apply` again resumes it. Rows marked `restored` are passed over and
+   `completed`, and `undo --id <op_id> --apply` resumes it (naming the op, as built 2026-11-19:
+   a bare `undo --apply` picks the latest completed operation, which may be another one). Rows marked `restored` are passed over and
    claim nothing, in this undo's checks and in every other operation's.
 4. The operation ends `undone`. Its `left:` list is kept on the manifest and printed by the
    undo. Taking out a link cannot leave another link dangling, so there is no link report.

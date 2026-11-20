@@ -1079,7 +1079,7 @@ def test_the_saver_saves_per_row_while_the_budget_lasts(monkeypatch, ...):
     raise; undo and `back` leave the row unmarked and raise). `then` is the caller's own next step,
     every one runnable: the apply's and forward's `The op is left at '<status>' - 'recover
     --resolve <op_id> --back --apply' takes out what landed.`, undo's `The relink stays
-    'completed'; run 'undo --apply' again to finish it.`, back's `The op is left at '<status>' -
+    'completed'; run 'undo --id <op_id> --apply' to finish it.`, back's `The op is left at '<status>' -
     run 'recover --resolve <op_id> --back --apply' again; it picks up where this stopped.`
     `<status>` is the op's status when the text is built, never a fixed word: the apply's is
     `writing`, but forward can run on an op that Task 6's status-save refusal left at
@@ -1432,7 +1432,7 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(...):
     4. **Preflight, before any write.** `todo` = rows `written` and not `restored`. Each is read
        once (`_relink_read`): any `"unreadable"` row refuses the whole undo now, nothing written
        (`could not read row <name> (<label>), so nothing was changed; the relink stays 'completed'
-       and 'undo --apply' resumes it once the row can be read.`). Each row's disposition is
+       and 'undo --id <op_id> --apply' resumes it once the row can be read.`). Each row's disposition is
        decided from that read: `"absent"` is one entry (`the row`, `gone from the store`);
        another `cliSessionId` is one entry (`the row`, `now opens another conversation`), nothing
        written, and its keys' states (`_relink_key_state` per key) decide its mark in step 6;
@@ -1445,7 +1445,7 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(...):
        then>)`, inside `try ... except BaseException: save_manifest(op); raise`: a row with keys to
        put back gets one `_relink_put(r, _relink_apply_old(data, r["old"], keys), roots, <undo's
        then>)` from the preflight's read (the lock is held and the app closed); a `False` from it
-       is `LayoutError("verify failed restoring row <name>: ... 'undo --apply' again re-reads it
+       is `LayoutError("verify failed restoring row <name>: ... 'undo --id <op_id> --apply' re-reads it
        and goes by what each key holds.")`, the row left unmarked so a resumed undo judges it
        afresh (the `except` saves what earlier rows recorded). Then the row's entries are appended
        to `m["undo_left"]`, each only if not already there; then
@@ -1455,7 +1455,7 @@ def test_an_earlier_relink_does_not_block_a_repoint_rollback(...):
        entry and stays unmarked, so the record says the key was not taken out; once the op is
        `undone` it claims nothing (spec D13, Global Constraints). Then
        `saver.tick()`. A write `OSError` refuses with undo's `then`; the rows already done keep
-       their entries and marks on disk, and `undo --apply` again resumes.
+       their entries and marks on disk, and `undo --id <op_id> --apply` resumes.
     7. `set_status(op, "undone")`; `rotate_ops`. No link report (spec, `undo` step 4).
   - `_relink_left_line(e) -> str` - `left    : <row> -> <label>: <what> (<why>)`.
   - `cmd_undo`: `"relink"` joins the candidate tuple; the preview line (Global Constraints, `n` the
@@ -1501,7 +1501,7 @@ def test_an_unreadable_row_refuses_the_undo_before_any_write(...):
     # status "completed"; no row restored; local_c3 restored by hand -> undo again "undone"
 def test_an_interrupted_undo_keeps_what_it_left_and_reports_it_once(monkeypatch, ...):
     # the app changes local_c2's spawnedFrom taskId; atomic_write raises OSError for local_c3 ->
-    # Refusal containing "run 'undo --apply' again"; on disk: local_c2 restored True and
+    # Refusal containing "run 'undo --id <op_id> --apply'"; on disk: local_c2 restored True and
     # undo_left == [local_c2's "spawnedFrom" entry]; unpatched undo again -> "undone", undo_left
     # holds that entry exactly once
 def test_undo_waits_while_another_operation_is_unfinished(...)
