@@ -1407,7 +1407,7 @@ def test_the_identity_warning_names_relink(mkenv, tmp_path, write_transcript, wr
     identity_files(env, A1, A2)
     m = plan(env)
     lines = ct._identity_warning_lines(env, m, command="relink")
-    remedies = [ln for ln in lines if "--live" in ln]
+    remedies = [ln for ln in lines if "(if the app is on" in ln]
     assert len(remedies) == 2
     assert all("claude-code-sessions relink --live" in ln for ln in remedies)
     # converge keeps its own command, and nothing but the command word differs
