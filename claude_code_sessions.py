@@ -20155,9 +20155,13 @@ def _relink_row_error(i, r):
     for k in ("label", "title", "parent_title"):
         if not isinstance(r.get(k), str):
             return "row {0} has no usable {1!r}".format(i, k)
+    # The name rule is the scan's (_retitle_scan reads every local_*.json, an
+    # Explorer copy's name among them), so a fresh plan passes its own check;
+    # equal to its dest_path's file, the name holds no separator. Undo and
+    # recovery re-read a row through its dest_path (_relink_read), never
+    # through _lineage_target, which reads such a name as unreadable.
     name, dest, store = r["name"], r["dest_path"], r["store_path"]
-    if not (name.endswith(".json")
-            and _LINEAGE_ROW_ID.fullmatch(name[:-len(".json")])
+    if not (name.startswith("local_") and name.endswith(".json")
             and os.path.basename(dest) == name):
         return "row {0}'s 'name' is not the row file its 'dest_path' names" \
             .format(i)
