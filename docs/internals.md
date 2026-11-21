@@ -1296,8 +1296,9 @@ existing row the link (`spawnedFrom`) and chain (`startChain`) its conversation'
 other accounts, translated by the same resolver, and changes no other key. It is a command of
 its own on `realign`'s per-key journal (D1, D3): its undo puts back the two keys and keeps
 whatever else the app wrote since, which is what the design relies on to edit the app's own
-rows. What the app does with a link added to a row it wrote itself is unmeasured, and waits on
-the release's run sheet (D2).
+rows. What the app does with a link added to a row it wrote itself was measured before 0.19.0
+(D2): seven rows of six kinds, one at a time, then the rest in one run; each child looked at was
+where it should be, and every link and chain read back as written (README, "`relink`").
 
 **Planning, in order.** `plan_relink` writes nothing.
 1. It records an identity disagreement for the dry run's warning and `--json`, and resolves

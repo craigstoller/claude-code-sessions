@@ -790,13 +790,22 @@ replaced, even one that disagrees. Every other key, the app's own included, keep
 its place. The file is rewritten as compact JSON, as `realign` writes rows, so its bytes change;
 the apply reads each row back and checks it by value.
 
-What the app does with a link added to a row it wrote itself, or to an archived row, has not
-been measured. Every link
-looked at in the app so far, in the probes behind 0.18.0 and in its acceptance check, was on a
-row this tool had written. The release's run sheet measures it: one row shaped like the app's
-own first, then one row of each riskier kind (an archived child among them), each looked at in
-the app before and after a reopen. It had not run when this section was written, which is why
-the apply's last line asks for a look rather than saying the rows nest:
+Before the release, `relink` ran on the machine it was built on, one row at a time first. Seven
+rows went one by one, each with its own apply: two shaped like the app's own (one of them in a
+second account), one in `converge`'s shape, one that gained its chain beside the link, an
+archived child, a child whose parent row is archived, and one whose holders' links carry
+`sharedFolder`. Each was looked at in the app, then again after a quit and reopen, and read back.
+The children nested under their parents. The archived child stayed among the archived sessions
+and out of the sidebar. The child of an archived parent stayed at the top level of the sidebar
+rather than disappearing; whether it nests once its parent is unarchived has not been looked at.
+An undo of the row with a chain took out the link and the chain and nothing else, and the child
+went back to the top level; the same row was then linked again. The rest went in one run: 924
+rows gained a link and 41 a chain across three accounts, and a second dry run found nothing
+more to add. 120 rows stayed out, every one because its holders disagree on the parent. Opening
+a session made the app rewrite keys of its own (moving an old session to the current model,
+recording that it could not resume one into a worktree folder that had been removed), and every
+link and chain still read back as written. The apply's last line still asks for a look rather
+than saying the rows nest:
 
 ```
 Reopen the app and check that the relinked rows show under their parents. 'undo' takes the links out again, key by key.
@@ -962,13 +971,14 @@ changed while it checked.
 | Windows 11 + Claude Desktop 4.4212.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor`, `alignment` and `converge --apply` verified 2026-11-01, the apply with the app closed and the browser helper running. Needs 0.16.3 or later to find the store | read-only + mutations |
 | Windows 11 + Claude Desktop 5.1231.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | on 0.16.5: `doctor` and `alignment` verified read-only 2026-11-10. Needs 0.16.3 or later to find the store | read-only + mutations, `--apply` not yet run on this build |
 | Windows 11 + Claude Desktop 6.6395.0 (user data still in `%LOCALAPPDATA%\Claude-Data`) | from 0.17.0: `doctor` and `realign --apply` verified 2026-11-17, the apply with the app closed; after the app reopened, `doctor` and a fresh `realign` plan found every rewritten row opening the live copy and no set-aside copy back in its old folder. From 0.18.0: `converge --apply` with carried links verified 2026-11-19, the apply with the app closed; the app nested both children opened, and after a reopen every carried link and chain read back as written. Needs 0.16.3 or later to find the store | read-only + mutations |
+| Windows 11 + Claude Desktop 6.28899.6 (user data still in `%LOCALAPPDATA%\Claude-Data`) | from 0.19.0: `relink --apply` verified 2026-11-20 and 2026-11-21, each apply with the app closed: seven rows one at a time, then 924 more in one run. Each child looked at was where it should be, after a reopen too (nested, or for an archived child and a child of an archived parent, where it was before), and every link and chain read back as written. The update to this build came in after the first of the seven had been applied and looked at once, on 6.6395.0. `doctor` and `alignment` read-only 2026-11-21. Needs 0.16.3 or later to find the store | read-only + mutations |
 | macOS / Linux desktop | unverified | **read-only only** - desktop-store mutations refuse, with no override |
 | CLI-only sessions (any OS) | transcript layout verified | mutations allowed via `--transcript-only` |
 
 The dates are measurements against specific builds of the MSIX that Anthropic signs and
-distributes itself from claude.ai - most recently Claude Desktop 6.6395.0.0 with Claude Code
-CLI 2.1.326 for `doctor` and the last two `--apply` runs, a `realign` on 2026-11-17 and a
-`converge` on 2026-11-19. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
+distributes itself from claude.ai - most recently Claude Desktop 6.28899.6.0 for `doctor` and a
+`relink` on 2026-11-21, and 6.6395.0.0 with Claude Code CLI 2.1.326 for a `realign` on
+2026-11-17 and a `converge` on 2026-11-19. The Microsoft Store build is a separate package, `AnthropicPBC.Claude_<id>`.
 This tool does not look in that package's folder and has never been run against it.
 On 2026-10-14 the
 read-only paths were verified against a real Desktop 2.x store, build 2.37337.1.0 (`list`,
@@ -1501,6 +1511,19 @@ window into `journaled`/`completed`/`rolled_back`.
   store that changed after the plan is judged as it stands, and recovery still never resolves.
   Example output in this README and in `docs/internals.md`, a docstring and one test's fixture
   now use the fake cast's ids, or none.
+- **0.19.0 adds `relink`, which gives a side session's older rows their parent link.** Since
+  0.18.0, `converge` and `sync` write the link (`spawnedFrom`) and the chain (`startChain`) on
+  the rows they write, but rows made before then were left as they were, so a side session
+  could sit under its parent in one account and on its own in another. `relink` gives such a
+  row the link another account's row carries, translated to its own account's rows, and the
+  chain beside it. It changes only those two keys, and never replaces a link or chain a row
+  already has. It plans and applies as `converge` does, with the app closed, and its `undo`
+  takes the keys out one by one: it leaves and names any key the app changed since, and waits,
+  named, on any key a later operation wrote. Before the release it ran on the machine it was
+  built on: seven rows one at a time, each looked at in the app and read back, then the other
+  924 rows in one run, 931 links and 42 chains in all across three accounts. Every link and
+  chain read back as written, and the 120 rows whose accounts disagree on the parent stayed out.
+  "`relink`" above says what was looked at and what was not.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
