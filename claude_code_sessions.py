@@ -4189,8 +4189,7 @@ def _anon_pairs(env):
     except Exception:
         rows = []
     for r in rows:
-        data = r.data if isinstance(r.data, dict) else {}
-        t = (data.get("title") or "").strip()
+        t = title_key(r.data.get("title") if isinstance(r.data, dict) else None)
         if len(t) >= _ANON_MIN:
             seen[t] = _anon_label("session", t)
             # A stored title wearing the EXACT generated leg suffix (see
@@ -4509,7 +4508,7 @@ def gather_list(env, query="", project=None):
         if not r.cli_session_id:
             continue
         if r.cli_session_id not in seen or seen[r.cli_session_id]["last_activity"] < r.last_activity:
-            seen[r.cli_session_id] = {"session_id": r.cli_session_id, "title": r.data.get("title") or "",
+            seen[r.cli_session_id] = {"session_id": r.cli_session_id, "title": _title_text(r.data),
                                       "cwd": r.cwd, "last_activity": r.last_activity, "listed": True}
     for folder, path in iter_transcripts(env.projects_root):
         sid = os.path.splitext(os.path.basename(path))[0]
@@ -5047,6 +5046,15 @@ def title_key(title):
     AttributeError on a malformed row.
     """
     return title.strip() if isinstance(title, str) else ""
+
+
+def _title_text(d):
+    """D's title when it is a string, else "": a number or a list in a row's
+    title reads as no title, as title_key compares it, so a malformed row
+    neither matches --only nor stops the command that passes it. relink's
+    _relink_title is the same reading. Never raises."""
+    t = d.get("title") if isinstance(d, dict) else None
+    return t if isinstance(t, str) else ""
 
 
 def gather_alignment(env):
@@ -6214,14 +6222,15 @@ def cmd_undo(env, ns):
             states = (prior.manifest.get("undo_status") or {}).values()
             if any(str(v).startswith("refused") for v in states):
                 line = ("a conversation marked 'refused' keeps realign's folder; "
-                        "re-run 'undo --apply' once its reason clears, or leave "
-                        "it (a conversation that has gained turns stays "
-                        "realigned for good)")
+                        "re-run 'undo --id {0} --apply' once its reason clears, or "
+                        "leave it (a conversation that has gained turns stays "
+                        "realigned for good)".format(prior.manifest["op_id"]))
                 print(line if ns.verbose else redact(env, line))
             if any(str(v).startswith("undoing") for v in states):
                 line = ("a conversation marked 'undoing' stopped part-way - some "
-                        "of its rows or copies are already back; re-run 'undo "
-                        "--apply' to finish it once its reason clears")
+                        "of its rows or copies are already back; re-run 'undo --id "
+                        "{0} --apply' to finish it once its reason clears".format(
+                            prior.manifest["op_id"]))
                 print(line if ns.verbose else redact(env, line))
             return 1
     # Converge's undo is FORGIVING - it deletes what is still redundant and
@@ -7826,7 +7835,7 @@ def select_sync_rows(env, source, dest, flags, found=None, decoded=None,
                         # local id, not the session id. Tombstones are written
                         # in both spaces - see _tombstone_ids.
                         "local_id": name[len("local_"):-len(".json")],
-                        "title": d.get("title") or "(untitled)",
+                        "title": _title_text(d) or "(untitled)",
                         # Through the same type check the destination side gets.
                         # plan_sync compares the two with `>`, so a source row
                         # carrying a STRING lastActivityAt raised TypeError and
@@ -11803,7 +11812,7 @@ def plan_repoint(env, flags):
                 continue
             if not isinstance(d, dict):
                 continue
-            title = d.get("title") or ""
+            title = _title_text(d)
             local_id = name[len("local_"):-len(".json")]
             if want in title.lower() or want in local_id.lower():
                 hits.append((store, label, name, p, d, title))
@@ -12257,7 +12266,7 @@ def plan_retitle(env, flags):
         cid = rec.data.get("cliSessionId") or ""
         if not cid:
             continue                    # a row that opens nothing is not a conversation
-        title = rec.data.get("title") or ""
+        title = _title_text(rec.data)
         if want in title.lower() or cid.lower().startswith(want):
             conversations.setdefault(cid, []).append(rec)
     if not conversations:
@@ -12309,7 +12318,7 @@ def plan_retitle(env, flags):
             continue
         if (rec.data.get("cliSessionId") or "") == sid:
             continue
-        if (rec.data.get("title") or "").strip() == new_title:
+        if title_key(rec.data.get("title")) == new_title:
             raise Refusal(
                 "that title already names a different conversation in {0}: row "
                 "{1!r} (opens {2}). Two rows in one sidebar under one name is "
@@ -12322,7 +12331,7 @@ def plan_retitle(env, flags):
     # so rather than forbidding it. alignment's `distinguishable` line counts
     # per sidebar, so a --store rename cannot increase it - but the accounts
     # can end up reading differently, which is what this reports.
-    sib_entries = [{"label": rec.label, "title": rec.data.get("title") or ""}
+    sib_entries = [{"label": rec.label, "title": _title_text(rec.data)}
                    for rec in sorted(siblings, key=lambda rec: (rec.store, rec.name))]
     divergence = any((e["title"] or "").strip() != new_title for e in sib_entries)
 
@@ -12334,7 +12343,7 @@ def plan_retitle(env, flags):
         post = json.dumps(post_data, separators=(",", ":")).encode("utf-8")
         rows.append({"name": rec.name, "dest_path": rec.path,
                      "store_path": rec.store, "label": rec.label,
-                     "title": rec.data.get("title") or "(untitled)",
+                     "title": _title_text(rec.data) or "(untitled)",
                      "pre_b64": b64(rec.raw), "post_b64": b64(post),
                      "is_update": True, "written": False})
     return {"op_type": "retitle", "cli_session_id": sid, "new_title": new_title,
@@ -12452,7 +12461,7 @@ def _retitle_recheck(env, m):
             continue
         if (rec.data.get("cliSessionId") or "") == sid:
             continue
-        if (rec.data.get("title") or "").strip() == new_title:
+        if title_key(rec.data.get("title")) == new_title:
             raise Refusal(
                 "that title now names a different conversation in {0}: row "
                 "{1!r} appeared or was renamed since this plan was made. Nothing "
@@ -12751,8 +12760,8 @@ def _retitle_restored_collision_note(env, m):
         hits = []
         for r in m.get("rows") or []:
             try:
-                old = (json.loads(_sync_pre_image(r).decode("utf-8"))
-                       .get("title") or "").strip()
+                old = title_key(json.loads(_sync_pre_image(r).decode("utf-8"))
+                                .get("title"))
             except Exception:
                 continue
             if not old:
@@ -12771,7 +12780,7 @@ def _retitle_restored_collision_note(env, m):
                     continue
                 if (d.get("cliSessionId") or "") == sid:
                     continue
-                if (d.get("title") or "").strip() == old:
+                if title_key(d.get("title")) == old:
                     hits.append("{0!r} is also row {1} in {2}".format(
                         old, name, r.get("label") or store))
                     break
@@ -14036,8 +14045,12 @@ def _realign_claimed_later(env, m, r):
     on its type, before its sort key or any of its rows is read: it sets
     only spawnedFrom and startChain, never a key realign writes (spec D13's
     per-key exception), so even a damaged relink record claims nothing here,
-    and cannot reach the except below to hide a later claimant. Never
-    raises."""
+    and cannot reach the except below to hide a later claimant. A finished
+    undo claims nothing either: no command can undo or withdraw it (cmd_undo
+    never picks one, and plan_undo refuses an undo of an undo), so its claim
+    would hold the row for good, as relink's claims also rule (departure
+    15). An undo still running claims, as every unfinished operation does.
+    Never raises."""
     try:
         mine = m.get("op_id") or ""
         my_key = _op_sort_key(m)
@@ -14048,6 +14061,8 @@ def _realign_claimed_later(env, m, r):
             if om.get("op_type") == "relink":
                 continue
             if oid == mine or om.get("status") in ("undone", "rolled_back"):
+                continue
+            if om.get("op_type") == "undo" and om.get("status") in TERMINAL:
                 continue
             if _op_sort_key(om) <= my_key:
                 continue
@@ -14178,8 +14193,8 @@ def _realign_undo_conversation(env, op, m, conv):
     OSError is a Refusal: the conversation is left at 'undoing', and the
     next undo resumes it."""
     sid = conv["session_id"]
-    then = ("The conversation is left part-way; run 'undo --apply' again to "
-            "finish it.")
+    then = ("The conversation is left part-way; run 'undo --id {0} --apply' "
+            "again to finish it.".format(m["op_id"]))
     for c in m["copies"]:
         if c["session_id"] == sid and c.get("moved"):
             _realign_restore_copy(env, op, c, then)
@@ -15015,7 +15030,7 @@ def _release_decide(env, op, c, entry, nt=(), disc=None):
     sid = c["session_id"]
     if str((m.get("undo_status") or {}).get(sid, "")).startswith("undoing"):
         return ("an undo of this conversation stopped part-way; finish it with "
-                "'undo --apply' first"), None
+                "'undo --id {0} --apply' first".format(m.get("op_id"))), None
     if disc is not None and any(r.get("session_id") == sid
                                 for r, _p in _unresolved_rows(disc, m)):
         return ("its journal names a row in a store this version does not read, so "
@@ -17578,7 +17593,7 @@ def plan_converge(env, flags):
         want = flags.only.lower()
         matches = {sid: recs for sid, recs in conversations.items()
                    if sid.lower().startswith(want)
-                   or any(want in (rec.data.get("title") or "").lower()
+                   or any(want in _title_text(rec.data).lower()
                           for rec in recs)}
         if not matches:
             raise Refusal(

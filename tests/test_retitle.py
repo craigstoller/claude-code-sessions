@@ -126,6 +126,27 @@ def test_ambiguous_only_lists_candidates_with_ids(mkenv, tmp_path, write_row):
     assert "2 conversations" in msg
 
 
+def test_a_title_that_is_not_text_reads_as_untitled(mkenv, tmp_path, write_row):
+    """A row whose title is a number or a list reads as untitled, as title_key
+    compares it: --only passes over it, the collision rule never matches it,
+    and the conversation it belongs to can still be renamed, here or in one
+    account beside a sibling that holds one."""
+    env = _monotonic_now(mkenv(tmp_path))
+    three_accounts(env, write_row)
+    p_b = write_row(env, 0, A1, O1, "local_2", row_data(SID_B, 42))
+    write_row(env, 0, A2, O2, "local_2", row_data(SID_B, ["ACME-REVIEW"]))
+    m = ct.plan_retitle(env, ct.RetitleFlags(only="board report", title="ACME-REVIEW"))
+    assert m["cli_session_id"] == SID and len(m["rows"]) == 3
+    assert ct.run_retitle(env, m) == "completed"
+    m = ct.plan_retitle(env, ct.RetitleFlags(only=SID_B[:8], title="Northwind",
+                                             store=A1[:8]))
+    assert [r["title"] for r in m["rows"]] == ["(untitled)"]
+    assert m["siblings"][0]["title"] == "" and m["sibling_divergence"] is True
+    assert ct.run_retitle(env, m) == "completed"
+    with open(p_b, encoding="utf-8") as fh:
+        assert json.load(fh)["title"] == "Northwind"
+
+
 def test_no_match_names_new_row_as_the_remedy(mkenv, tmp_path, write_row):
     env = mkenv(tmp_path)
     three_accounts(env, write_row)
@@ -665,6 +686,23 @@ def test_undo_restores_even_when_history_collides_and_says_so(
           if o.manifest.get("op_type") == "retitle"][-1]
     assert op.manifest["status"] == "undone"
     assert "collide" in op.manifest["undo_collision_note"]
+
+
+def test_the_undo_collision_note_passes_over_a_title_that_is_not_text(
+        mkenv, tmp_path, write_row, capsys):
+    """A row whose title is a number, read before the row that collides, is
+    passed over as untitled rather than taking the whole note with it."""
+    env = _monotonic_now(mkenv(tmp_path))
+    old = "Quarterly board report finalization"
+    write_row(env, 0, A1, O1, "local_1", row_data(SID, old))
+    ct.run_retitle(env, ct.plan_retitle(
+        env, ct.RetitleFlags(only=SID[:8], title="ACME-REVIEW")))
+    write_row(env, 0, A1, O1, "local_0",
+              row_data("11111111-9abc-def0-1234-56789abcdef0", 42))
+    write_row(env, 0, A1, O1, "local_2", row_data(SID_B, old))
+    assert ct.cmd_undo(env, undo_ns(apply=True)) == 0
+    out = capsys.readouterr().out
+    assert "note:" in out and "is also row local_2.json" in out
 
 
 def test_undo_preview_names_the_retitle(mkenv, tmp_path, write_row, capsys):

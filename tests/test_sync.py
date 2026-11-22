@@ -283,6 +283,26 @@ def test_only_filter(two_account_env, tmp_path):
     assert tally["filtered"] == ["Bravo"]
 
 
+def test_a_title_that_is_not_text_reads_as_untitled(two_account_env, tmp_path,
+                                                     monkeypatch, capsys):
+    """A row whose title is a number or a list reads as untitled, as title_key
+    compares it: --only passes over it, and the dry run around it still runs."""
+    env, src, dst = two_account_env(tmp_path)
+    _row(src, "local_a.json", "sid-a", "Alpha"); _transcript(env, "sid-a")
+    _row(src, "local_b.json", "sid-b", 42); _transcript(env, "sid-b")
+    _row(src, "local_c.json", "sid-c", ["Alpha"]); _transcript(env, "sid-c")
+    source, dest = ct.resolve_sync_endpoints(env)
+    picked, tally = ct.select_sync_rows(env, source, dest, ct.SyncFlags(only="alph"))
+    assert [p["title"] for p in picked] == ["Alpha"]
+    assert tally["filtered"] == ["(untitled)", "(untitled)"]
+    m = ct.plan_sync(env, ct.SyncFlags())
+    assert sorted(r["title"] for r in m["rows"]) == ["(untitled)", "(untitled)", "Alpha"]
+    monkeypatch.setattr(ct, "default_env", lambda: env)
+    for argv in (["sync", "--only", "alph"], ["sync", "--verbose"]):
+        assert ct.main(argv) == 0
+        assert "dry run" in capsys.readouterr().out.lower()
+
+
 def test_non_row_files_are_never_candidates(two_account_env, tmp_path):
     env, src, dst = two_account_env(tmp_path)
     for junk in ("scheduled-tasks.json", "deleted_sid-z", "local_q.json.tmp"):
