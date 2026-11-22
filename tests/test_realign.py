@@ -1198,6 +1198,37 @@ def test_two_operations_started_together_do_not_lock_each_other_out(world):
     assert sum(1 for c in claims if c) == 1
 
 
+def test_a_finished_undo_claims_nothing_and_one_still_running_does(world):
+    """A finished undo can never be undone itself (cmd_undo never picks one, and plan_undo
+    refuses an undo of an undo), so as a claimant it would hold a realign's row for good and
+    leave the realign un-undoable. Like relink's claims (departure 15), it claims nothing. An
+    undo still running claims, as any unfinished operation does."""
+    s = behind_store(world)
+    rows = [{"name": "local_1.json", "dest_path": s.r2,
+             "store_path": os.path.dirname(s.r2), "written": True}]
+
+    moved = [{"name": "local_1.json", "path": s.r2}]      # a move, and its undo, record `path`
+
+    def journaled_at(op_type, at, status):
+        # the world's clock stands still, so each operation's place in the journal's order
+        # (_op_sort_key: creation time, then op id) is set by hand
+        o = ct.new_op(world.env, {"op_type": op_type,
+                                  "rows": rows if op_type == "realign" else moved})
+        o.manifest["history"][0]["at"] = at
+        ct.set_status(o, status)
+        return o
+    mine = journaled_at("realign", 100, "completed")
+    later = journaled_at("undo", 200, "completed")
+    m = mine.manifest
+    assert ct._realign_claimed_later(world.env, m, m["rows"][0]) is None
+    ct.set_status(later, "journaled")
+    assert ct._realign_claimed_later(world.env, m, m["rows"][0]) == later.manifest["op_id"]
+    # a later move that finished still claims: its own undo may put the row back
+    ct.set_status(later, "completed")
+    move = journaled_at("move", 300, "completed")
+    assert ct._realign_claimed_later(world.env, m, m["rows"][0]) == move.manifest["op_id"]
+
+
 def test_the_plan_marks_an_archived_row(world, capsys):
     s = behind_store(world)
     world.row(A2, O2, "local_1", S1, s.old_cwd, activity=10, isArchived=True)
@@ -1791,6 +1822,40 @@ def test_an_open_operation_on_the_conversation_holds_its_release(world):
                           "rows": []})
     m = ct.plan_release(world.env, release_flags())
     assert m["copies"] == [] and "unfinished operation" in held_reasons(m)[S1]
+
+
+def test_every_hint_to_resume_a_realign_undo_names_the_operation(world, monkeypatch, capsys):
+    """A bare 'undo --apply' takes the latest completed operation, which by then may be
+    another one, so each way back into a realign's undo names it: 'undo --id <op_id>'."""
+    s, op = applied(world)
+    oid = op.manifest["op_id"]
+    named = "'undo --id {0} --apply'".format(oid)
+    # an undo stopped part-way: its refusal, and the release it then holds
+    monkeypatch.setattr(ct, "_shutil", types.SimpleNamespace(move=_boom))
+    with pytest.raises(ct.Refusal) as exc:
+        ct.undo_realign(world.env, op)
+    monkeypatch.undo()
+    assert named + " again" in str(exc.value)
+    with_bin(world)
+    assert named in held_reasons(ct.plan_release(world.env, release_flags()))[S1]
+    # its retry refused: cmd_undo's line for a conversation left part-way
+    with open(s.live_p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"content": "more"}}) + "\n")
+    capsys.readouterr()
+    assert ct.cmd_undo(world.env, undo_ns(op_id=oid, verbose=True)) == 1
+    out = capsys.readouterr().out
+    assert "re-run " + named + " to finish it once its reason clears" in out
+
+
+def test_cmd_undo_names_the_operation_for_a_refused_conversation(world, capsys):
+    """cmd_undo's line for a conversation refused outright names the operation too."""
+    s, op = applied(world)
+    oid = op.manifest["op_id"]
+    with open(s.live_p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"content": "more"}}) + "\n")
+    assert ct.cmd_undo(world.env, undo_ns(op_id=oid, verbose=True)) == 1
+    out = capsys.readouterr().out
+    assert "re-run 'undo --id {0} --apply' once its reason clears".format(oid) in out
 
 
 def test_an_undo_stopped_part_way_holds_its_release(world):

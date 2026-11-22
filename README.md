@@ -704,7 +704,8 @@ the keys realign changed, keeps whatever the app wrote to other keys since, and 
 conversation, naming the reason, when its rows no longer hold what realign wrote, now open
 another conversation, were written by a later operation, or when the conversation has gained
 turns since (bookkeeping records do not count). The other conversations go ahead, and a later
-`undo --apply` retries the refused ones.
+`undo --id <op_id> --apply` retries the refused ones; every hint to resume names the op, since a
+bare `undo --apply` takes the latest completed operation, which may by then be another.
 
 A copy realign sets aside stays in its journal until `undo` puts it back or `realign --release`
 sends it to the Recycle Bin; `doctor` lists every copy held. Once a conversation has gained

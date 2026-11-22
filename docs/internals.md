@@ -394,11 +394,15 @@ bytes cannot prove ownership, and the app rewrites other keys on open. A convers
 back (copies first, then the old value of each changed key, every other key as the app now has
 it) only if each row still holds what realign wrote and still opens that conversation, no
 operation after this one in the journal's order (`_op_sort_key`) wrote the row
-(`_realign_claimed_later`), each old
+(`_realign_claimed_later`; a finished undo does not count, since no command can undo it, so
+its claim would never clear), each old
 folder still exists and the folder a no-copy row returns to still holds no copy, the moved
 copies are intact in the journal with nothing back at their place, and the live copy has
 gained nothing but bookkeeping records. The result is recorded per conversation in
-`undo_status`; the operation becomes `undone` when every conversation is.
+`undo_status`; the operation becomes `undone` when every conversation is. Every hint to resume
+one refused or left part-way names the op as `undo --id <op_id> --apply`: `cmd_undo`'s two
+lines for a partial result, the `Refusal` from `_realign_undo_conversation`, and the hold
+`_release_decide` gives a release. A bare `undo --apply` takes the latest completed operation.
 
 ## Retention
 
@@ -1547,7 +1551,9 @@ rewritten a row it wrote).
   the very bytes the repoint read as its pre-image, so counting it would decline every rollback
   of a repoint of a relinked row.
 - `_realign_claimed_later` passes over a relink on its type, before reading anything of it: a
-  relink writes no key realign writes, so even a damaged relink record claims nothing there.
+  relink writes no key realign writes, so even a damaged relink record claims nothing there. It
+  passes over a finished undo too, for the reason relink's claims do (departure 15): nothing can
+  undo it, so its claim would hold the row for good.
 
 The first two read a relink in `_relink_claimant_standing`'s order, liveness before damage:
 "pass" for an undone, rolled-back or earlier relink; "claim" when a sort key cannot be computed

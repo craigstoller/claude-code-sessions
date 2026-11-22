@@ -6214,14 +6214,15 @@ def cmd_undo(env, ns):
             states = (prior.manifest.get("undo_status") or {}).values()
             if any(str(v).startswith("refused") for v in states):
                 line = ("a conversation marked 'refused' keeps realign's folder; "
-                        "re-run 'undo --apply' once its reason clears, or leave "
-                        "it (a conversation that has gained turns stays "
-                        "realigned for good)")
+                        "re-run 'undo --id {0} --apply' once its reason clears, or "
+                        "leave it (a conversation that has gained turns stays "
+                        "realigned for good)".format(prior.manifest["op_id"]))
                 print(line if ns.verbose else redact(env, line))
             if any(str(v).startswith("undoing") for v in states):
                 line = ("a conversation marked 'undoing' stopped part-way - some "
-                        "of its rows or copies are already back; re-run 'undo "
-                        "--apply' to finish it once its reason clears")
+                        "of its rows or copies are already back; re-run 'undo --id "
+                        "{0} --apply' to finish it once its reason clears".format(
+                            prior.manifest["op_id"]))
                 print(line if ns.verbose else redact(env, line))
             return 1
     # Converge's undo is FORGIVING - it deletes what is still redundant and
@@ -14036,8 +14037,12 @@ def _realign_claimed_later(env, m, r):
     on its type, before its sort key or any of its rows is read: it sets
     only spawnedFrom and startChain, never a key realign writes (spec D13's
     per-key exception), so even a damaged relink record claims nothing here,
-    and cannot reach the except below to hide a later claimant. Never
-    raises."""
+    and cannot reach the except below to hide a later claimant. A finished
+    undo claims nothing either: no command can undo or withdraw it (cmd_undo
+    never picks one, and plan_undo refuses an undo of an undo), so its claim
+    would hold the row for good, as relink's claims also rule (departure
+    15). An undo still running claims, as every unfinished operation does.
+    Never raises."""
     try:
         mine = m.get("op_id") or ""
         my_key = _op_sort_key(m)
@@ -14048,6 +14053,8 @@ def _realign_claimed_later(env, m, r):
             if om.get("op_type") == "relink":
                 continue
             if oid == mine or om.get("status") in ("undone", "rolled_back"):
+                continue
+            if om.get("op_type") == "undo" and om.get("status") in TERMINAL:
                 continue
             if _op_sort_key(om) <= my_key:
                 continue
@@ -14178,8 +14185,8 @@ def _realign_undo_conversation(env, op, m, conv):
     OSError is a Refusal: the conversation is left at 'undoing', and the
     next undo resumes it."""
     sid = conv["session_id"]
-    then = ("The conversation is left part-way; run 'undo --apply' again to "
-            "finish it.")
+    then = ("The conversation is left part-way; run 'undo --id {0} --apply' "
+            "again to finish it.".format(m["op_id"]))
     for c in m["copies"]:
         if c["session_id"] == sid and c.get("moved"):
             _realign_restore_copy(env, op, c, then)
@@ -15015,7 +15022,7 @@ def _release_decide(env, op, c, entry, nt=(), disc=None):
     sid = c["session_id"]
     if str((m.get("undo_status") or {}).get(sid, "")).startswith("undoing"):
         return ("an undo of this conversation stopped part-way; finish it with "
-                "'undo --apply' first"), None
+                "'undo --id {0} --apply' first".format(m.get("op_id"))), None
     if disc is not None and any(r.get("session_id") == sid
                                 for r, _p in _unresolved_rows(disc, m)):
         return ("its journal names a row in a store this version does not read, so "
