@@ -55,6 +55,21 @@ def test_the_flag_gates_it_and_labels_are_stable(mkenv, tmp_path, write_transcri
     assert ct.redact(env, "row: " + title) == first, "same title, same label, across runs"
 
 
+def test_a_title_that_is_not_text_does_not_stop_anonymizing(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A row whose title is a number or a list adds no pair, and every other
+    title is still replaced."""
+    env = mkenv(tmp_path)
+    title = seed(env, write_transcript, write_row)
+    for name, odd in (("local_2", 42), ("local_3", ["Board complaint"])):
+        write_row(env, 0, "acct", "org", name,
+                  {"sessionId": name, "cliSessionId": "s-1", "title": odd,
+                   "lastActivityAt": 1})
+    ct._ANONYMIZE = True
+    out = ct.redact(env, "row: " + title)
+    assert title not in out and "<session-" in out
+
+
 def test_long_titles_are_replaced_before_formatting_truncates_them(
         mkenv, tmp_path, write_transcript, write_row, capsys):
     """The first bug.

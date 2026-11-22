@@ -33,6 +33,23 @@ def test_gather_list_merges(mkenv, tmp_path, write_transcript, write_row):
     assert [i["session_id"] for i in ct.gather_list(env, query="hello")] == ["s-listed"]
 
 
+def test_list_reads_a_title_that_is_not_text_as_untitled(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """A row whose title is a number or a list lists as untitled, and a query
+    passes over it."""
+    env = mkenv(tmp_path)
+    for sid, title in (("s-a", "Hello"), ("s-b", 42), ("s-c", ["Hello"])):
+        write_transcript(env, "C--p", sid, [{"cwd": "C:\\p"}])
+        write_row(env, 0, "o", "a", "local_" + sid,
+                  {"sessionId": "local_" + sid, "cliSessionId": sid, "cwd": "C:\\p",
+                   "title": title, "lastActivityAt": 9})
+    assert [i["session_id"] for i in ct.gather_list(env, query="hello")] == ["s-a"]
+    assert {i["session_id"]: i["title"] for i in ct.gather_list(env)} == {
+        "s-a": "Hello", "s-b": "", "s-c": ""}
+    assert ct.cmd_list(env, ns()) == 0
+    assert "(no title)" in capsys.readouterr().out
+
+
 def test_gather_doctor_findings(mkenv, tmp_path, write_transcript, write_row, capsys):
     env = mkenv(tmp_path)
     write_row(env, 0, "o", "a", "local_blank",
@@ -249,6 +266,33 @@ def test_repoint_text_report_is_redacted_by_default(
     rc = ct.cmd_repoint(env, ns(only="Board pointer", to_session=target,
                                 store="", live="", apply=False, verbose=True))
     assert rc == 0 and target in capsys.readouterr().out
+
+
+def test_repoint_reads_a_title_that_is_not_text_as_untitled(
+        mkenv, tmp_path, write_transcript, write_row, capsys):
+    """A row whose title is a number or a list matches no title substring, so
+    --only still finds the row it names, by title or by local id."""
+    env = mkenv(tmp_path)
+    a1 = "aaaaaaaa-0000-0000-0000-000000000001"
+    o1 = "bbbbbbbb-0000-0000-0000-000000000002"
+    sid = "12345678-9abc-def0-1234-56789abcdef0"
+    target = "87654321-9abc-def0-1234-56789abcdef0"
+    write_transcript(env, "C--p", target, [{"cwd": "C:\\p"}])
+    write_row(env, 0, a1, o1, "local_1",
+              {"sessionId": "local_1", "cliSessionId": sid, "title": "Board pointer"})
+    write_row(env, 0, a1, o1, "local_2",
+              {"sessionId": "local_2", "cliSessionId": sid, "title": 42})
+    write_row(env, 0, a1, o1, "local_3",
+              {"sessionId": "local_3", "cliSessionId": sid, "title": ["Board"]})
+    with open(os.path.join(env.home, ".claude.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump({"oauthAccount": {"accountUuid": a1,
+                                    "organizationUuid": o1,
+                                    "emailAddress": "me@example.com"}}, fh)
+    for only in ("board", "2"):
+        rc = ct.cmd_repoint(env, ns(only=only, to_session=target,
+                                    store="", live="", apply=False))
+        assert rc == 0 and "will open" in capsys.readouterr().out, only
 
 
 def test_undo_dry_run_preview_redacted(mkenv, tmp_path, write_transcript, write_row, capsys):

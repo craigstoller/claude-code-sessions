@@ -361,6 +361,19 @@ def test_only_resolves_ambiguity_with_a_candidate_listing(
     assert S1[:8] in msg and S2[:8] in msg
 
 
+def test_only_passes_over_a_title_that_is_not_text(
+        mkenv, tmp_path, write_transcript, write_row):
+    """A row whose title is a number or a list matches no title substring, and
+    --only still finds the conversation another row's title or its id names."""
+    env = mkenv(tmp_path)
+    mixed_holdings(env, write_transcript, write_row)
+    write_row(env, 0, A2, O2, "local_s2", row_data(S2, 42))
+    write_row(env, 0, A3, O3, "local_s3", row_data(S3, ["Northwind"]))
+    for only, sid in (("acme", S1), ("quarterly", S2), (S2[:8], S2)):
+        m = ct.plan_converge(env, ct.ConvergeFlags(only=only))
+        assert {r["session"] for r in m["rows"]} == {sid}, only
+
+
 def test_only_no_match_names_new_row(mkenv, tmp_path, write_transcript,
                                      write_row):
     env = mkenv(tmp_path)
