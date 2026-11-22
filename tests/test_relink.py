@@ -3589,9 +3589,30 @@ def test_an_interrupted_undo_keeps_what_it_left_and_reports_it_once(
     assert "spawnedFrom" not in data_of(paths["local_c3"])
 
 
-@pytest.mark.parametrize("fail_in", [(), ("undo_relink",)], ids=["saved", "way-out-save-fails"])
+def record_undo_saves(monkeypatch, fail_repeat=False):
+    """Wrap save_manifest for an undo: each save is recorded by what the record holds when
+    it is saved (whether undo_started and undo_waiting are set, and each row's restored
+    mark), never by which function saved it. With FAIL_REPEAT, a save that marks no row the
+    save before it had not, once a row is marked, raises OSError instead of saving: the save
+    that ends a pass, or the way out after a failure."""
+    real = ct.save_manifest
+    saves = []
+
+    def save(op):
+        m = op.manifest
+        marks = [r.get("restored") for r in m.get("rows") or []]
+        repeat = bool(saves) and any(marks) and marks == saves[-1][2]
+        saves.append(("undo_started" in m, "undo_waiting" in m, marks))
+        if fail_repeat and repeat:
+            raise OSError(28, "No space left on device")
+        return real(op)
+    monkeypatch.setattr(ct, "save_manifest", save)
+    return saves
+
+
+@pytest.mark.parametrize("fail_way_out", [False, True], ids=["saved", "way-out-save-fails"])
 def test_a_failed_verify_leaves_the_row_unmarked_and_undo_again_reads_the_disk(
-        fail_in, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
+        fail_way_out, monkeypatch, mkenv, tmp_path, write_transcript, write_row):
     env = mkenv(tmp_path)
     paths, op = applied(env, write_transcript, write_row)
     real = ct.atomic_write
@@ -3601,16 +3622,17 @@ def test_a_failed_verify_leaves_the_row_unmarked_and_undo_again_reads_the_disk(
             return real(path, json.dumps({"cliSessionId": LC}).encode("utf-8"))
         return real(path, data)
     monkeypatch.setattr(ct, "atomic_write", wrong_for_c3)
-    saves = record_saves(monkeypatch, fail_in=fail_in)
+    saves = record_undo_saves(monkeypatch, fail_repeat=fail_way_out)
     with pytest.raises(ct.LayoutError) as exc:         # never the OSError, never a traceback
         ct.undo_relink(env, op_of(env, op.manifest["op_id"]))
     assert str(exc.value) == (
         "verify failed restoring row local_c3.json: the row on disk is not the row read "
         "with relink's keys put back. 'undo --id {0} --apply' again re-reads it and goes by "
         "what each key holds.".format(op.manifest["op_id"]))
-    # undo_started and undo_waiting before any write, local_c2's mark, then the way out
-    assert [who for who, _, _ in saves] == ["_relink_undo_save", "_relink_undo_save", "tick",
-                                            "undo_relink"]
+    # undo_started, then undo_waiting before any write, then local_c2's mark, then the way
+    # out, which marks nothing new
+    assert saves == [(True, False, [None, None]), (True, True, [None, None]),
+                     (True, True, [True, None]), (True, True, [True, None])]
     monkeypatch.undo()
     om = op_of(env, op.manifest["op_id"]).manifest
     assert om["status"] == "completed"
@@ -5152,10 +5174,13 @@ def test_the_claims_refusal_names_at_most_the_cap_of_rows_and_counts_the_rest():
     live = [{"row": r, "op_id": OPEN_ID, "keys": {"spawnedFrom"},
              "why": "operation {0} wrote it since".format(OPEN_ID)} for r in rows]
     live.append(dict(live[0], op_id=other, why="operation {0} wrote it since".format(other)))
-    assert ct._relink_claims_refusal("OP", live) == (     # a row two operations claim is one
+    line = ct._relink_live_line("undo", "OP", {OPEN_ID, other}, [c["row"] for c in live])
+    assert line == (                                       # a row two operations claim is one
         "cannot undo OP: operation(s) {0}, {1} wrote row(s) {2}, ... and 2 more after it - "
         "undo those first; if one of them cannot be undone, the keys it claims stay linked "
-        "for good. Nothing was changed.".format(OPEN_ID, other, shown))
+        "for good.".format(OPEN_ID, other, shown))
+    # the claims refusal is given live claims only by a direct caller; its words are the same
+    assert ct._relink_claims_refusal("OP", live) == line + " Nothing was changed."
     damaged = [{"row": r, "op_id": "F", "keys": {"spawnedFrom"}, "why": UNREADABLE_CLAIM}
                for r in rows]
     assert ct._relink_claims_refusal("OP", damaged, what="roll back") == (
@@ -5164,7 +5189,8 @@ def test_the_claims_refusal_names_at_most_the_cap_of_rows_and_counts_the_rest():
         "record: with the app closed, repair each one, or move its folder out of the journal. "
         "Nothing was changed.".format(shown))
     # at the cap, every row is named and none is counted
-    msg = ct._relink_claims_refusal("OP", live[:ct.RELINK_LIST_CAP])
+    msg = ct._relink_live_line("undo", "OP", {OPEN_ID},
+                               [c["row"] for c in live[:ct.RELINK_LIST_CAP]])
     assert "wrote row(s) " + shown + " after it" in msg and " more " not in msg
 
 
@@ -5852,15 +5878,9 @@ def test_a_save_that_fails_at_the_end_of_a_pass_refuses_naming_undo_id_and_what_
     oid = op.manifest["op_id"]
     retitled(env)
     target = op_of(env, oid)
-    real = ct.save_manifest
-
-    def full_at_the_end(o):
-        # the pass's own unbudgeted save once rows are marked; the rows' saves went first
-        if sys._getframe(1).f_code.co_name == "_relink_undo_save" and any(
-                r.get("restored") for r in o.manifest["rows"]):
-            raise OSError(28, "No space left on device")
-        return real(o)
-    monkeypatch.setattr(ct, "save_manifest", full_at_the_end)
+    # the save that ends the pass fails: it marks nothing new, as the rows' own saves went
+    # first
+    record_undo_saves(monkeypatch, fail_repeat=True)
     with pytest.raises(ct.Refusal) as exc:
         ct.undo_relink(env, target)
     assert str(exc.value) == (

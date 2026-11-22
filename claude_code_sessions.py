@@ -20712,10 +20712,10 @@ def _relink_write_rows(op, m, roots, saver):
         sha = _relink_sha(raw)
         if sha == r["post_sha256"]:
             # Defensive: the apply runs only from 'journaled', and nothing
-            # writes a row before that, so today only a test reaches this.
-            # It is kept because forward recovery and a resumed write loop
-            # rely on the same rule: a row already at its post-image landed,
-            # and is marked, never written again.
+            # writes a row before that, so today only a test reaches this. A
+            # row already at its post-image has landed: it is marked and never
+            # written again. Forward recovery holds to the same idea key by
+            # key, counting a key already at relink's value as landed.
             r["written"] = True
             saver.tick()
             continue
@@ -21044,12 +21044,12 @@ def _relink_claims(env, m, rows):
                             if orow.get("restored") is True \
                                     or not (orow.get("written") or unfinished):
                                 continue
-                            theirs = _relink_row_claims(orow)
-                            if theirs is None:
+                            row_keys = _relink_row_claims(orow)
+                            if row_keys is None:
                                 # Which keys it holds cannot be told: its
                                 # whole record is damaged (the except below).
                                 raise ValueError("a relink row it names is damaged")
-                            got = theirs & keys
+                            got = row_keys & keys
                         elif kind in ("move", "undo") or orow.get("written") \
                                 or unfinished:
                             got = set(keys)
@@ -21320,7 +21320,9 @@ def _relink_claims_refusal(op_id, claims, what="undo"):
     <WHAT> <op_id>`. Undo and recovery's back both refuse on the last two,
     which cover every key, and pass only those; a live claim holds only its
     own keys (undo's own refusal, when nothing else could go, is
-    _relink_undo_waits_refusal)."""
+    _relink_undo_waits_refusal). So no production caller reaches the live
+    line: it is kept for a direct caller, and its words are
+    _relink_live_line's, which _relink_undo_waits_refusal prints."""
     unlisted = [c for c in claims if not c["op_id"]]
     damaged = [c for c in claims
                if c["op_id"] and c["why"] == _RELINK_CLAIM_UNREADABLE]
