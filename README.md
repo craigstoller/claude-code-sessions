@@ -1525,6 +1525,19 @@ window into `journaled`/`completed`/`rolled_back`.
   924 rows in one run, 931 links and 42 chains in all across three accounts. Every link and
   chain read back as written, and the 120 rows whose accounts disagree on the parent stayed out.
   "`relink`" above says what was looked at and what was not.
+- **0.19.1 fixes three faults found while `relink` was built.** `realign`'s `undo` refuses a
+  conversation whose row a later operation wrote, and a finished `undo` of that later operation
+  counted as one. Nothing can undo an undo, so that refusal could never clear. A finished `undo`
+  now claims nothing there, as `relink`'s `undo` already read it; an `undo` still running holds
+  the row as before. Every hint to resume a `realign` undo now names the operation, `undo --id
+  <op_id> --apply`, since a bare `undo --apply` takes the latest completed operation, which by
+  then may be another one. A row whose title is not a string, a number or a list say, stopped
+  `sync`, `repoint`, `retitle`, `list` and `converge --only` with a Python error, and so did
+  any `--anonymize` run on a store holding one. Such a title now reads as no title, as the
+  duplicate-title check already read it, and `retitle`'s `undo` no longer loses its note that
+  a restored title collides to one. Each fix has a test that fails without it. The `converge`
+  sample above now adds up, and `relink`'s code has the comment, docstring and test cleanups
+  deferred from 0.19.0, with no change in what it does.
 - Platform rows above move from "unverified" to "verified" as contributors confirm the store
   paths and behavior on their own machines.
 
