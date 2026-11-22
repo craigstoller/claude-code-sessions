@@ -622,7 +622,7 @@ cycles  : 1 already present, left as they are
 Each part prints only when its count is not zero, the most frequent reason first. A row whose
 link was left out carries `[link: <reason>]` on its own line. The apply resolves every link
 again under the lock, against the store as it then stands, and its last lines say what changed
-since the plan: `links   : 4 carried, 1 left out (...); since the plan: 1 changed, 1 gained`.
+since the plan: `links   : 3 carried, 2 left out (...); since the plan: 1 changed, 1 dropped`.
 `changed` and `dropped` count links the plan had, `gained` one it did not. With `--verbose` the
 apply also lists them, one line per written row whose link or chain was left out or changed
 since the plan, with its account:
